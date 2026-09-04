@@ -1,4 +1,4 @@
-/** Shared frontend type placeholders. Domain types will expand with API work. */
+/** Shared frontend types. */
 
 export type UserRole = 'USER' | 'ADMIN'
 

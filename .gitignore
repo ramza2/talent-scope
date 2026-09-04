@@ -39,3 +39,5 @@ temp/
 # Local data
 *.sqlite
 *.sqlite3
+dump.rdb
+*.rdb
