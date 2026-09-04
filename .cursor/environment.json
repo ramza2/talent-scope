@@ -1,0 +1,6 @@
+{
+  "name": "TalentScope",
+  "install": "bash scripts/cloud-install.sh",
+  "start": "bash scripts/cloud-start.sh",
+  "ports": [5432]
+}
