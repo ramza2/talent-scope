@@ -120,7 +120,13 @@ def _cleanup_codes(db_session, codes: list[str]) -> None:
             db_session.execute(delete(CodeMaster).where(CodeMaster.code.in_(list(remaining))))
             remaining.clear()
             break
-    db_session.execute(delete(AuditLog).where(AuditLog.target_type == "CODE"))
+    # Delete only audits whose metadata.code matches codes created by this test.
+    db_session.execute(
+        delete(AuditLog).where(
+            AuditLog.target_type == "CODE",
+            AuditLog.metadata_json["code"].as_string().in_(list(codes)),
+        )
+    )
     db_session.commit()
 
 
@@ -392,3 +398,89 @@ def test_normalize_alias_unit() -> None:
         standard_name="Python",
     )
     assert pairs == [("파이썬", "파이썬")]
+
+
+def test_cleanup_codes_preserves_unrelated_code_audits(client: TestClient, db_session) -> None:
+    """Cleanup must not delete CODE audits for codes it did not create."""
+    from app.db.models.revision import AuditLog
+    from sqlalchemy import select
+
+    suffix = uuid.uuid4().hex[:8]
+    keeper_code = f"TECH-KEEP-{suffix}"
+    transient_code = f"TECH-TMP-{suffix}"
+    admin = _create_user(db_session, login_id=f"a_{suffix}", password="Secret123!", role="ADMIN")
+
+    # Seed a pre-existing CODE audit that must survive cleanup of another code.
+    keeper = AuditLog(
+        user_id=admin.id,
+        action_type="CODE_CREATE",
+        target_type="CODE",
+        target_id=None,
+        metadata_json={"code": keeper_code, "seed": "isolation"},
+    )
+    db_session.add(keeper)
+    db_session.commit()
+    db_session.refresh(keeper)
+    keeper_id = keeper.id
+
+    try:
+        csrf = _login(client, admin.login_id)
+        created = client.post(
+            "/api/v1/codes",
+            headers={"X-CSRF-Token": csrf},
+            json={"code": transient_code, "type": "TECH", "name": "Transient"},
+        )
+        assert created.status_code == 201
+
+        _cleanup_codes(db_session, [transient_code])
+
+        still = db_session.execute(
+            select(AuditLog).where(AuditLog.id == keeper_id)
+        ).scalar_one_or_none()
+        assert still is not None
+        assert still.metadata_json.get("code") == keeper_code
+
+        # Transient audits must be gone.
+        leftover = db_session.execute(
+            select(AuditLog).where(
+                AuditLog.target_type == "CODE",
+                AuditLog.metadata_json["code"].as_string() == transient_code,
+            )
+        ).scalars().all()
+        assert leftover == []
+    finally:
+        db_session.execute(delete(AuditLog).where(AuditLog.id == keeper_id))
+        db_session.commit()
+        _cleanup_codes(db_session, [transient_code, keeper_code])
+        _cleanup_user(db_session, admin.id)
+
+
+def test_create_code_integrity_error_maps_to_conflict(monkeypatch, db_session) -> None:
+    from sqlalchemy.exc import IntegrityError
+
+    from app.modules.codes.schemas import CodeCreateRequest
+    from app.modules.codes.service import CodeService
+
+    class _Orig:
+        sqlstate = "23505"
+        diag = type("D", (), {"constraint_name": "code_master_pkey"})()
+
+        def __str__(self) -> str:
+            return 'duplicate key value violates unique constraint "code_master_pkey"'
+
+    service = CodeService(db_session)
+    monkeypatch.setattr(service.repo, "get_by_code", lambda code: None)
+
+    def _boom(*args, **kwargs):  # noqa: ANN002, ANN003
+        raise IntegrityError("INSERT", {}, _Orig())
+
+    monkeypatch.setattr(service.repo, "create_code", _boom)
+
+    with pytest.raises(Exception) as exc_info:
+        service.create_code(
+            CodeCreateRequest(code="TECH-X", type="TECH", name="X"),
+            actor_user_id=uuid.uuid4(),
+        )
+    from app.core.exceptions import CodeAlreadyExistsError
+
+    assert isinstance(exc_info.value, CodeAlreadyExistsError)

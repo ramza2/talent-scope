@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from uuid import UUID
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.core.db_errors import is_unique_violation
 from app.core.exceptions import (
     CodeAlreadyExistsError,
     CodeHierarchyCycleError,
@@ -142,24 +144,30 @@ class CodeService:
             parent_code=payload.parent_code,
         )
         pairs = prepare_aliases(payload.aliases, standard_name=payload.name)
-        row = self.repo.create_code(
-            code=payload.code,
-            code_type=payload.type,
-            name=payload.name,
-            description=payload.description,
-            parent_code=payload.parent_code,
-            sort_order=payload.sort_order,
-        )
-        self.repo.replace_aliases(payload.code, pairs)
-        aliases = [a for a, _ in pairs]
-        self.repo.add_audit(
-            action_type="CODE_CREATE",
-            actor_user_id=actor_user_id,
-            code=payload.code,
-            after=self._snapshot(row, aliases),
-        )
-        self.db.commit()
-        self.db.refresh(row)
+        try:
+            row = self.repo.create_code(
+                code=payload.code,
+                code_type=payload.type,
+                name=payload.name,
+                description=payload.description,
+                parent_code=payload.parent_code,
+                sort_order=payload.sort_order,
+            )
+            self.repo.replace_aliases(payload.code, pairs)
+            aliases = [a for a, _ in pairs]
+            self.repo.add_audit(
+                action_type="CODE_CREATE",
+                actor_user_id=actor_user_id,
+                code=payload.code,
+                after=self._snapshot(row, aliases),
+            )
+            self.db.commit()
+            self.db.refresh(row)
+        except IntegrityError as exc:
+            self.db.rollback()
+            if is_unique_violation(exc, "code_master_pkey"):
+                raise CodeAlreadyExistsError() from exc
+            raise
         return self._to_item(row, aliases)
 
     def update_code(

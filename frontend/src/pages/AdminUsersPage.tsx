@@ -14,9 +14,10 @@ import {
 import { KeyOutlined, PlusOutlined, ReloadOutlined } from '@ant-design/icons'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import type { ColumnsType } from 'antd/es/table'
+import { useNavigate } from 'react-router-dom'
 
 import { apiErrorMessage } from '@/api/errors'
-import { useAuthMe } from '@/app/auth'
+import { authMeQueryKey, useAuthMe } from '@/app/auth'
 import {
   createUser,
   listUsers,
@@ -69,6 +70,7 @@ function formatDate(value?: string | null) {
 
 export function AdminUsersPage() {
   const queryClient = useQueryClient()
+  const navigate = useNavigate()
   const { data: me } = useAuthMe()
   const [filters, setFilters] = useState<Filters>({
     q: '',
@@ -88,6 +90,16 @@ export function AdminUsersPage() {
   const [createForm] = Form.useForm<CreateForm>()
   const [editForm] = Form.useForm<EditForm>()
   const [resetForm] = Form.useForm<ResetForm>()
+
+  const syncSelfSessionAfterInvalidation = async () => {
+    message.warning('현재 로그인 세션이 종료되었습니다. 다시 로그인해주세요.')
+    await queryClient.invalidateQueries({ queryKey: authMeQueryKey })
+    await queryClient.refetchQueries({ queryKey: authMeQueryKey })
+    const current = queryClient.getQueryData(authMeQueryKey)
+    if (!current) {
+      navigate('/login', { replace: true })
+    }
+  }
 
   const queryKey = ['users', filters] as const
   const { data, isLoading, isFetching } = useQuery({
@@ -117,11 +129,16 @@ export function AdminUsersPage() {
 
   const updateMutation = useMutation({
     mutationFn: ({ id, body }: { id: string; body: EditForm }) => updateUser(id, body),
-    onSuccess: async () => {
+    onSuccess: async (_data, variables) => {
       message.success('사용자 정보가 수정되었습니다.')
       setEditOpen(false)
+      const editedId = variables.id
+      const roleChanged = editing != null && variables.body.role !== editing.role
       setEditing(null)
       await queryClient.invalidateQueries({ queryKey: ['users'] })
+      if (me?.id === editedId && roleChanged) {
+        await syncSelfSessionAfterInvalidation()
+      }
     },
     onError: (error) => {
       message.error(apiErrorMessage(error, '사용자 수정에 실패했습니다.'))
@@ -131,12 +148,16 @@ export function AdminUsersPage() {
   const resetMutation = useMutation({
     mutationFn: ({ id, password }: { id: string; password: string }) =>
       resetUserPassword(id, password),
-    onSuccess: async () => {
+    onSuccess: async (_data, variables) => {
       message.success('비밀번호가 변경되었으며 기존 로그인 세션이 종료되었습니다.')
       setResetOpen(false)
+      const targetId = variables.id
       setResetTarget(null)
       resetForm.resetFields()
       await queryClient.invalidateQueries({ queryKey: ['users'] })
+      if (me?.id === targetId) {
+        await syncSelfSessionAfterInvalidation()
+      }
     },
     onError: (error) => {
       message.error(apiErrorMessage(error, '비밀번호 초기화에 실패했습니다.'))

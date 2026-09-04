@@ -289,59 +289,47 @@ def test_cannot_deactivate_self(client: TestClient, db_session) -> None:
         _cleanup_user(db_session, admin.id)
 
 
-def test_last_active_admin_protection(client: TestClient, db_session) -> None:
+def test_last_active_admin_protection(monkeypatch, client: TestClient, db_session) -> None:
+    """Verify last-admin guard without mutating pre-existing app_user rows.
+
+    ``count_active_admins`` is stubbed to 1 so protection triggers even when
+    other ACTIVE ADMINs exist in the shared development database.
+    """
+    from app.modules.users.repository import UserRepository
+
     suffix = uuid.uuid4().hex[:8]
-    # Isolate: only this admin is ACTIVE ADMIN among our created users;
-    # there may be other admins in DB from e2e. Count-based protection uses
-    # global count, so create a dedicated scenario by demoting extras is hard.
-    # Instead: create one admin, and if global count is 1 for our purpose we
-    # check the endpoint. If other ACTIVE ADMINs exist in DB, temporarily
-    # mark them inactive in the transaction scope of this test.
-    from app.db.models.user import AppUser
-
-    existing_admins = list(
-        db_session.execute(
-            select(AppUser).where(AppUser.role == "ADMIN", AppUser.status == "ACTIVE")
-        ).scalars()
+    actor = _create_user(db_session, login_id=f"actor_{suffix}", password="Secret123!", role="ADMIN")
+    target = _create_user(
+        db_session, login_id=f"target_{suffix}", password="Secret123!", role="ADMIN"
     )
-    paused = []
-    for row in existing_admins:
-        row.status = "INACTIVE"
-        paused.append(row.id)
-        db_session.add(row)
-    db_session.commit()
-
-    admin = _create_user(db_session, login_id=f"solo_{suffix}", password="Secret123!", role="ADMIN")
     try:
-        csrf = _login(client, admin.login_id)
+        monkeypatch.setattr(UserRepository, "count_active_admins", lambda self: 1)
+
+        csrf = _login(client, actor.login_id)
         demote = client.patch(
-            f"/api/v1/users/{admin.id}",
+            f"/api/v1/users/{target.id}",
             headers={"X-CSRF-Token": csrf},
             json={"role": "USER"},
         )
         assert demote.status_code == 400
         assert demote.json()["code"] == "LAST_ACTIVE_ADMIN_REQUIRED"
 
-        # Self-deactivate blocked first by CANNOT_DEACTIVATE_SELF when only self,
-        # but also LAST_ACTIVE_ADMIN — either is acceptable; self check runs first.
         inactive = client.patch(
-            f"/api/v1/users/{admin.id}",
+            f"/api/v1/users/{target.id}",
             headers={"X-CSRF-Token": csrf},
             json={"status": "INACTIVE"},
         )
         assert inactive.status_code == 400
-        assert inactive.json()["code"] in {
-            "CANNOT_DEACTIVATE_SELF",
-            "LAST_ACTIVE_ADMIN_REQUIRED",
-        }
+        assert inactive.json()["code"] == "LAST_ACTIVE_ADMIN_REQUIRED"
+
+        # Pre-existing rows untouched: only test-created users were used.
+        db_session.refresh(actor)
+        db_session.refresh(target)
+        assert actor.role == "ADMIN" and actor.status == "ACTIVE"
+        assert target.role == "ADMIN" and target.status == "ACTIVE"
     finally:
-        _cleanup_user(db_session, admin.id)
-        for uid in paused:
-            row = db_session.get(AppUser, uid)
-            if row is not None:
-                row.status = "ACTIVE"
-                db_session.add(row)
-        db_session.commit()
+        _cleanup_user(db_session, target.id)
+        _cleanup_user(db_session, actor.id)
 
 
 def test_reset_password_invalidates_and_changes_hash(client: TestClient, db_session) -> None:
@@ -422,3 +410,83 @@ def test_create_user_requires_csrf(client: TestClient, db_session) -> None:
         assert response.json()["code"] == "CSRF_INVALID"
     finally:
         _cleanup_user(db_session, admin.id)
+
+
+def test_create_user_integrity_error_maps_to_conflict(monkeypatch, db_session) -> None:
+    from sqlalchemy.exc import IntegrityError
+
+    from app.core.exceptions import UserLoginIdExistsError
+    from app.modules.users.schemas import UserCreateRequest
+    from app.modules.users.service import UserService
+
+    class _Orig:
+        sqlstate = "23505"
+        diag = type("D", (), {"constraint_name": "app_user_login_id_key"})()
+
+        def __str__(self) -> str:
+            return 'duplicate key value violates unique constraint "app_user_login_id_key"'
+
+    service = UserService(db_session)
+    monkeypatch.setattr(service.repo, "get_by_login_id", lambda login_id: None)
+
+    def _boom(*args, **kwargs):  # noqa: ANN002, ANN003
+        raise IntegrityError("INSERT", {}, _Orig())
+
+    monkeypatch.setattr(service.repo, "create_user", _boom)
+
+    with pytest.raises(UserLoginIdExistsError):
+        service.create_user(
+            UserCreateRequest(
+                login_id="dup_user",
+                name="Dup",
+                role="USER",
+                password="Secret123!",
+            ),
+            actor_user_id=uuid.uuid4(),
+        )
+
+
+def test_last_admin_test_does_not_mutate_foreign_users(monkeypatch, client, db_session) -> None:
+    """Snapshot unrelated ACTIVE ADMIN rows before/after last-admin guard test path."""
+    from app.db.models.user import AppUser
+    from app.modules.users.repository import UserRepository
+
+    before = {
+        str(u.id): (u.role, u.status, u.login_id)
+        for u in db_session.execute(
+            select(AppUser).where(AppUser.role == "ADMIN", AppUser.status == "ACTIVE")
+        ).scalars()
+    }
+
+    suffix = uuid.uuid4().hex[:8]
+    actor = _create_user(db_session, login_id=f"snap_a_{suffix}", password="Secret123!", role="ADMIN")
+    target = _create_user(
+        db_session, login_id=f"snap_t_{suffix}", password="Secret123!", role="ADMIN"
+    )
+    try:
+        monkeypatch.setattr(UserRepository, "count_active_admins", lambda self: 1)
+        csrf = _login(client, actor.login_id)
+        resp = client.patch(
+            f"/api/v1/users/{target.id}",
+            headers={"X-CSRF-Token": csrf},
+            json={"role": "USER"},
+        )
+        assert resp.status_code == 400
+        assert resp.json()["code"] == "LAST_ACTIVE_ADMIN_REQUIRED"
+    finally:
+        _cleanup_user(db_session, target.id)
+        _cleanup_user(db_session, actor.id)
+
+    db_session.expire_all()
+    if before:
+        after = {
+            str(u.id): (u.role, u.status, u.login_id)
+            for u in db_session.execute(
+                select(AppUser).where(
+                    AppUser.id.in_([uuid.UUID(i) for i in before.keys()])
+                )
+            ).scalars()
+        }
+        for uid, snapshot in before.items():
+            assert after.get(uid) == snapshot
+

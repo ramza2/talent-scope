@@ -6,8 +6,10 @@ import logging
 import math
 from uuid import UUID
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.core.db_errors import is_unique_violation
 from app.core.exceptions import (
     CannotDeactivateSelfError,
     InvalidUserRoleError,
@@ -144,22 +146,28 @@ class UserService:
                 f"비밀번호는 {MIN_PASSWORD_LENGTH}자 이상이어야 합니다."
             )
 
-        user = self.repo.create_user(
-            login_id=payload.login_id,
-            password_hash=hash_password(payload.password),
-            name=payload.name,
-            role=payload.role,
-            email=payload.email,
-            department=payload.department,
-        )
-        self.repo.add_audit(
-            action_type="USER_CREATE",
-            actor_user_id=actor_user_id,
-            target_user_id=user.id,
-            after=self._safe_snapshot(user),
-        )
-        self.db.commit()
-        self.db.refresh(user)
+        try:
+            user = self.repo.create_user(
+                login_id=payload.login_id,
+                password_hash=hash_password(payload.password),
+                name=payload.name,
+                role=payload.role,
+                email=payload.email,
+                department=payload.department,
+            )
+            self.repo.add_audit(
+                action_type="USER_CREATE",
+                actor_user_id=actor_user_id,
+                target_user_id=user.id,
+                after=self._safe_snapshot(user),
+            )
+            self.db.commit()
+            self.db.refresh(user)
+        except IntegrityError as exc:
+            self.db.rollback()
+            if is_unique_violation(exc, "app_user_login_id_key", "login_id"):
+                raise UserLoginIdExistsError() from exc
+            raise
         return self._to_item(user)
 
     def update_user(
