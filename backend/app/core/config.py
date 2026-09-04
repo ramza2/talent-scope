@@ -41,9 +41,20 @@ class Settings(BaseSettings):
     # Embedding dimension fixed by db/schema.sql (BGE-M3)
     embedding_dimensions: int = 1024
 
+    # Browser server-session auth (docs/15)
+    session_cookie_name: str = "ts_session"
+    session_ttl_seconds: int = 28800
+    csrf_cookie_name: str = "ts_csrf"
+    redis_key_prefix: str = "talentscope"
+
     @property
     def is_development(self) -> bool:
         return self.app_env.lower() in {"development", "dev", "local", "test"}
+
+    @property
+    def cookie_secure(self) -> bool:
+        """Secure cookies in non-dev environments (HTTPS)."""
+        return not self.is_development
 
 
 @lru_cache
