@@ -10,21 +10,39 @@ import { AdminCodesPage } from '@/pages/AdminCodesPage'
 import { AdminUsersPage } from '@/pages/AdminUsersPage'
 import { AdminAnalysesPage } from '@/pages/AdminAnalysesPage'
 import { NotFoundPage } from '@/pages/NotFoundPage'
+import { LoginPage } from '@/pages/LoginPage'
+import { ForbiddenPage } from '@/pages/ForbiddenPage'
+import { PublicOnly, RequireAdmin, RequireAuth } from '@/app/RequireAuth'
 
 export const router = createBrowserRouter([
   {
-    path: '/',
-    element: <MainLayout />,
+    element: <PublicOnly />,
+    children: [{ path: '/login', element: <LoginPage /> }],
+  },
+  {
+    element: <RequireAuth />,
     children: [
-      { index: true, element: <DashboardPage /> },
-      { path: 'people', element: <PeopleListPage /> },
-      { path: 'people/new', element: <PeopleNewPage /> },
-      { path: 'analyses', element: <AnalysesPage /> },
-      { path: 'search', element: <SearchPage /> },
-      { path: 'admin/codes', element: <AdminCodesPage /> },
-      { path: 'admin/users', element: <AdminUsersPage /> },
-      { path: 'admin/analyses', element: <AdminAnalysesPage /> },
-      { path: '*', element: <NotFoundPage /> },
+      {
+        path: '/',
+        element: <MainLayout />,
+        children: [
+          { index: true, element: <DashboardPage /> },
+          { path: 'people', element: <PeopleListPage /> },
+          { path: 'search', element: <SearchPage /> },
+          { path: 'forbidden', element: <ForbiddenPage /> },
+          {
+            element: <RequireAdmin />,
+            children: [
+              { path: 'people/new', element: <PeopleNewPage /> },
+              { path: 'analyses', element: <AnalysesPage /> },
+              { path: 'admin/codes', element: <AdminCodesPage /> },
+              { path: 'admin/users', element: <AdminUsersPage /> },
+              { path: 'admin/analyses', element: <AdminAnalysesPage /> },
+            ],
+          },
+          { path: '*', element: <NotFoundPage /> },
+        ],
+      },
     ],
   },
 ])
