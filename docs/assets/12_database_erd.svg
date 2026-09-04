@@ -1,0 +1,314 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1320" viewBox="0 0 1800 1320" role="img" aria-labelledby="title desc">
+  <title id="title">TalentScope Database ERD</title>
+  <desc id="desc">ERD for registration, personnel profile, documents, AI analysis, projects, evidence and search embeddings.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#5b6472"/>
+    </marker>
+    <style>
+      .bg { fill:#f7f8fa; }
+      .zone { fill:#ffffff; stroke:#d8dde6; stroke-width:2; rx:16; }
+      .zone-title { font:700 18px sans-serif; fill:#263238; }
+      .entity { fill:#ffffff; stroke:#8793a1; stroke-width:1.5; rx:10; }
+      .entity-title { font:700 16px sans-serif; fill:#1f2937; }
+      .field { font:13px sans-serif; fill:#374151; }
+      .note { font:12px sans-serif; fill:#6b7280; }
+      .line { stroke:#5b6472; stroke-width:1.7; fill:none; marker-end:url(#arrow); }
+      .line-dashed { stroke:#7b8794; stroke-width:1.5; stroke-dasharray:7 6; fill:none; marker-end:url(#arrow); }
+      .label { font:12px sans-serif; fill:#4b5563; }
+      .accent-reg { fill:#eef4ff; stroke:#5b8def; }
+      .accent-person { fill:#eefbf3; stroke:#4ca66a; }
+      .accent-doc { fill:#fff8e8; stroke:#d7a33d; }
+      .accent-ai { fill:#f5efff; stroke:#8d66d9; }
+      .accent-evidence { fill:#fff0f2; stroke:#d26474; }
+      .accent-search { fill:#eef9fb; stroke:#3d9cad; }
+    </style>
+  </defs>
+  <rect class="bg" width="1800" height="1320"/>
+  <text x="60" y="48" style="font:700 28px sans-serif; fill:#111827;">TalentScope Database ERD — 1차 MVP</text>
+  <text x="60" y="76" class="note">Candidate 분석 데이터와 Confirmed 운영 데이터를 분리하고, Evidence와 Search Index를 독립 계층으로 관리한다.</text>
+
+  <!-- Zones -->
+  <rect class="zone" x="40" y="105" width="330" height="390"/>
+  <text x="60" y="135" class="zone-title">1. Registration</text>
+
+  <rect class="zone" x="395" y="105" width="540" height="760"/>
+  <text x="415" y="135" class="zone-title">2. Confirmed Person / Profile</text>
+
+  <rect class="zone" x="960" y="105" width="385" height="600"/>
+  <text x="980" y="135" class="zone-title">3. Document</text>
+
+  <rect class="zone" x="1370" y="105" width="390" height="600"/>
+  <text x="1390" y="135" class="zone-title">4. AI Analysis / Review</text>
+
+  <rect class="zone" x="960" y="735" width="385" height="535"/>
+  <text x="980" y="765" class="zone-title">5. Evidence</text>
+
+  <rect class="zone" x="1370" y="735" width="390" height="535"/>
+  <text x="1390" y="765" class="zone-title">6. Search / Embedding</text>
+
+  <!-- Registration entities -->
+  <g transform="translate(65,165)">
+    <rect class="entity accent-reg" width="280" height="145"/>
+    <text x="16" y="26" class="entity-title">UPLOAD_SESSION</text>
+    <text x="16" y="50" class="field">PK id</text>
+    <text x="16" y="70" class="field">status</text>
+    <text x="16" y="90" class="field">identified_name/company</text>
+    <text x="16" y="110" class="field">identified_phone/email</text>
+    <text x="16" y="130" class="field">FK resolved_person_id</text>
+  </g>
+  <g transform="translate(65,335)">
+    <rect class="entity accent-reg" width="280" height="135"/>
+    <text x="16" y="26" class="entity-title">UPLOAD_TEMP_FILE</text>
+    <text x="16" y="50" class="field">PK id</text>
+    <text x="16" y="70" class="field">FK upload_session_id</text>
+    <text x="16" y="90" class="field">document_type_code</text>
+    <text x="16" y="110" class="field">temp_storage_key / sha256</text>
+  </g>
+
+  <!-- Person/Profile entities -->
+  <g transform="translate(425,165)">
+    <rect class="entity accent-person" width="230" height="120"/>
+    <text x="16" y="26" class="entity-title">PERSON</text>
+    <text x="16" y="50" class="field">PK id</text>
+    <text x="16" y="70" class="field">status</text>
+    <text x="16" y="90" class="field">created_by / created_at</text>
+    <text x="16" y="110" class="field">deleted_at</text>
+  </g>
+  <g transform="translate(680,165)">
+    <rect class="entity accent-person" width="225" height="170"/>
+    <text x="16" y="26" class="entity-title">PERSON_PROFILE</text>
+    <text x="16" y="50" class="field">PK/FK person_id</text>
+    <text x="16" y="70" class="field">name / phone / email</text>
+    <text x="16" y="90" class="field">affiliation_company</text>
+    <text x="16" y="110" class="field">technical_grade</text>
+    <text x="16" y="130" class="field">career_*_months</text>
+    <text x="16" y="150" class="field">profile_summary / version</text>
+  </g>
+
+  <g transform="translate(425,315)">
+    <rect class="entity accent-person" width="230" height="125"/>
+    <text x="16" y="26" class="entity-title">PERSON_JOB</text>
+    <text x="16" y="50" class="field">PK id / FK person_id</text>
+    <text x="16" y="70" class="field">FK job_code</text>
+    <text x="16" y="90" class="field">job_type</text>
+    <text x="16" y="110" class="field">source_type / confirmed_at</text>
+  </g>
+  <g transform="translate(680,365)">
+    <rect class="entity accent-person" width="225" height="125"/>
+    <text x="16" y="26" class="entity-title">PERSON_SKILL</text>
+    <text x="16" y="50" class="field">PK id / FK person_id</text>
+    <text x="16" y="70" class="field">FK tech_code</text>
+    <text x="16" y="90" class="field">last_used_year</text>
+    <text x="16" y="110" class="field">experience_months</text>
+  </g>
+  <g transform="translate(425,465)">
+    <rect class="entity accent-person" width="230" height="115"/>
+    <text x="16" y="26" class="entity-title">PERSON_EXPERTISE</text>
+    <text x="16" y="50" class="field">PK id / FK person_id</text>
+    <text x="16" y="70" class="field">FK exp_code</text>
+    <text x="16" y="90" class="field">evidence_type / source_type</text>
+  </g>
+
+  <g transform="translate(680,520)">
+    <rect class="entity accent-person" width="225" height="185"/>
+    <text x="16" y="26" class="entity-title">PROJECT</text>
+    <text x="16" y="50" class="field">PK id / FK person_id</text>
+    <text x="16" y="70" class="field">project_name / customer_name</text>
+    <text x="16" y="90" class="field">start_date / end_date</text>
+    <text x="16" y="110" class="field">responsibilities</text>
+    <text x="16" y="130" class="field">project_summary</text>
+    <text x="16" y="150" class="field">source_analysis_run_id</text>
+    <text x="16" y="170" class="field">deleted_at</text>
+  </g>
+  <g transform="translate(425,610)">
+    <rect class="entity accent-person" width="230" height="180"/>
+    <text x="16" y="26" class="entity-title">PROJECT_* LINKS</text>
+    <text x="16" y="52" class="field">PROJECT_JOB</text>
+    <text x="16" y="76" class="field">PROJECT_SKILL</text>
+    <text x="16" y="100" class="field">PROJECT_EXPERTISE</text>
+    <text x="16" y="124" class="field">PROJECT_BUSINESS_DOMAIN</text>
+    <text x="16" y="148" class="field">PROJECT_CUSTOMER_TYPE</text>
+    <text x="16" y="170" class="note">각각 project_id + code 복합 Unique</text>
+  </g>
+  <g transform="translate(680,730)">
+    <rect class="entity accent-person" width="225" height="105"/>
+    <text x="16" y="26" class="entity-title">PROFILE_REVISION</text>
+    <text x="16" y="50" class="field">PK id / FK person_id</text>
+    <text x="16" y="70" class="field">revision_no / snapshot_json</text>
+    <text x="16" y="90" class="field">source_analysis_run_id</text>
+  </g>
+
+  <!-- Document entities -->
+  <g transform="translate(985,165)">
+    <rect class="entity accent-doc" width="335" height="120"/>
+    <text x="16" y="26" class="entity-title">DOCUMENT_GROUP</text>
+    <text x="16" y="50" class="field">PK id / FK person_id</text>
+    <text x="16" y="70" class="field">document_type_code / title</text>
+    <text x="16" y="90" class="field">current_document_id</text>
+    <text x="16" y="110" class="field">deleted_at</text>
+  </g>
+  <g transform="translate(985,315)">
+    <rect class="entity accent-doc" width="335" height="170"/>
+    <text x="16" y="26" class="entity-title">DOCUMENT</text>
+    <text x="16" y="50" class="field">PK id / FK document_group_id</text>
+    <text x="16" y="70" class="field">version_no / original_filename</text>
+    <text x="16" y="90" class="field">storage_key / preview_storage_key</text>
+    <text x="16" y="110" class="field">sha256 / file_size / mime_type</text>
+    <text x="16" y="130" class="field">processing_status</text>
+    <text x="16" y="150" class="field">uploaded_by / uploaded_at</text>
+  </g>
+  <g transform="translate(985,515)">
+    <rect class="entity accent-doc" width="155" height="145"/>
+    <text x="14" y="26" class="entity-title">DOCUMENT_PAGE</text>
+    <text x="14" y="50" class="field">PK id</text>
+    <text x="14" y="70" class="field">FK document_id</text>
+    <text x="14" y="90" class="field">page_no</text>
+    <text x="14" y="110" class="field">extracted_text</text>
+    <text x="14" y="130" class="field">layout_json</text>
+  </g>
+  <g transform="translate(1165,515)">
+    <rect class="entity accent-doc" width="155" height="145"/>
+    <text x="14" y="26" class="entity-title">DOCUMENT_CHUNK</text>
+    <text x="14" y="50" class="field">PK id</text>
+    <text x="14" y="70" class="field">FK document_id</text>
+    <text x="14" y="90" class="field">page_from/to</text>
+    <text x="14" y="110" class="field">chunk_text</text>
+    <text x="14" y="130" class="field">metadata JSONB</text>
+  </g>
+
+  <!-- AI entities -->
+  <g transform="translate(1395,165)">
+    <rect class="entity accent-ai" width="340" height="180"/>
+    <text x="16" y="26" class="entity-title">ANALYSIS_RUN</text>
+    <text x="16" y="50" class="field">PK id / FK person_id</text>
+    <text x="16" y="70" class="field">status / base_profile_version</text>
+    <text x="16" y="90" class="field">candidate_json JSONB</text>
+    <text x="16" y="110" class="field">llm_model / vlm_model</text>
+    <text x="16" y="130" class="field">prompt_version / schema_version</text>
+    <text x="16" y="150" class="field">confirmed_by / confirmed_at</text>
+    <text x="16" y="170" class="field">error_message</text>
+  </g>
+  <g transform="translate(1395,375)">
+    <rect class="entity accent-ai" width="340" height="115"/>
+    <text x="16" y="26" class="entity-title">ANALYSIS_RUN_DOCUMENT</text>
+    <text x="16" y="50" class="field">FK analysis_run_id</text>
+    <text x="16" y="70" class="field">FK document_id</text>
+    <text x="16" y="90" class="field">analysis_role</text>
+  </g>
+  <g transform="translate(1395,520)">
+    <rect class="entity accent-ai" width="340" height="160"/>
+    <text x="16" y="26" class="entity-title">ANALYSIS_DIFF_ITEM</text>
+    <text x="16" y="50" class="field">PK id / FK analysis_run_id</text>
+    <text x="16" y="70" class="field">entity_type / field_name</text>
+    <text x="16" y="90" class="field">change_type / review_status</text>
+    <text x="16" y="110" class="field">old_value / new_value JSONB</text>
+    <text x="16" y="130" class="field">decided_value JSONB</text>
+    <text x="16" y="150" class="field">confidence / evidence_type</text>
+  </g>
+
+  <!-- Evidence entities -->
+  <g transform="translate(985,800)">
+    <rect class="entity accent-evidence" width="335" height="160"/>
+    <text x="16" y="26" class="entity-title">EVIDENCE</text>
+    <text x="16" y="50" class="field">PK id / FK document_id</text>
+    <text x="16" y="70" class="field">FK document_page_id / page_no</text>
+    <text x="16" y="90" class="field">quote_text</text>
+    <text x="16" y="110" class="field">bbox_json / char_start/end</text>
+    <text x="16" y="130" class="field">extraction_method</text>
+    <text x="16" y="150" class="field">confidence</text>
+  </g>
+  <g transform="translate(985,990)">
+    <rect class="entity accent-evidence" width="335" height="105"/>
+    <text x="16" y="26" class="entity-title">ANALYSIS_DIFF_EVIDENCE</text>
+    <text x="16" y="52" class="field">FK diff_item_id</text>
+    <text x="16" y="76" class="field">FK evidence_id</text>
+  </g>
+  <g transform="translate(985,1125)">
+    <rect class="entity accent-evidence" width="335" height="120"/>
+    <text x="16" y="26" class="entity-title">EVIDENCE_LINK</text>
+    <text x="16" y="50" class="field">PK id / FK evidence_id</text>
+    <text x="16" y="70" class="field">target_type / target_id</text>
+    <text x="16" y="90" class="field">field_name / relation_type</text>
+    <text x="16" y="110" class="note">Confirmed entity ↔ 원문 근거 연결</text>
+  </g>
+
+  <!-- Search entities -->
+  <g transform="translate(1395,800)">
+    <rect class="entity accent-search" width="340" height="175"/>
+    <text x="16" y="26" class="entity-title">SEARCH_INDEX_ITEM</text>
+    <text x="16" y="50" class="field">PK id / FK person_id</text>
+    <text x="16" y="70" class="field">object_type / object_id</text>
+    <text x="16" y="90" class="field">search_text / search_tsv</text>
+    <text x="16" y="110" class="field">embedding vector</text>
+    <text x="16" y="130" class="field">source_weight / metadata_json</text>
+    <text x="16" y="150" class="field">embedding_model/version</text>
+    <text x="16" y="170" class="field">indexed_at / is_active</text>
+  </g>
+  <g transform="translate(1395,1010)">
+    <rect class="entity accent-search" width="340" height="140"/>
+    <text x="16" y="26" class="entity-title">SEARCH_INDEX_JOB</text>
+    <text x="16" y="50" class="field">PK id / FK person_id</text>
+    <text x="16" y="70" class="field">object_type / object_id</text>
+    <text x="16" y="90" class="field">action UPSERT/DELETE</text>
+    <text x="16" y="110" class="field">status / retry_count</text>
+    <text x="16" y="130" class="field">error_message</text>
+  </g>
+  <g transform="translate(1395,1180)">
+    <rect class="entity accent-search" width="340" height="65"/>
+    <text x="16" y="26" class="entity-title">AUDIT_LOG</text>
+    <text x="16" y="50" class="field">user / action / target / before_json / after_json</text>
+  </g>
+
+  <!-- Relations -->
+  <path class="line" d="M205 310 L205 335"/>
+  <text x="214" y="327" class="label">1:N</text>
+  <path class="line" d="M345 235 L425 225"/>
+  <text x="365" y="217" class="label">resolve</text>
+
+  <path class="line" d="M655 225 L680 225"/>
+  <text x="658" y="214" class="label">1:1</text>
+  <path class="line" d="M540 285 L540 315"/>
+  <path class="line" d="M590 285 L745 365"/>
+  <path class="line" d="M520 285 L520 465"/>
+  <path class="line" d="M625 270 L735 520"/>
+  <path class="line" d="M680 610 L655 690"/>
+  <path class="line" d="M792 705 L792 730"/>
+
+  <path class="line" d="M655 205 L985 205"/>
+  <text x="790" y="194" class="label">1:N documents</text>
+  <path class="line" d="M1152 285 L1152 315"/>
+  <text x="1160" y="305" class="label">1:N version</text>
+  <path class="line" d="M1100 485 L1065 515"/>
+  <path class="line" d="M1200 485 L1242 515"/>
+
+  <path class="line" d="M905 245 L1395 245"/>
+  <text x="1120" y="233" class="label">analysis target person</text>
+  <path class="line" d="M1565 345 L1565 375"/>
+  <path class="line" d="M1395 430 L1320 400"/>
+  <text x="1318" y="386" class="label">document</text>
+  <path class="line" d="M1565 490 L1565 520"/>
+
+  <path class="line" d="M1065 660 L1065 800"/>
+  <text x="1074" y="740" class="label">page source</text>
+  <path class="line" d="M1395 600 L1320 845"/>
+  <text x="1324" y="725" class="label">evidence</text>
+  <path class="line" d="M1152 960 L1152 990"/>
+  <path class="line" d="M1152 1095 L1152 1125"/>
+  <path class="line-dashed" d="M985 1185 L905 680"/>
+  <text x="900" y="1030" class="label">Confirmed entity link</text>
+
+  <path class="line-dashed" d="M905 775 L1395 875"/>
+  <text x="1120" y="805" class="label">PROFILE → index</text>
+  <path class="line-dashed" d="M905 610 L1395 900"/>
+  <text x="1130" y="710" class="label">PROJECT → index</text>
+  <path class="line-dashed" d="M1320 590 L1395 925"/>
+  <text x="1335" y="780" class="label">CHUNK → index</text>
+  <path class="line" d="M1565 1150 L1565 975"/>
+  <text x="1576" y="1065" class="label">worker upsert</text>
+  <path class="line-dashed" d="M1565 680 L1565 1010"/>
+  <text x="1576" y="735" class="label">confirm → job</text>
+
+  <!-- Footer notes -->
+  <text x="60" y="1295" class="note">Source of Truth: PERSON_PROFILE / PROJECT / code links. Candidate JSON은 ANALYSIS_RUN에 보관하며, SEARCH_INDEX_ITEM은 재생성 가능한 파생 데이터이다.</text>
+</svg>
