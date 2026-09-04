@@ -88,6 +88,17 @@ TalentScope는 사내에서 보유한 이력서, 경력기술서, 인력 프로�
 
 실행 가능한 1차 MVP 기준 PostgreSQL Schema 초안은 [`db/schema.sql`](db/schema.sql)에 정리합니다. 구현 착수 이후 Schema 변경은 SQLAlchemy + Alembic Migration으로 관리합니다.
 
+## 개발 Skeleton
+
+애플리케이션 Skeleton은 다음 경로에 있습니다.
+
+- `backend/` — FastAPI + SQLAlchemy + Alembic + Celery
+- `frontend/` — React + Vite + Ant Design + TanStack Query + React Router
+- `docker-compose.dev.yml` — 로컬용 Postgres(pgvector)/Redis/MinIO/api/frontend
+- `AGENTS.md` — Cursor/AI Agent 작업 규칙
+
+Cloud Agent 환경은 `scripts/cloud-install.sh` / `scripts/cloud-start.sh`로 Host PostgreSQL(+Redis)을 기동합니다. Docker Compose는 이와 별개의 로컬 개발용 스택입니다(Postgres host port `5433`).
+
 `15_backend_api.md`에서는 인증·사용자·코드·인력·업로드·문서·AI 분석·프로젝트·근거·통합검색·운영상태 API의 Endpoint, 권한, Request/Response, 비동기 처리와 상태코드를 FIX합니다.
 
 향후 배포 설계는 **Docker Compose + Traefik Label 기반 라우팅**을 전제로 하며, Frontend/Backend/Worker/PostgreSQL(pgvector)/Redis/MinIO의 서비스·네트워크·Persistent Volume 구성을 별도 문서에서 구체화할 예정입니다.
