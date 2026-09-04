@@ -80,5 +80,6 @@ TalentScope는 사내에서 보유한 이력서, 경력기술서, 인력 프로�
 - [08. Search & Recommendation](docs/08_search_recommendation.md)
 - [09. Security & Permission](docs/09_security_permission.md)
 - [10. Information Architecture](docs/10_ia.md)
+- [11. Core Screen Wireframes](docs/11_wireframes.md)
 
-다음 단계에서는 `docs/11_wireframes.md`에 주요 화면별 Wireframe을 작성합니다.
+`11_wireframes.md`에는 신규 인력 등록·문서 업로드, AI 분석 결과 검토·확정, 인력 상세 프로필, 통합 인력검색의 4개 핵심 업무화면과 인력 목록 지원화면을 정리합니다.
