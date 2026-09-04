@@ -6,6 +6,10 @@
 # PostgreSQL 16 with the pgvector, pg_trgm and pgcrypto extensions, then applies
 # the baseline schema in db/schema.sql to a dev database.
 #
+# Additionally installs Redis (Celery broker) and Python/Node tooling needed for
+# the application skeleton. MinIO is optional and left to docker-compose.dev.yml
+# for local stacks — not required as a Host daemon for Agent skeleton work.
+#
 # This script is idempotent: it can run repeatedly and converges to the same
 # state. It only (re)applies the schema when the target database has no tables,
 # so existing data is never destroyed on re-run.
@@ -29,6 +33,21 @@ if ! dpkg -s "postgresql-${PG_VERSION}" >/dev/null 2>&1; then
     "postgresql-${PG_VERSION}-pgvector"
 else
   echo "    already installed, skipping apt-get"
+fi
+
+echo "==> Ensuring Redis server is installed (Celery broker)"
+if ! dpkg -s redis-server >/dev/null 2>&1; then
+  sudo apt-get update -qq
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq redis-server
+else
+  echo "    already installed, skipping apt-get"
+fi
+
+echo "==> Ensuring Python 3.12 venv tooling is available"
+if ! dpkg -s python3.12-venv >/dev/null 2>&1; then
+  sudo apt-get update -qq
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+    python3.12-venv python3.12-dev build-essential
 fi
 
 echo "==> Ensuring PostgreSQL cluster is running"
@@ -72,5 +91,26 @@ else
   echo "==> Schema already present (${TABLE_COUNT} tables), skipping load"
 fi
 
+echo "==> Installing backend Python dependencies (editable)"
+if [ -f "${REPO_ROOT}/backend/pyproject.toml" ]; then
+  python3 -m venv "${REPO_ROOT}/.venv"
+  # shellcheck disable=SC1091
+  source "${REPO_ROOT}/.venv/bin/activate"
+  pip install -U pip wheel setuptools -q
+  pip install -e "${REPO_ROOT}/backend[dev]" -q
+  deactivate || true
+fi
+
+echo "==> Installing frontend Node dependencies"
+if [ -f "${REPO_ROOT}/frontend/package.json" ]; then
+  if command -v npm >/dev/null 2>&1; then
+    (cd "${REPO_ROOT}/frontend" && npm install --no-fund --no-audit)
+  else
+    echo "    npm not found — skip frontend install"
+  fi
+fi
+
 echo "==> TalentScope dev database ready:"
 echo "    postgresql://${DB_USER}:***@127.0.0.1:5432/${DB_NAME}"
+echo "==> Backend venv: ${REPO_ROOT}/.venv"
+echo "==> Redis: install complete (started by cloud-start.sh)"

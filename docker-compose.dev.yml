@@ -1,0 +1,143 @@
+# Local / general development stack for TalentScope.
+# Cloud Agent environments already provision Host PostgreSQL via scripts/cloud-*.sh —
+# this Compose file is intentionally separate and uses host port 5433 for Postgres
+# to avoid colliding with the Agent Postgres on 5432.
+#
+# Secrets / runtime config:
+#   cp .env.example .env
+# then edit .env. Compose injects `.env` into api/worker (not `.env.example`).
+# Compose also reads `.env` for ${VAR} substitution in this file.
+#
+# Schema:
+#   Postgres starts empty (no schema.sql initdb mount) so Alembic remains the
+#   operational schema path. After postgres is healthy:
+#     docker compose -f docker-compose.dev.yml exec api alembic upgrade head
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: talentscope-postgres
+    environment:
+      POSTGRES_DB: talentscope
+      POSTGRES_USER: talentscope
+      POSTGRES_PASSWORD: talentscope
+    ports:
+      - "5433:5432"
+    volumes:
+      - talentscope_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U talentscope -d talentscope"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: talentscope-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    container_name: talentscope-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-minioadmin}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - talentscope_minio:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  minio-init:
+    image: minio/mc:latest
+    container_name: talentscope-minio-init
+    depends_on:
+      minio:
+        condition: service_started
+    entrypoint: >
+      /bin/sh -c "
+      sleep 3;
+      mc alias set local http://minio:9000 $${MINIO_ROOT_USER:-minioadmin} $${MINIO_ROOT_PASSWORD:-minioadmin};
+      mc mb -p local/$${S3_BUCKET:-talent-scope} || true;
+      exit 0;
+      "
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-minioadmin}
+      S3_BUCKET: ${S3_BUCKET:-talent-scope}
+
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: talentscope-api
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      APP_ENV: development
+      DATABASE_URL: postgresql+psycopg://talentscope:talentscope@postgres:5432/talentscope
+      REDIS_URL: redis://redis:6379/0
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-minioadmin}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-minioadmin}
+      S3_BUCKET: ${S3_BUCKET:-talent-scope}
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: talentscope-worker
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: postgresql+psycopg://talentscope:talentscope@postgres:5432/talentscope
+      REDIS_URL: redis://redis:6379/0
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-minioadmin}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-minioadmin}
+      S3_BUCKET: ${S3_BUCKET:-talent-scope}
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    command: >
+      celery -A app.tasks.celery_app.celery_app worker
+      -Q document,analysis,index -l info
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: talentscope-frontend
+    ports:
+      - "5173:80"
+    depends_on:
+      - api
+
+volumes:
+  talentscope_pgdata:
+  talentscope_minio:
