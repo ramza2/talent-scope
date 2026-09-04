@@ -495,3 +495,174 @@ def test_revisions_latest_first(client: TestClient, db_session) -> None:
         if person_id:
             _cleanup_person(db_session, person_id)
         _cleanup_user(db_session, admin.id)
+
+
+def test_profile_patch_name_and_length_validation(client: TestClient, db_session) -> None:
+    """Omit vs explicit null for name; VARCHAR max lengths rejected as 4xx."""
+    from app.db.models.person import PersonProfile
+
+    suffix = uuid.uuid4().hex[:8]
+    admin = _create_user(db_session, login_id=f"a_{suffix}", password="Secret123!", role="ADMIN")
+    person_id = None
+    original_name = f"Keep_{suffix}"
+    try:
+        csrf = _login(client, admin.login_id)
+        created = client.post(
+            "/api/v1/people",
+            headers={"X-CSRF-Token": csrf},
+            json={"name": original_name, "email": "a@example.com"},
+        )
+        assert created.status_code == 201, created.text
+        person_id = uuid.UUID(created.json()["data"]["id"])
+
+        omit = client.patch(
+            f"/api/v1/people/{person_id}/profile",
+            headers={"X-CSRF-Token": csrf},
+            json={"expected_profile_version": 1, "profile_summary": "summary-only"},
+        )
+        assert omit.status_code == 200, omit.text
+        assert omit.json()["data"]["profile"]["name"] == original_name
+        assert omit.json()["data"]["profile_version"] == 2
+
+        renamed = client.patch(
+            f"/api/v1/people/{person_id}/profile",
+            headers={"X-CSRF-Token": csrf},
+            json={"expected_profile_version": 2, "name": f"New_{suffix}"},
+        )
+        assert renamed.status_code == 200, renamed.text
+        assert renamed.json()["data"]["profile"]["name"] == f"New_{suffix}"
+        assert renamed.json()["data"]["profile_version"] == 3
+
+        for bad_name in (None, "", "   "):
+            bad = client.patch(
+                f"/api/v1/people/{person_id}/profile",
+                headers={"X-CSRF-Token": csrf},
+                json={"expected_profile_version": 3, "name": bad_name},
+            )
+            assert bad.status_code == 422, bad.text
+            db_session.expire_all()
+            profile = db_session.get(PersonProfile, person_id)
+            assert profile is not None
+            assert profile.name == f"New_{suffix}"
+            assert profile.profile_version == 3
+
+        email_ok = client.patch(
+            f"/api/v1/people/{person_id}/profile",
+            headers={"X-CSRF-Token": csrf},
+            json={"expected_profile_version": 3, "email": "e" * 243 + "@example.com"},
+        )
+        assert email_ok.status_code == 200, email_ok.text
+        assert len(email_ok.json()["data"]["profile"]["email"]) == 255
+        assert email_ok.json()["data"]["profile_version"] == 4
+
+        email_over = client.patch(
+            f"/api/v1/people/{person_id}/profile",
+            headers={"X-CSRF-Token": csrf},
+            json={"expected_profile_version": 4, "email": "x" * 256},
+        )
+        assert email_over.status_code == 422, email_over.text
+
+        aff_over = client.patch(
+            f"/api/v1/people/{person_id}/profile",
+            headers={"X-CSRF-Token": csrf},
+            json={"expected_profile_version": 4, "affiliation_company": "A" * 301},
+        )
+        assert aff_over.status_code == 422, aff_over.text
+
+        phone_over = client.patch(
+            f"/api/v1/people/{person_id}/profile",
+            headers={"X-CSRF-Token": csrf},
+            json={"expected_profile_version": 4, "phone": "1" * 51},
+        )
+        assert phone_over.status_code == 422, phone_over.text
+
+        # Failed validation must not leave the session unusable.
+        recover = client.patch(
+            f"/api/v1/people/{person_id}/profile",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "expected_profile_version": 4,
+                "department": f"Dept_{suffix}",
+            },
+        )
+        assert recover.status_code == 200, recover.text
+        assert recover.json()["data"]["profile_version"] == 5
+        assert recover.json()["data"]["profile"]["name"] == f"New_{suffix}"
+    finally:
+        if person_id:
+            _cleanup_person(db_session, person_id)
+        _cleanup_user(db_session, admin.id)
+
+
+def test_deleted_person_detail_rbac_and_restore(client: TestClient, db_session) -> None:
+    """USER cannot see DELETED detail; ADMIN can view and restore via status."""
+    from app.db.models.person import Person
+
+    suffix = uuid.uuid4().hex[:8]
+    admin = _create_user(db_session, login_id=f"a_{suffix}", password="Secret123!", role="ADMIN")
+    user = _create_user(db_session, login_id=f"u_{suffix}", password="Secret123!", role="USER")
+    person_id = None
+    try:
+        csrf = _login(client, admin.login_id)
+        created = client.post(
+            "/api/v1/people",
+            headers={"X-CSRF-Token": csrf},
+            json={"name": f"Gone_{suffix}"},
+        )
+        assert created.status_code == 201, created.text
+        person_id = uuid.UUID(created.json()["data"]["id"])
+
+        deleted = client.patch(
+            f"/api/v1/people/{person_id}",
+            headers={"X-CSRF-Token": csrf},
+            json={"status": "DELETED"},
+        )
+        assert deleted.status_code == 200, deleted.text
+
+        admin_detail = client.get(f"/api/v1/people/{person_id}")
+        assert admin_detail.status_code == 200, admin_detail.text
+        assert admin_detail.json()["data"]["status"] == "DELETED"
+
+        # Switch to USER session
+        admin_csrf = client.cookies.get("ts_csrf")
+        client.post("/api/v1/auth/logout", headers={"X-CSRF-Token": admin_csrf})
+        _login(client, user.login_id)
+
+        user_detail = client.get(f"/api/v1/people/{person_id}")
+        assert user_detail.status_code == 404, user_detail.text
+
+        user_list = client.get("/api/v1/people", params={"q": f"Gone_{suffix}"})
+        assert user_list.status_code == 200
+        assert all(item["id"] != str(person_id) for item in user_list.json()["data"])
+
+        user_deleted_filter = client.get("/api/v1/people", params={"status": "DELETED"})
+        assert user_deleted_filter.status_code == 400, user_deleted_filter.text
+
+        user_csrf = client.cookies.get("ts_csrf")
+        client.post("/api/v1/auth/logout", headers={"X-CSRF-Token": user_csrf})
+        csrf = _login(client, admin.login_id)
+
+        restored = client.patch(
+            f"/api/v1/people/{person_id}",
+            headers={"X-CSRF-Token": csrf},
+            json={"status": "ACTIVE"},
+        )
+        assert restored.status_code == 200, restored.text
+        assert restored.json()["data"]["status"] == "ACTIVE"
+
+        db_session.expire_all()
+        person = db_session.get(Person, person_id)
+        assert person is not None
+        assert person.status == "ACTIVE"
+        assert person.deleted_at is None
+
+        # USER can see restored person again
+        admin_csrf = client.cookies.get("ts_csrf")
+        client.post("/api/v1/auth/logout", headers={"X-CSRF-Token": admin_csrf})
+        _login(client, user.login_id)
+        assert client.get(f"/api/v1/people/{person_id}").status_code == 200
+    finally:
+        if person_id:
+            _cleanup_person(db_session, person_id)
+        _cleanup_user(db_session, admin.id)
+        _cleanup_user(db_session, user.id)

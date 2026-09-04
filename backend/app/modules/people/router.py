@@ -80,10 +80,12 @@ def create_person(
 @router.get("/{person_id}", response_model=PersonDetailResponse)
 def get_person(
     person_id: UUID,
-    _auth: AuthenticatedContext = Depends(require_authenticated_user),
+    ctx: AuthenticatedContext = Depends(require_authenticated_user),
     service: PeopleService = Depends(get_people_service),
 ) -> PersonDetailResponse:
-    return PersonDetailResponse(data=service.get_detail(person_id))
+    return PersonDetailResponse(
+        data=service.get_detail(person_id, is_admin=ctx.user.role == "ADMIN")
+    )
 
 
 @router.patch("/{person_id}", response_model=PersonDetailResponse)

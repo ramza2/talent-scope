@@ -6,7 +6,7 @@ from datetime import date, datetime
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 PersonStatus = Literal["ACTIVE", "INACTIVE", "ARCHIVED", "DELETED"]
 TechnicalGrade = Literal["BEGINNER", "INTERMEDIATE", "ADVANCED", "EXPERT", "UNKNOWN"]
@@ -162,20 +162,40 @@ class PersonStatusUpdateRequest(BaseModel):
 
 
 class ProfileUpdateRequest(BaseModel):
+    """Partial profile update.
+
+    Omitted fields keep existing values. Explicit ``name: null`` is rejected
+    because ``person_profile.name`` is NOT NULL.
+    """
+
     expected_profile_version: int = Field(ge=1)
-    name: str | None = Field(default=None, min_length=1, max_length=150)
+    name: str | None = Field(default=None, max_length=150)
     birth_year: int | None = Field(default=None, ge=1900, le=2100)
-    phone: str | None = None
-    email: str | None = None
-    address_region: str | None = None
-    affiliation_company: str | None = None
-    department: str | None = None
-    current_title: str | None = None
-    employment_type: str | None = None
+    phone: str | None = Field(default=None, max_length=50)
+    email: str | None = Field(default=None, max_length=255)
+    address_region: str | None = Field(default=None, max_length=200)
+    affiliation_company: str | None = Field(default=None, max_length=300)
+    department: str | None = Field(default=None, max_length=200)
+    current_title: str | None = Field(default=None, max_length=200)
+    employment_type: str | None = Field(default=None, max_length=50)
     technical_grade: TechnicalGrade | None = None
     career_start_date: date | None = None
     career_confirmed_months: int | None = Field(default=None, ge=0)
     profile_summary: str | None = None
+
+    @model_validator(mode="after")
+    def validate_explicit_name(self) -> ProfileUpdateRequest:
+        if "name" not in self.model_fields_set:
+            return self
+        if self.name is None:
+            raise ValueError("이름은 null일 수 없습니다.")
+        cleaned = self.name.strip()
+        if not cleaned:
+            raise ValueError("이름은 비어 있을 수 없습니다.")
+        if len(cleaned) > 150:
+            raise ValueError("이름은 150자를 초과할 수 없습니다.")
+        self.name = cleaned
+        return self
 
 
 class JobWriteItem(BaseModel):

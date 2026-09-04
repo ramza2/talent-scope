@@ -205,8 +205,11 @@ class PeopleService:
         )
         return items, meta
 
-    def get_detail(self, person_id: UUID) -> PersonDetail:
+    def get_detail(self, person_id: UUID, *, is_admin: bool = False) -> PersonDetail:
         person = self._require_person(person_id)
+        if person.status == "DELETED" and not is_admin:
+            # Do not reveal existence of soft-deleted persons to non-admins.
+            raise NotFoundError("인력을 찾을 수 없습니다.")
         profile = self.repo.get_profile(person_id)
         if profile is None:
             raise NotFoundError("인력 프로필을 찾을 수 없습니다.")
@@ -319,7 +322,7 @@ class PeopleService:
         )
         self.repo.enqueue_rebuild_person(person.id, profile.profile_version)
         self.db.commit()
-        return self.get_detail(person.id)
+        return self.get_detail(person.id, is_admin=True)
 
     def update_status(
         self,
@@ -348,7 +351,7 @@ class PeopleService:
             },
         )
         self.db.commit()
-        return self.get_detail(person.id)
+        return self.get_detail(person.id, is_admin=True)
 
     def update_profile(
         self,
@@ -399,7 +402,7 @@ class PeopleService:
         )
         self.repo.enqueue_rebuild_person(person_id, version)
         self.db.commit()
-        return self.get_detail(person_id)
+        return self.get_detail(person_id, is_admin=True)
 
     def replace_jobs(
         self,
@@ -445,7 +448,7 @@ class PeopleService:
         )
         self.repo.enqueue_rebuild_person(person_id, version)
         self.db.commit()
-        return self.get_detail(person_id)
+        return self.get_detail(person_id, is_admin=True)
 
     def replace_skills(
         self,
@@ -491,7 +494,7 @@ class PeopleService:
         )
         self.repo.enqueue_rebuild_person(person_id, version)
         self.db.commit()
-        return self.get_detail(person_id)
+        return self.get_detail(person_id, is_admin=True)
 
     def replace_expertise(
         self,
@@ -535,7 +538,7 @@ class PeopleService:
         )
         self.repo.enqueue_rebuild_person(person_id, version)
         self.db.commit()
-        return self.get_detail(person_id)
+        return self.get_detail(person_id, is_admin=True)
 
     def list_revisions(
         self, person_id: UUID, *, page: int = 1, page_size: int = 20

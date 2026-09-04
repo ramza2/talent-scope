@@ -34,11 +34,30 @@ import {
   replacePersonSkills,
   updatePersonProfile,
   updatePersonStatus,
+  type PersonDetail,
   type PersonStatus,
   type RevisionItem,
   type TechnicalGrade,
 } from '@/api/people'
 import { useAuthMe } from '@/app/auth'
+
+type CodeOption = { value: string; label: string }
+
+function mergeCodeOptions(
+  activeOptions: CodeOption[],
+  linked: Array<{ code: string; name: string }>,
+): CodeOption[] {
+  const map = new Map(activeOptions.map((o) => [o.value, o]))
+  for (const item of linked) {
+    if (!map.has(item.code)) {
+      map.set(item.code, {
+        value: item.code,
+        label: `${item.name} (비활성)`,
+      })
+    }
+  }
+  return Array.from(map.values())
+}
 
 export function PeopleDetailPage() {
   const { personId = '' } = useParams()
@@ -48,11 +67,16 @@ export function PeopleDetailPage() {
   const isAdmin = me?.role === 'ADMIN'
 
   const [profileOpen, setProfileOpen] = useState(false)
-  const [setsOpen, setSetsOpen] = useState(false)
+  const [jobsOpen, setJobsOpen] = useState(false)
+  const [skillsOpen, setSkillsOpen] = useState(false)
+  const [expertiseOpen, setExpertiseOpen] = useState(false)
   const [revisionOpen, setRevisionOpen] = useState(false)
   const [selectedRevision, setSelectedRevision] = useState<RevisionItem | null>(null)
+
   const [profileForm] = Form.useForm()
-  const [setsForm] = Form.useForm()
+  const [jobsForm] = Form.useForm()
+  const [skillsForm] = Form.useForm()
+  const [expertiseForm] = Form.useForm()
 
   const detailKey = ['people', personId] as const
   const { data, isLoading, refetch } = useQuery({
@@ -71,18 +95,43 @@ export function PeopleDetailPage() {
   const jobCodesQuery = useQuery({
     queryKey: ['codes', 'JOB', 'detail'],
     queryFn: () => listCodes({ type: 'JOB', active: true }),
-    enabled: setsOpen,
+    enabled: jobsOpen,
   })
   const techCodesQuery = useQuery({
     queryKey: ['codes', 'TECH', 'detail'],
     queryFn: () => listCodes({ type: 'TECH', active: true }),
-    enabled: setsOpen,
+    enabled: skillsOpen,
   })
   const expCodesQuery = useQuery({
     queryKey: ['codes', 'EXP', 'detail'],
     queryFn: () => listCodes({ type: 'EXP', active: true }),
-    enabled: setsOpen,
+    enabled: expertiseOpen,
   })
+
+  const jobOptions = useMemo(
+    () =>
+      mergeCodeOptions(
+        (jobCodesQuery.data?.data ?? []).map((c) => ({ value: c.code, label: c.name })),
+        (person?.jobs ?? []).map((j) => ({ code: j.code, name: j.name })),
+      ),
+    [jobCodesQuery.data, person?.jobs],
+  )
+  const techOptions = useMemo(
+    () =>
+      mergeCodeOptions(
+        (techCodesQuery.data?.data ?? []).map((c) => ({ value: c.code, label: c.name })),
+        (person?.skills ?? []).map((s) => ({ code: s.code, name: s.name })),
+      ),
+    [techCodesQuery.data, person?.skills],
+  )
+  const expOptions = useMemo(
+    () =>
+      mergeCodeOptions(
+        (expCodesQuery.data?.data ?? []).map((c) => ({ value: c.code, label: c.name })),
+        (person?.expertise ?? []).map((e) => ({ code: e.code, name: e.name })),
+      ),
+    [expCodesQuery.data, person?.expertise],
+  )
 
   const invalidateAll = async () => {
     await queryClient.invalidateQueries({ queryKey: ['people'] })
@@ -90,12 +139,18 @@ export function PeopleDetailPage() {
     await queryClient.invalidateQueries({ queryKey: ['people', personId, 'revisions'] })
   }
 
+  const closeEditModals = () => {
+    setProfileOpen(false)
+    setJobsOpen(false)
+    setSkillsOpen(false)
+    setExpertiseOpen(false)
+  }
+
   const handleVersionConflict = async (error: unknown) => {
     if (error instanceof ApiError && error.status === 409) {
       message.warning('다른 사용자가 먼저 프로필을 수정했습니다. 최신 정보를 다시 불러옵니다.')
       await refetch()
-      setProfileOpen(false)
-      setSetsOpen(false)
+      closeEditModals()
       return true
     }
     return false
@@ -114,42 +169,61 @@ export function PeopleDetailPage() {
     },
   })
 
-  const setsMutation = useMutation({
-    mutationFn: async (values: {
-      jobs: Array<{ job_code: string; job_type: string; sort_order?: number }>
+  const jobsMutation = useMutation({
+    mutationFn: (jobs: Array<{ job_code: string; job_type: string; sort_order?: number }>) =>
+      replacePersonJobs(personId, {
+        expected_profile_version: person!.profile_version,
+        jobs,
+      }),
+    onSuccess: async () => {
+      message.success('직무가 저장되었습니다.')
+      setJobsOpen(false)
+      await invalidateAll()
+    },
+    onError: async (error) => {
+      if (await handleVersionConflict(error)) return
+      message.error(apiErrorMessage(error, '직무 저장에 실패했습니다.'))
+    },
+  })
+
+  const skillsMutation = useMutation({
+    mutationFn: (
       skills: Array<{
         tech_code: string
         last_used_year?: number
         experience_months?: number
         is_representative?: boolean
-      }>
-      expertise: Array<{ exp_code: string; evidence_type?: string }>
-    }) => {
-      const version = person?.profile_version
-      if (version == null) throw new Error('missing version')
-      await replacePersonJobs(personId, {
-        expected_profile_version: version,
-        jobs: values.jobs ?? [],
-      })
-      const refreshed = await getPerson(personId)
-      await replacePersonSkills(personId, {
-        expected_profile_version: refreshed.data.profile_version,
-        skills: values.skills ?? [],
-      })
-      const refreshed2 = await getPerson(personId)
-      await replacePersonExpertise(personId, {
-        expected_profile_version: refreshed2.data.profile_version,
-        expertise: values.expertise ?? [],
-      })
-    },
+      }>,
+    ) =>
+      replacePersonSkills(personId, {
+        expected_profile_version: person!.profile_version,
+        skills,
+      }),
     onSuccess: async () => {
-      message.success('직무·기술·전문분야가 저장되었습니다.')
-      setSetsOpen(false)
+      message.success('기술이 저장되었습니다.')
+      setSkillsOpen(false)
       await invalidateAll()
     },
     onError: async (error) => {
       if (await handleVersionConflict(error)) return
-      message.error(apiErrorMessage(error, '직무/기술 저장에 실패했습니다.'))
+      message.error(apiErrorMessage(error, '기술 저장에 실패했습니다.'))
+    },
+  })
+
+  const expertiseMutation = useMutation({
+    mutationFn: (expertise: Array<{ exp_code: string; evidence_type?: string }>) =>
+      replacePersonExpertise(personId, {
+        expected_profile_version: person!.profile_version,
+        expertise,
+      }),
+    onSuccess: async () => {
+      message.success('전문분야가 저장되었습니다.')
+      setExpertiseOpen(false)
+      await invalidateAll()
+    },
+    onError: async (error) => {
+      if (await handleVersionConflict(error)) return
+      message.error(apiErrorMessage(error, '전문분야 저장에 실패했습니다.'))
     },
   })
 
@@ -172,32 +246,41 @@ export function PeopleDetailPage() {
   }
 
   const openProfileEdit = () => {
-    profileForm.setFieldsValue({
-      ...person.profile,
-      expected_profile_version: person.profile_version,
-    })
+    profileForm.setFieldsValue({ ...person.profile })
     setProfileOpen(true)
   }
 
-  const openSetsEdit = () => {
-    setsForm.setFieldsValue({
-      jobs: person.jobs.map((j) => ({
+  const openJobsEdit = (p: PersonDetail) => {
+    jobsForm.setFieldsValue({
+      jobs: p.jobs.map((j) => ({
         job_code: j.code,
         job_type: j.job_type,
         sort_order: j.sort_order,
       })),
-      skills: person.skills.map((s) => ({
+    })
+    setJobsOpen(true)
+  }
+
+  const openSkillsEdit = (p: PersonDetail) => {
+    skillsForm.setFieldsValue({
+      skills: p.skills.map((s) => ({
         tech_code: s.code,
         last_used_year: s.last_used_year ?? undefined,
         experience_months: s.experience_months ?? undefined,
         is_representative: s.is_representative,
       })),
-      expertise: person.expertise.map((e) => ({
+    })
+    setSkillsOpen(true)
+  }
+
+  const openExpertiseEdit = (p: PersonDetail) => {
+    expertiseForm.setFieldsValue({
+      expertise: p.expertise.map((e) => ({
         exp_code: e.code,
         evidence_type: e.evidence_type,
       })),
     })
-    setSetsOpen(true)
+    setExpertiseOpen(true)
   }
 
   const revisionColumns: ColumnsType<RevisionItem> = [
@@ -225,8 +308,7 @@ export function PeopleDetailPage() {
       <Space style={{ width: '100%', justifyContent: 'space-between', marginBottom: 12 }} align="start">
         <div>
           <Typography.Title level={3} style={{ marginBottom: 4 }}>
-            {person.profile.name}{' '}
-            <Tag>{person.status}</Tag>
+            {person.profile.name} <Tag>{person.status}</Tag>
           </Typography.Title>
           <Typography.Paragraph style={{ marginBottom: 4 }}>
             {primaryJob?.name || '주직무 미지정'} ·{' '}
@@ -261,9 +343,6 @@ export function PeopleDetailPage() {
               ]}
             />
             <Button onClick={openProfileEdit}>프로필 수정</Button>
-            <Button type="primary" onClick={openSetsEdit}>
-              직무·기술 수정
-            </Button>
           </Space>
         ) : null}
       </Space>
@@ -332,18 +411,39 @@ export function PeopleDetailPage() {
             label: '직무·기술',
             children: (
               <Space direction="vertical" style={{ width: '100%' }} size="large">
-                <Card title="직무" size="small">
+                <Card
+                  title="직무"
+                  size="small"
+                  extra={
+                    isAdmin ? (
+                      <Button type="link" onClick={() => openJobsEdit(person)}>
+                        직무 수정
+                      </Button>
+                    ) : null
+                  }
+                >
                   {person.jobs.length === 0 ? (
                     <Typography.Text type="secondary">등록된 직무 없음</Typography.Text>
                   ) : (
                     person.jobs.map((j) => (
                       <div key={`${j.code}-${j.job_type}`}>
-                        <Tag>{j.job_type}</Tag> {j.name} <Typography.Text code>{j.code}</Typography.Text>
+                        <Tag>{j.job_type}</Tag> {j.name}{' '}
+                        <Typography.Text code>{j.code}</Typography.Text>
                       </div>
                     ))
                   )}
                 </Card>
-                <Card title="기술 (TECH)" size="small">
+                <Card
+                  title="기술 (TECH)"
+                  size="small"
+                  extra={
+                    isAdmin ? (
+                      <Button type="link" onClick={() => openSkillsEdit(person)}>
+                        기술 수정
+                      </Button>
+                    ) : null
+                  }
+                >
                   {person.skills.length === 0 ? (
                     <Typography.Text type="secondary">등록된 기술 없음</Typography.Text>
                   ) : (
@@ -359,14 +459,23 @@ export function PeopleDetailPage() {
                     ))
                   )}
                 </Card>
-                <Card title="전문분야 (EXP)" size="small">
+                <Card
+                  title="전문분야 (EXP)"
+                  size="small"
+                  extra={
+                    isAdmin ? (
+                      <Button type="link" onClick={() => openExpertiseEdit(person)}>
+                        전문분야 수정
+                      </Button>
+                    ) : null
+                  }
+                >
                   {person.expertise.length === 0 ? (
                     <Typography.Text type="secondary">등록된 전문분야 없음</Typography.Text>
                   ) : (
                     person.expertise.map((e) => (
                       <div key={e.code}>
-                        {e.name}{' '}
-                        {e.evidence_type === 'INFERRED' ? <Tag>추론</Tag> : null}
+                        {e.name} {e.evidence_type === 'INFERRED' ? <Tag>추론</Tag> : null}
                       </div>
                     ))
                   )}
@@ -420,32 +529,32 @@ export function PeopleDetailPage() {
             })
           }
         >
-          <Form.Item name="name" label="이름" rules={[{ required: true }]}>
-            <Input />
+          <Form.Item name="name" label="이름" rules={[{ required: true, max: 150 }]}>
+            <Input maxLength={150} />
           </Form.Item>
           <Form.Item name="birth_year" label="출생연도">
             <InputNumber style={{ width: '100%' }} min={1900} max={2100} />
           </Form.Item>
-          <Form.Item name="phone" label="전화번호">
-            <Input />
+          <Form.Item name="phone" label="전화번호" rules={[{ max: 50 }]}>
+            <Input maxLength={50} />
           </Form.Item>
-          <Form.Item name="email" label="이메일">
-            <Input />
+          <Form.Item name="email" label="이메일" rules={[{ max: 255 }]}>
+            <Input maxLength={255} />
           </Form.Item>
-          <Form.Item name="address_region" label="지역">
-            <Input />
+          <Form.Item name="address_region" label="지역" rules={[{ max: 200 }]}>
+            <Input maxLength={200} />
           </Form.Item>
-          <Form.Item name="affiliation_company" label="소속회사">
-            <Input />
+          <Form.Item name="affiliation_company" label="소속회사" rules={[{ max: 300 }]}>
+            <Input maxLength={300} />
           </Form.Item>
-          <Form.Item name="department" label="부서">
-            <Input />
+          <Form.Item name="department" label="부서" rules={[{ max: 200 }]}>
+            <Input maxLength={200} />
           </Form.Item>
-          <Form.Item name="current_title" label="직함">
-            <Input />
+          <Form.Item name="current_title" label="직함" rules={[{ max: 200 }]}>
+            <Input maxLength={200} />
           </Form.Item>
-          <Form.Item name="employment_type" label="고용형태">
-            <Input />
+          <Form.Item name="employment_type" label="고용형태" rules={[{ max: 50 }]}>
+            <Input maxLength={50} />
           </Form.Item>
           <Form.Item name="technical_grade" label="기술등급">
             <Select
@@ -466,50 +575,34 @@ export function PeopleDetailPage() {
       </Modal>
 
       <Modal
-        title="직무·기술·전문분야 수정"
-        open={setsOpen}
-        onCancel={() => setSetsOpen(false)}
-        onOk={() => setsForm.submit()}
-        confirmLoading={setsMutation.isPending}
+        title={`직무 수정 · v${person.profile_version}`}
+        open={jobsOpen}
+        onCancel={() => setJobsOpen(false)}
+        onOk={() => jobsForm.submit()}
+        confirmLoading={jobsMutation.isPending}
         destroyOnHidden
-        width={860}
+        width={720}
       >
-        <Form form={setsForm} layout="vertical" onFinish={(v) => setsMutation.mutate(v)}>
+        <Form
+          form={jobsForm}
+          layout="vertical"
+          onFinish={(values) => jobsMutation.mutate(values.jobs ?? [])}
+        >
           <Form.List name="jobs">
             {(fields, { add, remove }) => (
-              <Card
-                size="small"
-                title="직무 (JOB)"
-                extra={
-                  <Button type="link" onClick={() => add({ job_type: 'SECONDARY', sort_order: 0 })}>
-                    추가
-                  </Button>
-                }
-                style={{ marginBottom: 12 }}
-              >
+              <>
                 {fields.map((field) => (
                   <Space key={field.key} align="baseline" style={{ display: 'flex', marginBottom: 8 }}>
-                    <Form.Item
-                      {...field}
-                      name={[field.name, 'job_code']}
-                      rules={[{ required: true }]}
-                    >
+                    <Form.Item {...field} name={[field.name, 'job_code']} rules={[{ required: true }]}>
                       <Select
                         showSearch
                         optionFilterProp="label"
                         style={{ width: 240 }}
-                        options={(jobCodesQuery.data?.data ?? []).map((c) => ({
-                          value: c.code,
-                          label: c.name,
-                        }))}
+                        options={jobOptions}
                         placeholder="직무"
                       />
                     </Form.Item>
-                    <Form.Item
-                      {...field}
-                      name={[field.name, 'job_type']}
-                      rules={[{ required: true }]}
-                    >
+                    <Form.Item {...field} name={[field.name, 'job_type']} rules={[{ required: true }]}>
                       <Select
                         style={{ width: 140 }}
                         options={[
@@ -527,33 +620,40 @@ export function PeopleDetailPage() {
                     </Button>
                   </Space>
                 ))}
-              </Card>
+                <Button type="dashed" onClick={() => add({ job_type: 'SECONDARY', sort_order: 0 })} block>
+                  직무 추가
+                </Button>
+              </>
             )}
           </Form.List>
+        </Form>
+      </Modal>
 
+      <Modal
+        title={`기술 수정 · v${person.profile_version}`}
+        open={skillsOpen}
+        onCancel={() => setSkillsOpen(false)}
+        onOk={() => skillsForm.submit()}
+        confirmLoading={skillsMutation.isPending}
+        destroyOnHidden
+        width={820}
+      >
+        <Form
+          form={skillsForm}
+          layout="vertical"
+          onFinish={(values) => skillsMutation.mutate(values.skills ?? [])}
+        >
           <Form.List name="skills">
             {(fields, { add, remove }) => (
-              <Card
-                size="small"
-                title="기술 (TECH)"
-                extra={<Button type="link" onClick={() => add({ is_representative: false })}>추가</Button>}
-                style={{ marginBottom: 12 }}
-              >
+              <>
                 {fields.map((field) => (
                   <Space key={field.key} align="baseline" wrap style={{ marginBottom: 8 }}>
-                    <Form.Item
-                      {...field}
-                      name={[field.name, 'tech_code']}
-                      rules={[{ required: true }]}
-                    >
+                    <Form.Item {...field} name={[field.name, 'tech_code']} rules={[{ required: true }]}>
                       <Select
                         showSearch
                         optionFilterProp="label"
                         style={{ width: 220 }}
-                        options={(techCodesQuery.data?.data ?? []).map((c) => ({
-                          value: c.code,
-                          label: c.name,
-                        }))}
+                        options={techOptions}
                         placeholder="기술"
                       />
                     </Form.Item>
@@ -563,11 +663,7 @@ export function PeopleDetailPage() {
                     <Form.Item {...field} name={[field.name, 'experience_months']}>
                       <InputNumber placeholder="개월" min={0} />
                     </Form.Item>
-                    <Form.Item
-                      {...field}
-                      name={[field.name, 'is_representative']}
-                      valuePropName="checked"
-                    >
+                    <Form.Item {...field} name={[field.name, 'is_representative']} valuePropName="checked">
                       <Switch checkedChildren="대표" unCheckedChildren="일반" />
                     </Form.Item>
                     <Button danger type="link" onClick={() => remove(field.name)}>
@@ -575,36 +671,40 @@ export function PeopleDetailPage() {
                     </Button>
                   </Space>
                 ))}
-              </Card>
+                <Button type="dashed" onClick={() => add({ is_representative: false })} block>
+                  기술 추가
+                </Button>
+              </>
             )}
           </Form.List>
+        </Form>
+      </Modal>
 
+      <Modal
+        title={`전문분야 수정 · v${person.profile_version}`}
+        open={expertiseOpen}
+        onCancel={() => setExpertiseOpen(false)}
+        onOk={() => expertiseForm.submit()}
+        confirmLoading={expertiseMutation.isPending}
+        destroyOnHidden
+        width={720}
+      >
+        <Form
+          form={expertiseForm}
+          layout="vertical"
+          onFinish={(values) => expertiseMutation.mutate(values.expertise ?? [])}
+        >
           <Form.List name="expertise">
             {(fields, { add, remove }) => (
-              <Card
-                size="small"
-                title="전문분야 (EXP)"
-                extra={
-                  <Button type="link" onClick={() => add({ evidence_type: 'EXPLICIT' })}>
-                    추가
-                  </Button>
-                }
-              >
+              <>
                 {fields.map((field) => (
                   <Space key={field.key} align="baseline" style={{ marginBottom: 8 }}>
-                    <Form.Item
-                      {...field}
-                      name={[field.name, 'exp_code']}
-                      rules={[{ required: true }]}
-                    >
+                    <Form.Item {...field} name={[field.name, 'exp_code']} rules={[{ required: true }]}>
                       <Select
                         showSearch
                         optionFilterProp="label"
                         style={{ width: 240 }}
-                        options={(expCodesQuery.data?.data ?? []).map((c) => ({
-                          value: c.code,
-                          label: c.name,
-                        }))}
+                        options={expOptions}
                         placeholder="전문분야"
                       />
                     </Form.Item>
@@ -622,7 +722,10 @@ export function PeopleDetailPage() {
                     </Button>
                   </Space>
                 ))}
-              </Card>
+                <Button type="dashed" onClick={() => add({ evidence_type: 'EXPLICIT' })} block>
+                  전문분야 추가
+                </Button>
+              </>
             )}
           </Form.List>
         </Form>
