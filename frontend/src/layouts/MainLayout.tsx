@@ -14,8 +14,8 @@ import { Outlet, useLocation, useNavigate } from 'react-router-dom'
 import type { ReactNode } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 
-import { logout } from '@/api/client'
-import { authMeQueryKey, useAuthMe } from '@/app/auth'
+import { useAuthMe } from '@/app/auth'
+import { performLogout } from '@/app/logout'
 
 const { Header, Sider, Content } = Layout
 
@@ -91,11 +91,8 @@ export function MainLayout() {
   const menuItems = buildMenuItems(Boolean(isAdmin))
 
   const onLogout = async () => {
-    try {
-      await logout()
-    } finally {
-      await queryClient.invalidateQueries({ queryKey: authMeQueryKey })
-      queryClient.setQueryData(authMeQueryKey, null)
+    const action = await performLogout(queryClient)
+    if (action === 'clear_and_redirect') {
       navigate('/login', { replace: true })
     }
   }

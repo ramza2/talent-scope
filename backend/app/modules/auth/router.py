@@ -17,6 +17,11 @@ from app.modules.auth.service import AuthService
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 
+def _set_no_store(response: Response) -> None:
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+
+
 def _set_auth_cookies(
     response: Response,
     *,
@@ -69,6 +74,7 @@ def login(
     settings: Settings = Depends(get_settings),
 ) -> AuthUserResponse:
     result = service.login(payload.login_id, payload.password)
+    _set_no_store(response)
     _set_auth_cookies(
         response,
         settings=settings,
@@ -87,8 +93,10 @@ def login(
 
 @router.get("/me", response_model=AuthUserResponse)
 def me(
+    response: Response,
     ctx: AuthenticatedContext = Depends(require_authenticated_user),
 ) -> AuthUserResponse:
+    _set_no_store(response)
     user = ctx.user
     return AuthUserResponse(
         data=AuthUserData(
@@ -110,6 +118,7 @@ def logout(
     settings: Settings = Depends(get_settings),
 ) -> Response:
     service.logout(ctx.session_id, ctx.user)
+    _set_no_store(response)
     _clear_auth_cookies(response, settings)
     response.status_code = status.HTTP_204_NO_CONTENT
     return response

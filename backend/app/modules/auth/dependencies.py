@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from fastapi import Cookie, Depends, Header, Request
+from fastapi import Depends, Header, Request
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings, get_settings
@@ -76,10 +76,8 @@ def require_csrf(
     ctx: AuthenticatedContext = Depends(require_authenticated_user),
     settings: Settings = Depends(get_settings),
     x_csrf_token: str | None = Header(default=None, alias="X-CSRF-Token"),
-    csrf_cookie: str | None = Cookie(default=None, alias="ts_csrf"),
 ) -> AuthenticatedContext:
-    cookie_name = settings.csrf_cookie_name
-    cookie_token = request.cookies.get(cookie_name) or csrf_cookie
+    cookie_token = request.cookies.get(settings.csrf_cookie_name)
     header_token = x_csrf_token
 
     if not cookie_token or not header_token:

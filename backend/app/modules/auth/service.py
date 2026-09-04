@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from uuid import UUID
 
 from sqlalchemy.orm import Session
 
@@ -46,15 +45,26 @@ class AuthService:
             raise InvalidCredentialsError()
 
         session_id, record = self.sessions.create_session(user.id)
-        self.repo.touch_last_login(user)
-        self.repo.add_audit(
-            action_type="AUTH_LOGIN_SUCCESS",
-            user_id=user.id,
-            target_id=user.id,
-            metadata={"login_id": user.login_id},
-        )
-        self.db.commit()
-        self.db.refresh(user)
+        try:
+            self.repo.touch_last_login(user)
+            self.repo.add_audit(
+                action_type="AUTH_LOGIN_SUCCESS",
+                user_id=user.id,
+                target_id=user.id,
+                metadata={"login_id": user.login_id},
+            )
+            self.db.commit()
+            self.db.refresh(user)
+        except Exception:
+            # Avoid orphan Redis sessions if DB commit fails after create_session.
+            self.db.rollback()
+            try:
+                self.sessions.invalidate_session(session_id)
+            except Exception:
+                # Best-effort cleanup must not mask the original DB error.
+                pass
+            raise
+
         return LoginResult(user=user, session_id=session_id, csrf_token=record.csrf_token)
 
     def logout(self, session_id: str, user: AppUser) -> None:
