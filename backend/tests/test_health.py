@@ -46,7 +46,14 @@ def test_health_ready_structure(client: TestClient) -> None:
     assert "redis" in body
     assert body["status"] in {"ready", "not_ready"}
     assert body["database"] in {"ok", "error"}
-    assert body["redis"] in {"ok", "error", "skipped"}
+    assert body["redis"] in {"ok", "error"}
+    if body["status"] == "ready":
+        assert response.status_code == 200
+        assert body["database"] == "ok"
+        assert body["redis"] == "ok"
+    else:
+        assert response.status_code == 503
+        assert body["database"] == "error" or body["redis"] == "error"
 
 
 def test_sqlalchemy_metadata_import() -> None:

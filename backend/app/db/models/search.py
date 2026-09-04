@@ -10,15 +10,15 @@ from typing import Any
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
+    Computed,
     DateTime,
     ForeignKey,
-    Index,
     Integer,
     Numeric,
     String,
     Text,
     UniqueConstraint,
-    Computed,
     func,
 )
 from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR, UUID
@@ -32,7 +32,16 @@ EMBEDDING_DIMENSIONS = 1024
 class SearchIndexItem(Base):
     __tablename__ = "search_index_item"
     __table_args__ = (
-        Index("idx_search_index_person_type", "person_id", "object_type"),
+        CheckConstraint(
+            "object_type IN ('PROFILE', 'PROJECT', 'DOCUMENT_CHUNK')",
+            name="search_index_item_object_type_check",
+        ),
+        # Partial / GIN / HNSW / expression unique indexes are Alembic/migration-only:
+        # idx_search_index_person_type
+        # idx_search_index_tsv
+        # idx_search_index_text_trgm
+        # idx_search_index_embedding_hnsw
+        # uq_search_index_active_object_version
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -72,9 +81,22 @@ class SearchIndexItem(Base):
 class SearchIndexJob(Base):
     __tablename__ = "search_index_job"
     __table_args__ = (
+        CheckConstraint(
+            "object_type IS NULL OR object_type IN ('PROFILE', 'PROJECT', 'DOCUMENT_CHUNK')",
+            name="search_index_job_object_type_check",
+        ),
+        CheckConstraint(
+            "action IN ('UPSERT', 'DELETE', 'REBUILD_PERSON', 'REBUILD_ALL')",
+            name="search_index_job_action_check",
+        ),
+        CheckConstraint(
+            "status IN ('PENDING', 'PROCESSING', 'COMPLETED', 'FAILED', 'CANCELLED')",
+            name="search_index_job_status_check",
+        ),
+        CheckConstraint("retry_count >= 0", name="search_index_job_retry_count_check"),
         UniqueConstraint("idempotency_key", name="search_index_job_idempotency_key_key"),
-        Index("idx_search_index_job_status_created", "status", "created_at"),
-        Index("idx_search_index_job_person", "person_id", "created_at"),
+        # idx_search_index_job_status_created, idx_search_index_job_person — Alembic/migration-only
+        # (created_at DESC on person index)
     )
 
     id: Mapped[uuid.UUID] = mapped_column(

@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, String, Text, func
+from sqlalchemy import CheckConstraint, DateTime, String, Text, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -14,6 +14,10 @@ from app.db.base import Base
 
 class AppUser(Base):
     __tablename__ = "app_user"
+    __table_args__ = (
+        CheckConstraint("role IN ('USER', 'ADMIN')", name="app_user_role_check"),
+        CheckConstraint("status IN ('ACTIVE', 'INACTIVE')", name="app_user_status_check"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()

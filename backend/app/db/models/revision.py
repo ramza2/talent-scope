@@ -6,7 +6,15 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, UniqueConstraint, func
+from sqlalchemy import (
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -16,8 +24,15 @@ from app.db.base import Base
 class ProfileRevision(Base):
     __tablename__ = "profile_revision"
     __table_args__ = (
-        UniqueConstraint("person_id", "revision_no", name="profile_revision_person_id_revision_no_key"),
-        Index("idx_profile_revision_person", "person_id", "revision_no"),
+        CheckConstraint("revision_no > 0", name="profile_revision_revision_no_check"),
+        CheckConstraint(
+            "source_type IN ('USER', 'AI_CONFIRMED', 'MIGRATION', 'SYSTEM')",
+            name="profile_revision_source_type_check",
+        ),
+        UniqueConstraint(
+            "person_id", "revision_no", name="profile_revision_person_id_revision_no_key"
+        ),
+        # idx_profile_revision_person (person_id, revision_no DESC) — Alembic/migration-only
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -42,10 +57,8 @@ class ProfileRevision(Base):
 
 class AuditLog(Base):
     __tablename__ = "audit_log"
-    __table_args__ = (
-        Index("idx_audit_log_target", "target_type", "target_id", "created_at"),
-        Index("idx_audit_log_user_created", "user_id", "created_at"),
-    )
+    # DESC indexes — Alembic/migration-only:
+    # idx_audit_log_target, idx_audit_log_user_created
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()

@@ -6,7 +6,16 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import BigInteger, DateTime, ForeignKey, Index, String, Text, func
+from sqlalchemy import (
+    BigInteger,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    String,
+    Text,
+    func,
+)
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -15,7 +24,13 @@ from app.db.base import Base
 
 class UploadSession(Base):
     __tablename__ = "upload_session"
-    __table_args__ = (Index("idx_upload_session_status_created", "status", "created_at"),)
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('UPLOADING', 'IDENTIFYING', 'IDENTIFIED', 'RESOLVED', 'CANCELLED', 'EXPIRED')",
+            name="upload_session_status_check",
+        ),
+        # idx_upload_session_status_created (status, created_at DESC) — Alembic/migration-only
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
@@ -43,6 +58,11 @@ class UploadSession(Base):
 class UploadTempFile(Base):
     __tablename__ = "upload_temp_file"
     __table_args__ = (
+        CheckConstraint("file_size >= 0", name="upload_temp_file_file_size_check"),
+        CheckConstraint(
+            "validation_status IN ('PENDING', 'VALID', 'INVALID', 'ENCRYPTED', 'DUPLICATE')",
+            name="upload_temp_file_validation_status_check",
+        ),
         Index("idx_upload_temp_session", "upload_session_id"),
         Index("idx_upload_temp_sha256", "sha256"),
     )

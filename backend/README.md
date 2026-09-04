@@ -33,6 +33,8 @@ Migrations (operational schema source after baseline):
 alembic upgrade head
 ```
 
+The initial revision embeds the MVP DDL (self-contained) and does not read
+`db/schema.sql` at runtime, so Backend Docker images can migrate empty databases.
 Worker:
 
 ```bash

@@ -28,7 +28,7 @@ from app.db.base import Base
 
 class DocumentGroup(Base):
     __tablename__ = "document_group"
-    __table_args__ = (Index("idx_document_group_person_type", "person_id", "document_type_code"),)
+    # idx_document_group_person_type ... WHERE deleted_at IS NULL — Alembic/migration-only
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
@@ -52,10 +52,22 @@ class DocumentGroup(Base):
 class Document(Base):
     __tablename__ = "document"
     __table_args__ = (
-        UniqueConstraint("document_group_id", "version_no", name="document_document_group_id_version_no_key"),
+        CheckConstraint("version_no > 0", name="document_version_no_check"),
+        CheckConstraint("file_size >= 0", name="document_file_size_check"),
+        CheckConstraint(
+            "preview_page_count IS NULL OR preview_page_count >= 0",
+            name="document_preview_page_count_check",
+        ),
+        CheckConstraint(
+            "processing_status IN ('UPLOADED', 'PROCESSING', 'READY', 'FAILED')",
+            name="document_processing_status_check",
+        ),
+        UniqueConstraint(
+            "document_group_id", "version_no", name="document_document_group_id_version_no_key"
+        ),
         Index("idx_document_sha256", "sha256"),
-        Index("idx_document_group_version", "document_group_id", "version_no"),
-        Index("idx_document_processing_status", "processing_status", "uploaded_at"),
+        # Partial / DESC indexes are Alembic/migration-only:
+        # uq_document_group_latest, idx_document_group_version, idx_document_processing_status
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -94,6 +106,12 @@ class Document(Base):
 class DocumentPage(Base):
     __tablename__ = "document_page"
     __table_args__ = (
+        CheckConstraint("page_no > 0", name="document_page_page_no_check"),
+        CheckConstraint(
+            "extraction_method IS NULL OR extraction_method IN "
+            "('TEXT_PARSER', 'VLM', 'OCR', 'HYBRID')",
+            name="document_page_extraction_method_check",
+        ),
         UniqueConstraint("document_id", "page_no", name="document_page_document_id_page_no_key"),
         Index("idx_document_page_document", "document_id", "page_no"),
     )
@@ -116,10 +134,17 @@ class DocumentPage(Base):
 class DocumentChunk(Base):
     __tablename__ = "document_chunk"
     __table_args__ = (
-        UniqueConstraint("document_id", "chunk_index", name="document_chunk_document_id_chunk_index_key"),
+        CheckConstraint("chunk_index >= 0", name="document_chunk_chunk_index_check"),
+        CheckConstraint(
+            "token_count IS NULL OR token_count >= 0",
+            name="document_chunk_token_count_check",
+        ),
         CheckConstraint(
             "page_to IS NULL OR page_from IS NULL OR page_to >= page_from",
             name="document_chunk_check",
+        ),
+        UniqueConstraint(
+            "document_id", "chunk_index", name="document_chunk_document_id_chunk_index_key"
         ),
         Index("idx_document_chunk_document", "document_id", "chunk_index"),
     )

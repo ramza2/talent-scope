@@ -2,6 +2,16 @@
 # Cloud Agent environments already provision Host PostgreSQL via scripts/cloud-*.sh —
 # this Compose file is intentionally separate and uses host port 5433 for Postgres
 # to avoid colliding with the Agent Postgres on 5432.
+#
+# Secrets / runtime config:
+#   cp .env.example .env
+# then edit .env. Compose injects `.env` into api/worker (not `.env.example`).
+# Compose also reads `.env` for ${VAR} substitution in this file.
+#
+# Schema:
+#   Postgres starts empty (no schema.sql initdb mount) so Alembic remains the
+#   operational schema path. After postgres is healthy:
+#     docker compose -f docker-compose.dev.yml exec api alembic upgrade head
 
 services:
   postgres:
@@ -15,7 +25,6 @@ services:
       - "5433:5432"
     volumes:
       - talentscope_pgdata:/var/lib/postgresql/data
-      - ./db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U talentscope -d talentscope"]
       interval: 5s
@@ -75,7 +84,8 @@ services:
       dockerfile: Dockerfile
     container_name: talentscope-api
     env_file:
-      - .env.example
+      - path: .env
+        required: false
     environment:
       APP_ENV: development
       DATABASE_URL: postgresql+psycopg://talentscope:talentscope@postgres:5432/talentscope
@@ -100,10 +110,15 @@ services:
       dockerfile: Dockerfile
     container_name: talentscope-worker
     env_file:
-      - .env.example
+      - path: .env
+        required: false
     environment:
       DATABASE_URL: postgresql+psycopg://talentscope:talentscope@postgres:5432/talentscope
       REDIS_URL: redis://redis:6379/0
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-minioadmin}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-minioadmin}
+      S3_BUCKET: ${S3_BUCKET:-talent-scope}
     depends_on:
       redis:
         condition: service_healthy

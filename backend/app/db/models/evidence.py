@@ -7,7 +7,17 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, Integer, Numeric, String, Text, func
+from sqlalchemy import (
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    Numeric,
+    String,
+    Text,
+    func,
+)
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -20,6 +30,15 @@ class Evidence(Base):
         CheckConstraint(
             "char_end IS NULL OR char_start IS NULL OR char_end >= char_start",
             name="evidence_check",
+        ),
+        CheckConstraint(
+            "extraction_method IS NULL OR extraction_method IN "
+            "('TEXT_PARSER', 'VLM', 'OCR', 'HYBRID')",
+            name="evidence_extraction_method_check",
+        ),
+        CheckConstraint(
+            "confidence IS NULL OR (confidence >= 0 AND confidence <= 1)",
+            name="evidence_confidence_check",
         ),
         Index("idx_evidence_document_page", "document_id", "page_no"),
     )

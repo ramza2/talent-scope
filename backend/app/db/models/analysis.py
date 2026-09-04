@@ -7,7 +7,17 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import DateTime, ForeignKey, Index, Integer, Numeric, String, Text, func
+from sqlalchemy import (
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    Numeric,
+    String,
+    Text,
+    func,
+)
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -17,8 +27,16 @@ from app.db.base import Base
 class AnalysisRun(Base):
     __tablename__ = "analysis_run"
     __table_args__ = (
-        Index("idx_analysis_run_person_created", "person_id", "created_at"),
-        Index("idx_analysis_run_status_created", "status", "created_at"),
+        CheckConstraint(
+            "status IN ('QUEUED', 'PROCESSING', 'REVIEWING', 'CONFIRMED', 'FAILED', 'CANCELLED')",
+            name="analysis_run_status_check",
+        ),
+        CheckConstraint(
+            "overall_confidence IS NULL OR (overall_confidence >= 0 AND overall_confidence <= 1)",
+            name="analysis_run_overall_confidence_check",
+        ),
+        # DESC indexes — Alembic/migration-only:
+        # idx_analysis_run_person_created, idx_analysis_run_status_created
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -70,6 +88,22 @@ class AnalysisRunDocument(Base):
 class AnalysisDiffItem(Base):
     __tablename__ = "analysis_diff_item"
     __table_args__ = (
+        CheckConstraint(
+            "change_type IN ('SAME', 'NEW', 'UPDATE', 'CONFLICT', 'REVIEW')",
+            name="analysis_diff_item_change_type_check",
+        ),
+        CheckConstraint(
+            "confidence IS NULL OR (confidence >= 0 AND confidence <= 1)",
+            name="analysis_diff_item_confidence_check",
+        ),
+        CheckConstraint(
+            "evidence_type IS NULL OR evidence_type IN ('EXPLICIT', 'INFERRED')",
+            name="analysis_diff_item_evidence_type_check",
+        ),
+        CheckConstraint(
+            "review_status IN ('PENDING', 'ACCEPTED', 'REJECTED', 'MODIFIED', 'MERGED')",
+            name="analysis_diff_item_review_status_check",
+        ),
         Index("idx_analysis_diff_run_status", "analysis_run_id", "review_status"),
         Index("idx_analysis_diff_run_change", "analysis_run_id", "change_type"),
     )

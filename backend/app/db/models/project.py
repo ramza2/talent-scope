@@ -29,7 +29,16 @@ class Project(Base):
             "end_date IS NULL OR start_date IS NULL OR end_date >= start_date",
             name="project_check",
         ),
-        Index("idx_project_person_period", "person_id", "start_date"),
+        CheckConstraint(
+            "duration_months IS NULL OR duration_months >= 0",
+            name="project_duration_months_check",
+        ),
+        CheckConstraint(
+            "source_type IN ('USER', 'AI_CONFIRMED', 'MIGRATION')",
+            name="project_source_type_check",
+        ),
+        # Complex indexes (DESC / partial WHERE / GIN trgm) are Alembic/migration-only:
+        # idx_project_person_period, idx_project_name_trgm, idx_project_customer_trgm
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -86,7 +95,13 @@ class ProjectSkill(Base):
 
 class ProjectExpertise(Base):
     __tablename__ = "project_expertise"
-    __table_args__ = (Index("idx_project_expertise_code", "exp_code", "project_id"),)
+    __table_args__ = (
+        CheckConstraint(
+            "evidence_type IN ('EXPLICIT', 'INFERRED')",
+            name="project_expertise_evidence_type_check",
+        ),
+        Index("idx_project_expertise_code", "exp_code", "project_id"),
+    )
 
     project_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("project.id", ondelete="CASCADE"), primary_key=True

@@ -1,9 +1,9 @@
 """Health check endpoints.
 
 GET /api/v1/health/live  — process liveness
-GET /api/v1/health/ready — dependency readiness (Postgres required; Redis best-effort)
+GET /api/v1/health/ready — dependency readiness (PostgreSQL + Redis required)
 
-LLM/VLM status is intentionally excluded from readiness.
+LLM/VLM/Embedding Runtime failures are intentionally excluded from readiness.
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ class LiveResponse(BaseModel):
 class ReadyResponse(BaseModel):
     status: str
     database: str
-    redis: str = Field(description="ok | error | skipped")
+    redis: str = Field(description="ok | error")
 
 
 def _check_database() -> str:
@@ -62,10 +62,7 @@ def ready(response: Response) -> ReadyResponse:
     database = _check_database()
     redis_status = _check_redis()
 
-    # Database is required for readiness. Redis is reported but does not fail
-    # the endpoint alone in Cloud Agent environments where Redis may be absent.
-    # If both DB and Redis are ok → ready; if DB fails → not_ready.
-    if database == "ok":
+    if database == "ok" and redis_status == "ok":
         payload = ReadyResponse(status="ready", database=database, redis=redis_status)
         response.status_code = status.HTTP_200_OK
         return payload

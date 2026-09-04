@@ -5,7 +5,18 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -15,6 +26,10 @@ from app.db.base import Base
 class CodeMaster(Base):
     __tablename__ = "code_master"
     __table_args__ = (
+        CheckConstraint(
+            "code_type IN ('JOB', 'TECH', 'EXP', 'BIZ', 'CUSTOMER_TYPE', 'DOC_TYPE')",
+            name="code_master_code_type_check",
+        ),
         Index("idx_code_master_type_parent", "code_type", "parent_code", "sort_order"),
     )
 
@@ -39,7 +54,7 @@ class CodeAlias(Base):
     __tablename__ = "code_alias"
     __table_args__ = (
         UniqueConstraint("code", "normalized_alias", name="code_alias_code_normalized_alias_key"),
-        # GIN trigram index is created in Alembic/schema.sql (not portable via Index())
+        # idx_code_alias_normalized: GIN (normalized_alias gin_trgm_ops) — Alembic/migration-only
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
