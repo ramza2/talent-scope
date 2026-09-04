@@ -1,0 +1,41 @@
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Node / Frontend
+node_modules/
+dist/
+coverage/
+.vite/
+
+# Build / package
+build/
+*.egg-info/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Runtime / temp
+*.log
+logs/
+tmp/
+temp/
+
+# Local data
+*.sqlite
+*.sqlite3
