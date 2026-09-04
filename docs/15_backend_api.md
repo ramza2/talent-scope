@@ -143,6 +143,7 @@ app_user              Redis
 - Role 변경/사용자 비활성화 시 기존 Session을 무효화할 수 있어야 한다.
 - 상태 변경 API는 CSRF 방어를 적용한다. 예: `ts_csrf` + `X-CSRF-Token` Double Submit 또는 동등한 방식.
 - 비밀번호는 Backend에서 안전한 Password Hash로 검증한다.
+- JWT Access/Refresh Token은 1차 MVP Browser 인증에 사용하지 않는다.
 
 ### Auth API
 
@@ -297,6 +298,16 @@ Response 예:
 | `PUT` | `/people/{person_id}/expertise` | ADMIN | 전문분야 Set 저장 |
 | `GET` | `/people/{person_id}/revisions` | ADMIN | Profile Revision 조회 |
 
+기술등급 DB/API 코드는 다음을 사용한다.
+
+```text
+BEGINNER      # 초급
+INTERMEDIATE  # 중급
+ADVANCED      # 고급
+EXPERT        # 특급
+UNKNOWN       # 미확정/알 수 없음
+```
+
 ### `GET /people`
 
 인력 목록 화면 전용 Query다. 복잡한 AI 추천은 `/search/people`을 사용한다.
@@ -306,7 +317,7 @@ Query 예:
 ```text
 ?q=Oracle
 &job_codes=JOB-DATA-DBA
-&grade=SPECIAL
+&grade=EXPERT
 &tech_codes=TECH-DB-ORACLE
 &exp_codes=EXP-DATA-DB-TUNING
 &affiliation=ABC
@@ -338,7 +349,7 @@ Query 예:
       "email": "hong@example.com",
       "address_region": "서울",
       "affiliation_company": "ABC테크",
-      "technical_grade": "SPECIAL",
+      "technical_grade": "EXPERT",
       "career_confirmed_months": 223,
       "profile_summary": "...",
       "profile_updated_at": "2026-09-04T13:00:00+09:00"
@@ -365,7 +376,7 @@ Query 예:
 ```json
 {
   "expected_profile_version": 7,
-  "technical_grade": "SPECIAL",
+  "technical_grade": "EXPERT",
   "career_confirmed_months": 223
 }
 ```
@@ -668,7 +679,7 @@ Diff Response는 Evidence Summary를 포함한다.
   "field_name": "technical_grade",
   "change_type": "CONFLICT",
   "old_value": "ADVANCED",
-  "new_value": "SPECIAL",
+  "new_value": "EXPERT",
   "confidence": 0.94,
   "evidence_type": "EXPLICIT",
   "review_status": "PENDING",
@@ -696,7 +707,7 @@ Diff Response는 Evidence Summary를 포함한다.
 ```json
 {
   "review_status": "MODIFIED",
-  "decided_value": "SPECIAL"
+  "decided_value": "EXPERT"
 }
 ```
 
@@ -708,10 +719,13 @@ Diff Response는 Evidence Summary를 포함한다.
   "existing_target_id": "existing-project-uuid",
   "decided_value": {
     "roles": ["JOB-MGT-PL", "JOB-AI-DEV"],
-    "skills": ["TECH-LANG-PYTHON", "TECH-AI-RAG"]
+    "skills": ["TECH-LANG-PYTHON"],
+    "expertise": ["EXP-AI-RAG"]
   }
 }
 ```
+
+`skills`에는 TECH만, `expertise`에는 EXP만 사용한다. 예를 들어 RAG는 TECH가 아니라 EXP다.
 
 ### 일괄 결정
 
@@ -881,7 +895,7 @@ Response:
       "expertise": [],
       "business_domains": [],
       "customer_types": [],
-      "grade": {"values": ["SPECIAL"]},
+      "grade": {"values": ["EXPERT"]},
       "career": null
     },
     "preferred": {
@@ -915,7 +929,7 @@ AI는 Code Alias를 가능한 표준코드로 정규화하며 임의의 인력 I
     "expertise": [],
     "business_domains": [],
     "customer_types": [],
-    "grade": {"values": ["SPECIAL"]},
+    "grade": {"values": ["EXPERT"]},
     "career": {"min_months": 120, "max_months": null},
     "affiliations": [],
     "certifications": [],
@@ -964,10 +978,11 @@ Evidence/Project 연결
       "score": 94,
       "person": {
         "name": "홍길동",
-        "technical_grade": "SPECIAL",
+        "technical_grade": "EXPERT",
         "career_months": 223,
         "primary_jobs": ["AI개발자", "PL"],
-        "skills": ["Python", "FastAPI", "RAG", "Qwen"]
+        "skills": ["Python", "FastAPI", "Qwen", "PostgreSQL"],
+        "expertise": ["LLM", "RAG", "AI Agent"]
       },
       "matches": [
         {
@@ -1035,7 +1050,7 @@ Evidence/Project 연결
     },
     {
       "action": "RELAX_GRADE",
-      "from": "SPECIAL",
+      "from": "EXPERT",
       "to": "ADVANCED_OR_HIGHER",
       "estimated_count": 7,
       "label": "고급 이상으로 변경"
@@ -1044,7 +1059,7 @@ Evidence/Project 연결
 }
 ```
 
-조건을 실제로 변경하는 것은 사용자가 제안을 선택했을 때만 수행한다.
+`ADVANCED_OR_HIGHER`는 저장 DB Enum이 아니라 조건완화 제안에서 사용하는 검색 표현이다. 조건을 실제로 변경하는 것은 사용자가 제안을 선택했을 때만 수행한다.
 
 ---
 
@@ -1127,11 +1142,11 @@ ADMIN 전용.
 
 ## 18. Health Check
 
-Traefik/Docker 운영을 위해 Application 업무 API와 별도 Health Endpoint를 둔다.
+Traefik/Docker 운영을 위해 Application 업무 API와 별도 Health Endpoint를 두되, 공통 Base Path `/api/v1` 아래에 둔다.
 
 ```text
-GET /health/live
-GET /health/ready
+GET /api/v1/health/live
+GET /api/v1/health/ready
 ```
 
 ### Liveness
@@ -1144,24 +1159,27 @@ Process가 요청을 받을 수 있는지만 확인한다.
 
 ### Readiness
 
-최소 PostgreSQL 연결을 확인한다. Redis/MinIO/AI Runtime 장애는 서비스 특성에 따라 세부 Component 상태로 반환하되 AI Runtime 일시 장애 때문에 기본 Profile 조회 전체가 Unready가 되지는 않도록 한다.
+MVP Readiness는 PostgreSQL과 Redis를 필수 의존성으로 확인한다.
 
-예:
+```text
+PostgreSQL OK + Redis OK → ready / 200
+PostgreSQL FAIL          → not_ready / 503
+Redis FAIL               → not_ready / 503
+```
+
+현재 Skeleton 응답 예:
 
 ```json
 {
   "status": "ready",
-  "components": {
-    "postgres": "ok",
-    "redis": "ok",
-    "minio": "ok",
-    "llm": "degraded",
-    "vlm": "ok"
-  }
+  "database": "ok",
+  "redis": "ok"
 }
 ```
 
-Traefik Health Check에는 `/health/ready` 또는 Docker Healthcheck를 연동한다.
+MinIO와 LLM/VLM/Embedding Runtime은 기본 Readiness 판정에 포함하지 않는다. 이들 기능상태는 운영상태 API에서 별도로 관리하며, AI Runtime 일시 장애 때문에 기존 Profile 조회와 DB 검색 전체가 Unready가 되지 않도록 한다.
+
+Traefik Health Check에는 `/api/v1/health/ready` 또는 동등한 Docker Healthcheck를 연동한다.
 
 ---
 
@@ -1331,19 +1349,21 @@ Pydantic Request/Response Schema와 Endpoint 구현이 본 문서의 계약을 �
 
 - REST Base Path: `/api/v1`
 - FastAPI + Pydantic v2
-- Same-Origin + Server Session Cookie 인증
+- Same-Origin + Redis Server Session + HttpOnly Cookie 인증
 - USER / ADMIN 2개 Role
+- 기술등급 API/DB 값은 `BEGINNER / INTERMEDIATE / ADVANCED / EXPERT / UNKNOWN` 사용
 - 신규 등록은 `upload-session` 기반 Wizard API
 - AI 분석은 `analysis_run` 기반 Async API
 - Candidate Diff는 개별/일괄 검토 후 명시적 Confirm
 - Profile 변경은 `profile_version` Optimistic Lock
 - 문서는 Backend 권한검사 후 Preview/Download 제공
 - Search는 `interpret → people` 2단계
+- TECH(`skills`)와 EXP(`expertise`)를 분리하며 RAG는 EXP로 처리
 - 검색결과 Ranking은 Backend가 결정하고 LLM은 설명 역할만 수행
 - 검색 설명은 결과 전체가 아니라 필요 시 후보 단위 On-demand 생성
 - Evidence에서 실제 문서/페이지까지 연결
 - Search Index/Embedding은 비동기 Worker 처리
 - PostgreSQL이 업무상태 Source of Truth
-- Health Endpoint는 Traefik/Docker 운영을 고려하여 제공
+- Health Endpoint는 `/api/v1/health/live`, `/api/v1/health/ready`로 통일하고 PostgreSQL/Redis를 필수 Readiness 의존성으로 사용
 
-다음 구현 단계에서는 이 API 계약을 기준으로 **FastAPI Project Skeleton, SQLAlchemy Model/Alembic 초기 Migration, Pydantic Schema, Router Stub**을 생성한다.
+Skeleton 구현 이후 실제 기능 개발은 이 API 계약을 기준으로 Auth/Session/RBAC부터 단계적으로 진행한다.
