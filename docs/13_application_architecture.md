@@ -31,7 +31,7 @@
 | RDB / Search | PostgreSQL + pgvector | 구조화 DB + FTS + Vector |
 | Fuzzy Search | pg_trgm | 이름/회사/프로젝트 유사검색 |
 | Async Job | Celery | 문서처리/AI분석/Embedding |
-| Broker / Cache | Redis | Celery Broker 및 단기 Cache |
+| Broker / Session / Cache | Redis | Celery Broker, 서버 세션 저장, 단기 Cache |
 | Object Storage | MinIO | S3 호환 원본/Preview 저장 |
 | HTTP Client | httpx | LLM/VLM 등 외부/내부 API 호출 |
 | PDF | PyMuPDF | PDF Text/Page 처리 |
@@ -141,8 +141,9 @@ TalentScope Stack
 
 ### `redis`
 
-- Celery Broker 및 짧은 TTL Cache.
+- Celery Broker, Browser 서버 세션 저장소 및 짧은 TTL Cache로 사용한다.
 - 업무 데이터 Source of Truth로 사용하지 않는다.
+- Session 만료/무효화는 Auth Service가 관리하고 사용자 권한정보의 Source of Truth는 PostgreSQL의 `app_user`다.
 
 ### `minio`
 
@@ -584,12 +585,27 @@ USER
 ADMIN
 ```
 
-권장 인증방식:
+MVP Browser 인증은 **ID/Password + Redis 서버 세션 + HttpOnly Cookie** 방식으로 FIX한다.
 
-- ID/Password
-- JWT Access/Refresh Token
-- Token은 HttpOnly Secure Cookie 방식 우선
-- 동일 Origin(`/`, `/api`) 구성
+```text
+app_user              Redis
+   │                    │
+   └ 로그인 검증        └ Session 저장 / TTL
+             │
+             ▼
+      HttpOnly Session Cookie
+```
+
+원칙:
+
+- Session Cookie 예: `ts_session`
+- Cookie에는 Session ID만 저장한다.
+- `HttpOnly=true`, 운영 HTTPS에서는 `Secure=true`, `SameSite=Lax`를 기본으로 한다.
+- 사용자 Role/상태의 Source of Truth는 PostgreSQL `app_user`이며 Redis Session에 저장된 값만 신뢰하지 않는다.
+- Role 변경 또는 사용자 비활성화 시 기존 Session을 무효화할 수 있어야 한다.
+- 상태 변경 API에는 CSRF 방어를 적용한다.
+- JWT Access/Refresh Token은 1차 MVP Browser 인증에 사용하지 않는다.
+- 동일 Origin(`/`, `/api`) 구성을 기본으로 한다.
 
 Frontend의 메뉴 숨김은 UX일 뿐 실제 권한은 Backend에서 검사한다.
 
@@ -655,6 +671,10 @@ APP_SECRET_KEY
 DATABASE_URL
 REDIS_URL
 
+SESSION_COOKIE_NAME
+SESSION_TTL_SECONDS
+CSRF_COOKIE_NAME
+
 S3_ENDPOINT
 S3_ACCESS_KEY
 S3_SECRET_KEY
@@ -683,11 +703,11 @@ TALENTSCOPE_HOST
 
 ## 18. Health Check
 
-Backend는 최소 두 Health Endpoint를 제공한다.
+Backend는 `/api/v1` Base Path 기준으로 최소 두 Health Endpoint를 제공한다.
 
 ```text
-GET /api/health/live
-GET /api/health/ready
+GET /api/v1/health/live
+GET /api/v1/health/ready
 ```
 
 ### live
@@ -696,14 +716,20 @@ Process가 정상적으로 실행 중인지 확인한다.
 
 ### ready
 
-최소 다음 의존성을 확인한다.
+MVP Readiness의 필수 의존성은 다음 두 개다.
 
 - PostgreSQL
 - Redis
 
-LLM/VLM 장애는 서비스 전체를 `not ready` 처리하지 않고 AI 기능상태로 별도 관리하는 것을 권장한다.
+판정 규칙:
 
-즉 LLM이 일시 장애여도 기존 인력 조회와 DB 검색은 계속 가능해야 한다.
+```text
+PostgreSQL OK + Redis OK → ready / HTTP 200
+PostgreSQL FAIL          → not_ready / HTTP 503
+Redis FAIL               → not_ready / HTTP 503
+```
+
+MinIO와 LLM/VLM/Embedding Runtime은 기본 Readiness 판정에 포함하지 않고 기능상태/운영상태에서 별도로 관리한다. AI Runtime이 일시 장애여도 기존 인력 조회와 DB 검색은 계속 가능해야 한다.
 
 ---
 
@@ -831,6 +857,8 @@ MVP에서는 Microservice로 나누지 않지만 Container Scale-out이 가능�
 14. 운영 배포는 **Docker Compose + Traefik Label** 구조를 전제로 한다.
 15. 외부에는 `frontend`와 `api`만 노출하고 DB/Redis/MinIO/Worker는 내부 Network에 둔다.
 16. 동일 Host에서 `/` → Frontend, `/api` → Backend Routing을 기본안으로 한다.
-17. Kubernetes, Elasticsearch/OpenSearch, 별도 Vector DB, Kafka는 1차 MVP에서 도입하지 않는다.
+17. Browser 인증은 **Redis Server Session + HttpOnly Cookie** 방식으로 사용하며 JWT Access/Refresh Token은 1차 MVP에 사용하지 않는다.
+18. Health Endpoint는 `/api/v1/health/live`, `/api/v1/health/ready`로 통일하고 PostgreSQL/Redis를 필수 Readiness 의존성으로 둔다.
+19. Kubernetes, Elasticsearch/OpenSearch, 별도 Vector DB, Kafka는 1차 MVP에서 도입하지 않는다.
 
 이 Architecture를 기준으로 이후 PostgreSQL DDL, Backend REST API, Docker/Traefik 배포설계를 진행한다.
