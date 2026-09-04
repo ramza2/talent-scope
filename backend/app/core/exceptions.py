@@ -70,3 +70,75 @@ class SessionStoreUnavailableError(TalentScopeError):
 
     def __init__(self, detail: str | None = None) -> None:
         super().__init__(detail or "세션 저장소를 사용할 수 없습니다.")
+
+
+class CodeAlreadyExistsError(ConflictError):
+    code = "CODE_ALREADY_EXISTS"
+    title = "Code already exists"
+
+    def __init__(self, detail: str | None = None) -> None:
+        super().__init__(detail or "이미 존재하는 코드입니다.")
+
+
+class InvalidCodeTypeError(ValidationAppError):
+    code = "INVALID_CODE_TYPE"
+    title = "Invalid code type"
+
+    def __init__(self, detail: str | None = None) -> None:
+        super().__init__(detail or "허용되지 않은 코드 유형입니다.")
+
+
+class InvalidCodeParentError(ValidationAppError):
+    code = "INVALID_CODE_PARENT"
+    title = "Invalid code parent"
+
+    def __init__(self, detail: str | None = None) -> None:
+        super().__init__(detail or "상위 코드가 올바르지 않습니다.")
+
+
+class CodeHierarchyCycleError(ValidationAppError):
+    code = "CODE_HIERARCHY_CYCLE"
+    title = "Code hierarchy cycle"
+
+    def __init__(self, detail: str | None = None) -> None:
+        super().__init__(detail or "코드 계층에 순환이 발생합니다.")
+
+
+class UserLoginIdExistsError(ConflictError):
+    code = "USER_LOGIN_ID_EXISTS"
+    title = "Login ID already exists"
+
+    def __init__(self, detail: str | None = None) -> None:
+        super().__init__(detail or "이미 사용 중인 로그인 ID입니다.")
+
+
+class InvalidUserRoleError(ValidationAppError):
+    code = "INVALID_USER_ROLE"
+    title = "Invalid user role"
+
+    def __init__(self, detail: str | None = None) -> None:
+        super().__init__(detail or "허용되지 않은 사용자 역할입니다.")
+
+
+class InvalidUserStatusError(ValidationAppError):
+    code = "INVALID_USER_STATUS"
+    title = "Invalid user status"
+
+    def __init__(self, detail: str | None = None) -> None:
+        super().__init__(detail or "허용되지 않은 사용자 상태입니다.")
+
+
+class CannotDeactivateSelfError(ValidationAppError):
+    code = "CANNOT_DEACTIVATE_SELF"
+    title = "Cannot deactivate self"
+
+    def __init__(self, detail: str | None = None) -> None:
+        super().__init__(detail or "자신의 계정을 비활성화할 수 없습니다.")
+
+
+class LastActiveAdminRequiredError(ValidationAppError):
+    code = "LAST_ACTIVE_ADMIN_REQUIRED"
+    title = "Last active admin required"
+
+    def __init__(self, detail: str | None = None) -> None:
+        super().__init__(detail or "마지막 활성 관리자 계정은 변경할 수 없습니다.")
