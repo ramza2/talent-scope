@@ -81,5 +81,8 @@ TalentScope는 사내에서 보유한 이력서, 경력기술서, 인력 프로�
 - [09. Security & Permission](docs/09_security_permission.md)
 - [10. Information Architecture](docs/10_ia.md)
 - [11. Core Screen Wireframes](docs/11_wireframes.md)
+- [12. Database ERD & Core Tables](docs/12_database_erd.md)
 
-`11_wireframes.md`에는 신규 인력 등록·문서 업로드, AI 분석 결과 검토·확정, 인력 상세 프로필, 통합 인력검색의 4개 핵심 업무화면과 인력 목록 지원화면을 정리합니다.
+`12_database_erd.md`에는 인력 등록부터 문서·AI 분석·프로젝트·근거·검색/임베딩까지 이어지는 데이터 모델과 SVG ERD를 정리합니다.
+
+향후 배포 설계는 **Docker Compose + Traefik Label 기반 라우팅**을 전제로 하며, Frontend/Backend/Worker/PostgreSQL(pgvector)/Object Storage의 서비스·네트워크·Persistent Volume 구성을 별도 문서에서 구체화할 예정입니다.
