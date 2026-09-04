@@ -142,3 +142,53 @@ class LastActiveAdminRequiredError(ValidationAppError):
 
     def __init__(self, detail: str | None = None) -> None:
         super().__init__(detail or "마지막 활성 관리자 계정은 변경할 수 없습니다.")
+
+
+class ProfileVersionConflictError(ConflictError):
+    code = "PROFILE_VERSION_CONFLICT"
+    title = "Profile version conflict"
+
+    def __init__(self, detail: str | None = None) -> None:
+        super().__init__(
+            detail or "프로필이 다른 작업에 의해 먼저 수정되었습니다. 최신 정보를 다시 불러오세요."
+        )
+
+
+class InvalidPersonStatusError(ValidationAppError):
+    code = "INVALID_PERSON_STATUS"
+    title = "Invalid person status"
+
+    def __init__(self, detail: str | None = None) -> None:
+        super().__init__(detail or "허용되지 않은 인력 상태입니다.")
+
+
+class InvalidTechnicalGradeError(ValidationAppError):
+    code = "INVALID_TECHNICAL_GRADE"
+    title = "Invalid technical grade"
+
+    def __init__(self, detail: str | None = None) -> None:
+        super().__init__(detail or "허용되지 않은 기술등급입니다.")
+
+
+class InvalidJobCodeError(ValidationAppError):
+    code = "INVALID_JOB_CODE"
+    title = "Invalid job code"
+
+    def __init__(self, detail: str | None = None) -> None:
+        super().__init__(detail or "유효하지 않은 직무 코드입니다.")
+
+
+class InvalidTechCodeError(ValidationAppError):
+    code = "INVALID_TECH_CODE"
+    title = "Invalid tech code"
+
+    def __init__(self, detail: str | None = None) -> None:
+        super().__init__(detail or "유효하지 않은 기술 코드입니다.")
+
+
+class InvalidExpCodeError(ValidationAppError):
+    code = "INVALID_EXP_CODE"
+    title = "Invalid expertise code"
+
+    def __init__(self, detail: str | None = None) -> None:
+        super().__init__(detail or "유효하지 않은 전문분야 코드입니다.")
