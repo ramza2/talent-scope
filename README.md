@@ -82,7 +82,6 @@ TalentScope는 사내에서 보유한 이력서, 경력기술서, 인력 프로�
 - [10. Information Architecture](docs/10_ia.md)
 - [11. Core Screen Wireframes](docs/11_wireframes.md)
 - [12. Database ERD & Core Tables](docs/12_database_erd.md)
+- [13. Application Architecture & Backend Stack](docs/13_application_architecture.md)
 
-`12_database_erd.md`에는 인력 등록부터 문서·AI 분석·프로젝트·근거·검색/임베딩까지 이어지는 데이터 모델과 SVG ERD를 정리합니다.
-
-향후 배포 설계는 **Docker Compose + Traefik Label 기반 라우팅**을 전제로 하며, Frontend/Backend/Worker/PostgreSQL(pgvector)/Object Storage의 서비스·네트워크·Persistent Volume 구성을 별도 문서에서 구체화할 예정입니다.
+`13_application_architecture.md`에서 FastAPI/PostgreSQL(pgvector)/Celery/Redis/MinIO 기반 Backend와 React Frontend, 기존 ALZI AI Runtime 연계, Docker Compose + Traefik Label 기반 운영배포 구조를 FIX합니다.
