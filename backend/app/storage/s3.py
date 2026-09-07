@@ -53,6 +53,8 @@ class S3ObjectStorage:
             self._client.put_object(**kwargs)
         except ClientError as exc:
             raise StorageError(f"객체 업로드 실패: {key}") from exc
+        except Exception as exc:  # connection errors, etc.
+            raise StorageError(f"객체 업로드 실패: {key}") from exc
 
     def put_fileobj(
         self,
@@ -73,6 +75,8 @@ class S3ObjectStorage:
                 ExtraArgs=extra or None,
             )
         except ClientError as exc:
+            raise StorageError(f"객체 업로드 실패: {key}") from exc
+        except Exception as exc:
             raise StorageError(f"객체 업로드 실패: {key}") from exc
 
     def head(self, key: str) -> ObjectHead:
