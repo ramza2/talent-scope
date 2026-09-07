@@ -298,6 +298,14 @@ class AIQueueUnavailableError(TalentScopeError):
         super().__init__(detail or "식별 작업을 큐에 등록할 수 없습니다. 잠시 후 다시 시도해 주세요.")
 
 
+class AnalysisStateConflictError(ConflictError):
+    code = "ANALYSIS_STATE_CONFLICT"
+    title = "Analysis state conflict"
+
+    def __init__(self, detail: str | None = None) -> None:
+        super().__init__(detail or "분석 실행 상태가 요청과 충돌합니다.")
+
+
 class AIProviderAppError(TalentScopeError):
     code = "AI_PROVIDER_ERROR"
     title = "AI provider error"
