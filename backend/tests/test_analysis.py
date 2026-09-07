@@ -100,7 +100,8 @@ def _create_user(db_session, *, login_id: str, password: str, role: str = "ADMIN
 def _login(client: TestClient, login_id: str, password: str) -> str:
     resp = client.post("/api/v1/auth/login", json={"login_id": login_id, "password": password})
     assert resp.status_code == 200, resp.text
-    csrf = resp.json()["data"]["csrf_token"]
+    csrf = client.cookies.get("ts_csrf")
+    assert csrf
     return csrf
 
 
