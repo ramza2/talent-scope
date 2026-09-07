@@ -173,6 +173,7 @@ def build_diffs(
             natural_key=lambda r: (
                 _norm_str(r.get("company_name") if isinstance(r, dict) else r.company_name),
                 _norm_str(r.get("start_date") if isinstance(r, dict) else r.start_date),
+                _norm_str(r.get("end_date") if isinstance(r, dict) else r.end_date),
             ),
             dump_row=_dump_model,
         )
@@ -186,8 +187,9 @@ def build_diffs(
             fields=EDUCATION_FIELDS,
             natural_key=lambda r: (
                 _norm_str(r.get("school_name") if isinstance(r, dict) else r.school_name),
-                _norm_str(r.get("major") if isinstance(r, dict) else r.major),
+                _norm_str(r.get("degree") if isinstance(r, dict) else r.degree),
                 _norm_str(r.get("start_date") if isinstance(r, dict) else r.start_date),
+                _norm_str(r.get("end_date") if isinstance(r, dict) else r.end_date),
             ),
             dump_row=_dump_model,
         )
@@ -609,16 +611,40 @@ def _diff_projects(
             )
             continue
         if not matches:
-            specs.append(
-                DiffSpec(
-                    entity_type="PROJECT",
-                    candidate_path=path,
-                    change_type="NEW",
-                    new_value=dump,
-                    confidence=project.confidence,
-                    source_refs=refs,
+            # Same name (+ optional customer) but different dates → ambiguous REVIEW.
+            similar = [
+                row
+                for row in existing
+                if _norm_str(row.get("project_name")) == key[0]
+                and (
+                    key[1] is None
+                    or _norm_str(row.get("customer_name")) is None
+                    or _norm_str(row.get("customer_name")) == key[1]
                 )
-            )
+            ]
+            if similar:
+                specs.append(
+                    DiffSpec(
+                        entity_type="PROJECT",
+                        candidate_path=path,
+                        change_type="REVIEW",
+                        old_value=similar if len(similar) > 1 else similar[0],
+                        new_value=dump,
+                        confidence=project.confidence,
+                        source_refs=refs,
+                    )
+                )
+            else:
+                specs.append(
+                    DiffSpec(
+                        entity_type="PROJECT",
+                        candidate_path=path,
+                        change_type="NEW",
+                        new_value=dump,
+                        confidence=project.confidence,
+                        source_refs=refs,
+                    )
+                )
             continue
 
         old = matches[0]

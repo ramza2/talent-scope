@@ -72,12 +72,38 @@ def _code_lookup(
     return text
 
 
+def _quote_in_source(
+    quote: str,
+    *,
+    doc_id: str | None,
+    page_no: int | None,
+    page_texts: dict[tuple[str, int], str] | None,
+) -> bool:
+    """Return True when quote appears in known page text (or when text unavailable)."""
+    if page_texts is None or not quote:
+        return True
+    if doc_id is None:
+        # No document context — cannot verify; drop hallucinated quote.
+        return False
+    if page_no is not None:
+        text = page_texts.get((doc_id, page_no))
+        if text is None:
+            return False
+        return quote in text
+    # Page unknown: accept if quote appears in any page of the document.
+    for (d_id, _p), text in page_texts.items():
+        if d_id == doc_id and quote in text:
+            return True
+    return False
+
+
 def _normalize_source_refs(
     refs: list[SourceRef] | list[dict[str, Any]] | None,
     *,
     allowed_documents: dict[str, set[int]],
     max_quote: int,
     max_refs: int,
+    page_texts: dict[tuple[str, int], str] | None = None,
 ) -> list[SourceRef]:
     if not refs:
         return []
@@ -94,18 +120,21 @@ def _normalize_source_refs(
         doc_id = str(ref.document_id).strip() if ref.document_id else None
         page_no = ref.page_no
         if doc_id is None or doc_id not in allowed_documents:
-            doc_id = None
-            page_no = None
-        elif page_no is not None:
-            pages = allowed_documents[doc_id]
-            if pages and page_no not in pages:
-                page_no = None
+            # Invalid document/page refs are discarded entirely.
+            continue
+        pages = allowed_documents[doc_id]
+        if page_no is not None and pages and page_no not in pages:
+            continue
         quote = ref.quote_text
         if quote is not None:
             quote = quote.strip()
             if len(quote) > max_quote:
                 quote = quote[:max_quote]
             if not quote:
+                quote = None
+            elif not _quote_in_source(
+                quote, doc_id=doc_id, page_no=page_no, page_texts=page_texts
+            ):
                 quote = None
         out.append(
             SourceRef(document_id=doc_id, page_no=page_no, quote_text=quote)
@@ -119,12 +148,14 @@ def normalize_candidate(
     catalog: dict[str, tuple[str, bool]],
     allowed_documents: dict[str, set[int]],
     settings: Settings | None = None,
+    page_texts: dict[tuple[str, int], str] | None = None,
 ) -> ProfileCandidateDocument:
     """Validate codes, source_refs, and strip sensitive keys.
 
     ``catalog`` maps code → (code_type, is_active).
     ``allowed_documents`` maps document_id str → set of valid page numbers
     (empty set means any page is accepted for that document).
+    ``page_texts`` maps (document_id, page_no) → extracted text for quote checks.
     """
     cfg = settings or get_settings()
     max_quote = int(cfg.analysis_max_quote_chars)
@@ -137,6 +168,15 @@ def normalize_candidate(
     doc = ProfileCandidateDocument.model_validate(cleaned)
     doc.schema_version = SCHEMA_VERSION
 
+    def _refs(refs: Any) -> list[SourceRef]:
+        return _normalize_source_refs(
+            refs,
+            allowed_documents=allowed_documents,
+            max_quote=max_quote,
+            max_refs=max_refs,
+            page_texts=page_texts,
+        )
+
     jobs: list[JobCandidate] = []
     for job in doc.jobs:
         code = _code_lookup(catalog, job.code, expected_type="JOB")
@@ -144,12 +184,7 @@ def normalize_candidate(
             job.model_copy(
                 update={
                     "code": code,
-                    "source_refs": _normalize_source_refs(
-                        job.source_refs,
-                        allowed_documents=allowed_documents,
-                        max_quote=max_quote,
-                        max_refs=max_refs,
-                    ),
+                    "source_refs": _refs(job.source_refs),
                 }
             )
         )
@@ -163,12 +198,7 @@ def normalize_candidate(
             skill.model_copy(
                 update={
                     "code": code,
-                    "source_refs": _normalize_source_refs(
-                        skill.source_refs,
-                        allowed_documents=allowed_documents,
-                        max_quote=max_quote,
-                        max_refs=max_refs,
-                    ),
+                    "source_refs": _refs(skill.source_refs),
                 }
             )
         )
@@ -181,12 +211,7 @@ def normalize_candidate(
             exp.model_copy(
                 update={
                     "code": code,
-                    "source_refs": _normalize_source_refs(
-                        exp.source_refs,
-                        allowed_documents=allowed_documents,
-                        max_quote=max_quote,
-                        max_refs=max_refs,
-                    ),
+                    "source_refs": _refs(exp.source_refs),
                 }
             )
         )
@@ -195,48 +220,21 @@ def normalize_candidate(
     employment: list[EmploymentCandidate] = []
     for row in doc.employment_history:
         employment.append(
-            row.model_copy(
-                update={
-                    "source_refs": _normalize_source_refs(
-                        row.source_refs,
-                        allowed_documents=allowed_documents,
-                        max_quote=max_quote,
-                        max_refs=max_refs,
-                    )
-                }
-            )
+            row.model_copy(update={"source_refs": _refs(row.source_refs)})
         )
     doc.employment_history = employment
 
     education: list[EducationCandidate] = []
     for row in doc.education:
         education.append(
-            row.model_copy(
-                update={
-                    "source_refs": _normalize_source_refs(
-                        row.source_refs,
-                        allowed_documents=allowed_documents,
-                        max_quote=max_quote,
-                        max_refs=max_refs,
-                    )
-                }
-            )
+            row.model_copy(update={"source_refs": _refs(row.source_refs)})
         )
     doc.education = education
 
     certifications: list[CertificationCandidate] = []
     for row in doc.certifications:
         certifications.append(
-            row.model_copy(
-                update={
-                    "source_refs": _normalize_source_refs(
-                        row.source_refs,
-                        allowed_documents=allowed_documents,
-                        max_quote=max_quote,
-                        max_refs=max_refs,
-                    )
-                }
-            )
+            row.model_copy(update={"source_refs": _refs(row.source_refs)})
         )
     doc.certifications = certifications
 
@@ -291,12 +289,7 @@ def normalize_candidate(
                     "expertise": exp_rel,
                     "business_domains": biz_rel,
                     "customer_types": cust_rel,
-                    "source_refs": _normalize_source_refs(
-                        project.source_refs,
-                        allowed_documents=allowed_documents,
-                        max_quote=max_quote,
-                        max_refs=max_refs,
-                    ),
+                    "source_refs": _refs(project.source_refs),
                 }
             )
         )

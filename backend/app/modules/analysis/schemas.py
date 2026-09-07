@@ -85,6 +85,8 @@ class AnalysisListItem(BaseModel):
     status: AnalysisStatus
     counts: DiffCounts = Field(default_factory=DiffCounts)
     base_profile_version: int | None = None
+    llm_model: str | None = None
+    prompt_version: str | None = None
     overall_confidence: Decimal | None = None
     error_message: str | None = None
     started_at: datetime | None = None

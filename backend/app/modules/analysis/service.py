@@ -222,11 +222,40 @@ class AnalysisService:
                 str(doc.id): {p.page_no for p in doc.pages}
                 for doc in claimed.documents
             }
+            page_texts: dict[tuple[str, int], str] = {}
+            for doc in claimed.documents:
+                for page in doc.pages:
+                    text = (page.extracted_text or "").strip()
+                    if text:
+                        page_texts[(str(doc.id), page.page_no)] = text
+            # Merge VLM-augmented page text from source blocks when present.
+            for block in bundle.blocks:
+                current_page: int | None = None
+                buf: list[str] = []
+                for line in (block.text or "").splitlines():
+                    if line.startswith("[PAGE ") and line.endswith("]"):
+                        if current_page is not None and buf:
+                            page_texts[(block.document_id, current_page)] = "\n".join(
+                                buf
+                            ).strip()
+                        buf = []
+                        try:
+                            current_page = int(line[6:-1].strip())
+                        except ValueError:
+                            current_page = None
+                        continue
+                    if current_page is not None:
+                        buf.append(line)
+                if current_page is not None and buf:
+                    page_texts[(block.document_id, current_page)] = "\n".join(
+                        buf
+                    ).strip()
             candidate = normalize_candidate(
                 raw,
                 catalog=catalog_map,
                 allowed_documents=allowed_docs,
                 settings=self.settings,
+                page_texts=page_texts,
             )
 
             if claimed.base_profile_version is None:
@@ -386,17 +415,18 @@ class AnalysisService:
             status = run.status
             self.db.rollback()
             return status
-        message = f"{type(exc).__name__}: {exc}"
         if isinstance(exc, AIResponseValidationError):
-            message = f"AI response invalid: {exc}"
+            message = "AI response validation failed"
         elif isinstance(exc, AIProviderError):
-            message = f"AI provider error: {exc}"
+            message = "AI provider error"
+        else:
+            message = "analysis failed"
         self.repo.mark_failed(run, message)
         self.repo.add_audit(
             action_type="ANALYSIS_FAILED",
             actor_user_id=actor_user_id,
             target_id=run_id,
-            after={"status": "FAILED", "error": message[:500]},
+            after={"status": "FAILED", "error": message},
         )
         self.db.commit()
         return "FAILED"
@@ -480,10 +510,12 @@ class AnalysisService:
         self.repo.add_audit(
             action_type="ANALYSIS_DIFF_REVIEW",
             actor_user_id=actor_user_id,
+            target_type="ANALYSIS_DIFF_ITEM",
             target_id=diff.id,
-            after={
-                "review_status": diff.review_status,
+            after={"review_status": diff.review_status},
+            metadata={
                 "analysis_run_id": str(analysis_id),
+                "person_id": str(run.person_id),
             },
         )
         self.db.commit()
@@ -522,10 +554,15 @@ class AnalysisService:
         self.repo.add_audit(
             action_type="ANALYSIS_DIFF_BULK_REVIEW",
             actor_user_id=actor_user_id,
+            target_type="ANALYSIS_RUN",
             target_id=analysis_id,
             after={
                 "review_status": payload.review_status,
                 "diff_ids": [str(i) for i in payload.diff_ids],
+            },
+            metadata={
+                "analysis_run_id": str(analysis_id),
+                "person_id": str(run.person_id),
             },
         )
         self.db.commit()
@@ -639,6 +676,8 @@ class AnalysisService:
             status=run.status,  # type: ignore[arg-type]
             counts=counts,
             base_profile_version=run.base_profile_version,
+            llm_model=run.llm_model,
+            prompt_version=run.prompt_version,
             overall_confidence=run.overall_confidence,
             error_message=run.error_message,
             started_at=run.started_at,
