@@ -279,3 +279,38 @@ class StorageError(TalentScopeError):
 
     def __init__(self, detail: str | None = None) -> None:
         super().__init__(detail or "객체 저장소 처리에 실패했습니다.")
+
+
+class UploadSessionStateConflictError(ConflictError):
+    code = "UPLOAD_SESSION_STATE_CONFLICT"
+    title = "Upload session state conflict"
+
+    def __init__(self, detail: str | None = None) -> None:
+        super().__init__(detail or "업로드 세션 상태가 요청과 충돌합니다.")
+
+
+class AIQueueUnavailableError(TalentScopeError):
+    code = "AI_QUEUE_UNAVAILABLE"
+    title = "AI queue unavailable"
+    status_code = 503
+
+    def __init__(self, detail: str | None = None) -> None:
+        super().__init__(detail or "식별 작업을 큐에 등록할 수 없습니다. 잠시 후 다시 시도해 주세요.")
+
+
+class AIProviderAppError(TalentScopeError):
+    code = "AI_PROVIDER_ERROR"
+    title = "AI provider error"
+    status_code = 502
+
+    def __init__(self, detail: str | None = None) -> None:
+        super().__init__(detail or "AI 제공자 호출에 실패했습니다.")
+
+
+class AIResponseInvalidError(TalentScopeError):
+    code = "AI_RESPONSE_INVALID"
+    title = "AI response invalid"
+    status_code = 502
+
+    def __init__(self, detail: str | None = None) -> None:
+        super().__init__(detail or "AI 응답을 검증할 수 없습니다.")

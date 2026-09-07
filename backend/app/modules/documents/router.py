@@ -19,6 +19,8 @@ from app.modules.documents.schemas import (
     DocumentDetailResponse,
     DocumentListResponse,
     DocumentVersionListResponse,
+    IdentifyResponse,
+    IdentifyResponseData,
     ResolveRequest,
     ResolveResponse,
     ResolveResponseData,
@@ -117,14 +119,24 @@ def delete_temp_file(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-@upload_sessions_router.post("/{session_id}/identify", status_code=status.HTTP_501_NOT_IMPLEMENTED)
+@upload_sessions_router.post(
+    "/{session_id}/identify",
+    response_model=IdentifyResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
 def identify_upload_session(
     session_id: UUID,
     _admin: AuthenticatedContext = Depends(require_admin),
     ctx: AuthenticatedContext = Depends(require_csrf),
     service: DocumentService = Depends(get_document_service),
-) -> None:
-    service.identify(session_id)
+) -> IdentifyResponse:
+    data = service.identify(session_id, actor_user_id=ctx.user.id)
+    return IdentifyResponse(
+        data=IdentifyResponseData(
+            upload_session_id=data["upload_session_id"],
+            status=data["status"],
+        )
+    )
 
 
 @upload_sessions_router.post(
@@ -144,6 +156,7 @@ def resolve_upload_session(
         data=ResolveResponseData(
             person_id=data["person_id"],
             document_ids=data["document_ids"],
+            profile_version=data["profile_version"],
             upload_session_id=data["upload_session_id"],
         )
     )
