@@ -40,6 +40,8 @@ import {
   type TechnicalGrade,
 } from '@/api/people'
 import { useAuthMe } from '@/app/auth'
+import { EducationCertTab } from '@/pages/people/EducationCertTab'
+import { ProjectCareerTab } from '@/pages/people/ProjectCareerTab'
 
 type CodeOption = { value: string; label: string }
 
@@ -402,6 +404,30 @@ export function PeopleDetailPage() {
                   <Descriptions.Item label="Summary" span={2}>
                     {person.profile.profile_summary || '—'}
                   </Descriptions.Item>
+                  <Descriptions.Item label="사업분야" span={2}>
+                    {person.business_domains.length
+                      ? person.business_domains.map((b) => (
+                          <Tag key={b.code}>{b.name}</Tag>
+                        ))
+                      : '—'}
+                  </Descriptions.Item>
+                  <Descriptions.Item label="고객유형" span={2}>
+                    {person.customer_types.length
+                      ? person.customer_types.map((c) => (
+                          <Tag key={c.code}>{c.name}</Tag>
+                        ))
+                      : '—'}
+                  </Descriptions.Item>
+                  <Descriptions.Item label="최근 프로젝트" span={2}>
+                    {person.recent_projects.length === 0
+                      ? '—'
+                      : person.recent_projects.map((p) => (
+                          <div key={p.id}>
+                            {p.project_name}
+                            {p.customer_name ? ` · ${p.customer_name}` : ''}
+                          </div>
+                        ))}
+                  </Descriptions.Item>
                 </Descriptions>
               </Card>
             ),
@@ -481,6 +507,28 @@ export function PeopleDetailPage() {
                   )}
                 </Card>
               </Space>
+            ),
+          },
+          {
+            key: 'projects',
+            label: '프로젝트 경력',
+            children: (
+              <ProjectCareerTab
+                personId={personId}
+                isAdmin={isAdmin}
+                onChanged={invalidateAll}
+              />
+            ),
+          },
+          {
+            key: 'education',
+            label: '학력·자격',
+            children: (
+              <EducationCertTab
+                personId={personId}
+                isAdmin={isAdmin}
+                onChanged={invalidateAll}
+              />
             ),
           },
           ...(isAdmin

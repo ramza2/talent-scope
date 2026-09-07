@@ -192,3 +192,43 @@ class InvalidExpCodeError(ValidationAppError):
 
     def __init__(self, detail: str | None = None) -> None:
         super().__init__(detail or "유효하지 않은 전문분야 코드입니다.")
+
+
+class InvalidProjectJobCodeError(ValidationAppError):
+    code = "INVALID_PROJECT_JOB_CODE"
+    title = "Invalid project job code"
+
+    def __init__(self, detail: str | None = None) -> None:
+        super().__init__(detail or "유효하지 않은 프로젝트 직무 코드입니다.")
+
+
+class InvalidProjectTechCodeError(ValidationAppError):
+    code = "INVALID_PROJECT_TECH_CODE"
+    title = "Invalid project tech code"
+
+    def __init__(self, detail: str | None = None) -> None:
+        super().__init__(detail or "유효하지 않은 프로젝트 기술 코드입니다.")
+
+
+class InvalidProjectExpCodeError(ValidationAppError):
+    code = "INVALID_PROJECT_EXP_CODE"
+    title = "Invalid project expertise code"
+
+    def __init__(self, detail: str | None = None) -> None:
+        super().__init__(detail or "유효하지 않은 프로젝트 전문분야 코드입니다.")
+
+
+class InvalidProjectBizCodeError(ValidationAppError):
+    code = "INVALID_PROJECT_BIZ_CODE"
+    title = "Invalid project business domain code"
+
+    def __init__(self, detail: str | None = None) -> None:
+        super().__init__(detail or "유효하지 않은 프로젝트 사업분야 코드입니다.")
+
+
+class InvalidProjectCustomerTypeCodeError(ValidationAppError):
+    code = "INVALID_PROJECT_CUSTOMER_TYPE_CODE"
+    title = "Invalid project customer type code"
+
+    def __init__(self, detail: str | None = None) -> None:
+        super().__init__(detail or "유효하지 않은 프로젝트 고객유형 코드입니다.")
