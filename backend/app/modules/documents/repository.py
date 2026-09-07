@@ -52,7 +52,9 @@ class DocumentRepository:
     ) -> UploadSession | None:
         stmt = select(UploadSession).where(UploadSession.id == session_id)
         if for_update:
-            stmt = stmt.with_for_update()
+            # Always refresh from DB so concurrent cancel/resolve status wins
+            # over a stale identity-map instance in long-lived sessions.
+            stmt = stmt.with_for_update().execution_options(populate_existing=True)
         return self.db.execute(stmt).scalar_one_or_none()
 
     def list_temp_files(self, session_id: UUID) -> list[UploadTempFile]:

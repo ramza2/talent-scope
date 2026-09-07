@@ -130,7 +130,7 @@ def identify_upload_session(
     ctx: AuthenticatedContext = Depends(require_csrf),
     service: DocumentService = Depends(get_document_service),
 ) -> IdentifyResponse:
-    data = service.identify(session_id)
+    data = service.identify(session_id, actor_user_id=ctx.user.id)
     return IdentifyResponse(
         data=IdentifyResponseData(
             upload_session_id=data["upload_session_id"],

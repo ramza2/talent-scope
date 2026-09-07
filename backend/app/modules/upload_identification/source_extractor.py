@@ -27,6 +27,17 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class TempFileSnapshot:
+    """Detached temp-file metadata for identify work outside a DB lock."""
+
+    id: object
+    original_filename: str
+    document_type_code: str | None
+    extension: str | None
+    temp_storage_key: str
+
+
+@dataclass
 class ExtractedFileSource:
     temp_file_id: str
     filename: str
@@ -47,23 +58,52 @@ class ExtractionBundle:
         return [s for s in self.sources if (s.text or "").strip()]
 
     def combined_document_blocks(self, max_chars: int) -> str:
+        """Build LLM document blocks with a hard character cap.
+
+        Header/footer overhead is included so ``len(result) <= max_chars``.
+        """
+        if max_chars <= 0:
+            return ""
+
         parts: list[str] = []
         remaining = max_chars
+        join_sep = "\n"
+
         for src in self.usable_sources:
             if remaining <= 0:
                 break
-            body = src.text.strip()
-            if len(body) > remaining:
-                body = body[:remaining]
-            block = (
+            sep_cost = len(join_sep) if parts else 0
+            if remaining <= sep_cost:
+                break
+            budget = remaining - sep_cost
+
+            header = (
                 "[FILE]\n"
                 f"filename: {src.filename}\n"
                 f"document_type: {src.document_type or ''}\n"
-                f"content:\n{body}\n"
+                "content:\n"
             )
+            footer = "\n"
+            overhead = len(header) + len(footer)
+            if overhead > budget:
+                chunk = (header + footer)[:budget]
+                if chunk:
+                    parts.append(chunk)
+                    remaining -= sep_cost + len(chunk)
+                break
+
+            body_budget = budget - overhead
+            body = (src.text or "").strip()
+            if len(body) > body_budget:
+                body = body[:body_budget]
+            block = f"{header}{body}{footer}"
             parts.append(block)
-            remaining -= len(block)
-        return "\n".join(parts).strip()
+            remaining -= sep_cost + len(block)
+
+        result = join_sep.join(parts)
+        if len(result) > max_chars:
+            result = result[:max_chars]
+        return result
 
 
 class IdentitySourceExtractor:

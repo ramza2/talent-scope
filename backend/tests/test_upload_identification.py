@@ -226,23 +226,54 @@ def _seed_session_with_pdf(client, db_session, csrf, *, codes, pdf_bytes, filena
 # --- Identify API ---
 
 
-def test_identify_user_forbidden(client, db_session):
+def test_identify_user_forbidden_on_existing_session(client, db_session, monkeypatch):
+    """USER must not call identify even when an ADMIN-created session exists."""
+    from app.db.models.upload import UploadSession
+    from app.modules.document_processing.parsers.pdf import build_minimal_pdf_with_text
+
     suffix = uuid.uuid4().hex[:8]
     codes = [f"DOC-RESUME-{suffix}"]
     _ensure_code(db_session, codes[0], "DOC_TYPE", "이력서")
-    user = _create_user(db_session, login_id=f"u_{suffix}", password="Secret123!", role="USER")
+    admin = _create_user(db_session, login_id=f"a_{suffix}", password="Secret123!")
+    user = _create_user(
+        db_session, login_id=f"u_{suffix}", password="Secret123!", role="USER"
+    )
+    enqueued: list = []
+
+    def capture(*_a, **_k):
+        enqueued.append(True)
+
+    monkeypatch.setattr("app.tasks.analysis_tasks.enqueue_upload_identify", capture)
     try:
-        csrf = _login(client, user.login_id)
-        session_id = client.post(
-            "/api/v1/upload-sessions",
-            headers={"X-CSRF-Token": csrf},
-            json={},
+        admin_csrf = _login(client, admin.login_id)
+        pdf = build_minimal_pdf_with_text("홍길동")
+        session_id, _ = _seed_session_with_pdf(
+            client, db_session, admin_csrf, codes=codes, pdf_bytes=pdf
         )
-        # USER cannot create upload sessions either (ADMIN only) — expect 403
-        assert session_id.status_code == 403
+        # Switch to USER session cookies.
+        client.post("/api/v1/auth/logout", headers={"X-CSRF-Token": admin_csrf})
+        user_csrf = _login(client, user.login_id)
+        res = client.post(
+            f"/api/v1/upload-sessions/{session_id}/identify",
+            headers={"X-CSRF-Token": user_csrf},
+        )
+        assert res.status_code == 403
+        assert enqueued == []
+        db_session.expire_all()
+        row = db_session.get(UploadSession, uuid.UUID(session_id))
+        assert row is not None
+        assert row.status == "UPLOADING"
     finally:
+        # cleanup as admin
+        client.post("/api/v1/auth/logout", headers={"X-CSRF-Token": user_csrf})
+        admin_csrf2 = _login(client, admin.login_id)
+        client.delete(
+            f"/api/v1/upload-sessions/{session_id}",
+            headers={"X-CSRF-Token": admin_csrf2},
+        )
         _cleanup_codes(db_session, codes)
         _cleanup_user(db_session, user.id)
+        _cleanup_user(db_session, admin.id)
 
 
 def test_identify_admin_no_csrf(client, db_session):
@@ -306,7 +337,7 @@ def test_identify_202_and_idempotent_no_duplicate_enqueue(
     admin = _create_user(db_session, login_id=f"a_{suffix}", password="Secret123!")
     enqueued: list[str] = []
 
-    def capture(sid):
+    def capture(sid, actor_user_id=None):
         enqueued.append(str(sid))
 
     monkeypatch.setattr(
@@ -356,7 +387,7 @@ def test_identify_enqueue_failure_restores_status(client, db_session, monkeypatc
     _ensure_code(db_session, codes[0], "DOC_TYPE", "이력서")
     admin = _create_user(db_session, login_id=f"a_{suffix}", password="Secret123!")
 
-    def boom(_sid):
+    def boom(_sid, _actor=None):
         raise RuntimeError("broker down")
 
     monkeypatch.setattr(
@@ -833,17 +864,205 @@ def test_cancel_race_discards_identify_result(db_session, client):
         llm = FakeLLMProvider({"name": "ShouldNotSave", "company": None, "phone": None, "email": None})
         status = IdentificationService(
             db_session, storage=storage, llm=llm, vlm=None
-        ).run(uuid.UUID(session_id))
+        ).run(uuid.UUID(session_id), actor_user_id=admin.id)
         assert status == "CANCELLED"
         db_session.expire_all()
         row = db_session.get(UploadSession, uuid.UUID(session_id))
         assert row is not None
         assert row.status == "CANCELLED"
         assert row.identified_name is None
-        assert row.duplicate_result_json == [] or row.duplicate_result_json is None or row.duplicate_result_json == []
+        assert row.duplicate_result_json == [] or row.duplicate_result_json is None
     finally:
         _cleanup_codes(db_session, codes)
         _cleanup_user(db_session, admin.id)
+        reset_object_storage_cache()
+
+
+def test_concurrent_cancel_during_blocked_llm(db_session, client):
+    """Cancel must complete while AI work is still blocked (no row-lock hold)."""
+    import threading
+    import time
+
+    from app.ai.schemas.identity import IdentityExtraction
+    from app.db.models.upload import UploadSession
+    from app.db.session import SessionLocal
+    from app.modules.document_processing.parsers.pdf import build_minimal_pdf_with_text
+    from app.modules.upload_identification.service import IdentificationService
+    from app.storage.s3 import build_object_storage, reset_object_storage_cache
+
+    class BlockingFakeLLM:
+        def __init__(self) -> None:
+            self.entered = threading.Event()
+            self.release = threading.Event()
+            self.calls = 0
+
+        def extract_identity(self, *, system_prompt, user_prompt, log_context=None):
+            self.calls += 1
+            self.entered.set()
+            assert self.release.wait(timeout=15), "LLM was not released"
+            return IdentityExtraction(
+                name="ShouldNotSave",
+                company=None,
+                phone=None,
+                email=None,
+            )
+
+    reset_object_storage_cache()
+    storage = build_object_storage()
+    suffix = uuid.uuid4().hex[:8]
+    codes = [f"DOC-RESUME-{suffix}"]
+    _ensure_code(db_session, codes[0], "DOC_TYPE", "이력서")
+    admin = _create_user(db_session, login_id=f"a_{suffix}", password="Secret123!")
+    worker_status: list[str] = []
+    worker_done = threading.Event()
+    llm = BlockingFakeLLM()
+
+    try:
+        csrf = _login(client, admin.login_id)
+        pdf = build_minimal_pdf_with_text("concurrent cancel")
+        session_id, _ = _seed_session_with_pdf(
+            client, db_session, csrf, codes=codes, pdf_bytes=pdf
+        )
+        row = db_session.get(UploadSession, uuid.UUID(session_id))
+        row.status = "IDENTIFYING"
+        db_session.add(row)
+        db_session.commit()
+        # Detach so cancel / worker sessions do not share this connection's view.
+        db_session.commit()
+
+        def worker() -> None:
+            session = SessionLocal()
+            try:
+                status = IdentificationService(
+                    session, storage=storage, llm=llm, vlm=None
+                ).run(uuid.UUID(session_id), actor_user_id=admin.id)
+                worker_status.append(status)
+            finally:
+                session.close()
+                worker_done.set()
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        assert llm.entered.wait(timeout=10), "worker did not reach LLM"
+
+        started = time.monotonic()
+        cancel_res = client.delete(
+            f"/api/v1/upload-sessions/{session_id}",
+            headers={"X-CSRF-Token": csrf},
+        )
+        cancel_elapsed = time.monotonic() - started
+        assert cancel_res.status_code == 204, cancel_res.text
+        # Must not block until AI finishes (LLM still waiting).
+        assert cancel_elapsed < 2.0, f"cancel blocked for {cancel_elapsed:.2f}s"
+        assert not worker_done.is_set()
+
+        db_session.expire_all()
+        mid = db_session.get(UploadSession, uuid.UUID(session_id))
+        assert mid is not None
+        assert mid.status == "CANCELLED"
+
+        llm.release.set()
+        assert worker_done.wait(timeout=15)
+        thread.join(timeout=5)
+        assert worker_status == ["CANCELLED"]
+
+        db_session.expire_all()
+        final = db_session.get(UploadSession, uuid.UUID(session_id))
+        assert final is not None
+        assert final.status == "CANCELLED"
+        assert final.identified_name is None
+        assert final.duplicate_result_json == [] or final.duplicate_result_json is None
+    finally:
+        llm.release.set()
+        worker_done.wait(timeout=2)
+        _cleanup_codes(db_session, codes)
+        _cleanup_user(db_session, admin.id)
+        reset_object_storage_cache()
+
+
+def test_identify_audit_actor_is_initiating_admin(client, db_session, monkeypatch):
+    from app.ai.providers.llm import FakeLLMProvider
+    from app.db.models.revision import AuditLog
+    from app.db.models.upload import UploadSession
+    from app.modules.document_processing.parsers.pdf import build_minimal_pdf_with_text
+    from app.modules.upload_identification.service import IdentificationService
+    from app.storage.s3 import build_object_storage, reset_object_storage_cache
+
+    reset_object_storage_cache()
+    storage = build_object_storage()
+    suffix = uuid.uuid4().hex[:8]
+    codes = [f"DOC-RESUME-{suffix}"]
+    _ensure_code(db_session, codes[0], "DOC_TYPE", "이력서")
+    admin_a = _create_user(db_session, login_id=f"aa_{suffix}", password="Secret123!")
+    admin_b = _create_user(db_session, login_id=f"ab_{suffix}", password="Secret123!")
+    enqueued: list[tuple[str, str | None]] = []
+
+    def capture(sid, actor_user_id=None):
+        enqueued.append((str(sid), str(actor_user_id) if actor_user_id else None))
+
+    monkeypatch.setattr("app.tasks.analysis_tasks.enqueue_upload_identify", capture)
+    try:
+        csrf_a = _login(client, admin_a.login_id)
+        pdf = build_minimal_pdf_with_text("actor test")
+        session_id, _ = _seed_session_with_pdf(
+            client, db_session, csrf_a, codes=codes, pdf_bytes=pdf
+        )
+        client.post("/api/v1/auth/logout", headers={"X-CSRF-Token": csrf_a})
+        csrf_b = _login(client, admin_b.login_id)
+        res = client.post(
+            f"/api/v1/upload-sessions/{session_id}/identify",
+            headers={"X-CSRF-Token": csrf_b},
+        )
+        assert res.status_code == 202, res.text
+        assert enqueued and enqueued[0][1] == str(admin_b.id)
+
+        start_audits = list(
+            db_session.execute(
+                select(AuditLog).where(
+                    AuditLog.target_id == uuid.UUID(session_id),
+                    AuditLog.action_type == "UPLOAD_SESSION_IDENTIFY_START",
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert start_audits
+        assert start_audits[-1].user_id == admin_b.id
+        assert start_audits[-1].user_id != admin_a.id
+
+        llm = FakeLLMProvider(
+            {"name": "감사대상", "company": None, "phone": None, "email": None}
+        )
+        status = IdentificationService(
+            db_session, storage=storage, llm=llm, vlm=None
+        ).run(uuid.UUID(session_id), actor_user_id=admin_b.id)
+        assert status == "IDENTIFIED"
+        done_audits = list(
+            db_session.execute(
+                select(AuditLog).where(
+                    AuditLog.target_id == uuid.UUID(session_id),
+                    AuditLog.action_type == "UPLOAD_SESSION_IDENTIFY",
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert done_audits
+        assert done_audits[-1].user_id == admin_b.id
+    finally:
+        row = db_session.get(UploadSession, uuid.UUID(session_id))
+        if row and row.status not in {"CANCELLED", "RESOLVED"}:
+            row.status = "UPLOADING"
+            db_session.add(row)
+            db_session.commit()
+        csrf = _login(client, admin_b.login_id)
+        client.delete(
+            f"/api/v1/upload-sessions/{session_id}",
+            headers={"X-CSRF-Token": csrf},
+        )
+        _cleanup_codes(db_session, codes)
+        _cleanup_user(db_session, admin_a.id)
+        _cleanup_user(db_session, admin_b.id)
         reset_object_storage_cache()
 
 
@@ -1110,8 +1329,9 @@ def test_create_new_happy_path(client, db_session, monkeypatch):
 
 def test_create_new_rollback_on_db_failure(client, db_session, monkeypatch):
     from app.db.models.document import Document, DocumentGroup
-    from app.db.models.person import Person
+    from app.db.models.person import Person, PersonProfile
     from app.db.models.revision import ProfileRevision
+    from app.db.models.search import SearchIndexJob
     from app.db.models.upload import UploadSession, UploadTempFile
     from app.modules.document_processing.parsers.pdf import build_minimal_pdf_with_text
     from app.modules.documents.repository import DocumentRepository
@@ -1123,10 +1343,13 @@ def test_create_new_rollback_on_db_failure(client, db_session, monkeypatch):
     codes = [f"DOC-RESUME-{suffix}"]
     _ensure_code(db_session, codes[0], "DOC_TYPE", "이력서")
     admin = _create_user(db_session, login_id=f"a_{suffix}", password="Secret123!")
+    created_keys: list[str] = []
+    original_create = DocumentRepository.create_document
 
     def boom(self, **kwargs):  # noqa: ANN001
         from app.core.exceptions import StorageError
 
+        # Capture any permanent keys already tracked by outer resolve compensation.
         raise StorageError("injected create_document failure")
 
     monkeypatch.setattr(DocumentRepository, "create_document", boom)
@@ -1136,21 +1359,36 @@ def test_create_new_rollback_on_db_failure(client, db_session, monkeypatch):
         session_id, fid = _seed_session_with_pdf(
             client, db_session, csrf, codes=codes, pdf_bytes=pdf
         )
-        temp_key = (
-            db_session.execute(
-                select(UploadTempFile).where(UploadTempFile.id == uuid.UUID(fid))
-            )
-            .scalar_one()
-            .temp_storage_key
-        )
+        temp_row = db_session.execute(
+            select(UploadTempFile).where(UploadTempFile.id == uuid.UUID(fid))
+        ).scalar_one()
+        temp_key = temp_row.temp_storage_key
         row = db_session.get(UploadSession, uuid.UUID(session_id))
         row.status = "IDENTIFIED"
         row.identified_name = "롤백"
         db_session.add(row)
         db_session.commit()
 
-        before_people = db_session.execute(select(Person)).scalars().all()
-        before_ids = {p.id for p in before_people}
+        before_person_ids = {
+            p.id for p in db_session.execute(select(Person)).scalars().all()
+        }
+        before_profile_ids = {
+            p.person_id
+            for p in db_session.execute(select(PersonProfile)).scalars().all()
+        }
+        before_rev_ids = {
+            r.id for r in db_session.execute(select(ProfileRevision)).scalars().all()
+        }
+        before_job_ids = {
+            j.id for j in db_session.execute(select(SearchIndexJob)).scalars().all()
+        }
+        before_group_ids = {
+            g.id for g in db_session.execute(select(DocumentGroup)).scalars().all()
+        }
+        before_doc_ids = {
+            d.id for d in db_session.execute(select(Document)).scalars().all()
+        }
+        before_storage_keys = set(storage.keys()) if hasattr(storage, "keys") else set()
 
         res = client.post(
             f"/api/v1/upload-sessions/{session_id}/resolve",
@@ -1170,14 +1408,45 @@ def test_create_new_rollback_on_db_failure(client, db_session, monkeypatch):
         assert res.status_code == 503
 
         db_session.expire_all()
-        after_people = [
+        new_people = [
             p
             for p in db_session.execute(select(Person)).scalars().all()
-            if p.id not in before_ids
+            if p.id not in before_person_ids
         ]
-        assert after_people == []
-        # Session remains IDENTIFIED, temp remains
+        assert new_people == []
+        new_profiles = [
+            p
+            for p in db_session.execute(select(PersonProfile)).scalars().all()
+            if p.person_id not in before_profile_ids
+        ]
+        assert new_profiles == []
+        new_revs = [
+            r
+            for r in db_session.execute(select(ProfileRevision)).scalars().all()
+            if r.id not in before_rev_ids
+        ]
+        assert new_revs == []
+        new_jobs = [
+            j
+            for j in db_session.execute(select(SearchIndexJob)).scalars().all()
+            if j.id not in before_job_ids
+        ]
+        assert new_jobs == []
+        new_groups = [
+            g
+            for g in db_session.execute(select(DocumentGroup)).scalars().all()
+            if g.id not in before_group_ids
+        ]
+        assert new_groups == []
+        new_docs = [
+            d
+            for d in db_session.execute(select(Document)).scalars().all()
+            if d.id not in before_doc_ids
+        ]
+        assert new_docs == []
+
         session = db_session.get(UploadSession, uuid.UUID(session_id))
+        assert session is not None
         assert session.status == "IDENTIFIED"
         temps = list(
             db_session.execute(
@@ -1190,22 +1459,17 @@ def test_create_new_rollback_on_db_failure(client, db_session, monkeypatch):
         )
         assert len(temps) == 1
         assert storage.exists(temp_key)
-        assert (
-            db_session.execute(
-                select(Document).join(
-                    DocumentGroup, Document.document_group_id == DocumentGroup.id
-                )
-            ).first()
-            is None
-            or True
-        )  # no new docs from this failed attempt — verified via after_people/temps
-        revs_new = [
-            r
-            for r in db_session.execute(select(ProfileRevision)).scalars().all()
-            if r.person_id not in before_ids
-        ]
-        assert revs_new == []
+        if hasattr(storage, "keys"):
+            after_keys = set(storage.keys())
+            # Permanent document keys must not remain from this failed attempt.
+            leaked = [
+                k
+                for k in after_keys - before_storage_keys
+                if k.startswith("documents/") and "/original" in k
+            ]
+            assert leaked == []
     finally:
+        _ = (original_create, created_keys)
         client.delete(
             f"/api/v1/upload-sessions/{session_id}",
             headers={"X-CSRF-Token": csrf},
@@ -1213,6 +1477,35 @@ def test_create_new_rollback_on_db_failure(client, db_session, monkeypatch):
         _cleanup_codes(db_session, codes)
         _cleanup_user(db_session, admin.id)
         reset_object_storage_cache()
+
+
+def test_combined_document_blocks_hard_char_limit():
+    from app.modules.upload_identification.source_extractor import (
+        ExtractedFileSource,
+        ExtractionBundle,
+    )
+
+    bundle = ExtractionBundle(
+        sources=[
+            ExtractedFileSource(
+                temp_file_id="1",
+                filename="resume.pdf",
+                document_type="DOC-RESUME",
+                text="A" * 5000,
+            ),
+            ExtractedFileSource(
+                temp_file_id="2",
+                filename="career.pdf",
+                document_type="DOC-CAREER",
+                text="B" * 5000,
+            ),
+        ]
+    )
+    for cap in (0, 1, 10, 50, 120, 1000, 3500):
+        out = bundle.combined_document_blocks(cap)
+        assert len(out) <= cap
+    tiny = bundle.combined_document_blocks(5)
+    assert len(tiny) <= 5
 
 
 def test_link_existing_during_identifying_conflict(client, db_session):

@@ -484,7 +484,7 @@ class DocumentService:
                     exc_info=True,
                 )
 
-    def identify(self, session_id: UUID) -> dict:
+    def identify(self, session_id: UUID, actor_user_id: UUID) -> dict:
         """Start async identity extraction. Returns 202 payload fields."""
         session = self._require_session(session_id, for_update=True)
         if session.status in {"RESOLVED", "CANCELLED", "EXPIRED"}:
@@ -509,7 +509,7 @@ class DocumentService:
         self.db.add(session)
         self.repo.add_audit(
             action_type="UPLOAD_SESSION_IDENTIFY_START",
-            actor_user_id=session.created_by,
+            actor_user_id=actor_user_id,
             target_type="UPLOAD_SESSION",
             target_id=session.id,
             after={"status": "IDENTIFYING", "previous_status": previous_status},
@@ -519,7 +519,7 @@ class DocumentService:
         from app.tasks.analysis_tasks import enqueue_upload_identify
 
         try:
-            enqueue_upload_identify(session_id)
+            enqueue_upload_identify(session_id, actor_user_id)
         except Exception:
             logger.exception("identify enqueue failed session_id=%s", session_id)
             # Restore prior status so the session is not stuck IDENTIFYING.

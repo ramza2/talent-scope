@@ -331,20 +331,11 @@ export function PeopleNewPage() {
     }
   }
 
-  const onConfirmIdentity = () => {
-    if (!identity.name.trim()) {
+  const onConfirmDecision = () => {
+    if (decision === 'CREATE_NEW' && !identity.name.trim()) {
       message.warning('이름은 필수입니다.')
       return
     }
-    const candidates = session?.duplicate_candidates ?? []
-    if (candidates.length === 0) {
-      setDecision('CREATE_NEW')
-      setSelectedPersonId(null)
-    }
-    setStep(3)
-  }
-
-  const onConfirmDecision = () => {
     if (decision === 'LINK_EXISTING' && !selectedPersonId) {
       message.warning('연결할 기존 인력을 선택하세요.')
       return
@@ -559,14 +550,7 @@ export function PeopleNewPage() {
             <Button type="primary" onClick={onConfirmDecision}>
               다음: 문서 등록 방식
             </Button>
-            <Button
-              onClick={() => {
-                onConfirmIdentity()
-                setStep(2)
-              }}
-            >
-              이전
-            </Button>
+            <Button onClick={() => setStep(2)}>이전</Button>
           </Space>
         </Card>
       )}
