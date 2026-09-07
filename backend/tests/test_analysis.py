@@ -5,7 +5,6 @@ from __future__ import annotations
 import os
 import uuid
 from collections.abc import Generator
-from datetime import UTC, datetime
 
 import pytest
 from fastapi.testclient import TestClient
