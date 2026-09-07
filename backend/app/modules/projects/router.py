@@ -44,7 +44,7 @@ def list_person_projects(
     date_to: str | None = Query(default=None, alias="to"),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
-    _ctx: AuthenticatedContext = Depends(require_authenticated_user),
+    ctx: AuthenticatedContext = Depends(require_authenticated_user),
     service: ProjectService = Depends(get_project_service),
 ) -> ProjectListResponse:
     items, meta = service.list_projects(
@@ -58,6 +58,7 @@ def list_person_projects(
         date_to=date_to,
         page=page,
         page_size=page_size,
+        is_admin=ctx.user.role == "ADMIN",
     )
     return ProjectListResponse(data=items, meta=meta)
 
@@ -82,10 +83,12 @@ def create_person_project(
 @projects_router.get("/{project_id}", response_model=ProjectDetailResponse)
 def get_project(
     project_id: UUID,
-    _ctx: AuthenticatedContext = Depends(require_authenticated_user),
+    ctx: AuthenticatedContext = Depends(require_authenticated_user),
     service: ProjectService = Depends(get_project_service),
 ) -> ProjectDetailResponse:
-    return ProjectDetailResponse(data=service.get_project(project_id))
+    return ProjectDetailResponse(
+        data=service.get_project(project_id, is_admin=ctx.user.role == "ADMIN")
+    )
 
 
 @projects_router.patch("/{project_id}", response_model=ProjectDetailResponse)

@@ -20,6 +20,7 @@ from app.db.models.project import Project
 from app.modules.people.finalize import finalize_confirmed_profile_change
 from app.modules.people.repository import PeopleRepository
 from app.modules.people.schemas import CodeRef, PageMeta
+from app.modules.people.visibility import ensure_person_readable
 from app.modules.projects.repository import ProjectRepository
 from app.modules.projects.schemas import (
     ALLOWED_EVIDENCE,
@@ -37,10 +38,18 @@ class ProjectService:
         self.repo = ProjectRepository(db)
         self.people_repo = PeopleRepository(db)
 
-    def _require_person_profile(self, person_id: UUID, *, for_update: bool = False):
+    def _require_person_profile(
+        self,
+        person_id: UUID,
+        *,
+        for_update: bool = False,
+        is_admin: bool | None = None,
+    ):
         person = self.people_repo.get_person(person_id, for_update=for_update)
         if person is None:
             raise NotFoundError("인력을 찾을 수 없습니다.")
+        if is_admin is not None:
+            ensure_person_readable(person, is_admin=is_admin)
         profile = self.people_repo.get_profile(person_id, for_update=for_update)
         if profile is None:
             raise NotFoundError("인력 프로필을 찾을 수 없습니다.")
@@ -168,8 +177,9 @@ class ProjectService:
         date_to: str | None = None,
         page: int = 1,
         page_size: int = 20,
+        is_admin: bool = False,
     ) -> tuple[list[ProjectDetail], PageMeta]:
-        self._require_person_profile(person_id)
+        self._require_person_profile(person_id, is_admin=is_admin)
         if page < 1:
             raise ValidationAppError("page는 1 이상이어야 합니다.")
         if page_size < 1 or page_size > 100:
@@ -198,8 +208,13 @@ class ProjectService:
         )
         return items, meta
 
-    def get_project(self, project_id: UUID) -> ProjectDetail:
-        return self._to_detail(self._require_project(project_id))
+    def get_project(self, project_id: UUID, *, is_admin: bool = False) -> ProjectDetail:
+        project = self._require_project(project_id)
+        person = self.people_repo.get_person(project.person_id)
+        if person is None:
+            raise NotFoundError("인력을 찾을 수 없습니다.")
+        ensure_person_readable(person, is_admin=is_admin)
+        return self._to_detail(project)
 
     def create_project(
         self, person_id: UUID, payload: ProjectCreateRequest, actor_user_id: UUID

@@ -48,10 +48,12 @@ def get_career_service(db: Session = Depends(get_db)) -> CareerService:
 )
 def list_employment(
     person_id: UUID,
-    _ctx: AuthenticatedContext = Depends(require_authenticated_user),
+    ctx: AuthenticatedContext = Depends(require_authenticated_user),
     service: CareerService = Depends(get_career_service),
 ) -> EmploymentListResponse:
-    return EmploymentListResponse(data=service.list_employment(person_id))
+    return EmploymentListResponse(
+        data=service.list_employment(person_id, is_admin=ctx.user.role == "ADMIN")
+    )
 
 
 @person_career_router.post(
@@ -101,10 +103,12 @@ def delete_employment(
 @person_career_router.get("/{person_id}/education", response_model=EducationListResponse)
 def list_education(
     person_id: UUID,
-    _ctx: AuthenticatedContext = Depends(require_authenticated_user),
+    ctx: AuthenticatedContext = Depends(require_authenticated_user),
     service: CareerService = Depends(get_career_service),
 ) -> EducationListResponse:
-    return EducationListResponse(data=service.list_education(person_id))
+    return EducationListResponse(
+        data=service.list_education(person_id, is_admin=ctx.user.role == "ADMIN")
+    )
 
 
 @person_career_router.post(
@@ -156,10 +160,12 @@ def delete_education(
 )
 def list_certifications(
     person_id: UUID,
-    _ctx: AuthenticatedContext = Depends(require_authenticated_user),
+    ctx: AuthenticatedContext = Depends(require_authenticated_user),
     service: CareerService = Depends(get_career_service),
 ) -> CertificationListResponse:
-    return CertificationListResponse(data=service.list_certifications(person_id))
+    return CertificationListResponse(
+        data=service.list_certifications(person_id, is_admin=ctx.user.role == "ADMIN")
+    )
 
 
 @person_career_router.post(

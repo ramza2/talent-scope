@@ -22,6 +22,7 @@ from app.modules.career.schemas import (
 )
 from app.modules.people.finalize import finalize_confirmed_profile_change
 from app.modules.people.repository import PeopleRepository
+from app.modules.people.visibility import ensure_person_readable
 
 
 def _iso(value) -> str | None:
@@ -34,10 +35,18 @@ class CareerService:
         self.repo = CareerRepository(db)
         self.people_repo = PeopleRepository(db)
 
-    def _require_person_profile(self, person_id: UUID, *, for_update: bool = False):
+    def _require_person_profile(
+        self,
+        person_id: UUID,
+        *,
+        for_update: bool = False,
+        is_admin: bool | None = None,
+    ):
         person = self.people_repo.get_person(person_id, for_update=for_update)
         if person is None:
             raise NotFoundError("인력을 찾을 수 없습니다.")
+        if is_admin is not None:
+            ensure_person_readable(person, is_admin=is_admin)
         profile = self.people_repo.get_profile(person_id, for_update=for_update)
         if profile is None:
             raise NotFoundError("인력 프로필을 찾을 수 없습니다.")
@@ -77,8 +86,10 @@ class CareerService:
             "source_type": row.source_type,
         }
 
-    def list_employment(self, person_id: UUID) -> list[EmploymentItem]:
-        self._require_person_profile(person_id)
+    def list_employment(
+        self, person_id: UUID, *, is_admin: bool = False
+    ) -> list[EmploymentItem]:
+        self._require_person_profile(person_id, is_admin=is_admin)
         return [self._employment_item(r) for r in self.repo.list_employment(person_id)]
 
     def create_employment(
@@ -203,8 +214,10 @@ class CareerService:
             "source_type": row.source_type,
         }
 
-    def list_education(self, person_id: UUID) -> list[EducationItem]:
-        self._require_person_profile(person_id)
+    def list_education(
+        self, person_id: UUID, *, is_admin: bool = False
+    ) -> list[EducationItem]:
+        self._require_person_profile(person_id, is_admin=is_admin)
         return [self._education_item(r) for r in self.repo.list_education(person_id)]
 
     def create_education(
@@ -322,8 +335,10 @@ class CareerService:
             "source_type": row.source_type,
         }
 
-    def list_certifications(self, person_id: UUID) -> list[CertificationItem]:
-        self._require_person_profile(person_id)
+    def list_certifications(
+        self, person_id: UUID, *, is_admin: bool = False
+    ) -> list[CertificationItem]:
+        self._require_person_profile(person_id, is_admin=is_admin)
         return [
             self._certification_item(r) for r in self.repo.list_certifications(person_id)
         ]

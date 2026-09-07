@@ -693,3 +693,138 @@ def test_employment_education_certification_and_version_flow(
         _cleanup_codes(db_session, list(codes.values()))
         _cleanup_user(db_session, admin.id)
         _cleanup_user(db_session, user.id)
+
+
+def test_deleted_person_hides_project_and_career_from_user(
+    client: TestClient, db_session
+) -> None:
+    """DELETED Person nested GETs follow People Core visibility (USER 404)."""
+    suffix = uuid.uuid4().hex[:8]
+    codes = {
+        "job": f"JOB-D-{suffix}",
+        "tech": f"TECH-D-{suffix}",
+        "exp": f"EXP-D-{suffix}",
+        "biz": f"BIZ-D-{suffix}",
+        "cust": f"CUSTOMER-TYPE-D-{suffix}",
+    }
+    for code, ctype, name in [
+        (codes["job"], "JOB", "PL"),
+        (codes["tech"], "TECH", "Python"),
+        (codes["exp"], "EXP", "RAG"),
+        (codes["biz"], "BIZ", "국방"),
+        (codes["cust"], "CUSTOMER_TYPE", "군"),
+    ]:
+        _ensure_code(db_session, code, ctype, name)
+
+    admin = _create_user(db_session, login_id=f"a_{suffix}", password="Secret123!", role="ADMIN")
+    user = _create_user(db_session, login_id=f"u_{suffix}", password="Secret123!", role="USER")
+    person_id = None
+    project_id = None
+    try:
+        csrf = _login(client, admin.login_id)
+        person_id = _create_person(client, csrf, f"삭제RBAC_{suffix}")
+
+        proj = client.post(
+            f"/api/v1/people/{person_id}/projects",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "project_name": "삭제전프로젝트",
+                "job_codes": [codes["job"]],
+                "tech_codes": [codes["tech"]],
+                "expertise": [{"exp_code": codes["exp"]}],
+                "biz_codes": [codes["biz"]],
+                "customer_type_codes": [codes["cust"]],
+            },
+        )
+        assert proj.status_code == 201, proj.text
+        project_id = proj.json()["data"]["id"]
+
+        assert (
+            client.post(
+                f"/api/v1/people/{person_id}/employment-history",
+                headers={"X-CSRF-Token": csrf},
+                json={"company_name": "삭제전회사"},
+            ).status_code
+            == 201
+        )
+        assert (
+            client.post(
+                f"/api/v1/people/{person_id}/education",
+                headers={"X-CSRF-Token": csrf},
+                json={"school_name": "삭제전학교"},
+            ).status_code
+            == 201
+        )
+        assert (
+            client.post(
+                f"/api/v1/people/{person_id}/certifications",
+                headers={"X-CSRF-Token": csrf},
+                json={"certification_name": "삭제전자격"},
+            ).status_code
+            == 201
+        )
+
+        status_resp = client.patch(
+            f"/api/v1/people/{person_id}",
+            headers={"X-CSRF-Token": csrf},
+            json={"status": "DELETED"},
+        )
+        assert status_resp.status_code == 200, status_resp.text
+        assert status_resp.json()["data"]["status"] == "DELETED"
+
+        # ADMIN can still read person + nested resources + project detail
+        assert client.get(f"/api/v1/people/{person_id}").status_code == 200
+        assert client.get(f"/api/v1/people/{person_id}/projects").status_code == 200
+        assert client.get(f"/api/v1/projects/{project_id}").status_code == 200
+        assert (
+            client.get(f"/api/v1/people/{person_id}/employment-history").status_code
+            == 200
+        )
+        assert client.get(f"/api/v1/people/{person_id}/education").status_code == 200
+        assert (
+            client.get(f"/api/v1/people/{person_id}/certifications").status_code == 200
+        )
+
+        # USER: all return 404 (do not reveal existence)
+        client.post("/api/v1/auth/logout", headers={"X-CSRF-Token": csrf})
+        _login(client, user.login_id)
+        for path in (
+            f"/api/v1/people/{person_id}",
+            f"/api/v1/people/{person_id}/projects",
+            f"/api/v1/projects/{project_id}",
+            f"/api/v1/people/{person_id}/employment-history",
+            f"/api/v1/people/{person_id}/education",
+            f"/api/v1/people/{person_id}/certifications",
+        ):
+            resp = client.get(path)
+            assert resp.status_code == 404, (path, resp.status_code, resp.text)
+            assert resp.json()["code"] == "NOT_FOUND"
+
+        # Soft-deleted project remains 404 for ADMIN as well
+        csrf = _login(client, admin.login_id)
+        # Restore person first so we can soft-delete the project via API
+        assert (
+            client.patch(
+                f"/api/v1/people/{person_id}",
+                headers={"X-CSRF-Token": csrf},
+                json={"status": "ACTIVE"},
+            ).status_code
+            == 200
+        )
+        assert (
+            client.delete(
+                f"/api/v1/projects/{project_id}",
+                headers={"X-CSRF-Token": csrf},
+            ).status_code
+            == 204
+        )
+        assert client.get(f"/api/v1/projects/{project_id}").status_code == 404
+        client.post("/api/v1/auth/logout", headers={"X-CSRF-Token": csrf})
+        _login(client, user.login_id)
+        assert client.get(f"/api/v1/projects/{project_id}").status_code == 404
+    finally:
+        if person_id:
+            _cleanup_person(db_session, uuid.UUID(person_id))
+        _cleanup_codes(db_session, list(codes.values()))
+        _cleanup_user(db_session, admin.id)
+        _cleanup_user(db_session, user.id)
