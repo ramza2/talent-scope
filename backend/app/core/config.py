@@ -31,6 +31,10 @@ class Settings(BaseSettings):
     upload_max_files_per_session: int = 20
     upload_session_ttl_hours: int = 24
 
+    # Document processing (LibreOffice headless)
+    libreoffice_bin: str = "soffice"
+    libreoffice_timeout_seconds: int = 120
+
     llm_base_url: str = "https://alzi-llm.openlink.kr"
     llm_api_key: str = "change-me"
     llm_model: str = "Qwen3-14B"

@@ -528,11 +528,20 @@ class DocumentService:
                     exc_info=True,
                 )
 
+        # Enqueue only after successful commit. Broker failure must not undo Documents.
+        self._enqueue_processing(document_ids)
+
         return {
             "person_id": person.id,
             "document_ids": document_ids,
             "upload_session_id": session.id,
         }
+
+    def _enqueue_processing(self, document_ids: list[UUID]) -> None:
+        from app.tasks.document_tasks import enqueue_document_processing
+
+        for doc_id in document_ids:
+            enqueue_document_processing(doc_id)
 
     def _promote_temp_file(
         self,
@@ -630,6 +639,10 @@ class DocumentService:
     def _to_list_item(
         self, doc: Document, group: DocumentGroup, type_name: str | None
     ) -> DocumentListItem:
+        error = None
+        if doc.processing_status == "FAILED" and doc.processing_error:
+            # Short indication only — no stack traces in list/UI.
+            error = doc.processing_error.strip().splitlines()[0][:200]
         return DocumentListItem(
             document_id=doc.id,
             document_group_id=group.id,
@@ -644,6 +657,7 @@ class DocumentService:
             mime_type=doc.mime_type,
             file_size=doc.file_size,
             processing_status=doc.processing_status,
+            processing_error=error,
             uploaded_at=doc.uploaded_at,
             deleted_at=doc.deleted_at,
         )

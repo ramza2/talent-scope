@@ -6,6 +6,8 @@ import {
   Space,
   Switch,
   Table,
+  Tag,
+  Tooltip,
   Typography,
   Upload,
   message,
@@ -33,6 +35,18 @@ type Props = {
   onChanged: () => Promise<void>
 }
 
+function statusTag(status: string) {
+  const color =
+    status === 'READY'
+      ? 'success'
+      : status === 'FAILED'
+        ? 'error'
+        : status === 'PROCESSING'
+          ? 'processing'
+          : 'default'
+  return <Tag color={color}>{status}</Tag>
+}
+
 export function DocumentsTab({ personId, isAdmin, onChanged }: Props) {
   const queryClient = useQueryClient()
   const [uploadOpen, setUploadOpen] = useState(false)
@@ -46,6 +60,14 @@ export function DocumentsTab({ personId, isAdmin, onChanged }: Props) {
       listPersonDocuments(personId, {
         includeDeleted: isAdmin && showDeleted,
       }),
+    refetchInterval: (query) => {
+      const items = query.state.data?.data ?? []
+      const pending = items.some(
+        (d) =>
+          d.processing_status === 'UPLOADED' || d.processing_status === 'PROCESSING',
+      )
+      return pending ? 3000 : false
+    },
   })
 
   const docTypesQuery = useQuery({
@@ -86,7 +108,7 @@ export function DocumentsTab({ personId, isAdmin, onChanged }: Props) {
       })
     },
     onSuccess: async () => {
-      message.success('문서를 업로드했습니다.')
+      message.success('문서를 업로드했습니다. 처리 상태를 갱신합니다.')
       setUploadOpen(false)
       setFileList([])
       setDocType(undefined)
@@ -153,7 +175,18 @@ export function DocumentsTab({ personId, isAdmin, onChanged }: Props) {
         </span>
       ),
     },
-    { title: '상태', dataIndex: 'processing_status', width: 110 },
+    {
+      title: '상태',
+      dataIndex: 'processing_status',
+      width: 130,
+      render: (status: string, row) => {
+        const tag = statusTag(status)
+        if (status === 'FAILED' && isAdmin && row.processing_error) {
+          return <Tooltip title={row.processing_error}>{tag}</Tooltip>
+        }
+        return tag
+      },
+    },
     {
       title: '업로드일',
       dataIndex: 'uploaded_at',
@@ -176,6 +209,9 @@ export function DocumentsTab({ personId, isAdmin, onChanged }: Props) {
       width: 220,
       render: (_, row) => {
         const deleted = Boolean(row.deleted_at)
+        const previewReady =
+          row.processing_status === 'READY' ||
+          ['pdf', 'jpg', 'jpeg', 'png'].includes((row.extension || '').toLowerCase())
         return (
           <Space size="small" wrap>
             {!deleted ? (
@@ -186,6 +222,7 @@ export function DocumentsTab({ personId, isAdmin, onChanged }: Props) {
                 <Button
                   type="link"
                   size="small"
+                  disabled={!previewReady && row.processing_status !== 'FAILED'}
                   onClick={() =>
                     window.open(
                       documentPreviewUrl(row.document_id),
@@ -255,8 +292,8 @@ export function DocumentsTab({ personId, isAdmin, onChanged }: Props) {
       </Space>
 
       <Typography.Paragraph type="secondary" style={{ marginTop: 0 }}>
-        AI 식별·신규 인력 Wizard는 다음 단계에서 제공됩니다. 여기서는 기존 인력에 문서를
-        추가·조회·다운로드할 수 있습니다.
+        업로드 후 미리보기/텍스트 추출이 백그라운드에서 처리됩니다. AI 식별·신규 인력 Wizard는
+        다음 단계에서 제공됩니다.
       </Typography.Paragraph>
 
       <Table

@@ -99,6 +99,8 @@ class DocumentListItem(BaseModel):
     mime_type: str | None = None
     file_size: int
     processing_status: str
+    # Truncated / safe summary for FAILED rows — never a full stack trace.
+    processing_error: str | None = None
     uploaded_at: datetime
     deleted_at: datetime | None = None
 

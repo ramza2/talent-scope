@@ -37,6 +37,7 @@ export type DocumentListItem = {
   mime_type?: string | null
   file_size: number
   processing_status: string
+  processing_error?: string | null
   uploaded_at: string
   deleted_at?: string | null
 }
