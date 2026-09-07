@@ -689,9 +689,7 @@ def test_successful_reprocess_swaps_preview_safely(db_session, client):
         assert row.processing_status == "READY"
         assert storage.exists(new_key)
         assert not storage.exists(old_key)
-        assert b"SECOND-PREVIEW" in _storage_bytes(storage, new_key) or (
-            _storage_bytes(storage, new_key) == second_pdf
-        )
+        assert _storage_bytes(storage, new_key) == second_pdf
     finally:
         _cleanup_person(db_session, person_id)
         _cleanup_codes(db_session, codes)
