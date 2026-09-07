@@ -362,17 +362,20 @@ class PeopleRepository:
         *,
         action_type: str,
         actor_user_id: UUID | None,
-        person_id: UUID,
+        person_id: UUID | None = None,
+        target_type: str = "PERSON",
+        target_id: UUID | None = None,
         before: dict[str, Any] | None = None,
         after: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> None:
+        resolved_target_id = target_id if target_id is not None else person_id
         self.db.add(
             AuditLog(
                 user_id=actor_user_id,
                 action_type=action_type,
-                target_type="PERSON",
-                target_id=person_id,
+                target_type=target_type,
+                target_id=resolved_target_id,
                 before_json=before,
                 after_json=after,
                 metadata_json=metadata or {},
