@@ -6,8 +6,18 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
+# LibreOffice (headless convert) + CJK fonts for Korean document rendering.
+# Image size impact: LibreOffice packages are large; kept to writer/calc/impress
+# rather than the full desktop metapackage where possible.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends build-essential libpq-dev \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        libpq-dev \
+        libreoffice-writer \
+        libreoffice-calc \
+        libreoffice-impress \
+        fonts-noto-cjk \
+        fonts-nanum \
     && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml README.md ./

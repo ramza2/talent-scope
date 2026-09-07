@@ -27,9 +27,14 @@ def redis_prefix() -> str:
 
 
 @pytest.fixture()
-def client(redis_prefix: str) -> Generator[TestClient, None, None]:
+def client(redis_prefix: str, monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient, None, None]:
     os.environ["REDIS_KEY_PREFIX"] = redis_prefix
     os.environ["APP_ENV"] = "test"
+
+    monkeypatch.setattr(
+        "app.tasks.document_tasks.process_document.delay",
+        lambda *_a, **_k: None,
+    )
 
     from app.core.config import get_settings
     from app.core.redis import get_redis
