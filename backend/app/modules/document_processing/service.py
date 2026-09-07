@@ -6,7 +6,7 @@ import logging
 import shutil
 import tempfile
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -44,27 +44,44 @@ class DocumentProcessingService:
         self.storage = storage or get_object_storage()
         self.converter = converter or LibreOfficeConverter(self.settings)
 
-    def preview_key(self, person_id: UUID, group_id: UUID, document_id: UUID) -> str:
-        return f"documents/{person_id}/{group_id}/{document_id}/preview.pdf"
+    def preview_key(
+        self,
+        person_id: UUID,
+        group_id: UUID,
+        document_id: UUID,
+        *,
+        preview_id: UUID | None = None,
+    ) -> str:
+        """Opaque unique preview object key (never overwrite an existing preview)."""
+        pid = preview_id or uuid4()
+        return f"documents/{person_id}/{group_id}/{document_id}/previews/{pid}.pdf"
 
     def process_document(self, document_id: UUID) -> str:
         """Process one document to READY or FAILED.
 
-        Returns final ``processing_status``.
+        Returns final ``processing_status``. Concurrent callers lose the atomic
+        claim and return the current status without running conversion.
         """
-        document = self.repo.get_document_for_update(document_id, skip_locked=True)
-        if document is None:
+        # Atomic claim closes the race between SKIP LOCKED select and status commit.
+        if not self.repo.try_claim_processing(document_id):
             existing = self.db.execute(
                 select(Document).where(Document.id == document_id)
             ).scalar_one_or_none()
             if existing is None or existing.deleted_at is not None:
                 raise NotFoundError("문서를 찾을 수 없습니다.")
             logger.info(
-                "process_document skipped (locked) document_id=%s status=%s",
+                "process_document skipped (already processing) document_id=%s status=%s",
                 document_id,
                 existing.processing_status,
             )
             return existing.processing_status
+
+        self.db.commit()
+
+        # Re-lock after claim commit for the remainder of the unit of work.
+        document = self.repo.get_document_for_update(document_id)
+        if document is None:
+            raise NotFoundError("문서를 찾을 수 없습니다.")
 
         group = self.repo.get_group(document.document_group_id)
         if group is None:
@@ -73,14 +90,6 @@ class DocumentProcessingService:
         previous_preview_key = document.preview_storage_key
         new_preview_key: str | None = None
         uploaded_new_preview = False
-
-        self.repo.mark_processing(document)
-        self.db.commit()
-
-        # Re-lock after status commit for the remainder of the unit of work.
-        document = self.repo.get_document_for_update(document_id)
-        if document is None:
-            raise NotFoundError("문서를 찾을 수 없습니다.")
 
         work_dir: Path | None = None
         try:
@@ -96,6 +105,8 @@ class DocumentProcessingService:
             )
 
             if result.preview_pdf_bytes is not None:
+                # Always use a fresh unique key so a failed reprocess never
+                # overwrites / compensates-away a previously good preview.
                 new_preview_key = self.preview_key(
                     group.person_id, group.id, document.id
                 )
@@ -143,6 +154,8 @@ class DocumentProcessingService:
         except Exception as exc:
             logger.exception("document processing failed document_id=%s", document_id)
             self.db.rollback()
+            # Compensate only the newly uploaded unique preview; never touch
+            # previous_preview_key / object (may still be the live READY preview).
             if uploaded_new_preview and new_preview_key:
                 try:
                     self.storage.delete(new_preview_key)
@@ -152,10 +165,9 @@ class DocumentProcessingService:
                         new_preview_key,
                         exc_info=True,
                     )
-            # Preserve original object and Document row; mark FAILED.
+            # Preserve original object and existing preview_storage_key; mark FAILED.
             document = self.repo.get_document_for_update(document_id)
             if document is not None:
-                # Do not clear an already-good previous preview on failure.
                 self.repo.mark_failed(document, self._safe_error(exc))
                 self.db.commit()
                 return "FAILED"
@@ -165,6 +177,9 @@ class DocumentProcessingService:
                 shutil.rmtree(work_dir, ignore_errors=True)
 
     def _download_original(self, document: Document) -> bytes:
+        # TODO(perf): stream ObjectStorage directly to work_dir source file to
+        # avoid holding up to ~50MB twice in Python memory (chunks list + join).
+        # Prefer path-based PyMuPDF open / LibreOffice source path after that.
         obj = self.storage.get(document.storage_key)
         try:
             chunks = list(obj.iter_chunks())

@@ -435,9 +435,11 @@ def test_office_converter_success_sets_preview(db_session, client):
         db_session.expire_all()
         row = db_session.get(Document, doc.id)
         assert row is not None
-        expected_key = f"documents/{person_id}/{group.id}/{doc.id}/preview.pdf"
-        assert row.preview_storage_key == expected_key
-        assert storage.exists(expected_key)
+        assert row.preview_storage_key is not None
+        prefix = f"documents/{person_id}/{group.id}/{doc.id}/previews/"
+        assert row.preview_storage_key.startswith(prefix)
+        assert row.preview_storage_key.endswith(".pdf")
+        assert storage.exists(row.preview_storage_key)
         assert row.preview_page_count == 1
     finally:
         _cleanup_person(db_session, person_id)
@@ -527,8 +529,6 @@ def test_preview_upload_db_failure_compensates(db_session, client, monkeypatch):
             data=b"PK-x",
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         )
-        preview_key = f"documents/{person_id}/{group.id}/{doc.id}/preview.pdf"
-
         def boom(self, document_id, pages):  # noqa: ANN001
             raise RuntimeError("injected replace_pages failure")
 
@@ -537,12 +537,290 @@ def test_preview_upload_db_failure_compensates(db_session, client, monkeypatch):
             db_session, storage=storage, converter=converter
         ).process_document(doc.id)
         assert status == "FAILED"
-        assert not storage.exists(preview_key)
+        preview_prefix = f"documents/{person_id}/{group.id}/{doc.id}/previews/"
+        assert not any(k.startswith(preview_prefix) for k in storage.keys())
         db_session.expire_all()
         row = db_session.get(Document, doc.id)
         assert row is not None
         assert row.processing_status == "FAILED"
+        assert row.preview_storage_key is None
         assert storage.exists(doc.storage_key)
+    finally:
+        _cleanup_person(db_session, person_id)
+        _cleanup_codes(db_session, codes)
+        _cleanup_user(db_session, admin.id)
+        reset_object_storage_cache()
+
+
+def _storage_bytes(storage, key: str) -> bytes:
+    obj = storage.get(key)
+    try:
+        return b"".join(obj.iter_chunks())
+    finally:
+        obj.close()
+
+
+def test_failed_reprocess_preserves_old_preview(db_session, client, monkeypatch):
+    """Reprocess DB failure must not overwrite or delete the prior good preview."""
+    from app.db.models.document import Document
+    from app.modules.document_processing.parsers.pdf import build_minimal_pdf_with_text
+    from app.modules.document_processing.repository import DocumentProcessingRepository
+    from app.modules.document_processing.service import DocumentProcessingService
+    from app.storage.s3 import build_object_storage, reset_object_storage_cache
+
+    reset_object_storage_cache()
+    storage = build_object_storage()
+    suffix = uuid.uuid4().hex[:8]
+    codes = [f"DOC-RESUME-{suffix}"]
+    _ensure_code(db_session, codes[0], "DOC_TYPE", "이력서")
+    admin = _create_user(db_session, login_id=f"a_{suffix}", password="Secret123!")
+    csrf = _login(client, admin.login_id)
+    person_id = uuid.UUID(_create_person(client, csrf, f"reprev_{suffix}"))
+    try:
+        old_pdf = build_minimal_pdf_with_text("OLD-PREVIEW-CONTENT")
+        new_pdf = build_minimal_pdf_with_text("NEW-PREVIEW-SHOULD-NOT-STICK")
+        converter = FakeConverter(old_pdf)
+        doc, group = _seed_document(
+            db_session,
+            storage,
+            person_id=person_id,
+            user_id=admin.id,
+            code=codes[0],
+            filename="resume.docx",
+            extension="docx",
+            data=b"PK-old",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+        svc = DocumentProcessingService(
+            db_session, storage=storage, converter=converter
+        )
+        assert svc.process_document(doc.id) == "READY"
+        db_session.expire_all()
+        row = db_session.get(Document, doc.id)
+        assert row is not None
+        old_key = row.preview_storage_key
+        assert old_key
+        assert storage.exists(old_key)
+        old_bytes = _storage_bytes(storage, old_key)
+        assert old_bytes == old_pdf
+        original_key = row.storage_key
+        assert storage.exists(original_key)
+
+        # Inject failure after new preview upload, during DB replace_pages.
+        converter.pdf_bytes = new_pdf
+        converter.calls = 0
+
+        def boom(self, document_id, pages):  # noqa: ANN001
+            raise RuntimeError("injected replace_pages failure on reprocess")
+
+        monkeypatch.setattr(DocumentProcessingRepository, "replace_pages", boom)
+        status = DocumentProcessingService(
+            db_session, storage=storage, converter=converter
+        ).process_document(doc.id)
+        assert status == "FAILED"
+        assert converter.calls == 1
+
+        db_session.expire_all()
+        row = db_session.get(Document, doc.id)
+        assert row is not None
+        assert row.processing_status == "FAILED"
+        assert row.preview_storage_key == old_key
+        assert storage.exists(old_key)
+        assert _storage_bytes(storage, old_key) == old_bytes
+        assert storage.exists(original_key)
+
+        preview_prefix = f"documents/{person_id}/{group.id}/{doc.id}/previews/"
+        preview_keys = [k for k in storage.keys() if k.startswith(preview_prefix)]
+        assert preview_keys == [old_key]
+    finally:
+        _cleanup_person(db_session, person_id)
+        _cleanup_codes(db_session, codes)
+        _cleanup_user(db_session, admin.id)
+        reset_object_storage_cache()
+
+
+def test_successful_reprocess_swaps_preview_safely(db_session, client):
+    from app.db.models.document import Document
+    from app.modules.document_processing.parsers.pdf import build_minimal_pdf_with_text
+    from app.modules.document_processing.service import DocumentProcessingService
+    from app.storage.s3 import build_object_storage, reset_object_storage_cache
+
+    reset_object_storage_cache()
+    storage = build_object_storage()
+    suffix = uuid.uuid4().hex[:8]
+    codes = [f"DOC-RESUME-{suffix}"]
+    _ensure_code(db_session, codes[0], "DOC_TYPE", "이력서")
+    admin = _create_user(db_session, login_id=f"a_{suffix}", password="Secret123!")
+    csrf = _login(client, admin.login_id)
+    person_id = uuid.UUID(_create_person(client, csrf, f"swap_{suffix}"))
+    try:
+        first_pdf = build_minimal_pdf_with_text("FIRST-PREVIEW")
+        second_pdf = build_minimal_pdf_with_text("SECOND-PREVIEW")
+        converter = FakeConverter(first_pdf)
+        doc, _group = _seed_document(
+            db_session,
+            storage,
+            person_id=person_id,
+            user_id=admin.id,
+            code=codes[0],
+            filename="resume.docx",
+            extension="docx",
+            data=b"PK-swap",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+        svc = DocumentProcessingService(
+            db_session, storage=storage, converter=converter
+        )
+        assert svc.process_document(doc.id) == "READY"
+        db_session.expire_all()
+        row = db_session.get(Document, doc.id)
+        assert row is not None
+        old_key = row.preview_storage_key
+        assert old_key and storage.exists(old_key)
+
+        converter.pdf_bytes = second_pdf
+        assert svc.process_document(doc.id) == "READY"
+        db_session.expire_all()
+        row = db_session.get(Document, doc.id)
+        assert row is not None
+        new_key = row.preview_storage_key
+        assert new_key
+        assert old_key != new_key
+        assert row.processing_status == "READY"
+        assert storage.exists(new_key)
+        assert not storage.exists(old_key)
+        assert b"SECOND-PREVIEW" in _storage_bytes(storage, new_key) or (
+            _storage_bytes(storage, new_key) == second_pdf
+        )
+    finally:
+        _cleanup_person(db_session, person_id)
+        _cleanup_codes(db_session, codes)
+        _cleanup_user(db_session, admin.id)
+        reset_object_storage_cache()
+
+
+def test_concurrent_claim_exactly_once(db_session, client):
+    """Two workers racing claim: exactly one converts; the other skips."""
+    import threading
+
+    from app.db.models.document import Document
+    from app.db.session import SessionLocal
+    from app.modules.document_processing.parsers.pdf import build_minimal_pdf_with_text
+    from app.modules.document_processing.repository import DocumentProcessingRepository
+    from app.modules.document_processing.service import DocumentProcessingService
+    from app.storage.s3 import build_object_storage, reset_object_storage_cache
+
+    reset_object_storage_cache()
+    storage = build_object_storage()
+    suffix = uuid.uuid4().hex[:8]
+    codes = [f"DOC-RESUME-{suffix}"]
+    _ensure_code(db_session, codes[0], "DOC_TYPE", "이력서")
+    admin = _create_user(db_session, login_id=f"a_{suffix}", password="Secret123!")
+    csrf = _login(client, admin.login_id)
+    person_id = uuid.UUID(_create_person(client, csrf, f"race_{suffix}"))
+    try:
+        fake_pdf = build_minimal_pdf_with_text("race-once")
+        converter = FakeConverter(fake_pdf)
+        # Slow convert so both workers can observe PROCESSING claim window.
+        original_convert = converter.convert_to_pdf
+
+        def slow_convert(source_path: Path, work_dir: Path) -> Path:
+            import time
+
+            time.sleep(0.15)
+            return original_convert(source_path, work_dir)
+
+        converter.convert_to_pdf = slow_convert  # type: ignore[method-assign]
+
+        doc, _ = _seed_document(
+            db_session,
+            storage,
+            person_id=person_id,
+            user_id=admin.id,
+            code=codes[0],
+            filename="race.docx",
+            extension="docx",
+            data=b"PK-race",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+        db_session.commit()
+
+        # Repository-level atomic claim race
+        claim_results: list[bool] = []
+        barrier = threading.Barrier(2)
+
+        def claim_worker() -> None:
+            session = SessionLocal()
+            try:
+                repo = DocumentProcessingRepository(session)
+                barrier.wait(timeout=5)
+                ok = repo.try_claim_processing(doc.id)
+                session.commit()
+                claim_results.append(ok)
+            finally:
+                session.close()
+
+        # Reset doc to UPLOADED for claim race after seed is UPLOADED already —
+        # seed is UPLOADED; run claim race first before process_document race.
+        t1 = threading.Thread(target=claim_worker)
+        t2 = threading.Thread(target=claim_worker)
+        t1.start()
+        t2.start()
+        t1.join(timeout=10)
+        t2.join(timeout=10)
+        assert claim_results.count(True) == 1
+        assert claim_results.count(False) == 1
+
+        db_session.expire_all()
+        claimed = db_session.get(Document, doc.id)
+        assert claimed is not None
+        assert claimed.processing_status == "PROCESSING"
+
+        # Reset to UPLOADED for process_document concurrency race.
+        claimed.processing_status = "UPLOADED"
+        claimed.processing_error = None
+        db_session.add(claimed)
+        db_session.commit()
+
+        statuses: list[str] = []
+        barrier2 = threading.Barrier(2)
+        lock = threading.Lock()
+
+        def process_worker() -> None:
+            session = SessionLocal()
+            try:
+                svc = DocumentProcessingService(
+                    session, storage=storage, converter=converter
+                )
+                barrier2.wait(timeout=5)
+                status = svc.process_document(doc.id)
+                with lock:
+                    statuses.append(status)
+            finally:
+                session.close()
+
+        p1 = threading.Thread(target=process_worker)
+        p2 = threading.Thread(target=process_worker)
+        p1.start()
+        p2.start()
+        p1.join(timeout=30)
+        p2.join(timeout=30)
+
+        assert converter.calls == 1
+        assert statuses.count("READY") == 1
+        assert statuses.count("PROCESSING") == 1
+
+        # Sequential re-run after READY must still be claimable.
+        db_session.expire_all()
+        ready_row = db_session.get(Document, doc.id)
+        assert ready_row is not None
+        assert ready_row.processing_status == "READY"
+        converter.calls = 0
+        again = DocumentProcessingService(
+            db_session, storage=storage, converter=converter
+        ).process_document(doc.id)
+        assert again == "READY"
+        assert converter.calls == 1
     finally:
         _cleanup_person(db_session, person_id)
         _cleanup_codes(db_session, codes)
