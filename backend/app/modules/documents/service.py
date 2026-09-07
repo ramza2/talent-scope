@@ -485,9 +485,9 @@ class DocumentService:
                     person_id=person.id,
                     item=item,
                     actor_user_id=actor_user_id,
+                    created_permanent_keys=created_permanent_keys,
                 )
                 document_ids.append(doc_id)
-                created_permanent_keys.append(dest_key)
                 source_temp_keys.append(temp_key)
 
             session.status = "RESOLVED"
@@ -541,23 +541,27 @@ class DocumentService:
         person_id: UUID,
         item: DocumentResolutionItem,
         actor_user_id: UUID,
+        created_permanent_keys: list[str],
     ) -> tuple[UUID, str, str]:
         """Copy temp→permanent and apply DB changes. Does NOT delete temp object.
 
         Temp storage cleanup happens only after the outer resolve() COMMIT.
+
+        ``created_permanent_keys`` is the outer resolve compensation list: after
+        ``storage.copy`` succeeds the destination key is appended immediately so
+        a later DB failure still deletes the permanent object on rollback.
         """
         temp = self.repo.get_temp_file(item.temp_file_id, for_update=True)
         if temp is None or temp.upload_session_id != session.id:
             raise NotFoundError("임시 파일을 찾을 수 없습니다.")
 
-        doc_type = item.document_type_code or temp.document_type_code
-        if not doc_type:
-            raise ValidationAppError("document_type_code가 필요합니다.")
-        self._validate_doc_type(doc_type)
-
         title = (item.title or temp.original_filename)[:500]
 
         if item.mode == "NEW_GROUP":
+            doc_type = item.document_type_code or temp.document_type_code
+            if not doc_type:
+                raise ValidationAppError("document_type_code가 필요합니다.")
+            self._validate_doc_type(doc_type)
             group = self.repo.create_group(
                 person_id=person_id,
                 document_type_code=doc_type,
@@ -572,6 +576,15 @@ class DocumentService:
                 raise NotFoundError("문서 그룹을 찾을 수 없습니다.")
             if group.person_id != person_id:
                 raise ValidationAppError("문서 그룹이 해당 인력에 속하지 않습니다.")
+            # Group document_type_code is authoritative; never change it here.
+            if (
+                item.document_type_code
+                and item.document_type_code != group.document_type_code
+            ):
+                raise ValidationAppError(
+                    "NEW_VERSION의 document_type_code가 문서 그룹과 일치하지 않습니다."
+                )
+            doc_type = group.document_type_code
             version_no = self.repo.max_version_no(group.id) + 1
             self.repo.clear_latest(group.id)
 
@@ -579,6 +592,8 @@ class DocumentService:
         dest_key = self._document_key(person_id, group.id, document_id)
         # S3 has no rename: COPY only here. Temp delete is deferred until COMMIT.
         self.storage.copy(temp.temp_storage_key, dest_key)
+        # Track immediately — DB work below may still fail.
+        created_permanent_keys.append(dest_key)
 
         mime = canonical_mime(temp.extension) if temp.extension else temp.mime_type
         doc = self.repo.create_document(

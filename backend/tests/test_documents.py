@@ -894,3 +894,223 @@ def test_s3_connection_errors_become_storage_error() -> None:
         storage.copy("a", "b")
     with pytest.raises(StorageError):
         storage.put_fileobj("k", io.BytesIO(b"x"), length=1)
+
+
+def test_resolve_copy_ok_create_document_failure_compensates(
+    client: TestClient, db_session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """copy succeeds then create_document fails → permanent must be compensated."""
+    from app.db.models.document import Document, DocumentGroup
+    from app.db.models.upload import UploadSession, UploadTempFile
+    from app.modules.documents.repository import DocumentRepository
+    from app.storage.s3 import build_object_storage
+
+    suffix = uuid.uuid4().hex[:8]
+    codes = [f"DOC-RESUME-{suffix}"]
+    _ensure_code(db_session, codes[0], "DOC_TYPE", "이력서")
+    admin = _create_user(db_session, login_id=f"a_{suffix}", password="Secret123!", role="ADMIN")
+    person_id = None
+    session_id = None
+    try:
+        csrf = _login(client, admin.login_id)
+        person_id = _create_person(client, csrf, f"copy_ok_db_fail_{suffix}")
+        session_id = client.post(
+            "/api/v1/upload-sessions",
+            headers={"X-CSRF-Token": csrf},
+            json={},
+        ).json()["data"]["id"]
+
+        pdf = b"%PDF-1.4 copy-ok-" + suffix.encode()
+        up = client.post(
+            f"/api/v1/upload-sessions/{session_id}/files",
+            headers={"X-CSRF-Token": csrf},
+            files=[("files", ("a.pdf", io.BytesIO(pdf), "application/pdf"))],
+        )
+        assert up.status_code == 201, up.text
+        fid = up.json()["data"][0]["temp_file_id"]
+        client.patch(
+            f"/api/v1/upload-sessions/{session_id}/files/{fid}",
+            headers={"X-CSRF-Token": csrf},
+            json={"document_type_code": codes[0]},
+        )
+
+        storage = build_object_storage()
+        temp_key = f"temp/{session_id}/{fid}"
+        assert storage.exists(temp_key)
+        before_keys = set(storage.keys())
+
+        def boom(self, *args, **kwargs):  # noqa: ANN001
+            raise RuntimeError("injected create_document failure")
+
+        monkeypatch.setattr(DocumentRepository, "create_document", boom)
+
+        with pytest.raises(RuntimeError, match="injected create_document failure"):
+            client.post(
+                f"/api/v1/upload-sessions/{session_id}/resolve",
+                headers={"X-CSRF-Token": csrf},
+                json={
+                    "mode": "LINK_EXISTING",
+                    "person_id": person_id,
+                    "document_resolution": [
+                        {
+                            "temp_file_id": fid,
+                            "mode": "NEW_GROUP",
+                            "document_type_code": codes[0],
+                            "title": "A",
+                        }
+                    ],
+                },
+            )
+
+        db_session.expire_all()
+        docs = (
+            db_session.execute(
+                select(Document)
+                .join(DocumentGroup, DocumentGroup.id == Document.document_group_id)
+                .where(DocumentGroup.person_id == uuid.UUID(person_id))
+            )
+            .scalars()
+            .all()
+        )
+        assert docs == []
+        groups = (
+            db_session.execute(
+                select(DocumentGroup).where(
+                    DocumentGroup.person_id == uuid.UUID(person_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert groups == []
+
+        sess = db_session.get(UploadSession, uuid.UUID(session_id))
+        assert sess is not None and sess.status == "UPLOADING"
+        temps = list(
+            db_session.execute(
+                select(UploadTempFile).where(
+                    UploadTempFile.upload_session_id == uuid.UUID(session_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(temps) == 1
+        assert str(temps[0].id) == fid
+        assert storage.exists(temp_key)
+
+        after_keys = set(storage.keys())
+        leftover = after_keys - before_keys
+        assert not any(k.startswith("documents/") for k in leftover)
+        assert not any(k.startswith("documents/") for k in after_keys)
+    finally:
+        if person_id:
+            _cleanup_person(db_session, uuid.UUID(person_id))
+        if session_id:
+            _cleanup_session(db_session, uuid.UUID(session_id))
+        _cleanup_codes(db_session, codes)
+        _cleanup_user(db_session, admin.id)
+
+
+def test_new_version_document_type_mismatch(client: TestClient, db_session) -> None:
+    suffix = uuid.uuid4().hex[:8]
+    codes = [f"DOC-RESUME-{suffix}", f"DOC-OTHER-{suffix}"]
+    _ensure_code(db_session, codes[0], "DOC_TYPE", "이력서")
+    _ensure_code(db_session, codes[1], "DOC_TYPE", "기타")
+    admin = _create_user(db_session, login_id=f"a_{suffix}", password="Secret123!", role="ADMIN")
+    person_id = None
+    session_ids: list[str] = []
+    try:
+        csrf = _login(client, admin.login_id)
+        person_id = _create_person(client, csrf, f"ver_mismatch_{suffix}")
+
+        s1 = client.post(
+            "/api/v1/upload-sessions",
+            headers={"X-CSRF-Token": csrf},
+            json={},
+        ).json()["data"]["id"]
+        session_ids.append(s1)
+        up = client.post(
+            f"/api/v1/upload-sessions/{s1}/files",
+            headers={"X-CSRF-Token": csrf},
+            files=[
+                (
+                    "files",
+                    ("v1.pdf", io.BytesIO(b"%PDF-1.4 v1-" + suffix.encode()), "application/pdf"),
+                )
+            ],
+        )
+        fid = up.json()["data"][0]["temp_file_id"]
+        client.patch(
+            f"/api/v1/upload-sessions/{s1}/files/{fid}",
+            headers={"X-CSRF-Token": csrf},
+            json={"document_type_code": codes[0]},
+        )
+        res = client.post(
+            f"/api/v1/upload-sessions/{s1}/resolve",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "mode": "LINK_EXISTING",
+                "person_id": person_id,
+                "document_resolution": [
+                    {
+                        "temp_file_id": fid,
+                        "mode": "NEW_GROUP",
+                        "document_type_code": codes[0],
+                        "title": "이력서",
+                    }
+                ],
+            },
+        )
+        assert res.status_code == 201, res.text
+        group_id = client.get(
+            f"/api/v1/documents/{res.json()['data']['document_ids'][0]}"
+        ).json()["data"]["document_group_id"]
+
+        s2 = client.post(
+            "/api/v1/upload-sessions",
+            headers={"X-CSRF-Token": csrf},
+            json={},
+        ).json()["data"]["id"]
+        session_ids.append(s2)
+        up2 = client.post(
+            f"/api/v1/upload-sessions/{s2}/files",
+            headers={"X-CSRF-Token": csrf},
+            files=[
+                (
+                    "files",
+                    ("v2.pdf", io.BytesIO(b"%PDF-1.4 v2-" + suffix.encode()), "application/pdf"),
+                )
+            ],
+        )
+        fid2 = up2.json()["data"][0]["temp_file_id"]
+        client.patch(
+            f"/api/v1/upload-sessions/{s2}/files/{fid2}",
+            headers={"X-CSRF-Token": csrf},
+            json={"document_type_code": codes[1]},
+        )
+        bad = client.post(
+            f"/api/v1/upload-sessions/{s2}/resolve",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "mode": "LINK_EXISTING",
+                "person_id": person_id,
+                "document_resolution": [
+                    {
+                        "temp_file_id": fid2,
+                        "mode": "NEW_VERSION",
+                        "document_group_id": group_id,
+                        "document_type_code": codes[1],
+                    }
+                ],
+            },
+        )
+        assert bad.status_code == 400, bad.text
+        assert bad.json()["code"] == "VALIDATION_ERROR"
+    finally:
+        if person_id:
+            _cleanup_person(db_session, uuid.UUID(person_id))
+        for sid in session_ids:
+            _cleanup_session(db_session, uuid.UUID(sid))
+        _cleanup_codes(db_session, codes)
+        _cleanup_user(db_session, admin.id)
