@@ -15,6 +15,10 @@ from app.storage.base import ObjectHead, StoredObject
 from app.storage.memory import MemoryObjectStorage
 
 
+def _wrap_storage_error(operation: str, key: str, exc: Exception) -> StorageError:
+    return StorageError(f"객체 {operation} 실패: {key}")
+
+
 class S3ObjectStorage:
     def __init__(
         self,
@@ -52,9 +56,9 @@ class S3ObjectStorage:
                 kwargs["ContentType"] = content_type
             self._client.put_object(**kwargs)
         except ClientError as exc:
-            raise StorageError(f"객체 업로드 실패: {key}") from exc
-        except Exception as exc:  # connection errors, etc.
-            raise StorageError(f"객체 업로드 실패: {key}") from exc
+            raise _wrap_storage_error("업로드", key, exc) from exc
+        except Exception as exc:  # connection / network errors
+            raise _wrap_storage_error("업로드", key, exc) from exc
 
     def put_fileobj(
         self,
@@ -75,9 +79,9 @@ class S3ObjectStorage:
                 ExtraArgs=extra or None,
             )
         except ClientError as exc:
-            raise StorageError(f"객체 업로드 실패: {key}") from exc
+            raise _wrap_storage_error("업로드", key, exc) from exc
         except Exception as exc:
-            raise StorageError(f"객체 업로드 실패: {key}") from exc
+            raise _wrap_storage_error("업로드", key, exc) from exc
 
     def head(self, key: str) -> ObjectHead:
         try:
@@ -86,7 +90,9 @@ class S3ObjectStorage:
             code = exc.response.get("Error", {}).get("Code", "")
             if code in {"404", "NoSuchKey", "NotFound"}:
                 raise NotFoundError("객체를 찾을 수 없습니다.") from exc
-            raise StorageError(f"객체 조회 실패: {key}") from exc
+            raise _wrap_storage_error("조회", key, exc) from exc
+        except Exception as exc:
+            raise _wrap_storage_error("조회", key, exc) from exc
         return ObjectHead(
             content_length=int(resp["ContentLength"]),
             content_type=resp.get("ContentType"),
@@ -111,7 +117,9 @@ class S3ObjectStorage:
                 if code == "InvalidRange":
                     raise StorageError("잘못된 byte range입니다.") from exc
                 raise NotFoundError("객체를 찾을 수 없습니다.") from exc
-            raise StorageError(f"객체 다운로드 실패: {key}") from exc
+            raise _wrap_storage_error("다운로드", key, exc) from exc
+        except Exception as exc:
+            raise _wrap_storage_error("다운로드", key, exc) from exc
 
         body = resp["Body"]
         content_length = int(resp.get("ContentLength") or 0)
@@ -129,7 +137,9 @@ class S3ObjectStorage:
         try:
             self._client.delete_object(Bucket=self.bucket, Key=key)
         except ClientError as exc:
-            raise StorageError(f"객체 삭제 실패: {key}") from exc
+            raise _wrap_storage_error("삭제", key, exc) from exc
+        except Exception as exc:
+            raise _wrap_storage_error("삭제", key, exc) from exc
 
     def copy(self, source_key: str, dest_key: str) -> None:
         try:
@@ -142,7 +152,9 @@ class S3ObjectStorage:
             code = exc.response.get("Error", {}).get("Code", "")
             if code in {"404", "NoSuchKey", "NotFound"}:
                 raise NotFoundError("원본 객체를 찾을 수 없습니다.") from exc
-            raise StorageError(f"객체 복사 실패: {source_key} → {dest_key}") from exc
+            raise _wrap_storage_error("복사", f"{source_key} → {dest_key}", exc) from exc
+        except Exception as exc:
+            raise _wrap_storage_error("복사", f"{source_key} → {dest_key}", exc) from exc
 
     def exists(self, key: str) -> bool:
         try:
@@ -159,6 +171,7 @@ def build_object_storage(settings: Settings | None = None):
     """Build storage backend.
 
     Uses in-memory storage when ``APP_ENV=test`` so pytest does not need MinIO.
+    Prefer ``get_object_storage()`` at request boundaries to reuse clients.
     """
     global _memory_singleton
     cfg = settings or get_settings()

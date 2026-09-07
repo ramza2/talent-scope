@@ -32,16 +32,18 @@ from app.modules.documents.service import (
     content_disposition_attachment,
     content_disposition_inline,
 )
-from app.storage.s3 import build_object_storage
+from app.storage.s3 import get_object_storage
 
 upload_sessions_router = APIRouter(prefix="/upload-sessions", tags=["upload-sessions"])
 documents_router = APIRouter(prefix="/documents", tags=["documents"])
 document_groups_router = APIRouter(prefix="/document-groups", tags=["documents"])
 person_documents_router = APIRouter(prefix="/people", tags=["documents"])
 
+_NOSNIFF = {"X-Content-Type-Options": "nosniff"}
+
 
 def get_document_service(db: Session = Depends(get_db)) -> DocumentService:
-    return DocumentService(db, storage=build_object_storage())
+    return DocumentService(db, storage=get_object_storage())
 
 
 # --- Upload sessions ---
@@ -73,13 +75,14 @@ def get_upload_session(
     response_model=TempFileListResponse,
     status_code=status.HTTP_201_CREATED,
 )
-async def upload_session_files(
+def upload_session_files(
     session_id: UUID,
     files: list[UploadFile] = File(...),
     _admin: AuthenticatedContext = Depends(require_admin),
     ctx: AuthenticatedContext = Depends(require_csrf),
     service: DocumentService = Depends(get_document_service),
 ) -> TempFileListResponse:
+    # Sync route: blocking file I/O + boto3 run in Starlette threadpool.
     return TempFileListResponse(
         data=service.upload_files(session_id, files, ctx.user.id)
     )
@@ -206,6 +209,7 @@ def download_document(
     headers = {
         "Content-Disposition": content_disposition_attachment(doc.original_filename),
         "Accept-Ranges": "bytes",
+        **_NOSNIFF,
     }
     if obj.content_length is not None:
         headers["Content-Length"] = str(obj.content_length)
@@ -218,7 +222,7 @@ def download_document(
 
     return StreamingResponse(
         stream(),
-        media_type=doc.mime_type or obj.content_type or "application/octet-stream",
+        media_type=service.download_media_type(doc),
         headers=headers,
         status_code=200,
     )
@@ -232,34 +236,36 @@ def preview_document(
     service: DocumentService = Depends(get_document_service),
 ) -> StreamingResponse:
     is_admin = ctx.user.role == "ADMIN"
-    # Peek size for Range parsing when needed
     range_header = request.headers.get("range")
     byte_range = None
     if range_header:
-        # Use storage head via a lightweight get_document + storage head
-        detail = service.get_document(document_id, is_admin=is_admin)
         from app.modules.documents.constants import INLINE_PREVIEW_EXTENSIONS
+        from app.core.exceptions import PreviewUnavailableError
 
         doc_row = service.repo.get_document(document_id, include_deleted=is_admin)
-        assert doc_row is not None
+        if doc_row is None:
+            from app.core.exceptions import NotFoundError
+
+            raise NotFoundError("문서를 찾을 수 없습니다.")
+        # Authz via get_document
+        service.get_document(document_id, is_admin=is_admin)
         key = doc_row.preview_storage_key
         if not key:
             ext = (doc_row.extension or "").lower()
             if ext not in INLINE_PREVIEW_EXTENSIONS:
-                from app.core.exceptions import PreviewUnavailableError
-
                 raise PreviewUnavailableError()
             key = doc_row.storage_key
         head = service.storage.head(key)
         byte_range = service.parse_range_header(range_header, head.content_length)
 
-    doc, filename, obj = service.open_preview(
+    doc, filename, obj, media_type = service.open_preview(
         document_id, is_admin=is_admin, byte_range=byte_range
     )
     headers = {
         "Content-Disposition": content_disposition_inline(filename),
         "Accept-Ranges": "bytes",
         "Content-Length": str(obj.content_length),
+        **_NOSNIFF,
     }
     if obj.content_range:
         headers["Content-Range"] = obj.content_range
@@ -272,7 +278,7 @@ def preview_document(
 
     return StreamingResponse(
         stream(),
-        media_type=doc.mime_type or obj.content_type or "application/octet-stream",
+        media_type=media_type,
         headers=headers,
         status_code=obj.status_code,
     )

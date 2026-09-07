@@ -516,3 +516,381 @@ def test_upload_session_document_flow(client: TestClient, db_session) -> None:
         _cleanup_codes(db_session, codes)
         _cleanup_user(db_session, admin.id)
         _cleanup_user(db_session, user.id)
+
+
+class _FailOnNthCopyStorage:
+    """Wrap MemoryObjectStorage; raise StorageError on the N-th copy call."""
+
+    def __init__(self, inner, *, fail_on_copy: int = 2) -> None:
+        self._inner = inner
+        self._fail_on_copy = fail_on_copy
+        self._copy_count = 0
+
+    def __getattr__(self, name: str):
+        return getattr(self._inner, name)
+
+    def copy(self, source_key: str, dest_key: str) -> None:
+        from app.core.exceptions import StorageError
+
+        self._copy_count += 1
+        if self._copy_count == self._fail_on_copy:
+            raise StorageError("injected copy failure")
+        return self._inner.copy(source_key, dest_key)
+
+
+def test_resolve_second_copy_failure_keeps_temps(client: TestClient, db_session) -> None:
+    from fastapi import Depends
+    from sqlalchemy.orm import Session
+
+    from app.db.models.document import Document, DocumentGroup
+    from app.db.models.upload import UploadSession, UploadTempFile
+    from app.db.session import get_db
+    from app.modules.documents import router as documents_router
+    from app.modules.documents.service import DocumentService
+    from app.storage.s3 import build_object_storage, reset_object_storage_cache
+
+    suffix = uuid.uuid4().hex[:8]
+    codes = [f"DOC-RESUME-{suffix}"]
+    _ensure_code(db_session, codes[0], "DOC_TYPE", "이력서")
+    admin = _create_user(db_session, login_id=f"a_{suffix}", password="Secret123!", role="ADMIN")
+    person_id = None
+    session_id = None
+    application = client.app
+    try:
+        csrf = _login(client, admin.login_id)
+        person_id = _create_person(client, csrf, f"resolve_fail_{suffix}")
+        session_id = client.post(
+            "/api/v1/upload-sessions",
+            headers={"X-CSRF-Token": csrf},
+            json={},
+        ).json()["data"]["id"]
+
+        pdf_a = b"%PDF-1.4 A-" + suffix.encode()
+        pdf_b = b"%PDF-1.4 B-" + suffix.encode()
+        up = client.post(
+            f"/api/v1/upload-sessions/{session_id}/files",
+            headers={"X-CSRF-Token": csrf},
+            files=[
+                ("files", ("a.pdf", io.BytesIO(pdf_a), "application/pdf")),
+                ("files", ("b.pdf", io.BytesIO(pdf_b), "application/pdf")),
+            ],
+        )
+        assert up.status_code == 201, up.text
+        files = up.json()["data"]
+        assert len(files) == 2
+        fa, fb = files[0]["temp_file_id"], files[1]["temp_file_id"]
+        for fid in (fa, fb):
+            client.patch(
+                f"/api/v1/upload-sessions/{session_id}/files/{fid}",
+                headers={"X-CSRF-Token": csrf},
+                json={"document_type_code": codes[0]},
+            )
+
+        storage = build_object_storage()
+        key_a = f"temp/{session_id}/{fa}"
+        key_b = f"temp/{session_id}/{fb}"
+        assert storage.exists(key_a) and storage.exists(key_b)
+        before_keys = set(storage.keys())
+
+        failing = _FailOnNthCopyStorage(storage, fail_on_copy=2)
+
+        def failing_service(db: Session = Depends(get_db)) -> DocumentService:
+            return DocumentService(db, storage=failing)
+
+        application.dependency_overrides[documents_router.get_document_service] = (
+            failing_service
+        )
+
+        resolved = client.post(
+            f"/api/v1/upload-sessions/{session_id}/resolve",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "mode": "LINK_EXISTING",
+                "person_id": person_id,
+                "document_resolution": [
+                    {
+                        "temp_file_id": fa,
+                        "mode": "NEW_GROUP",
+                        "document_type_code": codes[0],
+                        "title": "A",
+                    },
+                    {
+                        "temp_file_id": fb,
+                        "mode": "NEW_GROUP",
+                        "document_type_code": codes[0],
+                        "title": "B",
+                    },
+                ],
+            },
+        )
+        assert resolved.status_code == 503, resolved.text
+        assert resolved.json()["code"] == "STORAGE_ERROR"
+    finally:
+        application.dependency_overrides.pop(
+            documents_router.get_document_service, None
+        )
+
+    try:
+        db_session.expire_all()
+        docs = (
+            db_session.execute(
+                select(Document)
+                .join(DocumentGroup, DocumentGroup.id == Document.document_group_id)
+                .where(DocumentGroup.person_id == uuid.UUID(person_id))
+            )
+            .scalars()
+            .all()
+        )
+        assert docs == []
+        groups = (
+            db_session.execute(
+                select(DocumentGroup).where(
+                    DocumentGroup.person_id == uuid.UUID(person_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert groups == []
+
+        sess = db_session.get(UploadSession, uuid.UUID(session_id))
+        assert sess is not None
+        assert sess.status == "UPLOADING"
+        temps = list(
+            db_session.execute(
+                select(UploadTempFile).where(
+                    UploadTempFile.upload_session_id == uuid.UUID(session_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(temps) == 2
+        assert storage.exists(key_a)
+        assert storage.exists(key_b)
+        after_keys = set(storage.keys())
+        new_keys = after_keys - before_keys
+        assert not any(k.startswith("documents/") for k in new_keys)
+    finally:
+        if person_id:
+            _cleanup_person(db_session, uuid.UUID(person_id))
+        if session_id:
+            _cleanup_session(db_session, uuid.UUID(session_id))
+        _cleanup_codes(db_session, codes)
+        _cleanup_user(db_session, admin.id)
+        reset_object_storage_cache()
+
+
+def test_multi_upload_partial_failure_cleans_new_only(
+    client: TestClient, db_session
+) -> None:
+    from app.db.models.upload import UploadTempFile
+    from app.storage.s3 import build_object_storage
+
+    suffix = uuid.uuid4().hex[:8]
+    admin = _create_user(db_session, login_id=f"a_{suffix}", password="Secret123!", role="ADMIN")
+    session_id = None
+    try:
+        csrf = _login(client, admin.login_id)
+        session_id = client.post(
+            "/api/v1/upload-sessions",
+            headers={"X-CSRF-Token": csrf},
+            json={},
+        ).json()["data"]["id"]
+
+        existing = b"%PDF-1.4 existing-" + suffix.encode()
+        up0 = client.post(
+            f"/api/v1/upload-sessions/{session_id}/files",
+            headers={"X-CSRF-Token": csrf},
+            files=[("files", ("existing.pdf", io.BytesIO(existing), "application/pdf"))],
+        )
+        assert up0.status_code == 201, up0.text
+        existing_id = up0.json()["data"][0]["temp_file_id"]
+        existing_key = f"temp/{session_id}/{existing_id}"
+        storage = build_object_storage()
+        assert storage.exists(existing_key)
+        before_count = (
+            db_session.execute(
+                select(UploadTempFile).where(
+                    UploadTempFile.upload_session_id == uuid.UUID(session_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(before_count) == 1
+
+        bad = client.post(
+            f"/api/v1/upload-sessions/{session_id}/files",
+            headers={"X-CSRF-Token": csrf},
+            files=[
+                ("files", ("ok.pdf", io.BytesIO(b"%PDF-1.4 ok"), "application/pdf")),
+                ("files", ("malware.exe", io.BytesIO(b"MZ"), "application/octet-stream")),
+            ],
+        )
+        assert bad.status_code == 415, bad.text
+
+        db_session.expire_all()
+        temps = list(
+            db_session.execute(
+                select(UploadTempFile).where(
+                    UploadTempFile.upload_session_id == uuid.UUID(session_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(temps) == 1
+        assert str(temps[0].id) == existing_id
+        assert storage.exists(existing_key)
+        session_prefix = f"temp/{session_id}/"
+        session_keys = [k for k in storage.keys() if k.startswith(session_prefix)]
+        assert session_keys == [existing_key]
+    finally:
+        if session_id:
+            _cleanup_session(db_session, uuid.UUID(session_id))
+        _cleanup_user(db_session, admin.id)
+
+
+def test_mime_signature_and_preview_content_type(
+    client: TestClient, db_session
+) -> None:
+    from app.db.models.document import Document
+    from app.storage.s3 import build_object_storage
+
+    suffix = uuid.uuid4().hex[:8]
+    codes = [f"DOC-RESUME-{suffix}"]
+    _ensure_code(db_session, codes[0], "DOC_TYPE", "이력서")
+    admin = _create_user(db_session, login_id=f"a_{suffix}", password="Secret123!", role="ADMIN")
+    person_id = None
+    session_id = None
+    try:
+        csrf = _login(client, admin.login_id)
+        person_id = _create_person(client, csrf, f"mime_{suffix}")
+
+        session_id = client.post(
+            "/api/v1/upload-sessions",
+            headers={"X-CSRF-Token": csrf},
+            json={},
+        ).json()["data"]["id"]
+        evil = client.post(
+            f"/api/v1/upload-sessions/{session_id}/files",
+            headers={"X-CSRF-Token": csrf},
+            files=[
+                (
+                    "files",
+                    (
+                        "evil.pdf",
+                        io.BytesIO(b"<html><script>alert(1)</script></html>"),
+                        "text/html",
+                    ),
+                )
+            ],
+        )
+        assert evil.status_code == 415, evil.text
+
+        pdf = b"%PDF-1.4 good-" + suffix.encode()
+        up = client.post(
+            f"/api/v1/upload-sessions/{session_id}/files",
+            headers={"X-CSRF-Token": csrf},
+            files=[("files", ("good.pdf", io.BytesIO(pdf), "text/html"))],
+        )
+        assert up.status_code == 201, up.text
+        assert up.json()["data"][0]["mime_type"] == "application/pdf"
+        fid = up.json()["data"][0]["temp_file_id"]
+        client.patch(
+            f"/api/v1/upload-sessions/{session_id}/files/{fid}",
+            headers={"X-CSRF-Token": csrf},
+            json={"document_type_code": codes[0]},
+        )
+        resolved = client.post(
+            f"/api/v1/upload-sessions/{session_id}/resolve",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "mode": "LINK_EXISTING",
+                "person_id": person_id,
+                "document_resolution": [
+                    {
+                        "temp_file_id": fid,
+                        "mode": "NEW_GROUP",
+                        "document_type_code": codes[0],
+                    }
+                ],
+            },
+        )
+        assert resolved.status_code == 201, resolved.text
+        doc_id = resolved.json()["data"]["document_ids"][0]
+        detail = client.get(f"/api/v1/documents/{doc_id}")
+        assert detail.json()["data"]["mime_type"] == "application/pdf"
+        prev = client.get(f"/api/v1/documents/{doc_id}/preview")
+        assert prev.status_code == 200
+        assert prev.headers["content-type"].startswith("application/pdf")
+        assert prev.headers.get("x-content-type-options") == "nosniff"
+        dl = client.get(f"/api/v1/documents/{doc_id}/download")
+        assert dl.headers.get("x-content-type-options") == "nosniff"
+        assert dl.headers["content-type"].startswith("application/pdf")
+
+        storage = build_object_storage()
+        db_session.expire_all()
+        doc = db_session.get(Document, uuid.UUID(doc_id))
+        assert doc is not None
+        preview_key = (
+            f"documents/{person_id}/{doc.document_group_id}/{doc_id}/preview.pdf"
+        )
+        storage.put_bytes(
+            preview_key, b"%PDF-1.4 preview", content_type="application/pdf"
+        )
+        doc.extension = "hwp"
+        doc.mime_type = "application/x-hwp"
+        doc.preview_storage_key = preview_key
+        db_session.add(doc)
+        db_session.commit()
+
+        prev2 = client.get(f"/api/v1/documents/{doc_id}/preview")
+        assert prev2.status_code == 200
+        assert prev2.headers["content-type"].startswith("application/pdf")
+        assert prev2.content.startswith(b"%PDF-")
+    finally:
+        if person_id:
+            _cleanup_person(db_session, uuid.UUID(person_id))
+        if session_id:
+            _cleanup_session(db_session, uuid.UUID(session_id))
+        _cleanup_codes(db_session, codes)
+        _cleanup_user(db_session, admin.id)
+
+
+def test_s3_connection_errors_become_storage_error() -> None:
+    from botocore.exceptions import EndpointConnectionError
+
+    from app.core.exceptions import StorageError
+    from app.storage.s3 import S3ObjectStorage
+
+    storage = S3ObjectStorage(
+        endpoint_url="http://127.0.0.1:1",
+        access_key="x",
+        secret_key="y",
+        bucket="bucket",
+    )
+
+    def boom(*_a, **_k):
+        raise EndpointConnectionError(endpoint_url="http://127.0.0.1:1")
+
+    storage._client.put_object = boom  # type: ignore[method-assign]
+    storage._client.head_object = boom  # type: ignore[method-assign]
+    storage._client.get_object = boom  # type: ignore[method-assign]
+    storage._client.delete_object = boom  # type: ignore[method-assign]
+    storage._client.copy_object = boom  # type: ignore[method-assign]
+    storage._client.upload_fileobj = boom  # type: ignore[method-assign]
+
+    with pytest.raises(StorageError):
+        storage.put_bytes("k", b"data")
+    with pytest.raises(StorageError):
+        storage.head("k")
+    with pytest.raises(StorageError):
+        storage.get("k")
+    with pytest.raises(StorageError):
+        storage.delete("k")
+    with pytest.raises(StorageError):
+        storage.copy("a", "b")
+    with pytest.raises(StorageError):
+        storage.put_fileobj("k", io.BytesIO(b"x"), length=1)

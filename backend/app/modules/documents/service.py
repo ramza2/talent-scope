@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import mimetypes
 import re
 import tempfile
 from datetime import UTC, datetime, timedelta
@@ -21,7 +20,6 @@ from app.core.exceptions import (
     NotImplementedAppError,
     PayloadTooLargeError,
     PreviewUnavailableError,
-    StorageError,
     UnsupportedMediaTypeError,
     ValidationAppError,
 )
@@ -31,9 +29,9 @@ from app.modules.documents.constants import (
     ALLOWED_EXTENSIONS,
     BLOCKED_EXTENSIONS,
     CONVERSION_PENDING_EXTENSIONS,
-    DOC_TYPE_PREFIX,
-    EXTENSION_MIME,
     INLINE_PREVIEW_EXTENSIONS,
+    canonical_mime,
+    validate_inline_signature,
 )
 from app.modules.documents.repository import DocumentRepository
 from app.modules.documents.schemas import (
@@ -48,7 +46,7 @@ from app.modules.documents.schemas import (
 )
 from app.modules.people.visibility import ensure_person_readable
 from app.storage.base import ObjectStorage, StoredObject
-from app.storage.s3 import build_object_storage
+from app.storage.s3 import get_object_storage
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +88,7 @@ class DocumentService:
         self.db = db
         self.repo = DocumentRepository(db)
         self.settings = settings or get_settings()
-        self.storage = storage or build_object_storage(self.settings)
+        self.storage = storage or get_object_storage()
 
     # --- helpers ---
 
@@ -240,22 +238,47 @@ class DocumentService:
 
         max_bytes = self._max_bytes()
         results: list[TempFileItem] = []
-        for upload in files:
-            item = self._ingest_one_file(session, upload, max_bytes=max_bytes)
-            results.append(item)
+        # Track only objects created by THIS request for compensation.
+        created_keys: list[str] = []
+        try:
+            for upload in files:
+                item = self._ingest_one_file(
+                    session,
+                    upload,
+                    max_bytes=max_bytes,
+                    created_keys=created_keys,
+                )
+                results.append(item)
 
-        self.repo.add_audit(
-            action_type="UPLOAD_TEMP_FILE_CREATE",
-            actor_user_id=actor_user_id,
-            target_type="UPLOAD_SESSION",
-            target_id=session.id,
-            after={"file_ids": [str(i.temp_file_id) for i in results]},
-        )
-        self.db.commit()
+            self.repo.add_audit(
+                action_type="UPLOAD_TEMP_FILE_CREATE",
+                actor_user_id=actor_user_id,
+                target_type="UPLOAD_SESSION",
+                target_id=session.id,
+                after={"file_ids": [str(i.temp_file_id) for i in results]},
+            )
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            for key in created_keys:
+                try:
+                    self.storage.delete(key)
+                except Exception:
+                    logger.warning(
+                        "upload rollback: orphan temp cleanup failed key=%s",
+                        key,
+                        exc_info=True,
+                    )
+            raise
         return results
 
     def _ingest_one_file(
-        self, session: UploadSession, upload: UploadFile, *, max_bytes: int
+        self,
+        session: UploadSession,
+        upload: UploadFile,
+        *,
+        max_bytes: int,
+        created_keys: list[str],
     ) -> TempFileItem:
         original = _normalize_filename(upload.filename or "upload.bin")
         ext = _extension_of(original)
@@ -282,12 +305,17 @@ class DocumentService:
             if size == 0:
                 raise ValidationAppError("빈 파일은 업로드할 수 없습니다.")
 
+            spool.seek(0)
+            header = spool.read(16)
+            spool.seek(0)
+            if not validate_inline_signature(ext, header):
+                raise UnsupportedMediaTypeError(
+                    f"파일 내용이 .{ext} 형식과 일치하지 않습니다."
+                )
+
+            # Never trust client-supplied Content-Type; use extension canonical MIME.
+            mime = canonical_mime(ext)
             sha256 = hasher.hexdigest()
-            mime = (
-                upload.content_type
-                or EXTENSION_MIME.get(ext)
-                or mimetypes.guess_type(original)[0]
-            )
 
             suggested_code = self._suggest_doc_type(original)
             suggested = suggested_code is not None
@@ -304,13 +332,10 @@ class DocumentService:
                 validation_status = "DUPLICATE"
                 validation_message = "동일 SHA-256 파일이 이미 존재합니다."
 
-            spool.seek(0)
-            try:
-                self.storage.put_fileobj(
-                    key, spool, length=size, content_type=mime
-                )
-            except StorageError:
-                raise
+            self.storage.put_fileobj(key, spool, length=size, content_type=mime)
+            # After put succeeds, this request owns the key for rollback cleanup —
+            # including the case where DB create_temp_file fails next.
+            created_keys.append(key)
 
             row = self.repo.create_temp_file(
                 id=file_id,
@@ -359,7 +384,11 @@ class DocumentService:
     def delete_temp_file(
         self, session_id: UUID, file_id: UUID, actor_user_id: UUID
     ) -> None:
-        """Delete storage object first, then DB row (avoid orphan objects)."""
+        """DB-authoritative delete, then best-effort storage cleanup.
+
+        MVP policy: prefer orphan temp objects over dangling DB references.
+        After COMMIT succeeds we never resurrect the DB row if storage delete fails.
+        """
         session = self._require_session(session_id, for_update=True)
         self._ensure_mutable_session(session)
         row = self.repo.get_temp_file(file_id, for_update=True)
@@ -370,12 +399,6 @@ class DocumentService:
             "original_filename": row.original_filename,
             "temp_storage_key": key,
         }
-        # Compensation: storage-first. If storage fails, keep DB so user can retry.
-        try:
-            self.storage.delete(key)
-        except StorageError:
-            logger.exception("temp object delete failed key=%s", key)
-            raise
         self.repo.delete_temp_file(file_id)
         self.repo.add_audit(
             action_type="UPLOAD_TEMP_FILE_DELETE",
@@ -385,20 +408,28 @@ class DocumentService:
             before=before,
         )
         self.db.commit()
+        try:
+            self.storage.delete(key)
+        except Exception:
+            logger.warning(
+                "temp delete: orphan object after DB commit key=%s",
+                key,
+                exc_info=True,
+            )
 
     def cancel_session(self, session_id: UUID, actor_user_id: UUID) -> None:
+        """Cancel session in DB first, then best-effort temp object cleanup.
+
+        Same orphan-over-dangling policy as ``delete_temp_file``.
+        """
         session = self._require_session(session_id, for_update=True)
         if session.status == "CANCELLED":
             return
         if session.status == "RESOLVED":
             raise ValidationAppError("이미 확정된 세션은 취소할 수 없습니다.")
         files = self.repo.list_temp_files(session_id)
+        temp_keys = [f.temp_storage_key for f in files]
         for f in files:
-            try:
-                self.storage.delete(f.temp_storage_key)
-            except StorageError:
-                logger.exception("cancel: temp delete failed key=%s", f.temp_storage_key)
-                raise
             self.repo.delete_temp_file(f.id)
         session.status = "CANCELLED"
         self.db.add(session)
@@ -410,6 +441,15 @@ class DocumentService:
             after={"status": "CANCELLED"},
         )
         self.db.commit()
+        for key in temp_keys:
+            try:
+                self.storage.delete(key)
+            except Exception:
+                logger.warning(
+                    "cancel: orphan temp after DB commit key=%s",
+                    key,
+                    exc_info=True,
+                )
 
     def identify(self, session_id: UUID) -> None:
         self._require_session(session_id)
@@ -436,17 +476,19 @@ class DocumentService:
             raise NotFoundError("인력을 찾을 수 없습니다.")
 
         document_ids: list[UUID] = []
-        created_keys: list[str] = []
+        created_permanent_keys: list[str] = []
+        source_temp_keys: list[str] = []
         try:
             for item in payload.document_resolution:
-                doc_id, dest_key = self._promote_temp_file(
+                doc_id, dest_key, temp_key = self._promote_temp_file(
                     session=session,
                     person_id=person.id,
                     item=item,
                     actor_user_id=actor_user_id,
                 )
                 document_ids.append(doc_id)
-                created_keys.append(dest_key)
+                created_permanent_keys.append(dest_key)
+                source_temp_keys.append(temp_key)
 
             session.status = "RESOLVED"
             session.resolved_person_id = person.id
@@ -464,14 +506,27 @@ class DocumentService:
             )
             self.db.commit()
         except Exception:
-            # Compensation: remove copied permanent objects if DB txn fails.
+            # ROLLBACK restores UploadTempFile rows; keep temp source objects.
+            # Only compensate permanent destinations created during this attempt.
             self.db.rollback()
-            for key in created_keys:
+            for key in created_permanent_keys:
                 try:
                     self.storage.delete(key)
                 except Exception:
                     logger.exception("compensate delete failed key=%s", key)
             raise
+
+        # COMMIT succeeded: permanent Documents are authoritative. Clean temp
+        # sources best-effort; orphan temps are preferred over data loss.
+        for key in source_temp_keys:
+            try:
+                self.storage.delete(key)
+            except Exception:
+                logger.warning(
+                    "resolve: orphan temp after successful commit key=%s",
+                    key,
+                    exc_info=True,
+                )
 
         return {
             "person_id": person.id,
@@ -486,7 +541,11 @@ class DocumentService:
         person_id: UUID,
         item: DocumentResolutionItem,
         actor_user_id: UUID,
-    ) -> tuple[UUID, str]:
+    ) -> tuple[UUID, str, str]:
+        """Copy temp→permanent and apply DB changes. Does NOT delete temp object.
+
+        Temp storage cleanup happens only after the outer resolve() COMMIT.
+        """
         temp = self.repo.get_temp_file(item.temp_file_id, for_update=True)
         if temp is None or temp.upload_session_id != session.id:
             raise NotFoundError("임시 파일을 찾을 수 없습니다.")
@@ -518,14 +577,10 @@ class DocumentService:
 
         document_id = uuid4()
         dest_key = self._document_key(person_id, group.id, document_id)
-        # copy then delete temp (S3 has no rename)
+        # S3 has no rename: COPY only here. Temp delete is deferred until COMMIT.
         self.storage.copy(temp.temp_storage_key, dest_key)
-        try:
-            self.storage.delete(temp.temp_storage_key)
-        except StorageError:
-            # Permanent copy exists; orphan temp is acceptable — log and continue.
-            logger.exception("temp cleanup after promote failed key=%s", temp.temp_storage_key)
 
+        mime = canonical_mime(temp.extension) if temp.extension else temp.mime_type
         doc = self.repo.create_document(
             id=document_id,
             document_group_id=group.id,
@@ -533,7 +588,7 @@ class DocumentService:
             is_latest=True,
             original_filename=temp.original_filename,
             extension=temp.extension,
-            mime_type=temp.mime_type,
+            mime_type=mime,
             file_size=temp.file_size,
             storage_key=dest_key,
             sha256=temp.sha256,
@@ -553,7 +608,7 @@ class DocumentService:
                 "original_filename": doc.original_filename,
             },
         )
-        return doc.id, dest_key
+        return doc.id, dest_key, temp.temp_storage_key
 
     # --- Document queries ---
 
@@ -700,21 +755,34 @@ class DocumentService:
         *,
         is_admin: bool,
         byte_range: tuple[int, int] | None = None,
-    ) -> tuple[Document, str, StoredObject]:
+    ) -> tuple[Document, str, StoredObject, str]:
+        """Open preview stream.
+
+        Returns ``(doc, filename, obj, media_type)`` where ``media_type`` is a
+        server-chosen safe Content-Type (never client-supplied upload MIME).
+        """
         self.get_document(document_id, is_admin=is_admin)
         doc = self.repo.get_document(document_id, include_deleted=is_admin)
         assert doc is not None
         key = doc.preview_storage_key
-        filename = "preview.pdf"
-        if not key:
+        if key:
+            # Preview objects are generated as PDF in this product design.
+            filename = "preview.pdf"
+            media_type = "application/pdf"
+        else:
             ext = (doc.extension or "").lower()
-            if ext in INLINE_PREVIEW_EXTENSIONS:
-                key = doc.storage_key
-                filename = doc.original_filename
-            else:
+            if ext not in INLINE_PREVIEW_EXTENSIONS:
                 raise PreviewUnavailableError()
+            key = doc.storage_key
+            filename = doc.original_filename
+            media_type = canonical_mime(ext)
         obj = self.storage.get(key, byte_range=byte_range)
-        return doc, filename, obj
+        return doc, filename, obj, media_type
+
+    def download_media_type(self, doc: Document) -> str:
+        return canonical_mime(doc.extension) if doc.extension else (
+            doc.mime_type or "application/octet-stream"
+        )
 
     def parse_range_header(
         self, range_header: str | None, total_size: int

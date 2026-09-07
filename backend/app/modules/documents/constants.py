@@ -77,3 +77,25 @@ EXTENSION_MIME: dict[str, str] = {
 }
 
 DOC_TYPE_PREFIX = "DOC-"
+
+# Magic-byte checks for formats we may serve inline without conversion.
+FILE_SIGNATURES: dict[str, tuple[bytes, ...]] = {
+    "pdf": (b"%PDF-",),
+    "png": (b"\x89PNG\r\n\x1a\n",),
+    "jpg": (b"\xff\xd8\xff",),
+    "jpeg": (b"\xff\xd8\xff",),
+}
+
+
+def canonical_mime(extension: str | None) -> str:
+    ext = (extension or "").lower().strip()
+    return EXTENSION_MIME.get(ext, "application/octet-stream")
+
+
+def validate_inline_signature(extension: str, header: bytes) -> bool:
+    """Return True when signature matches, or when no signature rule applies."""
+    ext = extension.lower().strip()
+    expected = FILE_SIGNATURES.get(ext)
+    if expected is None:
+        return True
+    return any(header.startswith(sig) for sig in expected)
