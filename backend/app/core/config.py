@@ -43,6 +43,13 @@ class Settings(BaseSettings):
     vlm_api_key: str = "change-me"
     vlm_model: str = "Qwen2.5-VL-7B-Instruct"
 
+    # Upload identify / AI runtime limits
+    ai_request_timeout_seconds: float = 60.0
+    identify_max_pages: int = 5
+    identify_max_vlm_pages: int = 3
+    identify_max_text_chars: int = 20000
+    identify_pdf_render_dpi: int = 120
+
     embedding_base_url: str = "change-me"
     embedding_api_key: str = "change-me"
     embedding_model: str = "bge-m3"

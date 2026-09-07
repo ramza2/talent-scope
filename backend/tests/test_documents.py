@@ -274,28 +274,20 @@ def test_upload_session_document_flow(client: TestClient, db_session) -> None:
         assert patched.status_code == 200, patched.text
         assert patched.json()["data"][0]["document_type_code"] == codes[0]
 
-        # identify not implemented
-        assert (
-            client.post(
-                f"/api/v1/upload-sessions/{session_id}/identify",
-                headers={"X-CSRF-Token": csrf},
-            ).status_code
-            == 501
-        )
-
-        # CREATE_NEW not implemented
+        # CREATE_NEW requires IDENTIFIED
         assert (
             client.post(
                 f"/api/v1/upload-sessions/{session_id}/resolve",
                 headers={"X-CSRF-Token": csrf},
                 json={
                     "mode": "CREATE_NEW",
+                    "identity": {"name": "테스트"},
                     "document_resolution": [
                         {"temp_file_id": file_id, "mode": "NEW_GROUP"}
                     ],
                 },
             ).status_code
-            == 501
+            == 409
         )
 
         # LINK_EXISTING NEW_GROUP

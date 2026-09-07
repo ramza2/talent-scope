@@ -68,21 +68,40 @@ class DocumentResolutionItem(BaseModel):
     title: str | None = Field(default=None, max_length=500)
 
 
+class ResolveIdentity(BaseModel):
+    """User-confirmed identity for CREATE_NEW resolve."""
+
+    name: str = Field(min_length=1, max_length=150)
+    company: str | None = Field(default=None, max_length=300)
+    phone: str | None = Field(default=None, max_length=50)
+    email: str | None = Field(default=None, max_length=255)
+
+
 class ResolveRequest(BaseModel):
     mode: Literal["LINK_EXISTING", "CREATE_NEW"]
     person_id: UUID | None = None
-    identity: dict | None = None
+    identity: ResolveIdentity | None = None
     document_resolution: list[DocumentResolutionItem] = Field(min_length=1)
 
 
 class ResolveResponseData(BaseModel):
     person_id: UUID
     document_ids: list[UUID]
+    profile_version: int
     upload_session_id: UUID
 
 
 class ResolveResponse(BaseModel):
     data: ResolveResponseData
+
+
+class IdentifyResponseData(BaseModel):
+    upload_session_id: UUID
+    status: str
+
+
+class IdentifyResponse(BaseModel):
+    data: IdentifyResponseData
 
 
 class DocumentListItem(BaseModel):

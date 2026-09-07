@@ -16,8 +16,9 @@ from sqlalchemy.orm import Session
 
 from app.core.config import Settings, get_settings
 from app.core.exceptions import (
+    AIQueueUnavailableError,
     NotFoundError,
-    NotImplementedAppError,
+    UploadSessionStateConflictError,
     PayloadTooLargeError,
     PreviewUnavailableError,
     UnsupportedMediaTypeError,
@@ -44,6 +45,8 @@ from app.modules.documents.schemas import (
     UploadSessionCreateRequest,
     UploadSessionDetail,
 )
+from app.modules.people.repository import PeopleRepository
+from app.modules.people.snapshot import build_confirmed_profile_snapshot
 from app.modules.people.visibility import ensure_person_readable
 from app.storage.base import ObjectStorage, StoredObject
 from app.storage.s3 import get_object_storage
@@ -117,6 +120,26 @@ class DocumentService:
                 f"상태가 {session.status}인 세션은 변경할 수 없습니다."
             )
 
+    def _ensure_file_mutable_session(self, session: UploadSession) -> None:
+        """File mutations blocked while IDENTIFYING or terminal."""
+        if session.status == "IDENTIFYING":
+            raise UploadSessionStateConflictError(
+                "인력 식별이 진행 중에는 파일을 변경할 수 없습니다."
+            )
+        self._ensure_mutable_session(session)
+
+    def _invalidate_identity_if_needed(self, session: UploadSession) -> None:
+        """Clear stale identify results after file mutations on IDENTIFIED."""
+        if session.status != "IDENTIFIED":
+            return
+        session.status = "UPLOADING"
+        session.identified_name = None
+        session.identified_company = None
+        session.identified_phone = None
+        session.identified_email = None
+        session.duplicate_result_json = []
+        self.db.add(session)
+
     def _validate_doc_type(self, code: str, *, require_active: bool = True) -> None:
         row = self.repo.get_code(code)
         if row is None or row.code_type != "DOC_TYPE":
@@ -168,7 +191,14 @@ class DocumentService:
     ) -> UploadSessionDetail:
         files = [self._temp_item(f) for f in self.repo.list_temp_files(session.id)]
         identity = None
-        if session.identified_name or session.identified_company:
+        if any(
+            [
+                session.identified_name,
+                session.identified_company,
+                session.identified_phone,
+                session.identified_email,
+            ]
+        ):
             identity = {
                 "name": session.identified_name,
                 "company": session.identified_company,
@@ -226,7 +256,7 @@ class DocumentService:
         actor_user_id: UUID,
     ) -> list[TempFileItem]:
         session = self._require_session(session_id, for_update=True)
-        self._ensure_mutable_session(session)
+        self._ensure_file_mutable_session(session)
         if not files:
             raise ValidationAppError("업로드할 파일이 없습니다.")
 
@@ -250,6 +280,7 @@ class DocumentService:
                 )
                 results.append(item)
 
+            self._invalidate_identity_if_needed(session)
             self.repo.add_audit(
                 action_type="UPLOAD_TEMP_FILE_CREATE",
                 actor_user_id=actor_user_id,
@@ -360,7 +391,7 @@ class DocumentService:
         actor_user_id: UUID,
     ) -> TempFileItem:
         session = self._require_session(session_id, for_update=True)
-        self._ensure_mutable_session(session)
+        self._ensure_file_mutable_session(session)
         row = self.repo.get_temp_file(file_id, for_update=True)
         if row is None or row.upload_session_id != session_id:
             raise NotFoundError("임시 파일을 찾을 수 없습니다.")
@@ -369,6 +400,7 @@ class DocumentService:
         before = {"document_type_code": row.document_type_code}
         row.document_type_code = code
         self.db.add(row)
+        self._invalidate_identity_if_needed(session)
         self.repo.add_audit(
             action_type="UPLOAD_TEMP_FILE_UPDATE",
             actor_user_id=actor_user_id,
@@ -390,7 +422,7 @@ class DocumentService:
         After COMMIT succeeds we never resurrect the DB row if storage delete fails.
         """
         session = self._require_session(session_id, for_update=True)
-        self._ensure_mutable_session(session)
+        self._ensure_file_mutable_session(session)
         row = self.repo.get_temp_file(file_id, for_update=True)
         if row is None or row.upload_session_id != session_id:
             raise NotFoundError("임시 파일을 찾을 수 없습니다.")
@@ -400,6 +432,7 @@ class DocumentService:
             "temp_storage_key": key,
         }
         self.repo.delete_temp_file(file_id)
+        self._invalidate_identity_if_needed(session)
         self.repo.add_audit(
             action_type="UPLOAD_TEMP_FILE_DELETE",
             actor_user_id=actor_user_id,
@@ -451,29 +484,88 @@ class DocumentService:
                     exc_info=True,
                 )
 
-    def identify(self, session_id: UUID) -> None:
-        self._require_session(session_id)
-        raise NotImplementedAppError(
-            "AI identify는 다음 단계에서 구현됩니다."
-        )
+    def identify(self, session_id: UUID) -> dict:
+        """Start async identity extraction. Returns 202 payload fields."""
+        session = self._require_session(session_id, for_update=True)
+        if session.status in {"RESOLVED", "CANCELLED", "EXPIRED"}:
+            raise UploadSessionStateConflictError(
+                f"상태가 {session.status}인 세션은 식별할 수 없습니다."
+            )
+        if session.status == "IDENTIFYING":
+            # Idempotent: do not enqueue a second task.
+            return {"upload_session_id": session.id, "status": "IDENTIFYING"}
 
-    # --- Resolve / promote (LINK_EXISTING only this PR) ---
+        if session.status not in {"UPLOADING", "IDENTIFIED"}:
+            raise UploadSessionStateConflictError(
+                f"상태가 {session.status}인 세션은 식별할 수 없습니다."
+            )
+
+        files = self.repo.list_temp_files(session_id)
+        if not files:
+            raise ValidationAppError("식별할 업로드 파일이 없습니다.")
+
+        previous_status = session.status
+        session.status = "IDENTIFYING"
+        self.db.add(session)
+        self.repo.add_audit(
+            action_type="UPLOAD_SESSION_IDENTIFY_START",
+            actor_user_id=session.created_by,
+            target_type="UPLOAD_SESSION",
+            target_id=session.id,
+            after={"status": "IDENTIFYING", "previous_status": previous_status},
+        )
+        self.db.commit()
+
+        from app.tasks.analysis_tasks import enqueue_upload_identify
+
+        try:
+            enqueue_upload_identify(session_id)
+        except Exception:
+            logger.exception("identify enqueue failed session_id=%s", session_id)
+            # Restore prior status so the session is not stuck IDENTIFYING.
+            session = self._require_session(session_id, for_update=True)
+            if session.status == "IDENTIFYING":
+                session.status = previous_status
+                self.db.add(session)
+                self.db.commit()
+            raise AIQueueUnavailableError()
+
+        return {"upload_session_id": session_id, "status": "IDENTIFYING"}
+
+    # --- Resolve / promote ---
 
     def resolve(
         self, session_id: UUID, payload: ResolveRequest, actor_user_id: UUID
     ) -> dict:
         if payload.mode == "CREATE_NEW":
-            raise NotImplementedAppError(
-                "CREATE_NEW resolve(AI identify 연계)는 다음 단계에서 구현됩니다."
-            )
+            return self._resolve_create_new(session_id, payload, actor_user_id)
+        return self._resolve_link_existing(session_id, payload, actor_user_id)
+
+    def _resolve_link_existing(
+        self, session_id: UUID, payload: ResolveRequest, actor_user_id: UUID
+    ) -> dict:
         if payload.person_id is None:
             raise ValidationAppError("LINK_EXISTING에는 person_id가 필요합니다.")
 
         session = self._require_session(session_id, for_update=True)
-        self._ensure_mutable_session(session)
+        if session.status == "IDENTIFYING":
+            raise UploadSessionStateConflictError(
+                "인력 식별이 진행 중에는 확정할 수 없습니다."
+            )
+        if session.status not in {"UPLOADING", "IDENTIFIED"}:
+            raise ValidationAppError(
+                f"상태가 {session.status}인 세션은 확정할 수 없습니다."
+            )
+
         person = self.repo.get_person(payload.person_id, for_update=True)
-        if person is None:
+        if person is None or person.deleted_at is not None or person.status == "DELETED":
             raise NotFoundError("인력을 찾을 수 없습니다.")
+
+        people_repo = PeopleRepository(self.db)
+        profile = people_repo.get_profile(person.id, for_update=True)
+        if profile is None:
+            raise NotFoundError("인력 프로필을 찾을 수 없습니다.")
+        profile_version = int(profile.profile_version)
 
         document_ids: list[UUID] = []
         created_permanent_keys: list[str] = []
@@ -506,8 +598,6 @@ class DocumentService:
             )
             self.db.commit()
         except Exception:
-            # ROLLBACK restores UploadTempFile rows; keep temp source objects.
-            # Only compensate permanent destinations created during this attempt.
             self.db.rollback()
             for key in created_permanent_keys:
                 try:
@@ -516,8 +606,6 @@ class DocumentService:
                     logger.exception("compensate delete failed key=%s", key)
             raise
 
-        # COMMIT succeeded: permanent Documents are authoritative. Clean temp
-        # sources best-effort; orphan temps are preferred over data loss.
         for key in source_temp_keys:
             try:
                 self.storage.delete(key)
@@ -528,13 +616,134 @@ class DocumentService:
                     exc_info=True,
                 )
 
-        # Enqueue only after successful commit. Broker failure must not undo Documents.
         self._enqueue_processing(document_ids)
 
         return {
             "person_id": person.id,
             "document_ids": document_ids,
+            "profile_version": profile_version,
             "upload_session_id": session.id,
+        }
+
+    def _resolve_create_new(
+        self, session_id: UUID, payload: ResolveRequest, actor_user_id: UUID
+    ) -> dict:
+        if payload.identity is None:
+            raise ValidationAppError("CREATE_NEW에는 identity가 필요합니다.")
+        identity = payload.identity
+        name = identity.name.strip()
+        if not name:
+            raise ValidationAppError("이름은 필수입니다.")
+
+        for item in payload.document_resolution:
+            if item.mode != "NEW_GROUP":
+                raise ValidationAppError(
+                    "CREATE_NEW에서는 NEW_GROUP만 허용됩니다."
+                )
+
+        session = self._require_session(session_id, for_update=True)
+        if session.status != "IDENTIFIED":
+            raise UploadSessionStateConflictError(
+                "CREATE_NEW는 IDENTIFIED 상태에서만 가능합니다."
+            )
+
+        people_repo = PeopleRepository(self.db)
+        document_ids: list[UUID] = []
+        created_permanent_keys: list[str] = []
+        source_temp_keys: list[str] = []
+        person_id: UUID | None = None
+        try:
+            person = people_repo.create_person(created_by=actor_user_id)
+            person_id = person.id
+            profile = people_repo.create_profile(
+                person.id,
+                name=name[:150],
+                phone=(identity.phone.strip()[:50] if identity.phone else None),
+                email=(identity.email.strip()[:255] if identity.email else None),
+                affiliation_company=(
+                    identity.company.strip()[:300] if identity.company else None
+                ),
+            )
+            snapshot = build_confirmed_profile_snapshot(self.db, person.id)
+            people_repo.add_revision(
+                person_id=person.id,
+                revision_no=profile.profile_version,
+                snapshot=snapshot,
+                created_by=actor_user_id,
+                source_type="USER",
+            )
+            people_repo.add_audit(
+                action_type="PERSON_CREATE",
+                actor_user_id=actor_user_id,
+                person_id=person.id,
+                after={
+                    "name": profile.name,
+                    "affiliation_company": profile.affiliation_company,
+                    "phone": profile.phone,
+                    "email": profile.email,
+                },
+                metadata={
+                    "upload_session_id": str(session.id),
+                    "source": "UPLOAD_IDENTIFY",
+                },
+            )
+            people_repo.enqueue_rebuild_person(person.id, profile.profile_version)
+
+            for item in payload.document_resolution:
+                doc_id, dest_key, temp_key = self._promote_temp_file(
+                    session=session,
+                    person_id=person.id,
+                    item=item,
+                    actor_user_id=actor_user_id,
+                    created_permanent_keys=created_permanent_keys,
+                )
+                document_ids.append(doc_id)
+                source_temp_keys.append(temp_key)
+
+            session.status = "RESOLVED"
+            session.resolved_person_id = person.id
+            self.db.add(session)
+            self.repo.add_audit(
+                action_type="UPLOAD_SESSION_RESOLVE",
+                actor_user_id=actor_user_id,
+                target_type="UPLOAD_SESSION",
+                target_id=session.id,
+                after={
+                    "mode": "CREATE_NEW",
+                    "person_id": str(person.id),
+                    "document_ids": [str(i) for i in document_ids],
+                },
+                metadata={"source": "UPLOAD_IDENTIFY"},
+            )
+            self.db.commit()
+            profile_version = int(profile.profile_version)
+        except Exception:
+            self.db.rollback()
+            for key in created_permanent_keys:
+                try:
+                    self.storage.delete(key)
+                except Exception:
+                    logger.exception("compensate delete failed key=%s", key)
+            raise
+
+        for key in source_temp_keys:
+            try:
+                self.storage.delete(key)
+            except Exception:
+                logger.warning(
+                    "resolve: orphan temp after successful commit key=%s",
+                    key,
+                    exc_info=True,
+                )
+
+        self._enqueue_processing(document_ids)
+
+        assert person_id is not None
+        return {
+            "person_id": person_id,
+            "document_ids": document_ids,
+            "profile_version": profile_version,
+            "upload_session_id": session_id,
         }
 
     def _enqueue_processing(self, document_ids: list[UUID]) -> None:

@@ -1,5 +1,20 @@
 import { apiFetch, ApiError } from '@/api/client'
 
+export type IdentityInfo = {
+  name?: string | null
+  company?: string | null
+  phone?: string | null
+  email?: string | null
+}
+
+export type DuplicateCandidate = {
+  person_id: string
+  name: string
+  company?: string | null
+  match_reasons: string[]
+  score: number
+}
+
 export type UploadSession = {
   id: string
   status: string
@@ -8,6 +23,8 @@ export type UploadSession = {
   created_at: string
   expires_at?: string | null
   files: TempFileItem[]
+  identity?: IdentityInfo | null
+  duplicate_candidates?: DuplicateCandidate[]
 }
 
 export type TempFileItem = {
@@ -40,6 +57,14 @@ export type DocumentListItem = {
   processing_error?: string | null
   uploaded_at: string
   deleted_at?: string | null
+}
+
+export type DocumentResolutionItem = {
+  temp_file_id: string
+  mode: 'NEW_GROUP' | 'NEW_VERSION'
+  document_group_id?: string
+  document_type_code?: string
+  title?: string
 }
 
 function readCsrf(): string | undefined {
@@ -105,22 +130,39 @@ export function cancelUploadSession(sessionId: string) {
   return apiFetch<void>(`/upload-sessions/${sessionId}`, { method: 'DELETE' })
 }
 
+export function identifyUploadSession(sessionId: string) {
+  return apiFetch<{ data: { upload_session_id: string; status: string } }>(
+    `/upload-sessions/${sessionId}/identify`,
+    { method: 'POST', body: JSON.stringify({}) },
+  )
+}
+
 export function resolveUploadSession(
   sessionId: string,
-  body: {
-    mode: 'LINK_EXISTING'
-    person_id: string
-    document_resolution: Array<{
-      temp_file_id: string
-      mode: 'NEW_GROUP' | 'NEW_VERSION'
-      document_group_id?: string
-      document_type_code?: string
-      title?: string
-    }>
-  },
+  body:
+    | {
+        mode: 'LINK_EXISTING'
+        person_id: string
+        document_resolution: DocumentResolutionItem[]
+      }
+    | {
+        mode: 'CREATE_NEW'
+        identity: {
+          name: string
+          company?: string | null
+          phone?: string | null
+          email?: string | null
+        }
+        document_resolution: DocumentResolutionItem[]
+      },
 ) {
   return apiFetch<{
-    data: { person_id: string; document_ids: string[]; upload_session_id: string }
+    data: {
+      person_id: string
+      document_ids: string[]
+      profile_version: number
+      upload_session_id: string
+    }
   }>(`/upload-sessions/${sessionId}/resolve`, {
     method: 'POST',
     body: JSON.stringify(body),
@@ -219,4 +261,15 @@ export function formatFileSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+}
+
+export function matchReasonLabel(reason: string): string {
+  const map: Record<string, string> = {
+    EMAIL_EXACT: '이메일 일치',
+    PHONE_EXACT: '전화번호 일치',
+    NAME_EXACT: '이름 일치',
+    COMPANY_EXACT: '회사 일치',
+    NAME_COMPANY_EXACT: '이름+회사 일치',
+  }
+  return map[reason] ?? reason
 }
