@@ -23,6 +23,13 @@ class Settings(BaseSettings):
     s3_access_key: str = "change-me"
     s3_secret_key: str = "change-me"
     s3_bucket: str = "talent-scope"
+    # Force path-style for MinIO / local S3-compatible endpoints.
+    s3_force_path_style: bool = True
+
+    # Upload limits (docs/15 — 413 on exceed)
+    upload_max_file_size_mb: int = 50
+    upload_max_files_per_session: int = 20
+    upload_session_ttl_hours: int = 24
 
     llm_base_url: str = "https://alzi-llm.openlink.kr"
     llm_api_key: str = "change-me"

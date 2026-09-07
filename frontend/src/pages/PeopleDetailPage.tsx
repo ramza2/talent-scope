@@ -40,6 +40,7 @@ import {
   type TechnicalGrade,
 } from '@/api/people'
 import { useAuthMe } from '@/app/auth'
+import { DocumentsTab } from '@/pages/people/DocumentsTab'
 import { EducationCertTab } from '@/pages/people/EducationCertTab'
 import { ProjectCareerTab } from '@/pages/people/ProjectCareerTab'
 
@@ -525,6 +526,17 @@ export function PeopleDetailPage() {
             label: '학력·자격',
             children: (
               <EducationCertTab
+                personId={personId}
+                isAdmin={isAdmin}
+                onChanged={invalidateAll}
+              />
+            ),
+          },
+          {
+            key: 'documents',
+            label: '문서',
+            children: (
+              <DocumentsTab
                 personId={personId}
                 isAdmin={isAdmin}
                 onChanged={invalidateAll}

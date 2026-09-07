@@ -232,3 +232,50 @@ class InvalidProjectCustomerTypeCodeError(ValidationAppError):
 
     def __init__(self, detail: str | None = None) -> None:
         super().__init__(detail or "유효하지 않은 프로젝트 고객유형 코드입니다.")
+
+
+class PayloadTooLargeError(TalentScopeError):
+    code = "PAYLOAD_TOO_LARGE"
+    title = "Payload too large"
+    status_code = 413
+
+    def __init__(self, detail: str | None = None) -> None:
+        super().__init__(detail or "업로드 용량 또는 파일 개수 제한을 초과했습니다.")
+
+
+class UnsupportedMediaTypeError(TalentScopeError):
+    code = "UNSUPPORTED_MEDIA_TYPE"
+    title = "Unsupported media type"
+    status_code = 415
+
+    def __init__(self, detail: str | None = None) -> None:
+        super().__init__(detail or "지원하지 않는 파일 형식입니다.")
+
+
+class PreviewUnavailableError(ConflictError):
+    code = "PREVIEW_UNAVAILABLE"
+    title = "Preview unavailable"
+
+    def __init__(self, detail: str | None = None) -> None:
+        super().__init__(
+            detail
+            or "미리보기가 아직 준비되지 않았습니다. 변환이 필요한 형식입니다."
+        )
+
+
+class NotImplementedAppError(TalentScopeError):
+    code = "NOT_IMPLEMENTED"
+    title = "Not implemented"
+    status_code = 501
+
+    def __init__(self, detail: str | None = None) -> None:
+        super().__init__(detail or "아직 구현되지 않은 기능입니다.")
+
+
+class StorageError(TalentScopeError):
+    code = "STORAGE_ERROR"
+    title = "Storage error"
+    status_code = 503
+
+    def __init__(self, detail: str | None = None) -> None:
+        super().__init__(detail or "객체 저장소 처리에 실패했습니다.")
