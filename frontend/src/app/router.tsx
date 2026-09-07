@@ -3,6 +3,7 @@ import { createBrowserRouter } from 'react-router-dom'
 import { MainLayout } from '@/layouts/MainLayout'
 import { DashboardPage } from '@/pages/DashboardPage'
 import { PeopleListPage } from '@/pages/PeopleListPage'
+import { PeopleDetailPage } from '@/pages/PeopleDetailPage'
 import { PeopleNewPage } from '@/pages/PeopleNewPage'
 import { AnalysesPage } from '@/pages/AnalysesPage'
 import { SearchPage } from '@/pages/SearchPage'
@@ -40,6 +41,7 @@ export const router = createBrowserRouter([
               { path: 'admin/analyses', element: <AdminAnalysesPage /> },
             ],
           },
+          { path: 'people/:personId', element: <PeopleDetailPage /> },
           { path: '*', element: <NotFoundPage /> },
         ],
       },
