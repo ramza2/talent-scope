@@ -834,6 +834,23 @@ Query 예:
 /evidence?target_type=PERSON_SKILL&target_id={id}&field_name=tech_code
 ```
 
+`target_type` vocabulary (Confirm EvidenceLink와 동일):
+
+- `PERSON_PROFILE`
+- `PERSON_JOB`
+- `PERSON_SKILL`
+- `PERSON_EXPERTISE`
+- `EMPLOYMENT_HISTORY`
+- `EDUCATION`
+- `CERTIFICATION`
+- `PROJECT`
+
+Project relation EvidenceLink는 `target_type=PROJECT`, `target_id=Project.id`이며
+`field_name`은 `skills:TECH-LANG-PYTHON`처럼 `relation:code` convention을 사용한다.
+
+Review `MODIFIED` Diff는 Analysis 이력용 Evidence/AnalysisDiffEvidence만 만들고
+운영 Entity `SUPPORTS` EvidenceLink는 생성하지 않는다.
+
 Response:
 
 ```json

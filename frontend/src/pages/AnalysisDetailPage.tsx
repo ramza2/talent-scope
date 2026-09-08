@@ -2,6 +2,7 @@ import { useState } from 'react'
 import {
   Alert,
   Button,
+  Drawer,
   Form,
   Input,
   Modal,
@@ -18,6 +19,8 @@ import type { ColumnsType } from 'antd/es/table'
 import type { Key } from 'react'
 
 import { apiErrorCode, apiErrorMessage } from '@/api/errors'
+import { documentPreviewUrl } from '@/api/documents'
+import { getEvidence, type EvidenceDetail } from '@/api/evidence'
 import {
   bulkReviewDiffs,
   buildDefaultModifiedDecision,
@@ -37,6 +40,7 @@ import {
   type AnalysisStatus,
   type ChangeType,
   type DiffItem,
+  type EvidenceLite,
   type ReviewStatus,
 } from '@/api/analyses'
 
@@ -119,6 +123,9 @@ export function AnalysisDetailPage() {
   const [mergeOpen, setMergeOpen] = useState(false)
   const [confirmOpen, setConfirmOpen] = useState(false)
   const [editingDiff, setEditingDiff] = useState<DiffItem | null>(null)
+  const [evidenceOpen, setEvidenceOpen] = useState(false)
+  const [evidenceDetail, setEvidenceDetail] = useState<EvidenceDetail | null>(null)
+  const [evidenceLoading, setEvidenceLoading] = useState(false)
   const [editForm] = Form.useForm<{ decided_value: string }>()
   const [mergeForm] = Form.useForm<{
     existing_target_id: string
@@ -298,6 +305,22 @@ export function AnalysisDetailPage() {
     })
   }
 
+  const openEvidence = async (item: EvidenceLite) => {
+    if (!item.id) return
+    setEvidenceOpen(true)
+    setEvidenceLoading(true)
+    setEvidenceDetail(null)
+    try {
+      const res = await getEvidence(item.id)
+      setEvidenceDetail(res.data)
+    } catch (error) {
+      message.error(apiErrorMessage(error, '근거를 불러오지 못했습니다.'))
+      setEvidenceOpen(false)
+    } finally {
+      setEvidenceLoading(false)
+    }
+  }
+
   const columns: ColumnsType<DiffItem> = [
     {
       title: 'Entity',
@@ -342,6 +365,38 @@ export function AnalysisDetailPage() {
           {formatValue(v)}
         </Typography.Paragraph>
       ),
+    },
+    {
+      title: '문서 근거',
+      key: 'evidence',
+      width: 200,
+      render: (_, row) => {
+        const items = row.evidence ?? []
+        if (!items.length) {
+          return <Typography.Text type="secondary">—</Typography.Text>
+        }
+        return (
+          <Space direction="vertical" size={2}>
+            {items.slice(0, 3).map((ev, idx) => (
+              <div key={ev.id || `${row.id}-ev-${idx}`}>
+                <Typography.Text
+                  ellipsis
+                  style={{ maxWidth: 160, display: 'inline-block' }}
+                  title={ev.quote_text || undefined}
+                >
+                  {ev.page_no != null ? `p.${ev.page_no} ` : ''}
+                  {ev.quote_text || '근거'}
+                </Typography.Text>
+                {ev.id ? (
+                  <Button type="link" size="small" onClick={() => void openEvidence(ev)}>
+                    근거 보기
+                  </Button>
+                ) : null}
+              </div>
+            ))}
+          </Space>
+        )
+      },
     },
     {
       title: 'Confidence',
@@ -684,6 +739,90 @@ export function AnalysisDetailPage() {
           확정 후 Profile Version이 +1 되고, 검색 인덱스 갱신 작업이 대기열에 등록됩니다.
         </Typography.Paragraph>
       </Modal>
+
+      <Drawer
+        title="문서 근거"
+        open={evidenceOpen}
+        onClose={() => {
+          setEvidenceOpen(false)
+          setEvidenceDetail(null)
+        }}
+        width={480}
+        destroyOnHidden
+      >
+        {evidenceLoading ? (
+          <Typography.Text>불러오는 중…</Typography.Text>
+        ) : evidenceDetail ? (
+          <Space direction="vertical" size="middle" style={{ width: '100%' }}>
+            <div>
+              <Typography.Text type="secondary">문서</Typography.Text>
+              <div>
+                {evidenceDetail.document.title ||
+                  evidenceDetail.document.original_filename ||
+                  evidenceDetail.document.id}
+              </div>
+              {evidenceDetail.document.original_filename ? (
+                <Typography.Text type="secondary">
+                  {evidenceDetail.document.original_filename}
+                  {evidenceDetail.document.version_no != null
+                    ? ` v${evidenceDetail.document.version_no}`
+                    : ''}
+                </Typography.Text>
+              ) : null}
+            </div>
+            <div>
+              <Typography.Text type="secondary">페이지</Typography.Text>
+              <div>{evidenceDetail.page_no ?? '—'}</div>
+            </div>
+            <div>
+              <Typography.Text type="secondary">추출방식</Typography.Text>
+              <div>{evidenceDetail.extraction_method || '—'}</div>
+            </div>
+            <div>
+              <Typography.Text type="secondary">원문 인용</Typography.Text>
+              <Typography.Paragraph
+                style={{
+                  whiteSpace: 'pre-wrap',
+                  background: 'rgba(0,0,0,0.04)',
+                  padding: 8,
+                  marginTop: 4,
+                }}
+              >
+                {evidenceDetail.quote_text || '—'}
+              </Typography.Paragraph>
+            </div>
+            <div>
+              <Typography.Text type="secondary">연결 대상</Typography.Text>
+              {(evidenceDetail.links || []).length === 0 ? (
+                <div>—</div>
+              ) : (
+                evidenceDetail.links.map((link, i) => (
+                  <div key={`${link.target_id}-${link.field_name || ''}-${i}`}>
+                    {link.target_type}
+                    {link.field_name ? ` · ${link.field_name}` : ''}
+                    {' · '}
+                    {link.relation_type}
+                  </div>
+                ))
+              )}
+            </div>
+            <Button
+              type="primary"
+              href={documentPreviewUrl(evidenceDetail.document.id)}
+              target="_blank"
+              rel="noreferrer"
+            >
+              문서 보기
+              {evidenceDetail.page_no != null ? ` (p.${evidenceDetail.page_no})` : ''}
+            </Button>
+            <Typography.Text type="secondary">
+              Preview가 페이지 이동을 지원하지 않으면 문서만 열고 페이지 번호를 참고하세요.
+            </Typography.Text>
+          </Space>
+        ) : (
+          <Typography.Text type="secondary">근거 데이터가 없습니다.</Typography.Text>
+        )}
+      </Drawer>
     </div>
   )
 }

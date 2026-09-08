@@ -462,7 +462,28 @@ class AnalysisService:
             review_status=review_status,
             entity_type=entity_type,
         )
-        return [self._to_diff_response(row) for row in rows]
+        evidence_map: dict[UUID, list[EvidenceLite]] | None = None
+        if run.status == "CONFIRMED" and rows:
+            from app.modules.evidence.repository import EvidenceRepository
+
+            by_diff = EvidenceRepository(self.db).list_evidence_by_diff_ids(
+                [row.id for row in rows]
+            )
+            evidence_map = {
+                diff_id: [
+                    EvidenceLite(
+                        id=ev.id,
+                        document_id=ev.document_id,
+                        page_no=ev.page_no,
+                        quote_text=ev.quote_text,
+                    )
+                    for ev in evidences
+                ]
+                for diff_id, evidences in by_diff.items()
+            }
+        return [
+            self._to_diff_response(row, evidence_map=evidence_map) for row in rows
+        ]
 
     # ----------------------------------------------------------------- review
 
@@ -755,7 +776,16 @@ class AnalysisService:
             updated_at=run.updated_at,
         )
 
-    def _to_diff_response(self, row: AnalysisDiffItem) -> DiffItemResponse:
+    def _to_diff_response(
+        self,
+        row: AnalysisDiffItem,
+        *,
+        evidence_map: dict[UUID, list[EvidenceLite]] | None = None,
+    ) -> DiffItemResponse:
+        if evidence_map is not None and row.id in evidence_map and evidence_map[row.id]:
+            evidence = evidence_map[row.id]
+        else:
+            evidence = _evidence_from_new_value(row.new_value)
         return DiffItemResponse(
             id=row.id,
             entity_type=row.entity_type,
@@ -771,7 +801,7 @@ class AnalysisService:
             decided_value=row.decided_value,
             decided_by=row.decided_by,
             decided_at=row.decided_at,
-            evidence=_evidence_from_new_value(row.new_value),
+            evidence=evidence,
         )
 
 

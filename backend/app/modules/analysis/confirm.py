@@ -43,6 +43,11 @@ from app.modules.analysis.confirm_dates import assert_date_order, normalize_conf
 from app.modules.analysis.repository import AnalysisRepository
 from app.modules.analysis.schemas import ConfirmAnalysisResponseData
 from app.modules.career.repository import CareerRepository
+from app.modules.evidence.materializer import (
+    AppliedTargetRegistry,
+    materialize_confirm_evidence,
+    project_relation_field_name,
+)
 from app.modules.people.repository import PeopleRepository
 from app.modules.people.snapshot import build_confirmed_profile_snapshot
 from app.modules.projects.repository import ProjectRepository
@@ -469,6 +474,14 @@ def confirm_analysis_run(
     ctx.apply_all(diffs)
 
     db.flush()
+    evidence_stats = materialize_confirm_evidence(
+        db,
+        run=run,
+        diffs=diffs,
+        person_id=run.person_id,
+        registry=ctx.applied,
+    )
+    db.flush()
     version = people_repo.bump_profile_version(profile)
     people_repo.touch_person(person)
     snapshot = build_confirmed_profile_snapshot(db, person.id)
@@ -496,6 +509,9 @@ def confirm_analysis_run(
             "person_id": str(person.id),
             "base_profile_version": run.base_profile_version,
             "profile_version": version,
+            "evidence_count": evidence_stats.evidence_count,
+            "evidence_link_count": evidence_stats.evidence_link_count,
+            "diff_evidence_count": evidence_stats.diff_evidence_count,
             **counts,
         },
     )
@@ -697,6 +713,16 @@ class _ConfirmContext:
         self.locked_education = locked_education or {}
         self.locked_certifications = locked_certifications or {}
         self.locked_projects = locked_projects or {}
+        self.applied = AppliedTargetRegistry()
+
+    def _register(
+        self,
+        diff: AnalysisDiffItem,
+        target_type: str,
+        target_id: UUID,
+        field_name: str | None = None,
+    ) -> None:
+        self.applied.register(diff.id, target_type, target_id, field_name)
 
     def apply_all(self, diffs: list[AnalysisDiffItem]) -> None:
         project_roots: list[AnalysisDiffItem] = []
@@ -802,6 +828,7 @@ class _ConfirmContext:
         coerced = self._coerce_profile_value(field, value)
         setattr(self.profile, field, coerced)
         self.db.add(self.profile)
+        self._register(diff, "PERSON_PROFILE", self.person_id, field)
 
     def _coerce_profile_value(self, field: str, value: Any) -> Any:
         if field == "name":
@@ -876,21 +903,23 @@ class _ConfirmContext:
             )
         ).scalar_one_or_none()
         if existing is not None:
+            self._register(diff, "PERSON_JOB", existing.id, "job_code")
             return
         if diff.change_type not in {"NEW", "REVIEW"}:
             # Additive only — unexpected change types with ACCEPTED still insert.
             pass
-        self.db.add(
-            PersonJob(
-                person_id=self.person_id,
-                job_code=code,
-                job_type=job_type,
-                sort_order=_as_sort_order(data.get("sort_order")),
-                source_type="AI_CONFIRMED",
-                is_active=True,
-                confirmed_at=self.now,
-            )
+        row = PersonJob(
+            person_id=self.person_id,
+            job_code=code,
+            job_type=job_type,
+            sort_order=_as_sort_order(data.get("sort_order")),
+            source_type="AI_CONFIRMED",
+            is_active=True,
+            confirmed_at=self.now,
         )
+        self.db.add(row)
+        self.db.flush()
+        self._register(diff, "PERSON_JOB", row.id, "job_code")
 
     def _apply_tech(self, diff: AnalysisDiffItem) -> None:
         if diff.change_type == "SAME":
@@ -932,6 +961,7 @@ class _ConfirmContext:
                         field="is_representative",
                     )
                 self.db.add(existing)
+                self._register(diff, "PERSON_SKILL", existing.id, "tech_code")
                 return
 
             if status == "ACCEPTED" and diff.change_type in {
@@ -957,6 +987,7 @@ class _ConfirmContext:
                         existing.is_representative = True
                 # Preserve existing.source_type.
                 self.db.add(existing)
+            self._register(diff, "PERSON_SKILL", existing.id, "tech_code")
             return
 
         # NEW PersonSkill — Candidate/decided values may create the row.
@@ -986,17 +1017,18 @@ class _ConfirmContext:
             else:
                 is_rep = False
 
-        self.db.add(
-            PersonSkill(
-                person_id=self.person_id,
-                tech_code=code,
-                last_used_year=last_used,
-                experience_months=exp_months,
-                is_representative=is_rep,
-                source_type="AI_CONFIRMED",
-                confirmed_at=self.now,
-            )
+        row = PersonSkill(
+            person_id=self.person_id,
+            tech_code=code,
+            last_used_year=last_used,
+            experience_months=exp_months,
+            is_representative=is_rep,
+            source_type="AI_CONFIRMED",
+            confirmed_at=self.now,
         )
+        self.db.add(row)
+        self.db.flush()
+        self._register(diff, "PERSON_SKILL", row.id, "tech_code")
 
     def _apply_exp(self, diff: AnalysisDiffItem) -> None:
         if diff.change_type == "SAME":
@@ -1024,20 +1056,28 @@ class _ConfirmContext:
         if existing is not None:
             existing.evidence_type = evidence
             self.db.add(existing)
+            self._register(diff, "PERSON_EXPERTISE", existing.id, "exp_code")
             return
 
-        self.db.add(
-            PersonExpertise(
-                person_id=self.person_id,
-                exp_code=code,
-                evidence_type=evidence,
-                source_type="AI_CONFIRMED",
-                confirmed_at=self.now,
-            )
+        row = PersonExpertise(
+            person_id=self.person_id,
+            exp_code=code,
+            evidence_type=evidence,
+            source_type="AI_CONFIRMED",
+            confirmed_at=self.now,
         )
+        self.db.add(row)
+        self.db.flush()
+        self._register(diff, "PERSON_EXPERTISE", row.id, "exp_code")
 
     # ----------------------------------------- employment/education/certification
 
+    def _career_target_type(self, name_field: str) -> str:
+        if name_field == "company_name":
+            return "EMPLOYMENT_HISTORY"
+        if name_field == "school_name":
+            return "EDUCATION"
+        return "CERTIFICATION"
     def _apply_career_entity(
         self,
         diff: AnalysisDiffItem,
@@ -1085,6 +1125,9 @@ class _ConfirmContext:
                     # decided_value fields applied explicitly (overwrite).
                     self._overwrite_career(row, data, fields=fields)
                 toucher(row)
+                self._register(
+                    diff, self._career_target_type(name_field), row.id, None
+                )
                 return
 
             # NEW root or REVIEW without target → create
@@ -1101,7 +1144,13 @@ class _ConfirmContext:
                     )
                 payload[name_field] = name
                 payload["source_type"] = "AI_CONFIRMED"
-                creator(self.person_id, **payload)
+                created = creator(self.person_id, **payload)
+                self._register(
+                    diff,
+                    self._career_target_type(name_field),
+                    created.id,
+                    None,
+                )
                 return
 
         raise ConfirmValidationError(
@@ -1132,6 +1181,14 @@ class _ConfirmContext:
         setattr(row, field, coerced)
         self._assert_career_dates(row)
         toucher(row)
+        target_type = (
+            "EMPLOYMENT_HISTORY"
+            if isinstance(row, EmploymentHistory)
+            else "EDUCATION"
+            if isinstance(row, Education)
+            else "CERTIFICATION"
+        )
+        self._register(diff, target_type, row.id, field)
 
     def _career_create_payload(
         self, data: dict[str, Any], *, fields: frozenset[str]
@@ -1256,6 +1313,7 @@ class _ConfirmContext:
                 )
             self.project_repo.touch(project)
             self.project_ids_by_index[idx] = project.id
+            self._register(diff, "PROJECT", project.id, None)
             return
 
         if status not in {"ACCEPTED", "MODIFIED"}:
@@ -1283,6 +1341,7 @@ class _ConfirmContext:
         )
         self._add_project_relations_from_payload(project.id, data)
         self.project_ids_by_index[idx] = project.id
+        self._register(diff, "PROJECT", project.id, None)
 
     def _apply_project_child(self, diff: AnalysisDiffItem) -> None:
         status = diff.review_status
@@ -1318,6 +1377,17 @@ class _ConfirmContext:
         if field in _PROJECT_RELATION_FIELDS:
             self._apply_project_relation_diff(diff, project.id, field)
             self.project_repo.touch(project)
+            applied = _applied_value(diff)
+            code = _extract_code(
+                applied if not isinstance(applied, str) else {"code": applied}
+            )
+            if code:
+                self._register(
+                    diff,
+                    "PROJECT",
+                    project.id,
+                    project_relation_field_name(field, code),
+                )
             return
 
         if field in _PROJECT_SCALAR_FIELDS:
@@ -1331,6 +1401,7 @@ class _ConfirmContext:
             except ValueError as exc:
                 raise ConfirmValidationError(str(exc)) from exc
             self.project_repo.touch(project)
+            self._register(diff, "PROJECT", project.id, field)
             return
 
         raise ConfirmValidationError(
