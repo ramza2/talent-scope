@@ -2417,3 +2417,251 @@ def test_confirm_applies_profile_job_tech_project(
     assert run.status == "CONFIRMED"
     assert run.confirmed_by == user.id
     assert run.confirmed_at is not None
+
+
+def test_confirm_permissions_and_incomplete(client: TestClient, db_session):
+    from app.db.models.analysis import AnalysisDiffItem, AnalysisRun
+
+    admin = _create_user(
+        db_session, login_id=f"ca_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    user = _create_user(
+        db_session,
+        login_id=f"cu_{uuid.uuid4().hex[:10]}",
+        password="Passw0rd!",
+        role="USER",
+    )
+    csrf_admin = _login(client, admin.login_id, "Passw0rd!")
+    person, document = _seed_person_with_ready_doc(db_session, admin.id)
+    analysis_id = client.post(
+        "/api/v1/analyses",
+        headers={"X-CSRF-Token": csrf_admin},
+        json={
+            "person_id": str(person.id),
+            "document_ids": [str(document.id)],
+            "analysis_type": "PROFILE",
+        },
+    ).json()["data"]["analysis_id"]
+
+    run = db_session.execute(
+        select(AnalysisRun).where(AnalysisRun.id == uuid.UUID(analysis_id))
+    ).scalar_one()
+    run.status = "PROCESSING"
+    db_session.add(run)
+    db_session.commit()
+    assert (
+        client.post(
+            f"/api/v1/analyses/{analysis_id}/confirm",
+            headers={"X-CSRF-Token": csrf_admin},
+            json={"expected_profile_version": 1},
+        ).status_code
+        == 409
+    )
+
+    run.status = "REVIEWING"
+    db_session.add(
+        AnalysisDiffItem(
+            analysis_run_id=run.id,
+            entity_type="PROFILE",
+            candidate_path="profile.phone",
+            field_name="phone",
+            change_type="NEW",
+            new_value="010",
+            review_status="PENDING",
+        )
+    )
+    db_session.commit()
+
+    assert (
+        client.post(
+            f"/api/v1/analyses/{analysis_id}/confirm",
+            json={"expected_profile_version": 1},
+        ).status_code
+        == 403
+    )
+
+    incomplete = client.post(
+        f"/api/v1/analyses/{analysis_id}/confirm",
+        headers={"X-CSRF-Token": csrf_admin},
+        json={"expected_profile_version": 1},
+    )
+    assert incomplete.status_code == 409
+    assert incomplete.json()["code"] == "ANALYSIS_REVIEW_INCOMPLETE"
+
+    client.post("/api/v1/auth/logout", headers={"X-CSRF-Token": csrf_admin})
+    _login(client, user.login_id, "Passw0rd!")
+    assert (
+        client.post(
+            f"/api/v1/analyses/{analysis_id}/confirm",
+            json={"expected_profile_version": 1},
+        ).status_code
+        == 403
+    )
+
+    from app.db.models.user import AppUser
+    from app.db.models.revision import AuditLog
+
+    db_session.execute(delete(AuditLog).where(AuditLog.user_id == user.id))
+    db_session.execute(delete(AppUser).where(AppUser.id == user.id))
+    db_session.commit()
+    _cleanup_person(db_session, person.id, admin.id)
+
+
+def test_confirm_dates_and_version_base_lock(client: TestClient, db_session):
+    from datetime import date
+
+    from app.db.models.analysis import AnalysisDiffItem, AnalysisRun
+    from app.db.models.person import EmploymentHistory, PersonProfile
+    from app.modules.analysis.confirm_dates import normalize_confirmed_date
+
+    assert normalize_confirmed_date("2020", bound="start") == date(2020, 1, 1)
+    assert normalize_confirmed_date("2020", bound="end") == date(2020, 12, 31)
+    assert normalize_confirmed_date("2020-03", bound="start") == date(2020, 3, 1)
+    assert normalize_confirmed_date("2020-03", bound="end") == date(2020, 3, 31)
+
+    admin = _create_user(
+        db_session, login_id=f"cd_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    csrf = _login(client, admin.login_id, "Passw0rd!")
+    person, document = _seed_person_with_ready_doc(db_session, admin.id)
+    analysis_id = client.post(
+        "/api/v1/analyses",
+        headers={"X-CSRF-Token": csrf},
+        json={
+            "person_id": str(person.id),
+            "document_ids": [str(document.id)],
+            "analysis_type": "PROFILE",
+        },
+    ).json()["data"]["analysis_id"]
+
+    run = db_session.execute(
+        select(AnalysisRun).where(AnalysisRun.id == uuid.UUID(analysis_id))
+    ).scalar_one()
+    run.status = "REVIEWING"
+    run.base_profile_version = 1
+    emp_diff = AnalysisDiffItem(
+        analysis_run_id=run.id,
+        entity_type="EMPLOYMENT",
+        candidate_path="employment_history[0]",
+        change_type="NEW",
+        new_value={
+            "company_name": "DateCo",
+            "start_date": "2020",
+            "end_date": "2020-03",
+            "title": "Dev",
+        },
+        review_status="ACCEPTED",
+    )
+    db_session.add(emp_diff)
+    # Bump live profile to v2 while analysis is still base v1
+    profile = db_session.execute(
+        select(PersonProfile).where(PersonProfile.person_id == person.id)
+    ).scalar_one()
+    profile.profile_version = 2
+    db_session.add(profile)
+    db_session.commit()
+
+    conflict = client.post(
+        f"/api/v1/analyses/{analysis_id}/confirm",
+        headers={"X-CSRF-Token": csrf},
+        json={"expected_profile_version": 2},
+    )
+    assert conflict.status_code == 409
+    assert conflict.json()["code"] == "PROFILE_VERSION_CONFLICT"
+
+    profile.profile_version = 1
+    db_session.add(profile)
+    db_session.commit()
+
+    ok = client.post(
+        f"/api/v1/analyses/{analysis_id}/confirm",
+        headers={"X-CSRF-Token": csrf},
+        json={"expected_profile_version": 1},
+    )
+    assert ok.status_code == 200, ok.text
+    rows = list(
+        db_session.execute(
+            select(EmploymentHistory).where(EmploymentHistory.person_id == person.id)
+        ).scalars()
+    )
+    assert any(
+        r.company_name == "DateCo"
+        and r.start_date == date(2020, 1, 1)
+        and r.end_date == date(2020, 3, 31)
+        for r in rows
+    )
+
+    # Idempotent second confirm
+    again = client.post(
+        f"/api/v1/analyses/{analysis_id}/confirm",
+        headers={"X-CSRF-Token": csrf},
+        json={"expected_profile_version": 1},
+    )
+    assert again.status_code == 200
+    assert again.json()["data"]["profile_version"] == 2
+    assert (
+        len(
+            list(
+                db_session.execute(
+                    select(EmploymentHistory).where(
+                        EmploymentHistory.person_id == person.id,
+                        EmploymentHistory.company_name == "DateCo",
+                    )
+                ).scalars()
+            )
+        )
+        == 1
+    )
+
+    _cleanup_person(db_session, person.id, admin.id)
+
+
+def test_confirm_rejects_unmapped_code_accept(client: TestClient, db_session):
+    from app.db.models.analysis import AnalysisDiffItem, AnalysisRun
+    from app.db.models.person import PersonProfile
+
+    admin = _create_user(
+        db_session, login_id=f"uc_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    csrf = _login(client, admin.login_id, "Passw0rd!")
+    person, document = _seed_person_with_ready_doc(db_session, admin.id)
+    analysis_id = client.post(
+        "/api/v1/analyses",
+        headers={"X-CSRF-Token": csrf},
+        json={
+            "person_id": str(person.id),
+            "document_ids": [str(document.id)],
+            "analysis_type": "PROFILE",
+        },
+    ).json()["data"]["analysis_id"]
+    run = db_session.execute(
+        select(AnalysisRun).where(AnalysisRun.id == uuid.UUID(analysis_id))
+    ).scalar_one()
+    run.status = "REVIEWING"
+    db_session.add(
+        AnalysisDiffItem(
+            analysis_run_id=run.id,
+            entity_type="TECH",
+            candidate_path="skills[0]",
+            change_type="REVIEW",
+            new_value={"raw_value": "UnknownFramework", "code": None},
+            review_status="ACCEPTED",
+        )
+    )
+    db_session.commit()
+
+    resp = client.post(
+        f"/api/v1/analyses/{analysis_id}/confirm",
+        headers={"X-CSRF-Token": csrf},
+        json={"expected_profile_version": 1},
+    )
+    assert resp.status_code == 400
+    assert resp.json()["code"] == "CONFIRM_VALIDATION_ERROR"
+    profile = db_session.execute(
+        select(PersonProfile).where(PersonProfile.person_id == person.id)
+    ).scalar_one()
+    assert profile.profile_version == 1
+    db_session.refresh(run)
+    assert run.status == "REVIEWING"
+
+    _cleanup_person(db_session, person.id, admin.id)

@@ -17,13 +17,16 @@ import { useNavigate, useParams } from 'react-router-dom'
 import type { ColumnsType } from 'antd/es/table'
 import type { Key } from 'react'
 
-import { apiErrorMessage } from '@/api/errors'
+import { apiErrorCode, apiErrorMessage } from '@/api/errors'
 import {
   bulkReviewDiffs,
   confidenceColor,
   confidenceLabel,
+  confirmAnalysis,
+  countPendingActionableDiffs,
   getAnalysis,
   isActiveAnalysisStatus,
+  isProjectRootReview,
   listAnalysisDiffs,
   reviewDiff,
   type AnalysisStatus,
@@ -145,6 +148,7 @@ export function AnalysisDetailPage() {
   const [selectedKeys, setSelectedKeys] = useState<Key[]>([])
   const [editOpen, setEditOpen] = useState(false)
   const [mergeOpen, setMergeOpen] = useState(false)
+  const [confirmOpen, setConfirmOpen] = useState(false)
   const [editingDiff, setEditingDiff] = useState<DiffItem | null>(null)
   const [editForm] = Form.useForm<{ decided_value: string }>()
   const [mergeForm] = Form.useForm<{
@@ -185,6 +189,17 @@ export function AnalysisDetailPage() {
     },
     enabled: Boolean(analysisId) && showDiffs,
   })
+
+  const allDiffsQuery = useQuery({
+    queryKey: ['analyses', analysisId, 'diffs', 'all-for-confirm'],
+    queryFn: () => listAnalysisDiffs(analysisId),
+    enabled: Boolean(analysisId) && showDiffs,
+  })
+  const pendingActionable = countPendingActionableDiffs(allDiffsQuery.data?.data ?? [])
+  const canConfirm =
+    analysis?.status === 'REVIEWING' &&
+    pendingActionable === 0 &&
+    analysis.base_profile_version != null
 
   const invalidateDetail = async () => {
     await queryClient.invalidateQueries({ queryKey: ['analyses', analysisId] })
@@ -228,6 +243,28 @@ export function AnalysisDetailPage() {
     },
   })
 
+  const confirmMutation = useMutation({
+    mutationFn: () =>
+      confirmAnalysis(analysisId, {
+        expected_profile_version: analysis!.base_profile_version!,
+      }),
+    onSuccess: async (res) => {
+      message.success('AI 분석 결과가 프로필에 반영되었습니다.')
+      setConfirmOpen(false)
+      await invalidateDetail()
+      await queryClient.invalidateQueries({ queryKey: ['people', res.data.person_id] })
+    },
+    onError: (error) => {
+      if (apiErrorCode(error) === 'PROFILE_VERSION_CONFLICT') {
+        message.error(
+          '분석 이후 인력 프로필이 변경되었습니다. 현재 분석 결과를 그대로 확정할 수 없습니다. 최신 프로필 기준으로 다시 분석해 주세요.',
+        )
+        return
+      }
+      message.error(apiErrorMessage(error, '최종 확정에 실패했습니다.'))
+    },
+  })
+
   const openModify = (diff: DiffItem) => {
     setEditingDiff(diff)
     editForm.setFieldsValue({ decided_value: defaultDecidedValue(diff) })
@@ -254,12 +291,11 @@ export function AnalysisDetailPage() {
         message.error('JSON 형식이 올바르지 않습니다.')
         return
       }
-    } else if (
-      editingDiff.field_name === 'birth_year' ||
-      editingDiff.field_name === 'career_document_value'
-    ) {
+    } else if (editingDiff.field_name === 'birth_year') {
       const n = Number(values.decided_value)
       decided = Number.isNaN(n) ? values.decided_value : n
+    } else {
+      decided = values.decided_value
     }
     await decisionMutation.mutateAsync({
       diffId: editingDiff.id,
@@ -389,7 +425,7 @@ export function AnalysisDetailPage() {
             <Button type="link" size="small" onClick={() => openModify(row)}>
               수정
             </Button>
-            {row.entity_type === 'PROJECT' && row.change_type === 'REVIEW' ? (
+            {isProjectRootReview(row) ? (
               <Button type="link" size="small" onClick={() => openMerge(row)}>
                 병합
               </Button>
@@ -453,7 +489,15 @@ export function AnalysisDetailPage() {
           <Typography.Text type="secondary">
             생성 {formatDate(analysis.created_at)} · 완료 {formatDate(analysis.completed_at)}
           </Typography.Text>
-          <TooltipConfirmNotice />
+          {analysis.status === 'CONFIRMED' ? (
+            <Button type="primary" onClick={() => navigate(`/people/${analysis.person.id}`)}>
+              인력 상세 보기
+            </Button>
+          ) : analysis.status === 'REVIEWING' ? (
+            <Button type="primary" disabled={!canConfirm} onClick={() => setConfirmOpen(true)}>
+              최종 확정
+            </Button>
+          ) : null}
         </Space>
       </Space>
 
@@ -466,17 +510,22 @@ export function AnalysisDetailPage() {
         />
       ) : (
         <>
-          <Alert
-            type="warning"
-            showIcon
-            style={{ marginBottom: 16 }}
-            message="최종 확정은 다음 단계에서 제공됩니다."
-            action={
-              <Button disabled type="primary">
-                최종 확정
-              </Button>
-            }
-          />
+          {analysis.status === 'REVIEWING' && pendingActionable > 0 ? (
+            <Alert
+              type="warning"
+              showIcon
+              style={{ marginBottom: 16 }}
+              message={`미검토 항목 ${pendingActionable}건 — 모두 결정한 뒤 최종 확정할 수 있습니다.`}
+            />
+          ) : null}
+          {analysis.status === 'CONFIRMED' ? (
+            <Alert
+              type="success"
+              showIcon
+              style={{ marginBottom: 16 }}
+              message="확정 완료 — 검색 인덱스 갱신 대기(PENDING)일 수 있습니다."
+            />
+          ) : null}
 
           <Tabs
             activeKey={filterTab}
@@ -608,14 +657,31 @@ export function AnalysisDetailPage() {
           </Form.Item>
         </Form>
       </Modal>
-    </div>
-  )
-}
 
-function TooltipConfirmNotice() {
-  return (
-    <Button disabled title="최종 확정은 다음 단계에서 제공됩니다.">
-      최종 확정
-    </Button>
+      <Modal
+        title="최종 확정"
+        open={confirmOpen}
+        onCancel={() => setConfirmOpen(false)}
+        onOk={() => confirmMutation.mutate()}
+        confirmLoading={confirmMutation.isPending}
+        okText="확정"
+        destroyOnHidden
+      >
+        <Typography.Paragraph>
+          검토 결과를 운영 프로필에 반영합니다.
+        </Typography.Paragraph>
+        <Typography.Paragraph>
+          Base Profile Version:{' '}
+          <strong>
+            {analysis?.base_profile_version != null
+              ? `v${analysis.base_profile_version}`
+              : '—'}
+          </strong>
+        </Typography.Paragraph>
+        <Typography.Paragraph type="secondary">
+          확정 후 Profile Version이 +1 되고, 검색 인덱스 갱신 작업이 대기열에 등록됩니다.
+        </Typography.Paragraph>
+      </Modal>
+    </div>
   )
 }
