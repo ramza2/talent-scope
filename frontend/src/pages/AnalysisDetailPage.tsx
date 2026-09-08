@@ -23,6 +23,7 @@ import {
   confidenceColor,
   confidenceLabel,
   confirmAnalysis,
+  canConfirmAnalysis,
   countPendingActionableDiffs,
   getAnalysis,
   isActiveAnalysisStatus,
@@ -196,10 +197,12 @@ export function AnalysisDetailPage() {
     enabled: Boolean(analysisId) && showDiffs,
   })
   const pendingActionable = countPendingActionableDiffs(allDiffsQuery.data?.data ?? [])
-  const canConfirm =
-    analysis?.status === 'REVIEWING' &&
-    pendingActionable === 0 &&
-    analysis.base_profile_version != null
+  const canConfirm = canConfirmAnalysis({
+    status: analysis?.status,
+    diffsQuerySuccess: allDiffsQuery.isSuccess,
+    pendingActionable,
+    baseProfileVersion: analysis?.base_profile_version,
+  })
 
   const invalidateDetail = async () => {
     await queryClient.invalidateQueries({ queryKey: ['analyses', analysisId] })

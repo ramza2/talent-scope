@@ -2665,3 +2665,699 @@ def test_confirm_rejects_unmapped_code_accept(client: TestClient, db_session):
     assert run.status == "REVIEWING"
 
     _cleanup_person(db_session, person.id, admin.id)
+
+
+def _ensure_analysis_code(db_session, code: str, code_type: str, name: str) -> None:
+    from app.db.models.code import CodeMaster
+
+    if db_session.get(CodeMaster, code) is None:
+        db_session.add(
+            CodeMaster(
+                code=code,
+                code_type=code_type,
+                name=name,
+                sort_order=1,
+                is_active=True,
+            )
+        )
+        db_session.commit()
+
+
+def _start_reviewing_analysis(client, db_session, csrf: str, person, document):
+    from app.db.models.analysis import AnalysisRun
+
+    analysis_id = client.post(
+        "/api/v1/analyses",
+        headers={"X-CSRF-Token": csrf},
+        json={
+            "person_id": str(person.id),
+            "document_ids": [str(document.id)],
+            "analysis_type": "PROFILE",
+        },
+    ).json()["data"]["analysis_id"]
+    run = db_session.execute(
+        select(AnalysisRun).where(AnalysisRun.id == uuid.UUID(analysis_id))
+    ).scalar_one()
+    run.status = "REVIEWING"
+    run.base_profile_version = 1
+    db_session.add(run)
+    db_session.commit()
+    return analysis_id, run
+
+
+def test_confirm_tech_accepted_preserves_missing_metadata(client: TestClient, db_session):
+    from datetime import UTC, datetime
+
+    from app.db.models.analysis import AnalysisDiffItem
+    from app.db.models.person import PersonSkill
+
+    admin = _create_user(
+        db_session, login_id=f"tp_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    csrf = _login(client, admin.login_id, "Passw0rd!")
+    person, document = _seed_person_with_ready_doc(db_session, admin.id)
+    db_session.add(
+        PersonSkill(
+            person_id=person.id,
+            tech_code="TECH-LANG-PYTHON",
+            last_used_year=2024,
+            experience_months=60,
+            is_representative=True,
+            source_type="USER",
+            confirmed_at=datetime.now(UTC),
+        )
+    )
+    db_session.commit()
+
+    analysis_id, run = _start_reviewing_analysis(
+        client, db_session, csrf, person, document
+    )
+    db_session.add(
+        AnalysisDiffItem(
+            analysis_run_id=run.id,
+            entity_type="TECH",
+            candidate_path="skills[0]",
+            change_type="UPDATE",
+            old_value={
+                "code": "TECH-LANG-PYTHON",
+                "last_used_year": 2024,
+                "experience_months": 60,
+                "is_representative": True,
+            },
+            new_value={
+                "code": "TECH-LANG-PYTHON",
+                "last_used_year": 2026,
+                "experience_months": None,
+                "is_representative": False,
+            },
+            review_status="ACCEPTED",
+        )
+    )
+    db_session.commit()
+
+    resp = client.post(
+        f"/api/v1/analyses/{analysis_id}/confirm",
+        headers={"X-CSRF-Token": csrf},
+        json={"expected_profile_version": 1},
+    )
+    assert resp.status_code == 200, resp.text
+    db_session.expire_all()
+    skill = db_session.execute(
+        select(PersonSkill).where(
+            PersonSkill.person_id == person.id,
+            PersonSkill.tech_code == "TECH-LANG-PYTHON",
+        )
+    ).scalar_one()
+    assert skill.last_used_year == 2026
+    assert skill.experience_months == 60
+    assert skill.is_representative is True
+    assert skill.source_type == "USER"
+
+    _cleanup_person(db_session, person.id, admin.id)
+
+
+def test_confirm_tech_modified_explicit_false(client: TestClient, db_session):
+    from datetime import UTC, datetime
+
+    from app.db.models.analysis import AnalysisDiffItem
+    from app.db.models.person import PersonSkill
+
+    admin = _create_user(
+        db_session, login_id=f"tm_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    csrf = _login(client, admin.login_id, "Passw0rd!")
+    person, document = _seed_person_with_ready_doc(db_session, admin.id)
+    db_session.add(
+        PersonSkill(
+            person_id=person.id,
+            tech_code="TECH-LANG-PYTHON",
+            last_used_year=2024,
+            experience_months=60,
+            is_representative=True,
+            source_type="USER",
+            confirmed_at=datetime.now(UTC),
+        )
+    )
+    db_session.commit()
+
+    analysis_id, run = _start_reviewing_analysis(
+        client, db_session, csrf, person, document
+    )
+    db_session.add(
+        AnalysisDiffItem(
+            analysis_run_id=run.id,
+            entity_type="TECH",
+            candidate_path="skills[0]",
+            change_type="UPDATE",
+            old_value={"code": "TECH-LANG-PYTHON", "is_representative": True},
+            new_value={"code": "TECH-LANG-PYTHON", "is_representative": False},
+            decided_value={
+                "code": "TECH-LANG-PYTHON",
+                "is_representative": False,
+            },
+            review_status="MODIFIED",
+        )
+    )
+    db_session.commit()
+
+    resp = client.post(
+        f"/api/v1/analyses/{analysis_id}/confirm",
+        headers={"X-CSRF-Token": csrf},
+        json={"expected_profile_version": 1},
+    )
+    assert resp.status_code == 200, resp.text
+    db_session.expire_all()
+    skill = db_session.execute(
+        select(PersonSkill).where(
+            PersonSkill.person_id == person.id,
+            PersonSkill.tech_code == "TECH-LANG-PYTHON",
+        )
+    ).scalar_one()
+    assert skill.is_representative is False
+    assert skill.last_used_year == 2024
+    assert skill.experience_months == 60
+    assert skill.source_type == "USER"
+
+    _cleanup_person(db_session, person.id, admin.id)
+
+
+def test_confirm_invalid_tech_metadata_rolls_back(client: TestClient, db_session):
+    from datetime import UTC, datetime
+
+    from app.db.models.analysis import AnalysisDiffItem, AnalysisRun
+    from app.db.models.person import PersonProfile, PersonSkill
+    from app.db.models.project import Project
+    from app.db.models.revision import AuditLog, ProfileRevision
+    from app.db.models.search import SearchIndexJob
+
+    admin = _create_user(
+        db_session, login_id=f"ti_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    csrf = _login(client, admin.login_id, "Passw0rd!")
+    person, document = _seed_person_with_ready_doc(db_session, admin.id)
+    profile = db_session.execute(
+        select(PersonProfile).where(PersonProfile.person_id == person.id)
+    ).scalar_one()
+    original_name = profile.name
+    original_grade = profile.technical_grade
+    db_session.add(
+        PersonSkill(
+            person_id=person.id,
+            tech_code="TECH-LANG-PYTHON",
+            last_used_year=2024,
+            experience_months=60,
+            is_representative=True,
+            source_type="USER",
+            confirmed_at=datetime.now(UTC),
+        )
+    )
+    db_session.commit()
+
+    analysis_id, run = _start_reviewing_analysis(
+        client, db_session, csrf, person, document
+    )
+    db_session.add_all(
+        [
+            AnalysisDiffItem(
+                analysis_run_id=run.id,
+                entity_type="PROFILE",
+                candidate_path="profile.technical_grade",
+                field_name="technical_grade",
+                change_type="UPDATE",
+                old_value="ADVANCED",
+                new_value="EXPERT",
+                review_status="ACCEPTED",
+            ),
+            AnalysisDiffItem(
+                analysis_run_id=run.id,
+                entity_type="TECH",
+                candidate_path="skills[0]",
+                change_type="UPDATE",
+                new_value={
+                    "code": "TECH-LANG-PYTHON",
+                    "experience_months": "abc",
+                },
+                review_status="ACCEPTED",
+            ),
+        ]
+    )
+    db_session.commit()
+
+    resp = client.post(
+        f"/api/v1/analyses/{analysis_id}/confirm",
+        headers={"X-CSRF-Token": csrf},
+        json={"expected_profile_version": 1},
+    )
+    assert resp.status_code == 400
+    assert resp.json()["code"] == "CONFIRM_VALIDATION_ERROR"
+
+    db_session.expire_all()
+    profile = db_session.execute(
+        select(PersonProfile).where(PersonProfile.person_id == person.id)
+    ).scalar_one()
+    assert profile.name == original_name
+    assert profile.technical_grade == original_grade
+    assert profile.profile_version == 1
+    skill = db_session.execute(
+        select(PersonSkill).where(PersonSkill.person_id == person.id)
+    ).scalar_one()
+    assert skill.experience_months == 60
+    assert skill.is_representative is True
+    assert (
+        db_session.execute(
+            select(Project).where(Project.person_id == person.id)
+        ).scalars().first()
+        is None
+    )
+    assert (
+        db_session.execute(
+            select(ProfileRevision).where(
+                ProfileRevision.person_id == person.id,
+                ProfileRevision.revision_no == 2,
+            )
+        ).scalar_one_or_none()
+        is None
+    )
+    assert (
+        list(
+            db_session.execute(
+                select(SearchIndexJob).where(SearchIndexJob.person_id == person.id)
+            ).scalars()
+        )
+        == []
+    )
+    assert (
+        list(
+            db_session.execute(
+                select(AuditLog).where(
+                    AuditLog.action_type == "ANALYSIS_CONFIRM",
+                    AuditLog.target_id == uuid.UUID(analysis_id),
+                )
+            ).scalars()
+        )
+        == []
+    )
+    run = db_session.execute(
+        select(AnalysisRun).where(AnalysisRun.id == uuid.UUID(analysis_id))
+    ).scalar_one()
+    assert run.status == "REVIEWING"
+    assert run.confirmed_by is None
+    assert run.confirmed_at is None
+
+    # negative months also rejected
+    for d in db_session.execute(
+        select(AnalysisDiffItem).where(AnalysisDiffItem.analysis_run_id == run.id)
+    ).scalars():
+        if d.entity_type == "TECH":
+            d.new_value = {"code": "TECH-LANG-PYTHON", "experience_months": -1}
+            db_session.add(d)
+    db_session.commit()
+    resp2 = client.post(
+        f"/api/v1/analyses/{analysis_id}/confirm",
+        headers={"X-CSRF-Token": csrf},
+        json={"expected_profile_version": 1},
+    )
+    assert resp2.status_code == 400
+    assert resp2.json()["code"] == "CONFIRM_VALIDATION_ERROR"
+
+    _cleanup_person(db_session, person.id, admin.id)
+
+
+def test_confirm_merged_preserves_project_exp_evidence(client: TestClient, db_session):
+    from app.db.models.analysis import AnalysisDiffItem
+    from app.db.models.project import Project, ProjectExpertise
+
+    _ensure_analysis_code(db_session, "EXP-AI-AGENT", "EXP", "Agent")
+    admin = _create_user(
+        db_session, login_id=f"me_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    csrf = _login(client, admin.login_id, "Passw0rd!")
+    person, document = _seed_person_with_ready_doc(db_session, admin.id)
+    project = Project(
+        person_id=person.id,
+        project_name="기존 프로젝트",
+        source_type="USER",
+    )
+    db_session.add(project)
+    db_session.flush()
+    db_session.add(
+        ProjectExpertise(
+            project_id=project.id,
+            exp_code="EXP-AI-RAG",
+            evidence_type="INFERRED",
+        )
+    )
+    db_session.commit()
+
+    analysis_id, run = _start_reviewing_analysis(
+        client, db_session, csrf, person, document
+    )
+    db_session.add(
+        AnalysisDiffItem(
+            analysis_run_id=run.id,
+            entity_type="PROJECT",
+            candidate_path="projects[0]",
+            change_type="REVIEW",
+            existing_target_id=project.id,
+            new_value={
+                "project_name": "기존 프로젝트",
+                "expertise": [
+                    {"code": "EXP-AI-RAG"},
+                    {"code": "EXP-AI-AGENT"},
+                ],
+            },
+            review_status="MERGED",
+        )
+    )
+    db_session.commit()
+
+    resp = client.post(
+        f"/api/v1/analyses/{analysis_id}/confirm",
+        headers={"X-CSRF-Token": csrf},
+        json={"expected_profile_version": 1},
+    )
+    assert resp.status_code == 200, resp.text
+    db_session.expire_all()
+    rows = list(
+        db_session.execute(
+            select(ProjectExpertise).where(ProjectExpertise.project_id == project.id)
+        ).scalars()
+    )
+    by_code = {r.exp_code: r for r in rows}
+    assert set(by_code) == {"EXP-AI-RAG", "EXP-AI-AGENT"}
+    assert by_code["EXP-AI-RAG"].evidence_type == "INFERRED"
+    assert by_code["EXP-AI-AGENT"].evidence_type == "EXPLICIT"
+
+    _cleanup_person(db_session, person.id, admin.id)
+
+
+def test_confirm_rejects_invalid_explicit_job_and_evidence(
+    client: TestClient, db_session
+):
+    from app.db.models.analysis import AnalysisDiffItem
+
+    admin = _create_user(
+        db_session, login_id=f"ij_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    csrf = _login(client, admin.login_id, "Passw0rd!")
+    person, document = _seed_person_with_ready_doc(db_session, admin.id)
+    analysis_id, run = _start_reviewing_analysis(
+        client, db_session, csrf, person, document
+    )
+    db_session.add(
+        AnalysisDiffItem(
+            analysis_run_id=run.id,
+            entity_type="JOB",
+            candidate_path="jobs[0]",
+            change_type="NEW",
+            new_value={"code": "JOB-AI-DEV", "job_type": "INVALID_TYPE"},
+            review_status="ACCEPTED",
+        )
+    )
+    db_session.commit()
+    bad_job = client.post(
+        f"/api/v1/analyses/{analysis_id}/confirm",
+        headers={"X-CSRF-Token": csrf},
+        json={"expected_profile_version": 1},
+    )
+    assert bad_job.status_code == 400
+    assert bad_job.json()["code"] == "CONFIRM_VALIDATION_ERROR"
+
+    # Replace with invalid evidence_type
+    for d in db_session.execute(
+        select(AnalysisDiffItem).where(AnalysisDiffItem.analysis_run_id == run.id)
+    ).scalars():
+        db_session.delete(d)
+    db_session.add(
+        AnalysisDiffItem(
+            analysis_run_id=run.id,
+            entity_type="EXP",
+            candidate_path="expertise[0]",
+            change_type="NEW",
+            new_value={"code": "EXP-AI-RAG", "evidence_type": "GUESSED"},
+            review_status="ACCEPTED",
+        )
+    )
+    db_session.commit()
+    bad_exp = client.post(
+        f"/api/v1/analyses/{analysis_id}/confirm",
+        headers={"X-CSRF-Token": csrf},
+        json={"expected_profile_version": 1},
+    )
+    assert bad_exp.status_code == 400
+    assert bad_exp.json()["code"] == "CONFIRM_VALIDATION_ERROR"
+
+    _cleanup_person(db_session, person.id, admin.id)
+
+
+def test_confirm_revision_failure_rolls_back(
+    client: TestClient, db_session, monkeypatch: pytest.MonkeyPatch
+):
+    from app.db.models.analysis import AnalysisDiffItem, AnalysisRun
+    from app.db.models.person import PersonProfile
+    from app.db.models.revision import AuditLog, ProfileRevision
+    from app.db.models.search import SearchIndexJob
+
+    admin = _create_user(
+        db_session, login_id=f"rf_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    csrf = _login(client, admin.login_id, "Passw0rd!")
+    person, document = _seed_person_with_ready_doc(db_session, admin.id)
+    profile = db_session.execute(
+        select(PersonProfile).where(PersonProfile.person_id == person.id)
+    ).scalar_one()
+    original_grade = profile.technical_grade
+
+    analysis_id, run = _start_reviewing_analysis(
+        client, db_session, csrf, person, document
+    )
+    db_session.add(
+        AnalysisDiffItem(
+            analysis_run_id=run.id,
+            entity_type="PROFILE",
+            candidate_path="profile.technical_grade",
+            field_name="technical_grade",
+            change_type="UPDATE",
+            old_value="ADVANCED",
+            new_value="EXPERT",
+            review_status="ACCEPTED",
+        )
+    )
+    db_session.commit()
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("revision injection")
+
+    monkeypatch.setattr(
+        "app.modules.people.repository.PeopleRepository.add_revision",
+        _boom,
+    )
+
+    with pytest.raises(RuntimeError, match="revision injection"):
+        # Direct service call so exception is not swallowed by HTTP layer.
+        from app.modules.analysis.service import AnalysisService
+        from app.storage.s3 import get_object_storage
+
+        service = AnalysisService(db_session, storage=get_object_storage())
+        service.confirm_analysis(
+            uuid.UUID(analysis_id),
+            expected_profile_version=1,
+            actor_user_id=admin.id,
+        )
+
+    db_session.expire_all()
+    profile = db_session.execute(
+        select(PersonProfile).where(PersonProfile.person_id == person.id)
+    ).scalar_one()
+    assert profile.technical_grade == original_grade
+    assert profile.profile_version == 1
+    assert (
+        db_session.execute(
+            select(ProfileRevision).where(
+                ProfileRevision.person_id == person.id,
+                ProfileRevision.revision_no == 2,
+            )
+        ).scalar_one_or_none()
+        is None
+    )
+    assert (
+        list(
+            db_session.execute(
+                select(SearchIndexJob).where(SearchIndexJob.person_id == person.id)
+            ).scalars()
+        )
+        == []
+    )
+    assert (
+        list(
+            db_session.execute(
+                select(AuditLog).where(
+                    AuditLog.action_type == "ANALYSIS_CONFIRM",
+                    AuditLog.target_id == uuid.UUID(analysis_id),
+                )
+            ).scalars()
+        )
+        == []
+    )
+    run = db_session.execute(
+        select(AnalysisRun).where(AnalysisRun.id == uuid.UUID(analysis_id))
+    ).scalar_one()
+    assert run.status == "REVIEWING"
+    assert run.confirmed_by is None
+
+    _cleanup_person(db_session, person.id, admin.id)
+
+
+def test_confirm_concurrent_serialized(client: TestClient, db_session):
+    """Two sessions: FOR UPDATE serializes; one mutation + idempotent second."""
+    import threading
+
+    from app.db.models.analysis import AnalysisDiffItem, AnalysisRun
+    from app.db.models.person import PersonProfile
+    from app.db.models.project import Project
+    from app.db.models.revision import AuditLog, ProfileRevision
+    from app.db.models.search import SearchIndexJob
+    from app.db.session import SessionLocal
+    from app.modules.analysis.confirm import confirm_analysis_run
+
+    admin = _create_user(
+        db_session, login_id=f"cc_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    csrf = _login(client, admin.login_id, "Passw0rd!")
+    person, document = _seed_person_with_ready_doc(db_session, admin.id)
+    analysis_id, run = _start_reviewing_analysis(
+        client, db_session, csrf, person, document
+    )
+    db_session.add(
+        AnalysisDiffItem(
+            analysis_run_id=run.id,
+            entity_type="PROJECT",
+            candidate_path="projects[0]",
+            change_type="NEW",
+            new_value={
+                "project_name": "ConcurrentProj",
+                "jobs": [],
+                "skills": [],
+                "expertise": [],
+                "business_domains": [],
+                "customer_types": [],
+            },
+            review_status="ACCEPTED",
+        )
+    )
+    db_session.commit()
+
+    results: list = []
+    errors: list = []
+    barrier = threading.Barrier(2)
+
+    def _worker() -> None:
+        session = SessionLocal()
+        try:
+            barrier.wait(timeout=10)
+            out = confirm_analysis_run(
+                session,
+                analysis_id=uuid.UUID(analysis_id),
+                expected_profile_version=1,
+                actor_user_id=admin.id,
+            )
+            session.commit()
+            results.append(out)
+        except Exception as exc:  # noqa: BLE001
+            session.rollback()
+            errors.append(exc)
+        finally:
+            session.close()
+
+    t1 = threading.Thread(target=_worker)
+    t2 = threading.Thread(target=_worker)
+    t1.start()
+    t2.start()
+    t1.join(timeout=30)
+    t2.join(timeout=30)
+    assert not t1.is_alive() and not t2.is_alive()
+    assert errors == [], errors
+    assert len(results) == 2
+    assert all(r.profile_version == 2 and r.status == "CONFIRMED" for r in results)
+
+    db_session.expire_all()
+    profile = db_session.execute(
+        select(PersonProfile).where(PersonProfile.person_id == person.id)
+    ).scalar_one()
+    assert profile.profile_version == 2
+    projects = list(
+        db_session.execute(
+            select(Project).where(
+                Project.person_id == person.id,
+                Project.project_name == "ConcurrentProj",
+            )
+        ).scalars()
+    )
+    assert len(projects) == 1
+    revs = list(
+        db_session.execute(
+            select(ProfileRevision).where(
+                ProfileRevision.person_id == person.id,
+                ProfileRevision.revision_no == 2,
+            )
+        ).scalars()
+    )
+    assert len(revs) == 1
+    jobs = list(
+        db_session.execute(
+            select(SearchIndexJob).where(
+                SearchIndexJob.person_id == person.id,
+                SearchIndexJob.action == "REBUILD_PERSON",
+            )
+        ).scalars()
+    )
+    assert len(jobs) == 1
+    audits = list(
+        db_session.execute(
+            select(AuditLog).where(
+                AuditLog.action_type == "ANALYSIS_CONFIRM",
+                AuditLog.target_id == uuid.UUID(analysis_id),
+            )
+        ).scalars()
+    )
+    assert len(audits) == 1
+    run = db_session.execute(
+        select(AnalysisRun).where(AnalysisRun.id == uuid.UUID(analysis_id))
+    ).scalar_one()
+    assert run.status == "CONFIRMED"
+
+    _cleanup_person(db_session, person.id, admin.id)
+
+
+def test_frontend_confirm_loading_gate_contract():
+    """Frontend Confirm CTA must require diffs query success (not loading→0)."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2]
+    api = (root / "frontend" / "src" / "api" / "analyses.ts").read_text(encoding="utf-8")
+    page = (
+        root / "frontend" / "src" / "pages" / "AnalysisDetailPage.tsx"
+    ).read_text(encoding="utf-8")
+    assert "export function canConfirmAnalysis" in api
+    assert "diffsQuerySuccess" in api
+    assert "diffsQuerySuccess: allDiffsQuery.isSuccess" in page
+    assert "canConfirmAnalysis" in page
+
+    def can_confirm(
+        *,
+        status: str | None,
+        diffs_ok: bool,
+        pending: int,
+        base_ver: int | None,
+    ) -> bool:
+        return (
+            status == "REVIEWING"
+            and diffs_ok
+            and pending == 0
+            and base_ver is not None
+        )
+
+    assert can_confirm(status="REVIEWING", diffs_ok=False, pending=0, base_ver=1) is False
+    assert can_confirm(status="REVIEWING", diffs_ok=True, pending=1, base_ver=1) is False
+    assert can_confirm(status="REVIEWING", diffs_ok=True, pending=0, base_ver=None) is False
+    assert can_confirm(status="REVIEWING", diffs_ok=True, pending=0, base_ver=1) is True

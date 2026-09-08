@@ -666,16 +666,28 @@ class AnalysisService:
         expected_profile_version: int,
         actor_user_id: UUID,
     ) -> ConfirmAnalysisResponseData:
+        from sqlalchemy.exc import IntegrityError
+
+        from app.core.exceptions import ConfirmValidationError
         from app.modules.analysis.confirm import confirm_analysis_run
 
-        result = confirm_analysis_run(
-            self.db,
-            analysis_id=analysis_id,
-            expected_profile_version=expected_profile_version,
-            actor_user_id=actor_user_id,
-        )
-        self.db.commit()
-        return result
+        try:
+            result = confirm_analysis_run(
+                self.db,
+                analysis_id=analysis_id,
+                expected_profile_version=expected_profile_version,
+                actor_user_id=actor_user_id,
+            )
+            self.db.commit()
+            return result
+        except IntegrityError as exc:
+            self.db.rollback()
+            raise ConfirmValidationError(
+                "확정 중 데이터 제약 조건을 위반했습니다."
+            ) from exc
+        except Exception:
+            self.db.rollback()
+            raise
 
     # ----------------------------------------------------------------- mappers
 

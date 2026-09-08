@@ -273,6 +273,21 @@ export function countPendingActionableDiffs(diffs: DiffItem[]): number {
   ).length
 }
 
+/** Confirm CTA gate — require diffs query success so loading ≠ pending 0. */
+export function canConfirmAnalysis(input: {
+  status?: AnalysisStatus | string | null
+  diffsQuerySuccess: boolean
+  pendingActionable: number
+  baseProfileVersion: number | null | undefined
+}): boolean {
+  return (
+    input.status === 'REVIEWING' &&
+    input.diffsQuerySuccess &&
+    input.pendingActionable === 0 &&
+    input.baseProfileVersion != null
+  )
+}
+
 export function isActiveAnalysisStatus(status: AnalysisStatus): boolean {
   return status === 'QUEUED' || status === 'PROCESSING'
 }

@@ -237,6 +237,101 @@ def _require_active_code(
         )
 
 
+def _as_sort_order(raw: Any) -> int:
+    if raw is None or raw == "":
+        return 0
+    if isinstance(raw, bool):
+        raise ConfirmValidationError(f"sort_order가 올바르지 않습니다: {raw!r}")
+    try:
+        return int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ConfirmValidationError(
+            f"sort_order가 올바르지 않습니다: {raw!r}"
+        ) from exc
+
+
+def _as_optional_year(raw: Any, *, field: str = "last_used_year") -> int | None:
+    if raw is None or raw == "":
+        return None
+    if isinstance(raw, bool):
+        raise ConfirmValidationError(f"{field}가 올바르지 않습니다: {raw!r}")
+    try:
+        year = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ConfirmValidationError(
+            f"{field}가 올바르지 않습니다: {raw!r}"
+        ) from exc
+    if year < 1900 or year > 2100:
+        raise ConfirmValidationError(
+            f"{field} 범위가 올바르지 않습니다: {year}"
+        )
+    return year
+
+
+def _as_optional_months(raw: Any, *, field: str = "experience_months") -> int | None:
+    if raw is None or raw == "":
+        return None
+    if isinstance(raw, bool):
+        raise ConfirmValidationError(f"{field}가 올바르지 않습니다: {raw!r}")
+    try:
+        months = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ConfirmValidationError(
+            f"{field}가 올바르지 않습니다: {raw!r}"
+        ) from exc
+    if months < 0:
+        raise ConfirmValidationError(
+            f"{field}는 0 이상이어야 합니다: {months}"
+        )
+    return months
+
+
+def _as_bool(raw: Any, *, field: str) -> bool:
+    if isinstance(raw, bool):
+        return raw
+    raise ConfirmValidationError(f"{field}는 boolean이어야 합니다: {raw!r}")
+
+
+def _parse_job_type(data: dict[str, Any]) -> str:
+    """Missing/blank → PRIMARY. Explicit invalid → CONFIRM_VALIDATION_ERROR."""
+    if "job_type" not in data:
+        return "PRIMARY"
+    raw = data.get("job_type")
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return "PRIMARY"
+    text = (_norm_str(raw) or "").upper()
+    if text not in _JOB_TYPES:
+        raise ConfirmValidationError(f"허용되지 않은 job_type입니다: {raw!r}")
+    return text
+
+
+def _parse_evidence_type(
+    data: dict[str, Any],
+    *,
+    fallback: str | None = None,
+) -> str:
+    """Missing → fallback/EXPLICIT. Explicit invalid → CONFIRM_VALIDATION_ERROR."""
+    if "evidence_type" in data:
+        raw = data.get("evidence_type")
+        if raw is None or (isinstance(raw, str) and not str(raw).strip()):
+            return (fallback or "EXPLICIT").upper()
+        text = (_norm_str(raw) or "").upper()
+        if text not in _EVIDENCE_TYPES:
+            raise ConfirmValidationError(
+                f"허용되지 않은 evidence_type입니다: {raw!r}"
+            )
+        return text
+    if fallback:
+        text = (_norm_str(fallback) or "").upper()
+        if text and text not in _EVIDENCE_TYPES:
+            raise ConfirmValidationError(
+                f"허용되지 않은 evidence_type입니다: {fallback!r}"
+            )
+        if text in _EVIDENCE_TYPES:
+            return text
+    return "EXPLICIT"
+
+
 def confirm_analysis_run(
     db: Session,
     *,
@@ -520,14 +615,7 @@ class _ConfirmContext:
                 raise ConfirmValidationError("이름은 비어 있을 수 없습니다.")
             return text
         if field == "birth_year":
-            if value is None or value == "":
-                return None
-            try:
-                return int(value)
-            except (TypeError, ValueError) as exc:
-                raise ConfirmValidationError(
-                    f"birth_year가 올바르지 않습니다: {value!r}"
-                ) from exc
+            return _as_optional_year(value, field="birth_year")
         if field == "technical_grade":
             text = _norm_str(value)
             if text is None:
@@ -563,9 +651,7 @@ class _ConfirmContext:
                 f"JOB 코드가 없어 확정할 수 없습니다: {diff.candidate_path}"
             )
         _require_active_code(self.people_repo, code, "JOB")
-        job_type = (_norm_str(data.get("job_type")) or "PRIMARY").upper()
-        if job_type not in _JOB_TYPES:
-            job_type = "PRIMARY"
+        job_type = _parse_job_type(data)
 
         existing = self.db.execute(
             select(PersonJob).where(
@@ -584,7 +670,7 @@ class _ConfirmContext:
                 person_id=self.person_id,
                 job_code=code,
                 job_type=job_type,
-                sort_order=int(data.get("sort_order") or 0),
+                sort_order=_as_sort_order(data.get("sort_order")),
                 source_type="AI_CONFIRMED",
                 is_active=True,
                 confirmed_at=self.now,
@@ -612,26 +698,78 @@ class _ConfirmContext:
             )
         ).scalar_one_or_none()
 
-        last_used = data.get("last_used_year")
-        exp_months = data.get("experience_months")
-        is_rep = bool(data.get("is_representative", False))
-        if last_used is not None and last_used != "":
-            last_used = int(last_used)
-        else:
-            last_used = None
-        if exp_months is not None and exp_months != "":
-            exp_months = int(exp_months)
-        else:
-            exp_months = None
+        status = diff.review_status
 
         if existing is not None:
-            # UPDATE metadata; preserve source_type. Also covers EXP-style overlap.
-            if diff.change_type in {"UPDATE", "NEW", "REVIEW", "CONFLICT"}:
-                existing.last_used_year = last_used
-                existing.experience_months = exp_months
-                existing.is_representative = is_rep
+            if status == "MODIFIED":
+                # Explicit keys only — never fill missing fields with null/default.
+                if "last_used_year" in data:
+                    existing.last_used_year = _as_optional_year(
+                        data.get("last_used_year")
+                    )
+                if "experience_months" in data:
+                    existing.experience_months = _as_optional_months(
+                        data.get("experience_months")
+                    )
+                if "is_representative" in data:
+                    existing.is_representative = _as_bool(
+                        data.get("is_representative"),
+                        field="is_representative",
+                    )
+                self.db.add(existing)
+                return
+
+            if status == "ACCEPTED" and diff.change_type in {
+                "UPDATE",
+                "NEW",
+                "REVIEW",
+                "CONFLICT",
+            }:
+                # Non-destructive: null candidate metadata must not wipe Confirmed.
+                last_used = _as_optional_year(data.get("last_used_year"))
+                exp_months = _as_optional_months(data.get("experience_months"))
+                if last_used is not None:
+                    existing.last_used_year = last_used
+                if exp_months is not None:
+                    existing.experience_months = exp_months
+                if "is_representative" in data:
+                    rep = _as_bool(
+                        data.get("is_representative"),
+                        field="is_representative",
+                    )
+                    # false→true promote only; never auto-demote true→false.
+                    if rep:
+                        existing.is_representative = True
+                # Preserve existing.source_type.
                 self.db.add(existing)
             return
+
+        # NEW PersonSkill — Candidate/decided values may create the row.
+        if status == "MODIFIED":
+            last_used = (
+                _as_optional_year(data.get("last_used_year"))
+                if "last_used_year" in data
+                else None
+            )
+            exp_months = (
+                _as_optional_months(data.get("experience_months"))
+                if "experience_months" in data
+                else None
+            )
+            is_rep = (
+                _as_bool(data.get("is_representative"), field="is_representative")
+                if "is_representative" in data
+                else False
+            )
+        else:
+            last_used = _as_optional_year(data.get("last_used_year"))
+            exp_months = _as_optional_months(data.get("experience_months"))
+            if "is_representative" in data:
+                is_rep = _as_bool(
+                    data.get("is_representative"), field="is_representative"
+                )
+            else:
+                is_rep = False
 
         self.db.add(
             PersonSkill(
@@ -658,13 +796,9 @@ class _ConfirmContext:
                 f"EXP 코드가 없어 확정할 수 없습니다: {diff.candidate_path}"
             )
         _require_active_code(self.people_repo, code, "EXP")
-        evidence = (
-            _norm_str(data.get("evidence_type"))
-            or _norm_str(diff.evidence_type)
-            or "EXPLICIT"
-        ).upper()
-        if evidence not in _EVIDENCE_TYPES:
-            evidence = "EXPLICIT"
+        evidence = _parse_evidence_type(
+            data, fallback=_norm_str(diff.evidence_type)
+        )
 
         existing = self.db.execute(
             select(PersonExpertise).where(
@@ -1022,14 +1156,8 @@ class _ConfirmContext:
         if field in {"start_date", "end_date"}:
             return _normalize_field_date(field, value)
         if field == "duration_months":
-            if value is None or value == "":
-                return None
-            try:
-                return int(value)
-            except (TypeError, ValueError) as exc:
-                raise ConfirmValidationError(
-                    f"duration_months가 올바르지 않습니다: {value!r}"
-                ) from exc
+            months = _as_optional_months(value, field="duration_months")
+            return months
         if isinstance(value, str):
             return value.strip() or None
         return value
@@ -1081,6 +1209,7 @@ class _ConfirmContext:
     def _insert_project_relation(
         self, project_id: UUID, field: str, item: dict[str, Any]
     ) -> None:
+        """Additive insert helper — existing relations are never overwritten."""
         code = _extract_code(item)
         if not code:
             raise ConfirmValidationError("프로젝트 관계 코드가 필요합니다.")
@@ -1113,28 +1242,23 @@ class _ConfirmContext:
             if exists is None:
                 self.db.add(ProjectSkill(project_id=project_id, tech_code=code))
         elif field == "expertise":
-            evidence = (
-                _norm_str(item.get("evidence_type")) or "EXPLICIT"
-            ).upper()
-            if evidence not in _EVIDENCE_TYPES:
-                evidence = "EXPLICIT"
             exists = self.db.execute(
                 select(ProjectExpertise).where(
                     ProjectExpertise.project_id == project_id,
                     ProjectExpertise.exp_code == code,
                 )
             ).scalar_one_or_none()
-            if exists is None:
-                self.db.add(
-                    ProjectExpertise(
-                        project_id=project_id,
-                        exp_code=code,
-                        evidence_type=evidence,
-                    )
+            if exists is not None:
+                # Additive no-op — never mutate existing evidence_type.
+                return
+            evidence = _parse_evidence_type(item)
+            self.db.add(
+                ProjectExpertise(
+                    project_id=project_id,
+                    exp_code=code,
+                    evidence_type=evidence,
                 )
-            else:
-                exists.evidence_type = evidence
-                self.db.add(exists)
+            )
         elif field == "business_domains":
             exists = self.db.execute(
                 select(ProjectBusinessDomain).where(
