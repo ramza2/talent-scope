@@ -3543,3 +3543,613 @@ def test_confirm_rejects_oversized_profile_string(client: TestClient, db_session
     assert resp.json()["code"] == "CONFIRM_VALIDATION_ERROR"
 
     _cleanup_person(db_session, person.id, admin.id)
+
+
+def test_collect_mutable_existing_target_ids_deterministic():
+    from types import SimpleNamespace
+    from uuid import UUID
+
+    from app.modules.analysis.confirm import collect_mutable_existing_target_ids
+
+    emp_b = UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+    emp_a = UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+    edu = UUID("cccccccc-cccc-cccc-cccc-cccccccccccc")
+    proj_dup = UUID("dddddddd-dddd-dddd-dddd-dddddddddddd")
+    cert = UUID("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee")
+
+    diffs = [
+        SimpleNamespace(
+            entity_type="PROJECT",
+            existing_target_id=proj_dup,
+            review_status="ACCEPTED",
+        ),
+        SimpleNamespace(
+            entity_type="EMPLOYMENT",
+            existing_target_id=emp_b,
+            review_status="MODIFIED",
+        ),
+        SimpleNamespace(
+            entity_type="EMPLOYMENT",
+            existing_target_id=emp_a,
+            review_status="ACCEPTED",
+        ),
+        SimpleNamespace(
+            entity_type="EMPLOYMENT",
+            existing_target_id=emp_a,
+            review_status="ACCEPTED",
+        ),
+        SimpleNamespace(
+            entity_type="EDUCATION",
+            existing_target_id=edu,
+            review_status="MERGED",  # ignored for education MERGED in apply, still collected
+        ),
+        SimpleNamespace(
+            entity_type="CERTIFICATION",
+            existing_target_id=cert,
+            review_status="ACCEPTED",
+        ),
+        SimpleNamespace(
+            entity_type="PROJECT",
+            existing_target_id=proj_dup,
+            review_status="MODIFIED",
+        ),
+        SimpleNamespace(
+            entity_type="EMPLOYMENT",
+            existing_target_id=emp_b,
+            review_status="REJECTED",
+        ),
+        SimpleNamespace(
+            entity_type="TECH",
+            existing_target_id=None,
+            review_status="ACCEPTED",
+        ),
+    ]
+    collected = collect_mutable_existing_target_ids(diffs)
+    assert list(collected.keys()) == [
+        "EMPLOYMENT",
+        "EDUCATION",
+        "CERTIFICATION",
+        "PROJECT",
+    ]
+    assert collected["EMPLOYMENT"] == [emp_a, emp_b]
+    assert collected["EDUCATION"] == [edu]
+    assert collected["CERTIFICATION"] == [cert]
+    assert collected["PROJECT"] == [proj_dup]
+
+
+def test_project_nameless_root_review_no_mapped_child_update():
+    from app.ai.schemas.profile_candidate import (
+        CodeRefCandidate,
+        ProfileCandidateDocument,
+        ProjectCandidate,
+    )
+    from app.modules.analysis.diff_engine import build_diffs
+
+    cand = ProfileCandidateDocument(
+        projects=[
+            ProjectCandidate(
+                project_name=None,
+                skills=[
+                    CodeRefCandidate(code="TECH-LANG-PYTHON", raw_value="Python"),
+                    CodeRefCandidate(code=None, raw_value="UnknownFramework"),
+                ],
+            )
+        ]
+    )
+    base = {
+        "profile": {},
+        "jobs": [],
+        "skills": [],
+        "expertise": [],
+        "employment_history": [],
+        "education": [],
+        "certifications": [],
+        "projects": [],
+    }
+    specs = build_diffs(cand, base)
+    proj = [s for s in specs if s.entity_type == "PROJECT"]
+    roots = [s for s in proj if s.candidate_path == "projects[0]"]
+    assert len(roots) == 1
+    assert roots[0].change_type == "REVIEW"
+    assert not any(
+        s.change_type == "UPDATE" and s.field_name == "skills" for s in proj
+    )
+    assert any(
+        s.change_type == "REVIEW"
+        and s.field_name == "skills"
+        and isinstance(s.new_value, dict)
+        and s.new_value.get("raw_value") == "UnknownFramework"
+        for s in proj
+    )
+
+
+def test_confirm_nameless_root_modified_unmapped_rejected(
+    client: TestClient, db_session
+):
+    from app.db.models.analysis import AnalysisDiffItem
+    from app.db.models.project import Project, ProjectSkill
+
+    admin = _create_user(
+        db_session, login_id=f"nr_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    csrf = _login(client, admin.login_id, "Passw0rd!")
+    person, document = _seed_person_with_ready_doc(db_session, admin.id)
+    analysis_id, run = _start_reviewing_analysis(
+        client, db_session, csrf, person, document
+    )
+    db_session.add_all(
+        [
+            AnalysisDiffItem(
+                analysis_run_id=run.id,
+                entity_type="PROJECT",
+                candidate_path="projects[0]",
+                change_type="REVIEW",
+                new_value={
+                    "project_name": None,
+                    "skills": [
+                        {"code": "TECH-LANG-PYTHON", "raw_value": "Python"},
+                        {"code": None, "raw_value": "UnknownFramework"},
+                    ],
+                    "jobs": [],
+                    "expertise": [],
+                    "business_domains": [],
+                    "customer_types": [],
+                },
+                decided_value={
+                    "project_name": "새 프로젝트",
+                    "skills": [
+                        {"code": "TECH-LANG-PYTHON", "raw_value": "Python"},
+                    ],
+                    "jobs": [],
+                    "expertise": [],
+                    "business_domains": [],
+                    "customer_types": [],
+                },
+                review_status="MODIFIED",
+            ),
+            AnalysisDiffItem(
+                analysis_run_id=run.id,
+                entity_type="PROJECT",
+                candidate_path="projects[0].skills[1]",
+                field_name="skills",
+                change_type="REVIEW",
+                new_value={"code": None, "raw_value": "UnknownFramework"},
+                review_status="REJECTED",
+            ),
+        ]
+    )
+    db_session.commit()
+
+    resp = client.post(
+        f"/api/v1/analyses/{analysis_id}/confirm",
+        headers={"X-CSRF-Token": csrf},
+        json={"expected_profile_version": 1},
+    )
+    assert resp.status_code == 200, resp.text
+    db_session.expire_all()
+    project = db_session.execute(
+        select(Project).where(
+            Project.person_id == person.id,
+            Project.project_name == "새 프로젝트",
+            Project.deleted_at.is_(None),
+        )
+    ).scalar_one()
+    skills = list(
+        db_session.execute(
+            select(ProjectSkill).where(ProjectSkill.project_id == project.id)
+        ).scalars()
+    )
+    assert {s.tech_code for s in skills} == {"TECH-LANG-PYTHON"}
+
+    _cleanup_person(db_session, person.id, admin.id)
+
+
+def test_confirm_rejects_foreign_existing_target(client: TestClient, db_session):
+    from app.db.models.analysis import AnalysisDiffItem
+    from app.db.models.project import Project
+
+    admin = _create_user(
+        db_session, login_id=f"ft_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    other = _create_user(
+        db_session, login_id=f"fo_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    csrf = _login(client, admin.login_id, "Passw0rd!")
+    person, document = _seed_person_with_ready_doc(db_session, admin.id)
+    other_person, _ = _seed_person_with_ready_doc(db_session, other.id)
+    foreign = Project(
+        person_id=other_person.id,
+        project_name="Foreign",
+        source_type="USER",
+    )
+    db_session.add(foreign)
+    db_session.commit()
+
+    analysis_id, run = _start_reviewing_analysis(
+        client, db_session, csrf, person, document
+    )
+    db_session.add(
+        AnalysisDiffItem(
+            analysis_run_id=run.id,
+            entity_type="PROJECT",
+            candidate_path="projects[0].project_summary",
+            field_name="project_summary",
+            change_type="UPDATE",
+            existing_target_id=foreign.id,
+            new_value="hack",
+            review_status="ACCEPTED",
+        )
+    )
+    db_session.commit()
+
+    resp = client.post(
+        f"/api/v1/analyses/{analysis_id}/confirm",
+        headers={"X-CSRF-Token": csrf},
+        json={"expected_profile_version": 1},
+    )
+    assert resp.status_code == 400
+    assert resp.json()["code"] == "CONFIRM_VALIDATION_ERROR"
+
+    _cleanup_person(db_session, person.id, admin.id)
+    _cleanup_person(db_session, other_person.id, other.id)
+
+
+def test_confirm_vs_manual_project_lock_order_no_deadlock(db_session):
+    """Manual Project→Person/Profile vs Confirm Entity-prelock→Person/Profile."""
+    import threading
+    import time
+
+    from sqlalchemy import select
+    from sqlalchemy.exc import DBAPIError, OperationalError
+
+    from app.core.exceptions import ProfileVersionConflictError
+    from app.db.models.analysis import AnalysisDiffItem, AnalysisRun
+    from app.db.models.person import Person, PersonProfile
+    from app.db.models.project import Project
+    from app.db.models.revision import AuditLog, ProfileRevision
+    from app.db.models.search import SearchIndexJob
+    from app.db.session import SessionLocal
+    from app.modules.analysis.confirm import confirm_analysis_run
+
+    admin = _create_user(
+        db_session, login_id=f"dl_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    person, document = _seed_person_with_ready_doc(db_session, admin.id)
+    project = Project(
+        person_id=person.id,
+        project_name="LockProj",
+        project_summary="before",
+        source_type="USER",
+    )
+    db_session.add(project)
+    db_session.flush()
+
+    # Create analysis via lightweight direct row setup
+    analysis = AnalysisRun(
+        person_id=person.id,
+        status="REVIEWING",
+        base_profile_version=1,
+    )
+    db_session.add(analysis)
+    db_session.flush()
+    from app.db.models.analysis import AnalysisRunDocument
+
+    db_session.add(
+        AnalysisRunDocument(analysis_run_id=analysis.id, document_id=document.id)
+    )
+    db_session.add(
+        AnalysisDiffItem(
+            analysis_run_id=analysis.id,
+            entity_type="PROJECT",
+            candidate_path="projects[0].project_summary",
+            field_name="project_summary",
+            change_type="UPDATE",
+            existing_target_id=project.id,
+            old_value="before",
+            new_value="from-confirm",
+            review_status="ACCEPTED",
+        )
+    )
+    db_session.commit()
+
+    project_id = project.id
+    person_id = person.id
+    analysis_id = analysis.id
+    actor_id = admin.id
+
+    project_locked = threading.Event()
+    confirm_started = threading.Event()
+    manual_may_finish = threading.Event()
+    outcomes: dict[str, object] = {}
+
+    def manual_worker() -> None:
+        session = SessionLocal()
+        try:
+            locked_project = session.execute(
+                select(Project)
+                .where(Project.id == project_id)
+                .with_for_update()
+            ).scalar_one()
+            project_locked.set()
+            # Wait until Confirm has begun (and should be blocked on Project).
+            assert confirm_started.wait(timeout=15)
+            time.sleep(0.4)
+            session.execute(
+                select(Person).where(Person.id == person_id).with_for_update()
+            ).scalar_one()
+            profile = session.execute(
+                select(PersonProfile)
+                .where(PersonProfile.person_id == person_id)
+                .with_for_update()
+            ).scalar_one()
+            locked_project.project_summary = "manual-edit"
+            profile.profile_version += 1
+            session.add(locked_project)
+            session.add(profile)
+            session.commit()
+            outcomes["manual"] = "ok"
+        except Exception as exc:  # noqa: BLE001
+            session.rollback()
+            outcomes["manual"] = exc
+        finally:
+            session.close()
+            manual_may_finish.set()
+
+    def confirm_worker() -> None:
+        assert project_locked.wait(timeout=15)
+        session = SessionLocal()
+        try:
+            confirm_started.set()
+            confirm_analysis_run(
+                session,
+                analysis_id=analysis_id,
+                expected_profile_version=1,
+                actor_user_id=actor_id,
+            )
+            session.commit()
+            outcomes["confirm"] = "ok"
+        except ProfileVersionConflictError:
+            session.rollback()
+            outcomes["confirm"] = "conflict"
+        except (OperationalError, DBAPIError) as exc:
+            session.rollback()
+            outcomes["confirm"] = exc
+        except Exception as exc:  # noqa: BLE001
+            session.rollback()
+            outcomes["confirm"] = exc
+        finally:
+            session.close()
+
+    t_manual = threading.Thread(target=manual_worker)
+    t_confirm = threading.Thread(target=confirm_worker)
+    t_manual.start()
+    assert project_locked.wait(timeout=15)
+    t_confirm.start()
+    t_manual.join(timeout=30)
+    t_confirm.join(timeout=30)
+    assert not t_manual.is_alive() and not t_confirm.is_alive()
+
+    assert outcomes.get("manual") == "ok", outcomes
+    assert outcomes.get("confirm") == "conflict", outcomes
+    # Deadlock must not surface as DBAPI/OperationalError.
+    assert not isinstance(outcomes.get("manual"), (OperationalError, DBAPIError))
+    assert not isinstance(outcomes.get("confirm"), (OperationalError, DBAPIError))
+
+    db_session.expire_all()
+    profile = db_session.execute(
+        select(PersonProfile).where(PersonProfile.person_id == person_id)
+    ).scalar_one()
+    assert profile.profile_version == 2
+    proj = db_session.execute(
+        select(Project).where(Project.id == project_id)
+    ).scalar_one()
+    assert proj.project_summary == "manual-edit"
+    run = db_session.execute(
+        select(AnalysisRun).where(AnalysisRun.id == analysis_id)
+    ).scalar_one()
+    assert run.status == "REVIEWING"
+    assert run.confirmed_by is None
+    assert (
+        db_session.execute(
+            select(ProfileRevision).where(
+                ProfileRevision.person_id == person_id,
+                ProfileRevision.revision_no == 2,
+            )
+        ).scalar_one_or_none()
+        is None
+    )
+    assert (
+        list(
+            db_session.execute(
+                select(SearchIndexJob).where(SearchIndexJob.person_id == person_id)
+            ).scalars()
+        )
+        == []
+    )
+    assert (
+        list(
+            db_session.execute(
+                select(AuditLog).where(
+                    AuditLog.action_type == "ANALYSIS_CONFIRM",
+                    AuditLog.target_id == analysis_id,
+                )
+            ).scalars()
+        )
+        == []
+    )
+
+    _cleanup_person(db_session, person_id, admin.id)
+
+
+def test_confirm_vs_manual_employment_lock_order_no_deadlock(db_session):
+    """Career Employment pre-lock before Profile — same lock order as Project."""
+    import threading
+    import time
+
+    from sqlalchemy import select
+    from sqlalchemy.exc import DBAPIError, OperationalError
+
+    from app.core.exceptions import ProfileVersionConflictError
+    from app.db.models.analysis import AnalysisDiffItem, AnalysisRun, AnalysisRunDocument
+    from app.db.models.person import EmploymentHistory, Person, PersonProfile
+    from app.db.models.revision import AuditLog, ProfileRevision
+    from app.db.models.search import SearchIndexJob
+    from app.db.session import SessionLocal
+    from app.modules.analysis.confirm import confirm_analysis_run
+
+    admin = _create_user(
+        db_session, login_id=f"de_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    person, document = _seed_person_with_ready_doc(db_session, admin.id)
+    emp = EmploymentHistory(
+        person_id=person.id,
+        company_name="LockCo",
+        title="Dev",
+        source_type="USER",
+    )
+    db_session.add(emp)
+    db_session.flush()
+    analysis = AnalysisRun(
+        person_id=person.id,
+        status="REVIEWING",
+        base_profile_version=1,
+    )
+    db_session.add(analysis)
+    db_session.flush()
+    db_session.add(
+        AnalysisRunDocument(analysis_run_id=analysis.id, document_id=document.id)
+    )
+    db_session.add(
+        AnalysisDiffItem(
+            analysis_run_id=analysis.id,
+            entity_type="EMPLOYMENT",
+            candidate_path="employment_history[0].title",
+            field_name="title",
+            change_type="UPDATE",
+            existing_target_id=emp.id,
+            old_value="Dev",
+            new_value="Lead",
+            review_status="ACCEPTED",
+        )
+    )
+    db_session.commit()
+
+    emp_id = emp.id
+    person_id = person.id
+    analysis_id = analysis.id
+    actor_id = admin.id
+
+    emp_locked = threading.Event()
+    confirm_started = threading.Event()
+    outcomes: dict[str, object] = {}
+
+    def manual_worker() -> None:
+        session = SessionLocal()
+        try:
+            locked_emp = session.execute(
+                select(EmploymentHistory)
+                .where(EmploymentHistory.id == emp_id)
+                .with_for_update()
+            ).scalar_one()
+            emp_locked.set()
+            assert confirm_started.wait(timeout=15)
+            time.sleep(0.4)
+            session.execute(
+                select(Person).where(Person.id == person_id).with_for_update()
+            ).scalar_one()
+            profile = session.execute(
+                select(PersonProfile)
+                .where(PersonProfile.person_id == person_id)
+                .with_for_update()
+            ).scalar_one()
+            locked_emp.title = "ManualTitle"
+            profile.profile_version += 1
+            session.add(locked_emp)
+            session.add(profile)
+            session.commit()
+            outcomes["manual"] = "ok"
+        except Exception as exc:  # noqa: BLE001
+            session.rollback()
+            outcomes["manual"] = exc
+        finally:
+            session.close()
+
+    def confirm_worker() -> None:
+        assert emp_locked.wait(timeout=15)
+        session = SessionLocal()
+        try:
+            confirm_started.set()
+            confirm_analysis_run(
+                session,
+                analysis_id=analysis_id,
+                expected_profile_version=1,
+                actor_user_id=actor_id,
+            )
+            session.commit()
+            outcomes["confirm"] = "ok"
+        except ProfileVersionConflictError:
+            session.rollback()
+            outcomes["confirm"] = "conflict"
+        except (OperationalError, DBAPIError) as exc:
+            session.rollback()
+            outcomes["confirm"] = exc
+        except Exception as exc:  # noqa: BLE001
+            session.rollback()
+            outcomes["confirm"] = exc
+        finally:
+            session.close()
+
+    t_manual = threading.Thread(target=manual_worker)
+    t_confirm = threading.Thread(target=confirm_worker)
+    t_manual.start()
+    assert emp_locked.wait(timeout=15)
+    t_confirm.start()
+    t_manual.join(timeout=30)
+    t_confirm.join(timeout=30)
+    assert not t_manual.is_alive() and not t_confirm.is_alive()
+    assert outcomes.get("manual") == "ok", outcomes
+    assert outcomes.get("confirm") == "conflict", outcomes
+
+    db_session.expire_all()
+    emp_row = db_session.execute(
+        select(EmploymentHistory).where(EmploymentHistory.id == emp_id)
+    ).scalar_one()
+    assert emp_row.title == "ManualTitle"
+    profile = db_session.execute(
+        select(PersonProfile).where(PersonProfile.person_id == person_id)
+    ).scalar_one()
+    assert profile.profile_version == 2
+    run = db_session.execute(
+        select(AnalysisRun).where(AnalysisRun.id == analysis_id)
+    ).scalar_one()
+    assert run.status == "REVIEWING"
+    assert (
+        list(
+            db_session.execute(
+                select(SearchIndexJob).where(SearchIndexJob.person_id == person_id)
+            ).scalars()
+        )
+        == []
+    )
+    assert (
+        list(
+            db_session.execute(
+                select(AuditLog).where(
+                    AuditLog.action_type == "ANALYSIS_CONFIRM",
+                    AuditLog.target_id == analysis_id,
+                )
+            ).scalars()
+        )
+        == []
+    )
+    assert (
+        db_session.execute(
+            select(ProfileRevision).where(
+                ProfileRevision.person_id == person_id,
+                ProfileRevision.revision_no == 2,
+            )
+        ).scalar_one_or_none()
+        is None
+    )
+
+    _cleanup_person(db_session, person_id, admin.id)

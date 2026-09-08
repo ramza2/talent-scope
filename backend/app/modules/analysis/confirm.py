@@ -409,6 +409,7 @@ def confirm_analysis_run(
     career_repo = CareerRepository(db)
     project_repo = ProjectRepository(db)
 
+    # A. AnalysisRun first — serialize review decisions for this run.
     run = analysis_repo.get_run(analysis_id, for_update=True)
     if run is None:
         raise NotFoundError("분석을 찾을 수 없습니다.")
@@ -421,6 +422,21 @@ def confirm_analysis_run(
             f"상태가 {run.status}인 분석은 확정할 수 없습니다."
         )
 
+    # B. Validate review completeness while AnalysisRun is locked.
+    diffs = analysis_repo.list_diffs(run.id)
+    _assert_review_complete(diffs)
+    _assert_project_parent_consistency(diffs)
+
+    # C. Pre-lock existing mutation targets BEFORE Person/Profile
+    #    (matches manual Project/Career: Entity → Person/Profile).
+    locked = _prelock_existing_targets(
+        person_id=run.person_id,
+        diffs=diffs,
+        career_repo=career_repo,
+        project_repo=project_repo,
+    )
+
+    # D. Person/Profile after entity locks — then optimistic version check.
     person = analysis_repo.get_person(run.person_id, for_update=True)
     profile = analysis_repo.get_profile(run.person_id, for_update=True)
     if person is None or profile is None:
@@ -435,10 +451,6 @@ def confirm_analysis_run(
     ):
         raise ProfileVersionConflictError()
 
-    diffs = analysis_repo.list_diffs(run.id)
-    _assert_review_complete(diffs)
-    _assert_project_parent_consistency(diffs)
-
     ctx = _ConfirmContext(
         db=db,
         run=run,
@@ -449,6 +461,10 @@ def confirm_analysis_run(
         project_repo=project_repo,
         analysis_repo=analysis_repo,
         now=datetime.now(UTC),
+        locked_employment=locked["EMPLOYMENT"],
+        locked_education=locked["EDUCATION"],
+        locked_certifications=locked["CERTIFICATION"],
+        locked_projects=locked["PROJECT"],
     )
     ctx.apply_all(diffs)
 
@@ -500,6 +516,86 @@ def confirm_analysis_run(
         status="CONFIRMED",
         search_index_status="PENDING",
     )
+
+
+_MUTABLE_CONFIRM_STATUSES = frozenset({"ACCEPTED", "MODIFIED", "MERGED"})
+
+# Deterministic Confirm pre-lock table order (Entity → Person/Profile).
+_PRELOCK_ENTITY_ORDER: tuple[str, ...] = (
+    "EMPLOYMENT",
+    "EDUCATION",
+    "CERTIFICATION",
+    "PROJECT",
+)
+
+
+def collect_mutable_existing_target_ids(
+    diffs: list[AnalysisDiffItem],
+) -> dict[str, list[UUID]]:
+    """Collect existing_target_id values for Confirm pre-lock.
+
+    Dedupes IDs and returns UUID-sorted lists per table in lock order.
+    """
+    buckets: dict[str, set[UUID]] = {name: set() for name in _PRELOCK_ENTITY_ORDER}
+    for diff in diffs:
+        if diff.review_status not in _MUTABLE_CONFIRM_STATUSES:
+            continue
+        target_id = diff.existing_target_id
+        if target_id is None:
+            continue
+        if diff.entity_type in buckets:
+            buckets[diff.entity_type].add(target_id)
+    return {
+        name: sorted(buckets[name], key=lambda value: str(value))
+        for name in _PRELOCK_ENTITY_ORDER
+    }
+
+
+def _prelock_existing_targets(
+    *,
+    person_id: UUID,
+    diffs: list[AnalysisDiffItem],
+    career_repo: CareerRepository,
+    project_repo: ProjectRepository,
+) -> dict[str, dict[UUID, Any]]:
+    """FOR UPDATE existing career/project targets before Person/Profile locks."""
+    target_ids = collect_mutable_existing_target_ids(diffs)
+    locked: dict[str, dict[UUID, Any]] = {name: {} for name in _PRELOCK_ENTITY_ORDER}
+
+    for employment_id in target_ids["EMPLOYMENT"]:
+        row = career_repo.get_employment(employment_id, for_update=True)
+        if row is None or row.person_id != person_id:
+            raise ConfirmValidationError(
+                f"existing_target_id가 해당 인력의 경력이 아닙니다: {employment_id}"
+            )
+        locked["EMPLOYMENT"][employment_id] = row
+
+    for education_id in target_ids["EDUCATION"]:
+        row = career_repo.get_education(education_id, for_update=True)
+        if row is None or row.person_id != person_id:
+            raise ConfirmValidationError(
+                f"existing_target_id가 해당 인력의 학력이 아닙니다: {education_id}"
+            )
+        locked["EDUCATION"][education_id] = row
+
+    for certification_id in target_ids["CERTIFICATION"]:
+        row = career_repo.get_certification(certification_id, for_update=True)
+        if row is None or row.person_id != person_id:
+            raise ConfirmValidationError(
+                f"existing_target_id가 해당 인력의 자격이 아닙니다: "
+                f"{certification_id}"
+            )
+        locked["CERTIFICATION"][certification_id] = row
+
+    for project_id in target_ids["PROJECT"]:
+        row = project_repo.get_project(project_id, for_update=True)
+        if row is None or row.person_id != person_id:
+            raise ConfirmValidationError(
+                f"existing_target_id가 해당 인력의 프로젝트가 아닙니다: {project_id}"
+            )
+        locked["PROJECT"][project_id] = row
+
+    return locked
 
 
 def _idempotent_response(db: Session, run: AnalysisRun) -> ConfirmAnalysisResponseData:
@@ -581,6 +677,10 @@ class _ConfirmContext:
         project_repo: ProjectRepository,
         analysis_repo: AnalysisRepository,
         now: datetime,
+        locked_employment: dict[UUID, EmploymentHistory] | None = None,
+        locked_education: dict[UUID, Education] | None = None,
+        locked_certifications: dict[UUID, Certification] | None = None,
+        locked_projects: dict[UUID, Project] | None = None,
     ) -> None:
         self.db = db
         self.run = run
@@ -593,6 +693,10 @@ class _ConfirmContext:
         self.now = now
         # projects[n] → Project.id after root create/merge
         self.project_ids_by_index: dict[int, UUID] = {}
+        self.locked_employment = locked_employment or {}
+        self.locked_education = locked_education or {}
+        self.locked_certifications = locked_certifications or {}
+        self.locked_projects = locked_projects or {}
 
     def apply_all(self, diffs: list[AnalysisDiffItem]) -> None:
         project_roots: list[AnalysisDiffItem] = []
@@ -615,6 +719,33 @@ class _ConfirmContext:
         for diff in project_children:
             self._apply_project_child(diff)
 
+    def _require_locked_employment(self, employment_id: UUID) -> EmploymentHistory:
+        row = self.locked_employment.get(employment_id)
+        if row is None or row.person_id != self.person_id:
+            raise ConfirmValidationError(
+                f"existing_target_id가 해당 인력의 경력이 아닙니다: {employment_id}"
+            )
+        return row
+
+    def _require_locked_education(self, education_id: UUID) -> Education:
+        row = self.locked_education.get(education_id)
+        if row is None or row.person_id != self.person_id:
+            raise ConfirmValidationError(
+                f"existing_target_id가 해당 인력의 학력이 아닙니다: {education_id}"
+            )
+        return row
+
+    def _require_locked_certification(
+        self, certification_id: UUID
+    ) -> Certification:
+        row = self.locked_certifications.get(certification_id)
+        if row is None or row.person_id != self.person_id:
+            raise ConfirmValidationError(
+                f"existing_target_id가 해당 인력의 자격이 아닙니다: "
+                f"{certification_id}"
+            )
+        return row
+
     def _apply_one(self, diff: AnalysisDiffItem) -> None:
         if diff.review_status in {"REJECTED", "SAME", "PENDING"}:
             return
@@ -632,7 +763,7 @@ class _ConfirmContext:
                 diff,
                 fields=_EMPLOYMENT_FIELDS,
                 name_field="company_name",
-                getter=self.career_repo.get_employment,
+                getter=self._require_locked_employment,
                 creator=self.career_repo.create_employment,
                 toucher=self.career_repo.touch_employment,
             )
@@ -641,7 +772,7 @@ class _ConfirmContext:
                 diff,
                 fields=_EDUCATION_FIELDS,
                 name_field="school_name",
-                getter=self.career_repo.get_education,
+                getter=self._require_locked_education,
                 creator=self.career_repo.create_education,
                 toucher=self.career_repo.touch_education,
             )
@@ -650,7 +781,7 @@ class _ConfirmContext:
                 diff,
                 fields=_CERTIFICATION_FIELDS,
                 name_field="certification_name",
-                getter=self.career_repo.get_certification,
+                getter=self._require_locked_certification,
                 creator=self.career_repo.create_certification,
                 toucher=self.career_repo.touch_certification,
             )
@@ -1224,7 +1355,10 @@ class _ConfirmContext:
         self._insert_project_relation(project_id, field, item)
 
     def _require_owned_project(self, project_id: UUID) -> Project:
-        project = self.project_repo.get_project(project_id)
+        project = self.locked_projects.get(project_id)
+        if project is None:
+            # Newly created in this Confirm TX (not an existing pre-lock target).
+            project = self.project_repo.get_project(project_id)
         if project is None or project.person_id != self.person_id:
             raise ConfirmValidationError(
                 f"existing_target_id가 해당 인력의 프로젝트가 아닙니다: {project_id}"
@@ -1384,6 +1518,7 @@ class _ConfirmContext:
 
 
 __all__ = [
+    "collect_mutable_existing_target_ids",
     "confirm_analysis_run",
     "is_project_root",
     "parse_project_index",

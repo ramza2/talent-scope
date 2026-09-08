@@ -779,6 +779,7 @@ def _diff_projects(
                     existing_target_id=None,
                     confidence=project.confidence,
                     source_refs=refs,
+                    additions_only_unmapped=True,
                 )
             )
             continue
