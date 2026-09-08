@@ -78,7 +78,13 @@ class EvidenceService:
             field_name=field_name,
         )
         out: list[EvidenceListItem] = []
+        seen_evidence_ids: set[UUID] = set()
         for link, evidence in rows:
+            # Without field_name filter, dedupe identical Evidence across links.
+            if field_name is None:
+                if evidence.id in seen_evidence_ids:
+                    continue
+                seen_evidence_ids.add(evidence.id)
             doc_pair = self.repo.get_document_with_group(evidence.document_id)
             if doc_pair is None:
                 continue

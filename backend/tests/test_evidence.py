@@ -1504,3 +1504,535 @@ def test_revision_failure_rolls_back_evidence(
     assert run.status == "REVIEWING"
 
     _cleanup_person(db_session, person.id, admin.id)
+
+
+# --------------------------------------------------------------------------- real pipeline provenance
+
+
+def _persist_specs_as_reviewing(
+    db_session,
+    *,
+    person,
+    document,
+    specs,
+    accept_paths: set[str] | None = None,
+):
+    """Persist DiffSpec list onto a REVIEWING AnalysisRun (real Diff persistence)."""
+    from app.db.models.analysis import AnalysisDiffItem, AnalysisRun, AnalysisRunDocument
+
+    analysis = AnalysisRun(
+        person_id=person.id,
+        status="REVIEWING",
+        base_profile_version=1,
+        prompt_version="profile-extract-v2",
+        schema_version="profile-candidate-v1",
+        candidate_json={"schema_version": "profile-candidate-v1"},
+    )
+    db_session.add(analysis)
+    db_session.flush()
+    db_session.add(
+        AnalysisRunDocument(analysis_run_id=analysis.id, document_id=document.id)
+    )
+    created = []
+    accept_paths = accept_paths or set()
+    for spec in specs:
+        payload = spec.to_persist_dict()
+        if payload.get("candidate_path") in accept_paths:
+            payload["review_status"] = "ACCEPTED"
+        elif payload.get("change_type") == "SAME":
+            payload["review_status"] = "PENDING"
+        row = AnalysisDiffItem(analysis_run_id=analysis.id, **payload)
+        db_session.add(row)
+        created.append(row)
+    db_session.commit()
+    for row in created:
+        db_session.refresh(row)
+    db_session.refresh(analysis)
+    return analysis, created
+
+
+def test_real_pipeline_profile_scalar_source_refs_to_evidence(
+    client: TestClient, db_session
+):
+    """raw Candidate → normalize → build_diffs → Confirm → Evidence (no manual Diff refs)."""
+    from app.modules.analysis.diff_engine import build_diffs
+    from app.modules.analysis.normalize import normalize_candidate
+    from app.modules.people.snapshot import build_confirmed_profile_snapshot
+
+    quote = "성명 홍길동"
+    admin = _create_user(
+        db_session, login_id=f"ev_pp_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    csrf = _login(client, admin.login_id, "Passw0rd!")
+    person, document = _seed_person_with_ready_doc(
+        db_session, admin.id, page_text=f"이력서 머리말 {quote} / 연락처"
+    )
+
+    raw = {
+        "schema_version": "profile-candidate-v1",
+        "profile": {
+            "name": "홍길동",
+            "source_refs": {
+                "name": [
+                    {
+                        "document_id": str(document.id),
+                        "page_no": 1,
+                        "quote_text": quote,
+                    }
+                ],
+                "not_a_field": [{"document_id": str(document.id), "page_no": 1, "quote_text": quote}],
+            },
+        },
+    }
+    catalog: dict[str, tuple[str, bool]] = {}
+    allowed = {str(document.id): {1}}
+    page_texts = {(str(document.id), 1): f"이력서 머리말 {quote} / 연락처"}
+    doc = normalize_candidate(
+        raw,
+        catalog=catalog,
+        allowed_documents=allowed,
+        page_texts=page_texts,
+    )
+    assert "name" in doc.profile.source_refs
+    assert "not_a_field" not in doc.profile.source_refs
+    assert doc.profile.source_refs["name"][0].quote_text == quote
+
+    snap = build_confirmed_profile_snapshot(db_session, person.id)
+    specs = build_diffs(doc, snap)
+    name_specs = [s for s in specs if s.field_name == "name"]
+    assert len(name_specs) == 1
+    assert name_specs[0].source_refs
+    assert name_specs[0].source_refs[0]["quote_text"] == quote
+    # Must come from Candidate map, not manually injected Diff.new_value.
+    assert "source_refs" not in (name_specs[0].new_value if isinstance(name_specs[0].new_value, dict) else {})
+
+    analysis, diffs = _persist_specs_as_reviewing(
+        db_session,
+        person=person,
+        document=document,
+        specs=specs,
+        accept_paths={"profile.name"},
+    )
+    name_diff = next(d for d in diffs if d.field_name == "name")
+    assert isinstance(name_diff.new_value, dict)
+    assert name_diff.new_value.get("source_refs")
+
+    resp = _confirm(client, csrf, analysis.id)
+    assert resp.status_code == 200, resp.text
+
+    db_session.expire_all()
+    counts = _evidence_counts(db_session, document_id=document.id)
+    assert counts["evidence"] >= 1
+    assert counts["diff_evidence"] >= 1
+    assert counts["links"] >= 1
+    ev = _list_evidence_for_doc(db_session, document.id)[0]
+    assert ev.quote_text == quote
+    links = _links_for_evidence(db_session, ev.id)
+    assert any(
+        link.target_type == "PERSON_PROFILE"
+        and link.target_id == person.id
+        and link.field_name == "name"
+        for link in links
+    )
+    assert _diff_evidence_for(db_session, name_diff.id)
+
+    _cleanup_person(db_session, person.id, admin.id)
+
+
+def test_real_pipeline_project_relation_item_refs_not_root(
+    client: TestClient, db_session
+):
+    from app.db.models.project import Project, ProjectSkill
+    from app.modules.analysis.diff_engine import build_diffs
+    from app.modules.analysis.normalize import normalize_candidate
+    from app.modules.people.snapshot import build_confirmed_profile_snapshot
+
+    _ensure_common_codes(db_session)
+    root_quote = "AI 플랫폼 구축 프로젝트"
+    py_quote = "Python/FastAPI 기반 API 개발"
+    admin = _create_user(
+        db_session, login_id=f"ev_prp_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    csrf = _login(client, admin.login_id, "Passw0rd!")
+    page_text = f"소개 {root_quote}. 기술스택 {py_quote}."
+    person, document = _seed_person_with_ready_doc(
+        db_session, admin.id, page_text=page_text
+    )
+    project = Project(
+        person_id=person.id,
+        project_name="AI 플랫폼",
+        source_type="USER",
+    )
+    db_session.add(project)
+    db_session.commit()
+    db_session.refresh(project)
+
+    raw = {
+        "schema_version": "profile-candidate-v1",
+        "projects": [
+            {
+                "project_name": "AI 플랫폼",
+                "source_refs": [
+                    {
+                        "document_id": str(document.id),
+                        "page_no": 1,
+                        "quote_text": root_quote,
+                    }
+                ],
+                "skills": [
+                    {
+                        "raw_value": "Python",
+                        "code": "TECH-LANG-PYTHON",
+                        "source_refs": [
+                            {
+                                "document_id": str(document.id),
+                                "page_no": 1,
+                                "quote_text": py_quote,
+                            }
+                        ],
+                    }
+                ],
+            }
+        ],
+    }
+    catalog = {"TECH-LANG-PYTHON": ("TECH", True)}
+    allowed = {str(document.id): {1}}
+    page_texts = {(str(document.id), 1): page_text}
+    cand = normalize_candidate(
+        raw, catalog=catalog, allowed_documents=allowed, page_texts=page_texts
+    )
+    assert cand.projects[0].skills[0].source_refs[0].quote_text == py_quote
+
+    snap = build_confirmed_profile_snapshot(db_session, person.id)
+    specs = build_diffs(cand, snap)
+    skill_specs = [
+        s
+        for s in specs
+        if s.field_name == "skills" and s.change_type == "UPDATE"
+    ]
+    assert len(skill_specs) == 1
+    quotes = {r.get("quote_text") for r in skill_specs[0].source_refs}
+    assert py_quote in quotes
+    assert root_quote not in quotes
+
+    analysis, diffs = _persist_specs_as_reviewing(
+        db_session,
+        person=person,
+        document=document,
+        specs=specs,
+        accept_paths={skill_specs[0].candidate_path},
+    )
+    skill_diff = next(
+        d for d in diffs if d.field_name == "skills" and d.change_type == "UPDATE"
+    )
+    resp = _confirm(client, csrf, analysis.id)
+    assert resp.status_code == 200, resp.text
+
+    db_session.expire_all()
+    assert db_session.execute(
+        select(ProjectSkill).where(
+            ProjectSkill.project_id == project.id,
+            ProjectSkill.tech_code == "TECH-LANG-PYTHON",
+        )
+    ).scalar_one_or_none()
+
+    links = []
+    for ev in _list_evidence_for_doc(db_session, document.id):
+        for link in _links_for_evidence(db_session, ev.id):
+            if link.field_name == "skills:TECH-LANG-PYTHON":
+                links.append((ev, link))
+    assert len(links) == 1
+    assert links[0][0].quote_text == py_quote
+    assert links[0][0].quote_text != root_quote
+
+    _cleanup_person(db_session, person.id, admin.id)
+
+
+def test_relation_without_item_refs_no_field_evidence_link(
+    client: TestClient, db_session
+):
+    from app.db.models.project import Project, ProjectSkill
+    from app.modules.analysis.diff_engine import build_diffs
+    from app.modules.analysis.normalize import normalize_candidate
+    from app.modules.people.snapshot import build_confirmed_profile_snapshot
+
+    _ensure_common_codes(db_session)
+    root_quote = "플랫폼 전체 설명 문구"
+    admin = _create_user(
+        db_session, login_id=f"ev_norel_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    csrf = _login(client, admin.login_id, "Passw0rd!")
+    page_text = f"본문 {root_quote}"
+    person, document = _seed_person_with_ready_doc(
+        db_session, admin.id, page_text=page_text
+    )
+    project = Project(
+        person_id=person.id,
+        project_name="무근거 스킬 프로젝트",
+        source_type="USER",
+    )
+    db_session.add(project)
+    db_session.commit()
+    db_session.refresh(project)
+
+    raw = {
+        "schema_version": "profile-candidate-v1",
+        "projects": [
+            {
+                "project_name": "무근거 스킬 프로젝트",
+                "source_refs": [
+                    {
+                        "document_id": str(document.id),
+                        "page_no": 1,
+                        "quote_text": root_quote,
+                    }
+                ],
+                "skills": [
+                    {
+                        "raw_value": "Python",
+                        "code": "TECH-LANG-PYTHON",
+                        "source_refs": [],
+                    }
+                ],
+            }
+        ],
+    }
+    cand = normalize_candidate(
+        raw,
+        catalog={"TECH-LANG-PYTHON": ("TECH", True)},
+        allowed_documents={str(document.id): {1}},
+        page_texts={(str(document.id), 1): page_text},
+    )
+    specs = build_diffs(cand, build_confirmed_profile_snapshot(db_session, person.id))
+    skill_specs = [s for s in specs if s.field_name == "skills" and s.change_type == "UPDATE"]
+    assert len(skill_specs) == 1
+    assert skill_specs[0].source_refs == []
+
+    analysis, _diffs = _persist_specs_as_reviewing(
+        db_session,
+        person=person,
+        document=document,
+        specs=specs,
+        accept_paths={skill_specs[0].candidate_path},
+    )
+    assert _confirm(client, csrf, analysis.id).status_code == 200
+
+    db_session.expire_all()
+    assert db_session.execute(
+        select(ProjectSkill).where(
+            ProjectSkill.project_id == project.id,
+            ProjectSkill.tech_code == "TECH-LANG-PYTHON",
+        )
+    ).scalar_one_or_none()
+    skill_links = [
+        link
+        for ev in _list_evidence_for_doc(db_session, document.id)
+        for link in _links_for_evidence(db_session, ev.id)
+        if link.field_name == "skills:TECH-LANG-PYTHON"
+    ]
+    assert skill_links == []
+
+    _cleanup_person(db_session, person.id, admin.id)
+
+
+def test_confirmed_diff_no_raw_fallback_for_invalid_or_empty_refs(
+    client: TestClient, db_session
+):
+    quote = "유효한 인용문"
+    admin = _create_user(
+        db_session, login_id=f"ev_fb_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    csrf = _login(client, admin.login_id, "Passw0rd!")
+    person, document = _seed_person_with_ready_doc(
+        db_session, admin.id, page_text=f"문서 {quote}"
+    )
+
+    # Mixed refs Diff → only valid materialized.
+    analysis, diffs = _seed_reviewing_run(
+        db_session,
+        person=person,
+        document=document,
+        diffs=[
+            {
+                "entity_type": "PROFILE",
+                "candidate_path": "profile.department",
+                "field_name": "department",
+                "change_type": "NEW",
+                "new_value": {
+                    "value": "플랫폼팀",
+                    "source_refs": [
+                        _source_ref(document, quote_text=quote),
+                        {
+                            "document_id": str(document.id),
+                            "page_no": 99,
+                            "quote_text": "없는 페이지",
+                        },
+                    ],
+                },
+                "review_status": "ACCEPTED",
+            },
+            {
+                "entity_type": "PROFILE",
+                "candidate_path": "profile.phone",
+                "field_name": "phone",
+                "change_type": "NEW",
+                "new_value": {
+                    "value": "010-0000-0000",
+                    "source_refs": [
+                        {
+                            "document_id": str(document.id),
+                            "page_no": 99,
+                            "quote_text": "전부 무효",
+                        }
+                    ],
+                },
+                "review_status": "ACCEPTED",
+            },
+        ],
+    )
+    # REVIEWING may expose raw refs (incl. invalid) via fallback.
+    reviewing = client.get(f"/api/v1/analyses/{analysis.id}/diffs")
+    assert reviewing.status_code == 200
+    before = {row["id"]: row["evidence"] for row in reviewing.json()["data"]}
+    assert len(before[str(diffs[0].id)]) == 2
+    assert all(item.get("id") is None for item in before[str(diffs[0].id)])
+
+    assert _confirm(client, csrf, analysis.id).status_code == 200
+
+    confirmed = client.get(f"/api/v1/analyses/{analysis.id}/diffs")
+    assert confirmed.status_code == 200
+    after = {row["id"]: row["evidence"] for row in confirmed.json()["data"]}
+    dept_ev = after[str(diffs[0].id)]
+    assert len(dept_ev) == 1
+    assert dept_ev[0]["id"] is not None
+    assert dept_ev[0]["quote_text"] == quote
+    assert dept_ev[0]["page_no"] == 1
+    # All-invalid Diff → empty list, never raw id=null fallback.
+    assert after[str(diffs[1].id)] == []
+
+    _cleanup_person(db_session, person.id, admin.id)
+
+
+def test_old_candidate_without_new_provenance_fields_loads():
+    from app.ai.schemas.profile_candidate import ProfileCandidateDocument
+
+    raw = {
+        "schema_version": "profile-candidate-v1",
+        "profile": {"name": "구버전"},
+        "projects": [
+            {
+                "project_name": "레거시",
+                "skills": [{"raw_value": "Python", "code": "TECH-LANG-PYTHON"}],
+            }
+        ],
+    }
+    doc = ProfileCandidateDocument.model_validate(raw)
+    assert doc.profile.source_refs == {}
+    assert doc.projects[0].skills[0].source_refs == []
+
+
+def test_new_analysis_uses_profile_extract_v2(client: TestClient, db_session):
+    from app.ai.prompts.profile_extract_v2 import PROMPT_VERSION
+
+    admin = _create_user(
+        db_session, login_id=f"ev_pv_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    csrf = _login(client, admin.login_id, "Passw0rd!")
+    person, document = _seed_person_with_ready_doc(db_session, admin.id)
+    create = client.post(
+        "/api/v1/analyses",
+        headers={"X-CSRF-Token": csrf},
+        json={"person_id": str(person.id), "document_ids": [str(document.id)]},
+    )
+    assert create.status_code in {200, 202}, create.text
+    analysis_id = create.json()["data"]["analysis_id"]
+    detail = client.get(f"/api/v1/analyses/{analysis_id}")
+    assert detail.status_code == 200
+    assert detail.json()["data"]["prompt_version"] == PROMPT_VERSION
+    assert PROMPT_VERSION == "profile-extract-v2"
+
+    _cleanup_person(db_session, person.id, admin.id)
+
+
+def test_evidence_list_dedupes_same_evidence_without_field_filter(
+    client: TestClient, db_session
+):
+    from app.db.models.evidence import Evidence, EvidenceLink
+
+    quote = "공유 인용"
+    admin = _create_user(
+        db_session, login_id=f"ev_dd_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    csrf = _login(client, admin.login_id, "Passw0rd!")
+    person, document = _seed_person_with_ready_doc(
+        db_session, admin.id, page_text=f"본문 {quote}"
+    )
+    from app.db.models.document import DocumentPage
+
+    page = db_session.execute(
+        select(DocumentPage).where(DocumentPage.document_id == document.id)
+    ).scalar_one()
+    ev = Evidence(
+        document_id=document.id,
+        document_page_id=page.id,
+        page_no=1,
+        quote_text=quote,
+        extraction_method="TEXT_PARSER",
+    )
+    db_session.add(ev)
+    db_session.flush()
+    db_session.add(
+        EvidenceLink(
+            evidence_id=ev.id,
+            target_type="PERSON_PROFILE",
+            target_id=person.id,
+            field_name="name",
+            relation_type="SUPPORTS",
+        )
+    )
+    db_session.add(
+        EvidenceLink(
+            evidence_id=ev.id,
+            target_type="PERSON_PROFILE",
+            target_id=person.id,
+            field_name="phone",
+            relation_type="SUPPORTS",
+        )
+    )
+    db_session.commit()
+
+    listed = client.get(
+        "/api/v1/evidence",
+        params={"target_type": "PERSON_PROFILE", "target_id": str(person.id)},
+    )
+    assert listed.status_code == 200, listed.text
+    assert len(listed.json()["data"]) == 1
+    assert listed.json()["data"][0]["id"] == str(ev.id)
+
+    by_field = client.get(
+        "/api/v1/evidence",
+        params={
+            "target_type": "PERSON_PROFILE",
+            "target_id": str(person.id),
+            "field_name": "name",
+        },
+    )
+    assert by_field.status_code == 200
+    assert len(by_field.json()["data"]) == 1
+
+    _cleanup_person(db_session, person.id, admin.id)
+
+
+def test_profile_extract_v2_template_has_provenance_keys():
+    from app.ai.prompts.profile_extract_v2 import (
+        CANDIDATE_JSON_TEMPLATE,
+        PROMPT_VERSION,
+        SYSTEM_PROMPT,
+    )
+
+    assert PROMPT_VERSION == "profile-extract-v2"
+    assert '"source_refs"' in CANDIDATE_JSON_TEMPLATE
+    assert '"name": []' in CANDIDATE_JSON_TEMPLATE
+    assert '"source_refs": []' in CANDIDATE_JSON_TEMPLATE
+    assert "relation" in SYSTEM_PROMPT.lower() or "Project relation" in SYSTEM_PROMPT
+    assert "profile.source_refs" in SYSTEM_PROMPT

@@ -12,7 +12,7 @@ from uuid import UUID
 
 from sqlalchemy.orm import Session
 
-from app.ai.prompts.profile_extract_v1 import (
+from app.ai.prompts.profile_extract_v2 import (
     PROMPT_VERSION,
     SCHEMA_VERSION,
     SYSTEM_PROMPT,
@@ -782,8 +782,9 @@ class AnalysisService:
         *,
         evidence_map: dict[UUID, list[EvidenceLite]] | None = None,
     ) -> DiffItemResponse:
-        if evidence_map is not None and row.id in evidence_map and evidence_map[row.id]:
-            evidence = evidence_map[row.id]
+        if evidence_map is not None:
+            # CONFIRMED: only materialized AnalysisDiffEvidence — no raw fallback.
+            evidence = evidence_map.get(row.id, [])
         else:
             evidence = _evidence_from_new_value(row.new_value)
         return DiffItemResponse(

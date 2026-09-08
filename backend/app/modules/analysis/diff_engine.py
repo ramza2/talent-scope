@@ -7,23 +7,9 @@ from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
-from app.ai.schemas.profile_candidate import ProfileCandidateDocument
-
-# Profile scalar fields compared against snapshot["profile"].
-PROFILE_SCALAR_FIELDS: tuple[str, ...] = (
-    "name",
-    "birth_year",
-    "phone",
-    "email",
-    "address_region",
-    "affiliation_company",
-    "department",
-    "current_title",
-    "employment_type",
-    "technical_grade",
-    "career_start_date",
-    "career_document_value",
-    "profile_summary",
+from app.ai.schemas.profile_candidate import (
+    PROFILE_SCALAR_FIELDS,
+    ProfileCandidateDocument,
 )
 
 EMPLOYMENT_FIELDS: tuple[str, ...] = (
@@ -233,6 +219,7 @@ def _diff_profile_scalars(
 ) -> list[DiffSpec]:
     specs: list[DiffSpec] = []
     cand = candidate.profile.model_dump(mode="json")
+    profile_refs = candidate.profile.source_refs or {}
     for field_name in PROFILE_SCALAR_FIELDS:
         new_val = cand.get(field_name)
         if new_val is None or new_val == "":
@@ -254,6 +241,7 @@ def _diff_profile_scalars(
                 change_type=change,
                 old_value=old_val,
                 new_value=new_val,
+                source_refs=_refs_dump(profile_refs.get(field_name)),
             )
         )
     return specs
@@ -778,7 +766,6 @@ def _diff_projects(
                     new_project=dump,
                     existing_target_id=None,
                     confidence=project.confidence,
-                    source_refs=refs,
                     additions_only_unmapped=True,
                 )
             )
@@ -841,7 +828,6 @@ def _diff_projects(
                         new_project=dump,
                         existing_target_id=None,
                         confidence=project.confidence,
-                        source_refs=refs,
                         additions_only_unmapped=True,
                     )
                 )
@@ -856,7 +842,6 @@ def _diff_projects(
             new_project=dump,
             existing_target_id=target_id,
             confidence=project.confidence,
-            source_refs=refs,
         )
 
         if not field_changes and not relation_specs:
@@ -921,10 +906,13 @@ def _diff_project_relations(
     new_project: dict[str, Any],
     existing_target_id: UUID | None,
     confidence: Any,
-    source_refs: list[dict[str, Any]],
     additions_only_unmapped: bool = False,
 ) -> list[DiffSpec]:
-    """Additive Project relation Diffs — never emit removal for omitted codes."""
+    """Additive Project relation Diffs — never emit removal for omitted codes.
+
+    Child Diff source_refs come from the relation item only — never fall back to
+    project.root source_refs.
+    """
     specs: list[DiffSpec] = []
     for rel_field in PROJECT_RELATION_FIELDS:
         existing_rows = (old_project or {}).get(rel_field) or []
@@ -940,6 +928,7 @@ def _diff_project_relations(
             code = _relation_item_code(item)
             raw_value = _norm_str(item.get("raw_value") or item.get("name"))
             item_path = f"{path}.{rel_field}[{idx}]"
+            item_refs = _refs_dump(item.get("source_refs"))
 
             if code is None:
                 if raw_value:
@@ -952,7 +941,7 @@ def _diff_project_relations(
                             change_type="REVIEW",
                             new_value=item,
                             confidence=confidence,
-                            source_refs=source_refs,
+                            source_refs=item_refs,
                         )
                     )
                 continue
@@ -982,7 +971,7 @@ def _diff_project_relations(
                     change_type="UPDATE",
                     new_value=new_value,
                     confidence=confidence,
-                    source_refs=source_refs,
+                    source_refs=item_refs,
                 )
             )
     return specs

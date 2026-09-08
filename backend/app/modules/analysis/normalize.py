@@ -12,6 +12,7 @@ from app.ai.schemas.profile_candidate import (
     EmploymentCandidate,
     ExpertiseCandidate,
     JobCandidate,
+    PROFILE_SCALAR_FIELD_NAMES,
     ProfileCandidateDocument,
     ProjectCandidate,
     SkillCandidate,
@@ -177,6 +178,17 @@ def normalize_candidate(
             page_texts=page_texts,
         )
 
+    # Profile per-field source_refs map (keys limited to PROFILE_SCALAR_FIELDS).
+    profile_ref_map: dict[str, list[SourceRef]] = {}
+    raw_profile_refs = doc.profile.source_refs or {}
+    for field_name, field_refs in raw_profile_refs.items():
+        if field_name not in PROFILE_SCALAR_FIELD_NAMES:
+            continue
+        normalized = _refs(field_refs)
+        if normalized:
+            profile_ref_map[field_name] = normalized
+    doc.profile = doc.profile.model_copy(update={"source_refs": profile_ref_map})
+
     jobs: list[JobCandidate] = []
     for job in doc.jobs:
         code = _code_lookup(catalog, job.code, expected_type="JOB")
@@ -244,7 +256,10 @@ def normalize_candidate(
         for ref in project.jobs:
             jobs_rel.append(
                 ref.model_copy(
-                    update={"code": _code_lookup(catalog, ref.code, expected_type="JOB")}
+                    update={
+                        "code": _code_lookup(catalog, ref.code, expected_type="JOB"),
+                        "source_refs": _refs(ref.source_refs),
+                    }
                 )
             )
         skills_rel = []
@@ -252,7 +267,8 @@ def normalize_candidate(
             skills_rel.append(
                 ref.model_copy(
                     update={
-                        "code": _code_lookup(catalog, ref.code, expected_type="TECH")
+                        "code": _code_lookup(catalog, ref.code, expected_type="TECH"),
+                        "source_refs": _refs(ref.source_refs),
                     }
                 )
             )
@@ -260,14 +276,20 @@ def normalize_candidate(
         for ref in project.expertise:
             exp_rel.append(
                 ref.model_copy(
-                    update={"code": _code_lookup(catalog, ref.code, expected_type="EXP")}
+                    update={
+                        "code": _code_lookup(catalog, ref.code, expected_type="EXP"),
+                        "source_refs": _refs(ref.source_refs),
+                    }
                 )
             )
         biz_rel = []
         for ref in project.business_domains:
             biz_rel.append(
                 ref.model_copy(
-                    update={"code": _code_lookup(catalog, ref.code, expected_type="BIZ")}
+                    update={
+                        "code": _code_lookup(catalog, ref.code, expected_type="BIZ"),
+                        "source_refs": _refs(ref.source_refs),
+                    }
                 )
             )
         cust_rel = []
@@ -277,7 +299,8 @@ def normalize_candidate(
                     update={
                         "code": _code_lookup(
                             catalog, ref.code, expected_type="CUSTOMER_TYPE"
-                        )
+                        ),
+                        "source_refs": _refs(ref.source_refs),
                     }
                 )
             )
