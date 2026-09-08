@@ -1923,3 +1923,262 @@ def test_code_catalog_includes_aliases():
     )
     assert "TECH-LANG-PYTHON\tPython\tPy|Python3" in text
     assert "JOB-AI-DEV\tAI Engineer\tAI개발" in text
+
+
+def test_employment_education_cert_date_ambiguity_review():
+    from app.ai.schemas.profile_candidate import (
+        CertificationCandidate,
+        EducationCandidate,
+        EmploymentCandidate,
+        ProfileCandidateDocument,
+    )
+    from app.modules.analysis.diff_engine import build_diffs, dates_compatible
+
+    assert dates_compatible("2020", "2020-03-01")
+    assert dates_compatible("2020-03", "2020-03-15")
+    assert not dates_compatible("2020", "2021-03")
+
+    base = {
+        "profile": {},
+        "jobs": [],
+        "skills": [],
+        "expertise": [],
+        "employment_history": [
+            {
+                "id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                "company_name": "A사",
+                "start_date": "2020-03-01",
+                "end_date": "2022-12-31",
+                "title": "Eng",
+            }
+        ],
+        "education": [
+            {
+                "id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                "school_name": "K대",
+                "degree": "학사",
+                "start_date": "2010-03-01",
+                "end_date": "2014-02-28",
+            }
+        ],
+        "certifications": [
+            {
+                "id": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+                "certification_name": "정보처리기사",
+                "issuer": "한국산업인력공단",
+                "acquired_date": "2015-05-01",
+            }
+        ],
+        "projects": [],
+    }
+
+    candidate = ProfileCandidateDocument(
+        employment_history=[
+            EmploymentCandidate(company_name="A사", start_date="2020", end_date="2022"),
+            EmploymentCandidate(company_name="A사", start_date="2020-03-01", end_date=None),
+            EmploymentCandidate(company_name="B사", start_date="2018", end_date="2019"),
+        ],
+        education=[
+            EducationCandidate(
+                school_name="K대", degree="학사", start_date="2010", end_date="2014"
+            ),
+            EducationCandidate(
+                school_name="S대", degree="석사", start_date="2015", end_date="2017"
+            ),
+        ],
+        certifications=[
+            CertificationCandidate(
+                certification_name="정보처리기사",
+                issuer="한국산업인력공단",
+                acquired_date="2015",
+            ),
+            CertificationCandidate(
+                certification_name="SQLD",
+                issuer="한국데이터산업진흥원",
+                acquired_date="2018-01-01",
+            ),
+        ],
+    )
+    specs = build_diffs(candidate, base)
+
+    emp = [s for s in specs if s.entity_type == "EMPLOYMENT"]
+    assert any(
+        s.change_type == "REVIEW"
+        and str(s.existing_target_id) == "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        and isinstance(s.new_value, dict)
+        and s.new_value.get("start_date") == "2020"
+        for s in emp
+    )
+    assert any(
+        s.change_type == "REVIEW"
+        and isinstance(s.new_value, dict)
+        and s.new_value.get("end_date") is None
+        for s in emp
+    )
+    assert any(
+        s.change_type == "NEW"
+        and isinstance(s.new_value, dict)
+        and s.new_value.get("company_name") == "B사"
+        for s in emp
+    )
+    assert not any(
+        s.change_type == "NEW"
+        and isinstance(s.new_value, dict)
+        and s.new_value.get("company_name") == "A사"
+        for s in emp
+    )
+
+    edu = [s for s in specs if s.entity_type == "EDUCATION"]
+    assert any(s.change_type == "REVIEW" for s in edu)
+    assert any(
+        s.change_type == "NEW"
+        and isinstance(s.new_value, dict)
+        and s.new_value.get("school_name") == "S대"
+        for s in edu
+    )
+
+    cert = [s for s in specs if s.entity_type == "CERTIFICATION"]
+    assert any(
+        s.change_type == "REVIEW"
+        and isinstance(s.new_value, dict)
+        and s.new_value.get("certification_name") == "정보처리기사"
+        for s in cert
+    )
+    assert any(
+        s.change_type == "NEW"
+        and isinstance(s.new_value, dict)
+        and s.new_value.get("certification_name") == "SQLD"
+        for s in cert
+    )
+
+
+def test_prompt_source_char_cap_scopes_source_refs():
+    from app.modules.analysis.normalize import normalize_candidate
+    from app.modules.analysis.source_builder import (
+        AnalysisSourceBundle,
+        DocumentSourceBlock,
+    )
+
+    doc_id = "dddddddd-dddd-dddd-dddd-dddddddddddd"
+    pages = []
+    for i in range(1, 6):
+        pages.append(f"[PAGE {i}]\nUNIQUE_PAGE_{i}_TEXT " + ("Z" * 120))
+    body = "\n\n".join(pages)
+    bundle = AnalysisSourceBundle(
+        blocks=[
+            DocumentSourceBlock(
+                document_id=doc_id,
+                filename="resume.pdf",
+                document_type="DOC-RESUME",
+                text=body,
+            )
+        ]
+    )
+    # Small enough that only early pages enter the actual prompt.
+    prompt_source = bundle.build_prompt_source(260)
+    allowed = prompt_source.allowed_documents.get(doc_id, set())
+    assert 1 in allowed
+    assert 4 not in allowed
+    assert 5 not in allowed
+
+    # Quote exists in DB page 4 text, but page 4 was not in the LLM prompt.
+    raw = {
+        "schema_version": "profile-candidate-v1",
+        "profile": {"name": "홍길동"},
+        "jobs": [
+            {
+                "raw_value": "Dev",
+                "code": None,
+                "source_refs": [
+                    {
+                        "document_id": doc_id,
+                        "page_no": 1,
+                        "quote_text": "UNIQUE_PAGE_1_TEXT",
+                    },
+                    {
+                        "document_id": doc_id,
+                        "page_no": 4,
+                        "quote_text": "UNIQUE_PAGE_4_TEXT",
+                    },
+                ],
+            }
+        ],
+        "skills": [],
+        "expertise": [],
+        "employment_history": [],
+        "education": [],
+        "certifications": [],
+        "projects": [],
+        "summary": {},
+        "analysis": {},
+    }
+    # Full DB texts would include page 4 — must still discard via prompt scope.
+    db_page_texts = {
+        (doc_id, i): f"UNIQUE_PAGE_{i}_TEXT " + ("Z" * 120) for i in range(1, 6)
+    }
+    doc = normalize_candidate(
+        raw,
+        catalog={},
+        allowed_documents=prompt_source.allowed_documents,
+        page_texts=prompt_source.page_texts,
+    )
+    pages_kept = {r.page_no for r in doc.jobs[0].source_refs}
+    assert 1 in pages_kept
+    assert 4 not in pages_kept
+
+    # Even if caller mistakenly passed full DB texts, allowed_documents gates page 4.
+    doc2 = normalize_candidate(
+        raw,
+        catalog={},
+        allowed_documents=prompt_source.allowed_documents,
+        page_texts=db_page_texts,
+    )
+    assert 4 not in {r.page_no for r in doc2.jobs[0].source_refs}
+
+
+def test_profile_extract_prompt_nested_schema_keys():
+    from app.ai.prompts.profile_extract_v1 import (
+        CANDIDATE_JSON_TEMPLATE,
+        SYSTEM_PROMPT,
+        build_user_prompt,
+    )
+
+    required_top = [
+        "schema_version",
+        "profile",
+        "jobs",
+        "skills",
+        "expertise",
+        "employment_history",
+        "education",
+        "certifications",
+        "projects",
+        "summary",
+        "analysis",
+    ]
+    for key in required_top:
+        assert f'"{key}"' in CANDIDATE_JSON_TEMPLATE
+        assert key in SYSTEM_PROMPT
+
+    for key in (
+        "project_name",
+        "customer_name",
+        "start_date",
+        "end_date",
+        "duration_months",
+        "responsibilities",
+        "project_summary",
+        "business_domains",
+        "customer_types",
+        "source_refs",
+        "career_document_value",
+        "evidence_type",
+        "job_type",
+    ):
+        assert key in CANDIDATE_JSON_TEMPLATE
+
+    assert "2020-03-15" in SYSTEM_PROMPT
+    assert "Markdown fence" in SYSTEM_PROMPT or "JSON object만" in SYSTEM_PROMPT
+    user = build_user_prompt(code_catalog="TECH-LANG-PYTHON\tPython", document_blocks="[PAGE 1]\nx")
+    assert "UNTRUSTED DOCUMENT DATA" in user
+    assert "document_id" in user or "source_refs" in user

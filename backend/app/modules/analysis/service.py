@@ -193,9 +193,10 @@ class AnalysisService:
                 list(claimed.documents),
                 log_context={"analysis_run_id": str(run_id)},
             )
-            blocks = bundle.combined_document_blocks(
+            prompt_source = bundle.build_prompt_source(
                 int(self.settings.analysis_max_total_text_chars)
             )
+            blocks = prompt_source.text
             if not blocks.strip():
                 raise AIProviderError("no usable text for profile analysis")
 
@@ -218,47 +219,13 @@ class AnalysisService:
                 code: (code_type, active)
                 for code, code_type, active in claimed.catalog
             }
-            max_pages = int(self.settings.analysis_max_pages_per_document)
-            # source_ref validation must match pages actually sent to the LLM.
-            allowed_docs = {
-                str(doc.id): {p.page_no for p in list(doc.pages)[:max_pages]}
-                for doc in claimed.documents
-            }
-            page_texts: dict[tuple[str, int], str] = {}
-            for doc in claimed.documents:
-                for page in list(doc.pages)[:max_pages]:
-                    text = (page.extracted_text or "").strip()
-                    if text:
-                        page_texts[(str(doc.id), page.page_no)] = text
-            # Merge VLM-augmented page text from source blocks when present.
-            for block in bundle.blocks:
-                current_page: int | None = None
-                buf: list[str] = []
-                for line in (block.text or "").splitlines():
-                    if line.startswith("[PAGE ") and line.endswith("]"):
-                        if current_page is not None and buf:
-                            key = (block.document_id, current_page)
-                            if current_page in allowed_docs.get(block.document_id, set()):
-                                page_texts[key] = "\n".join(buf).strip()
-                        buf = []
-                        try:
-                            current_page = int(line[6:-1].strip())
-                        except ValueError:
-                            current_page = None
-                        continue
-                    if current_page is not None:
-                        buf.append(line)
-                if current_page is not None and buf:
-                    if current_page in allowed_docs.get(block.document_id, set()):
-                        page_texts[(block.document_id, current_page)] = "\n".join(
-                            buf
-                        ).strip()
+            # source_ref validation uses only pages actually present in the LLM prompt.
             candidate = normalize_candidate(
                 raw,
                 catalog=catalog_map,
-                allowed_documents=allowed_docs,
+                allowed_documents=prompt_source.allowed_documents,
                 settings=self.settings,
-                page_texts=page_texts,
+                page_texts=prompt_source.page_texts,
             )
 
             if claimed.base_profile_version is None:

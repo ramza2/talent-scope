@@ -58,6 +58,37 @@ class DocumentSourceBlock:
 
 
 @dataclass
+class PromptSource:
+    """Text actually sent to the LLM, plus page scope for source_ref validation."""
+
+    text: str
+    allowed_documents: dict[str, set[int]] = field(default_factory=dict)
+    page_texts: dict[tuple[str, int], str] = field(default_factory=dict)
+
+
+def _parse_page_segments(body: str) -> list[tuple[int, str]]:
+    """Split DocumentSourceBlock body into ``(page_no, page_text)`` segments."""
+    segments: list[tuple[int, str]] = []
+    current_page: int | None = None
+    buf: list[str] = []
+    for line in (body or "").splitlines():
+        if line.startswith("[PAGE ") and line.endswith("]"):
+            if current_page is not None:
+                segments.append((current_page, "\n".join(buf).strip()))
+            buf = []
+            try:
+                current_page = int(line[6:-1].strip())
+            except ValueError:
+                current_page = None
+            continue
+        if current_page is not None:
+            buf.append(line)
+    if current_page is not None:
+        segments.append((current_page, "\n".join(buf).strip()))
+    return segments
+
+
+@dataclass
 class AnalysisSourceBundle:
     blocks: list[DocumentSourceBlock] = field(default_factory=list)
     total_vlm_pages: int = 0
@@ -68,12 +99,18 @@ class AnalysisSourceBundle:
 
     def combined_document_blocks(self, max_chars: int) -> str:
         """Build ``[DOCUMENT]`` / ``[PAGE n]`` blocks with a hard char cap."""
+        return self.build_prompt_source(max_chars).text
+
+    def build_prompt_source(self, max_chars: int) -> PromptSource:
+        """Build LLM document text and the exact page scope included in it."""
         if max_chars <= 0:
-            return ""
+            return PromptSource(text="")
 
         parts: list[str] = []
         remaining = max_chars
         join_sep = "\n\n"
+        allowed: dict[str, set[int]] = {}
+        page_texts: dict[tuple[str, int], str] = {}
 
         for src in self.usable_blocks:
             if remaining <= 0:
@@ -92,7 +129,7 @@ class AnalysisSourceBundle:
             )
             footer = "\n"
             overhead = len(header) + len(footer)
-            if overhead > budget:
+            if overhead >= budget:
                 chunk = (header + footer)[:budget]
                 if chunk:
                     parts.append(chunk)
@@ -100,9 +137,42 @@ class AnalysisSourceBundle:
                 break
 
             body_budget = budget - overhead
-            body = (src.text or "").strip()
-            if len(body) > body_budget:
-                body = body[:body_budget]
+            page_parts: list[str] = []
+            used_body = 0
+            segments = _parse_page_segments((src.text or "").strip())
+            if not segments:
+                # No page markers — include truncated whole body without page refs.
+                body = (src.text or "").strip()
+                if len(body) > body_budget:
+                    body = body[:body_budget]
+                block = f"{header}{body}{footer}"
+                parts.append(block)
+                remaining -= sep_cost + len(block)
+                continue
+
+            for page_no, page_text in segments:
+                page_header = f"[PAGE {page_no}]\n"
+                sep = "\n\n" if page_parts else ""
+                available = body_budget - used_body - len(sep) - len(page_header)
+                if available <= 0:
+                    break
+                included = page_text
+                truncated = False
+                if len(included) > available:
+                    included = included[:available]
+                    truncated = True
+                if not included and not page_text:
+                    # Empty page still marks presence if header fits.
+                    pass
+                chunk = f"{sep}{page_header}{included}"
+                page_parts.append(chunk)
+                used_body += len(chunk)
+                allowed.setdefault(src.document_id, set()).add(page_no)
+                page_texts[(src.document_id, page_no)] = included
+                if truncated:
+                    break
+
+            body = "".join(page_parts)
             block = f"{header}{body}{footer}"
             parts.append(block)
             remaining -= sep_cost + len(block)
@@ -110,7 +180,11 @@ class AnalysisSourceBundle:
         result = join_sep.join(parts)
         if len(result) > max_chars:
             result = result[:max_chars]
-        return result
+        return PromptSource(
+            text=result,
+            allowed_documents=allowed,
+            page_texts=page_texts,
+        )
 
 
 class AnalysisSourceBuilder:

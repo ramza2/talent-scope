@@ -176,6 +176,7 @@ def build_diffs(
                 _norm_str(r.get("end_date") if isinstance(r, dict) else r.end_date),
             ),
             dump_row=_dump_model,
+            similar_match=_employment_similar,
         )
     )
     specs.extend(
@@ -192,6 +193,7 @@ def build_diffs(
                 _norm_str(r.get("end_date") if isinstance(r, dict) else r.end_date),
             ),
             dump_row=_dump_model,
+            similar_match=_education_similar,
         )
     )
     specs.extend(
@@ -213,6 +215,7 @@ def build_diffs(
                 ),
             ),
             dump_row=_dump_model,
+            similar_match=_certification_similar,
         )
     )
     specs.extend(_diff_projects(candidate, snap.get("projects") or []))
@@ -446,6 +449,129 @@ def _diff_expertise(
     return specs
 
 
+def _field(row: Any, name: str) -> Any:
+    if isinstance(row, dict):
+        return row.get(name)
+    return getattr(row, name, None)
+
+
+def parse_date_parts(value: Any) -> tuple[int, int | None, int | None] | None:
+    """Parse conservative YEAR / YEAR-MONTH / YYYY-MM-DD (or ISO date) strings."""
+    text = _norm_str(value)
+    if not text:
+        return None
+    # Allow trailing time from ISO datetimes: 2020-03-01T00:00:00
+    if "T" in text:
+        text = text.split("T", 1)[0]
+    text = text.replace("/", "-")
+    parts = text.split("-")
+    if not parts or not parts[0].isdigit() or len(parts[0]) != 4:
+        return None
+    year = int(parts[0])
+    if year < 1900 or year > 2100:
+        return None
+    month: int | None = None
+    day: int | None = None
+    if len(parts) >= 2 and parts[1].isdigit():
+        month = int(parts[1])
+        if month < 1 or month > 12:
+            return None
+    if len(parts) >= 3 and parts[2].isdigit():
+        day = int(parts[2])
+        if day < 1 or day > 31:
+            return None
+    if day is not None and month is None:
+        return None
+    return (year, month, day)
+
+
+def dates_compatible(a: Any, b: Any) -> bool:
+    """True when dates share a consistent prefix; None vs value is not 'equal' but OK for similarity.
+
+    - both None → True (no conflicting date signal)
+    - one None → True (missing precision / omitted end)
+    - both present → True only if year matches and more-precise parts agree
+    """
+    if a is None or a == "":
+        return True
+    if b is None or b == "":
+        return True
+    pa = parse_date_parts(a)
+    pb = parse_date_parts(b)
+    if pa is None or pb is None:
+        # Unparseable: only exact string equality counts as compatible.
+        return _eq(a, b)
+    ya, ma, da = pa
+    yb, mb, db = pb
+    if ya != yb:
+        return False
+    if ma is not None and mb is not None and ma != mb:
+        return False
+    if da is not None and db is not None and da != db:
+        return False
+    return True
+
+
+def _optional_str_compatible(a: Any, b: Any) -> bool:
+    na = _norm_str(a)
+    nb = _norm_str(b)
+    if na is None or nb is None:
+        return True
+    return na == nb
+
+
+def _employment_similar(cand: Any, existing_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    company = _norm_str(_field(cand, "company_name"))
+    if not company:
+        return []
+    out: list[dict[str, Any]] = []
+    for row in existing_rows:
+        if _norm_str(row.get("company_name")) != company:
+            continue
+        if not dates_compatible(_field(cand, "start_date"), row.get("start_date")):
+            continue
+        if not dates_compatible(_field(cand, "end_date"), row.get("end_date")):
+            continue
+        out.append(row)
+    return out
+
+
+def _education_similar(cand: Any, existing_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    school = _norm_str(_field(cand, "school_name"))
+    if not school:
+        return []
+    out: list[dict[str, Any]] = []
+    for row in existing_rows:
+        if _norm_str(row.get("school_name")) != school:
+            continue
+        if not _optional_str_compatible(_field(cand, "degree"), row.get("degree")):
+            continue
+        if not dates_compatible(_field(cand, "start_date"), row.get("start_date")):
+            continue
+        if not dates_compatible(_field(cand, "end_date"), row.get("end_date")):
+            continue
+        out.append(row)
+    return out
+
+
+def _certification_similar(
+    cand: Any, existing_rows: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    name = _norm_str(_field(cand, "certification_name"))
+    if not name:
+        return []
+    out: list[dict[str, Any]] = []
+    for row in existing_rows:
+        if _norm_str(row.get("certification_name")) != name:
+            continue
+        if not _optional_str_compatible(_field(cand, "issuer"), row.get("issuer")):
+            continue
+        if not dates_compatible(_field(cand, "acquired_date"), row.get("acquired_date")):
+            continue
+        out.append(row)
+    return out
+
+
 def _diff_keyed_records(
     *,
     entity_type: str,
@@ -455,6 +581,7 @@ def _diff_keyed_records(
     fields: tuple[str, ...],
     natural_key,
     dump_row,
+    similar_match=None,
 ) -> list[DiffSpec]:
     specs: list[DiffSpec] = []
     grouped: dict[tuple, list[dict[str, Any]]] = {}
@@ -496,16 +623,43 @@ def _diff_keyed_records(
             )
             continue
         if not matches:
-            specs.append(
-                DiffSpec(
-                    entity_type=entity_type,
-                    candidate_path=path,
-                    change_type="NEW",
-                    new_value=dump,
-                    confidence=getattr(cand, "confidence", None),
-                    source_refs=refs,
+            similar = similar_match(cand, existing_rows) if similar_match else []
+            if not similar:
+                specs.append(
+                    DiffSpec(
+                        entity_type=entity_type,
+                        candidate_path=path,
+                        change_type="NEW",
+                        new_value=dump,
+                        confidence=getattr(cand, "confidence", None),
+                        source_refs=refs,
+                    )
                 )
-            )
+            elif len(similar) == 1:
+                specs.append(
+                    DiffSpec(
+                        entity_type=entity_type,
+                        candidate_path=path,
+                        existing_target_id=_as_uuid(similar[0].get("id")),
+                        change_type="REVIEW",
+                        old_value=similar[0],
+                        new_value=dump,
+                        confidence=getattr(cand, "confidence", None),
+                        source_refs=refs,
+                    )
+                )
+            else:
+                specs.append(
+                    DiffSpec(
+                        entity_type=entity_type,
+                        candidate_path=path,
+                        change_type="REVIEW",
+                        old_value=similar,
+                        new_value=dump,
+                        confidence=getattr(cand, "confidence", None),
+                        source_refs=refs,
+                    )
+                )
             continue
 
         old = matches[0]
@@ -526,7 +680,6 @@ def _diff_keyed_records(
             )
             continue
 
-        # Emit one item per differing field for clarity in review UI.
         for field_name, change, old_v, new_v in field_changes:
             specs.append(
                 DiffSpec(
