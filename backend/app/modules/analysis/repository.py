@@ -11,7 +11,7 @@ from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session
 
 from app.db.models.analysis import AnalysisDiffItem, AnalysisRun, AnalysisRunDocument
-from app.db.models.code import CodeMaster
+from app.db.models.code import CodeAlias, CodeMaster
 from app.db.models.document import Document, DocumentGroup, DocumentPage
 from app.db.models.person import Person, PersonProfile
 from app.db.models.project import Project
@@ -406,3 +406,24 @@ class AnalysisRepository:
             .scalars()
             .all()
         )
+
+    def list_aliases_for_codes(self, codes: list[str]) -> dict[str, list[str]]:
+        """Return deterministic alias lists keyed by code (sorted by alias)."""
+        if not codes:
+            return {}
+        rows = list(
+            self.db.execute(
+                select(CodeAlias.code, CodeAlias.alias)
+                .where(CodeAlias.code.in_(codes))
+                .order_by(CodeAlias.code.asc(), CodeAlias.alias.asc())
+            ).all()
+        )
+        out: dict[str, list[str]] = {}
+        for code, alias in rows:
+            text = (alias or "").strip()
+            if not text:
+                continue
+            bucket = out.setdefault(code, [])
+            if text not in bucket:
+                bucket.append(text)
+        return out

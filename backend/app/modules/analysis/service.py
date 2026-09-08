@@ -218,13 +218,15 @@ class AnalysisService:
                 code: (code_type, active)
                 for code, code_type, active in claimed.catalog
             }
+            max_pages = int(self.settings.analysis_max_pages_per_document)
+            # source_ref validation must match pages actually sent to the LLM.
             allowed_docs = {
-                str(doc.id): {p.page_no for p in doc.pages}
+                str(doc.id): {p.page_no for p in list(doc.pages)[:max_pages]}
                 for doc in claimed.documents
             }
             page_texts: dict[tuple[str, int], str] = {}
             for doc in claimed.documents:
-                for page in doc.pages:
+                for page in list(doc.pages)[:max_pages]:
                     text = (page.extracted_text or "").strip()
                     if text:
                         page_texts[(str(doc.id), page.page_no)] = text
@@ -235,9 +237,9 @@ class AnalysisService:
                 for line in (block.text or "").splitlines():
                     if line.startswith("[PAGE ") and line.endswith("]"):
                         if current_page is not None and buf:
-                            page_texts[(block.document_id, current_page)] = "\n".join(
-                                buf
-                            ).strip()
+                            key = (block.document_id, current_page)
+                            if current_page in allowed_docs.get(block.document_id, set()):
+                                page_texts[key] = "\n".join(buf).strip()
                         buf = []
                         try:
                             current_page = int(line[6:-1].strip())
@@ -247,9 +249,10 @@ class AnalysisService:
                     if current_page is not None:
                         buf.append(line)
                 if current_page is not None and buf:
-                    page_texts[(block.document_id, current_page)] = "\n".join(
-                        buf
-                    ).strip()
+                    if current_page in allowed_docs.get(block.document_id, set()):
+                        page_texts[(block.document_id, current_page)] = "\n".join(
+                            buf
+                        ).strip()
             candidate = normalize_candidate(
                 raw,
                 catalog=catalog_map,
@@ -334,7 +337,8 @@ class AnalysisService:
 
         codes = self.repo.list_active_codes()
         catalog = tuple((c.code, c.code_type, bool(c.is_active)) for c in codes)
-        catalog_text = self._format_code_catalog(codes)
+        aliases = self.repo.list_aliases_for_codes([c.code for c in codes])
+        catalog_text = self._format_code_catalog(codes, aliases)
 
         # Release row lock before Storage / VLM / LLM work.
         self.db.commit()
@@ -347,8 +351,11 @@ class AnalysisService:
             code_catalog_text=catalog_text,
         )
 
-    def _format_code_catalog(self, codes: list) -> str:
+    def _format_code_catalog(
+        self, codes: list, aliases: dict[str, list[str]] | None = None
+    ) -> str:
         max_chars = int(self.settings.analysis_code_context_max_chars)
+        alias_map = aliases or {}
         lines: list[str] = []
         used = 0
         current_type: str | None = None
@@ -360,7 +367,11 @@ class AnalysisService:
                     break
                 lines.append(header)
                 used += len(header)
-            line = f"{row.code}\t{row.name}\n"
+            alias_part = "|".join(alias_map.get(row.code, []))
+            if alias_part:
+                line = f"{row.code}\t{row.name}\t{alias_part}\n"
+            else:
+                line = f"{row.code}\t{row.name}\n"
             if used + len(line) > max_chars:
                 break
             lines.append(line)
@@ -505,6 +516,10 @@ class AnalysisService:
         diff = self.repo.get_diff(diff_id, for_update=True)
         if diff is None or diff.analysis_run_id != analysis_id:
             raise NotFoundError("Diff를 찾을 수 없습니다.")
+        if diff.review_status != "PENDING":
+            raise AnalysisStateConflictError(
+                "이미 결정된 Diff는 재결정할 수 없습니다."
+            )
 
         self._apply_decision(run, diff, payload, actor_user_id)
         self.repo.add_audit(
@@ -535,11 +550,21 @@ class AnalysisService:
                 f"상태가 {run.status}인 분석은 검토할 수 없습니다."
             )
 
-        results: list[DiffItemResponse] = []
+        if payload.review_status not in {"ACCEPTED", "REJECTED"}:
+            raise ValidationAppError(
+                "일괄 검토는 ACCEPTED 또는 REJECTED만 지원합니다."
+            )
+
+        # Validate all selected diffs first — no partial apply.
+        locked: list[AnalysisDiffItem] = []
         for diff_id in payload.diff_ids:
             diff = self.repo.get_diff(diff_id, for_update=True)
             if diff is None or diff.analysis_run_id != analysis_id:
                 raise NotFoundError(f"Diff를 찾을 수 없습니다: {diff_id}")
+            if diff.review_status != "PENDING":
+                raise AnalysisStateConflictError(
+                    "이미 결정된 Diff가 포함되어 일괄 검토할 수 없습니다."
+                )
             if payload.review_status == "ACCEPTED" and diff.change_type in {
                 "CONFLICT",
                 "REVIEW",
@@ -547,6 +572,10 @@ class AnalysisService:
                 raise ValidationAppError(
                     "CONFLICT/REVIEW Diff는 일괄 ACCEPTED할 수 없습니다."
                 )
+            locked.append(diff)
+
+        results: list[DiffItemResponse] = []
+        for diff in locked:
             decision = DiffDecisionRequest(review_status=payload.review_status)
             self._apply_decision(run, diff, decision, actor_user_id)
             results.append(self._to_diff_response(diff))
@@ -580,6 +609,10 @@ class AnalysisService:
         status = payload.review_status
         if status == "PENDING":
             raise ValidationAppError("review_status를 PENDING으로 설정할 수 없습니다.")
+        if diff.review_status != "PENDING":
+            raise AnalysisStateConflictError(
+                "이미 결정된 Diff는 재결정할 수 없습니다."
+            )
 
         if status == "MODIFIED":
             if payload.decided_value is None:

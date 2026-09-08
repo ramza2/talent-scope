@@ -1511,3 +1511,415 @@ def test_retry_state_guards_and_broker_fail(
     assert run.status == "FAILED"
 
     _cleanup_person(db_session, person.id, admin.id)
+
+
+def test_exp_same_code_different_evidence_is_review_not_new():
+    from app.ai.schemas.profile_candidate import (
+        ExpertiseCandidate,
+        ProfileCandidateDocument,
+    )
+    from app.modules.analysis.diff_engine import build_diffs
+
+    candidate = ProfileCandidateDocument(
+        expertise=[
+            ExpertiseCandidate(code="EXP-AI-RAG", evidence_type="INFERRED", raw_value="RAG")
+        ]
+    )
+    base = {
+        "profile": {},
+        "jobs": [],
+        "skills": [],
+        "expertise": [{"code": "EXP-AI-RAG", "evidence_type": "EXPLICIT"}],
+        "employment_history": [],
+        "education": [],
+        "certifications": [],
+        "projects": [],
+    }
+    specs = build_diffs(candidate, base)
+    exp_specs = [s for s in specs if s.entity_type == "EXP"]
+    assert len(exp_specs) == 1
+    assert exp_specs[0].change_type == "REVIEW"
+    assert exp_specs[0].change_type != "NEW"
+    assert exp_specs[0].old_value["evidence_type"] == "EXPLICIT"
+    assert exp_specs[0].new_value["evidence_type"] == "INFERRED"
+
+
+def test_project_relation_additive_and_unmapped_review():
+    from app.ai.schemas.profile_candidate import (
+        CodeRefCandidate,
+        ProfileCandidateDocument,
+        ProjectCandidate,
+    )
+    from app.modules.analysis.diff_engine import build_diffs
+
+    pid = "11111111-1111-1111-1111-111111111111"
+    base = {
+        "profile": {},
+        "jobs": [],
+        "skills": [],
+        "expertise": [],
+        "employment_history": [],
+        "education": [],
+        "certifications": [],
+        "projects": [
+            {
+                "id": pid,
+                "project_name": "P1",
+                "customer_name": "C",
+                "start_date": "2020",
+                "end_date": "2021",
+                "project_summary": "s",
+                "jobs": [{"code": "JOB-PL"}],
+                "skills": [
+                    {"code": "TECH-LANG-PYTHON"},
+                    {"code": "TECH-LANG-JAVA"},
+                ],
+                "expertise": [{"code": "EXP-AI-RAG", "evidence_type": "EXPLICIT"}],
+                "business_domains": [],
+                "customer_types": [],
+            }
+        ],
+    }
+
+    # A: omit Java → no removal semantics
+    cand_a = ProfileCandidateDocument(
+        projects=[
+            ProjectCandidate(
+                project_name="P1",
+                customer_name="C",
+                start_date="2020",
+                end_date="2021",
+                project_summary="s",
+                jobs=[CodeRefCandidate(code="JOB-PL")],
+                skills=[CodeRefCandidate(code="TECH-LANG-PYTHON")],
+                expertise=[CodeRefCandidate(code="EXP-AI-RAG")],
+            )
+        ]
+    )
+    specs_a = build_diffs(cand_a, base)
+    proj_a = [s for s in specs_a if s.entity_type == "PROJECT"]
+    assert len(proj_a) == 1 and proj_a[0].change_type == "SAME"
+    assert not any(
+        s.field_name in {"skills", "jobs", "expertise"} and s.change_type != "SAME"
+        for s in proj_a
+    )
+
+    # B: add Go → additive UPDATE only
+    cand_b = ProfileCandidateDocument(
+        projects=[
+            ProjectCandidate(
+                project_name="P1",
+                customer_name="C",
+                start_date="2020",
+                end_date="2021",
+                project_summary="s",
+                jobs=[CodeRefCandidate(code="JOB-PL")],
+                skills=[
+                    CodeRefCandidate(code="TECH-LANG-PYTHON"),
+                    CodeRefCandidate(code="TECH-LANG-GO", raw_value="Go"),
+                ],
+                expertise=[CodeRefCandidate(code="EXP-AI-RAG")],
+            )
+        ]
+    )
+    specs_b = build_diffs(cand_b, base)
+    proj_b = [s for s in specs_b if s.entity_type == "PROJECT"]
+    assert any(
+        s.change_type == "UPDATE"
+        and s.field_name == "skills"
+        and isinstance(s.new_value, dict)
+        and s.new_value.get("code") == "TECH-LANG-GO"
+        for s in proj_b
+    )
+    assert not any(
+        "JAVA" in str(s.new_value).upper() or "JAVA" in str(s.old_value).upper()
+        for s in proj_b
+        if s.change_type in {"UPDATE", "CONFLICT", "REVIEW", "NEW"}
+        and s.field_name == "skills"
+        and s.change_type != "UPDATE"
+    )
+    # Java must not appear as a removal CONFLICT/UPDATE
+    assert not any(
+        s.change_type == "CONFLICT" and s.field_name == "skills" for s in proj_b
+    )
+
+    # C: unmapped raw skill → REVIEW
+    cand_c = ProfileCandidateDocument(
+        projects=[
+            ProjectCandidate(
+                project_name="P1",
+                customer_name="C",
+                start_date="2020",
+                end_date="2021",
+                project_summary="s",
+                skills=[
+                    CodeRefCandidate(code="TECH-LANG-PYTHON"),
+                    CodeRefCandidate(code=None, raw_value="Unknown Framework"),
+                ],
+            )
+        ]
+    )
+    specs_c = build_diffs(cand_c, base)
+    assert any(
+        s.entity_type == "PROJECT"
+        and s.change_type == "REVIEW"
+        and s.field_name == "skills"
+        and isinstance(s.new_value, dict)
+        and s.new_value.get("raw_value") == "Unknown Framework"
+        for s in specs_c
+    )
+
+    # D: same JOB relation → no job relation diffs
+    cand_d = ProfileCandidateDocument(
+        projects=[
+            ProjectCandidate(
+                project_name="P1",
+                customer_name="C",
+                start_date="2020",
+                end_date="2021",
+                project_summary="s",
+                jobs=[CodeRefCandidate(code="JOB-PL")],
+                skills=[
+                    CodeRefCandidate(code="TECH-LANG-PYTHON"),
+                    CodeRefCandidate(code="TECH-LANG-JAVA"),
+                ],
+                expertise=[CodeRefCandidate(code="EXP-AI-RAG")],
+            )
+        ]
+    )
+    specs_d = build_diffs(cand_d, base)
+    proj_d = [s for s in specs_d if s.entity_type == "PROJECT"]
+    assert len(proj_d) == 1 and proj_d[0].change_type == "SAME"
+    assert not any(s.field_name == "jobs" for s in proj_d)
+
+    # EXP additive on project
+    cand_exp = ProfileCandidateDocument(
+        projects=[
+            ProjectCandidate(
+                project_name="P1",
+                customer_name="C",
+                start_date="2020",
+                end_date="2021",
+                project_summary="s",
+                expertise=[
+                    CodeRefCandidate(code="EXP-AI-RAG"),
+                    CodeRefCandidate(code="EXP-AI-AGENT", raw_value="Agent"),
+                ],
+            )
+        ]
+    )
+    specs_exp = build_diffs(cand_exp, base)
+    assert any(
+        s.change_type == "UPDATE"
+        and s.field_name == "expertise"
+        and isinstance(s.new_value, dict)
+        and s.new_value.get("code") == "EXP-AI-AGENT"
+        for s in specs_exp
+        if s.entity_type == "PROJECT"
+    )
+    # omitting existing EXP-AI-RAG alone would still be SAME for expertise set
+    # (not tested here); adding must not conflict-remove RAG.
+
+
+def test_review_decision_is_one_shot(client: TestClient, db_session):
+    from app.db.models.analysis import AnalysisDiffItem, AnalysisRun
+
+    admin = _create_user(
+        db_session, login_id=f"a_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    csrf = _login(client, admin.login_id, "Passw0rd!")
+    person, document = _seed_person_with_ready_doc(db_session, admin.id)
+    analysis_id = client.post(
+        "/api/v1/analyses",
+        headers={"X-CSRF-Token": csrf},
+        json={
+            "person_id": str(person.id),
+            "document_ids": [str(document.id)],
+            "analysis_type": "PROFILE",
+        },
+    ).json()["data"]["analysis_id"]
+
+    run = db_session.execute(
+        select(AnalysisRun).where(AnalysisRun.id == uuid.UUID(analysis_id))
+    ).scalar_one()
+    run.status = "REVIEWING"
+    diff = AnalysisDiffItem(
+        analysis_run_id=run.id,
+        entity_type="PROFILE",
+        candidate_path="profile.phone",
+        field_name="phone",
+        change_type="NEW",
+        new_value="010",
+        review_status="PENDING",
+    )
+    db_session.add(diff)
+    db_session.commit()
+    db_session.refresh(diff)
+
+    first = client.patch(
+        f"/api/v1/analyses/{analysis_id}/diffs/{diff.id}",
+        headers={"X-CSRF-Token": csrf},
+        json={"review_status": "MODIFIED", "decided_value": "010-1111-2222"},
+    )
+    assert first.status_code == 200, first.text
+    decided_at = first.json()["data"]["decided_at"]
+    decided_by = first.json()["data"]["decided_by"]
+
+    second = client.patch(
+        f"/api/v1/analyses/{analysis_id}/diffs/{diff.id}",
+        headers={"X-CSRF-Token": csrf},
+        json={"review_status": "REJECTED"},
+    )
+    assert second.status_code == 409
+    assert second.json()["code"] == "ANALYSIS_STATE_CONFLICT"
+
+    db_session.refresh(diff)
+    assert diff.review_status == "MODIFIED"
+    assert diff.decided_value == "010-1111-2222"
+    assert str(diff.decided_by) == decided_by
+    assert diff.decided_at is not None
+
+    _cleanup_person(db_session, person.id, admin.id)
+
+
+def test_bulk_mixed_pending_and_decided_is_atomic_409(client: TestClient, db_session):
+    from app.db.models.analysis import AnalysisDiffItem, AnalysisRun
+
+    admin = _create_user(
+        db_session, login_id=f"a_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    csrf = _login(client, admin.login_id, "Passw0rd!")
+    person, document = _seed_person_with_ready_doc(db_session, admin.id)
+    analysis_id = client.post(
+        "/api/v1/analyses",
+        headers={"X-CSRF-Token": csrf},
+        json={
+            "person_id": str(person.id),
+            "document_ids": [str(document.id)],
+            "analysis_type": "PROFILE",
+        },
+    ).json()["data"]["analysis_id"]
+
+    run = db_session.execute(
+        select(AnalysisRun).where(AnalysisRun.id == uuid.UUID(analysis_id))
+    ).scalar_one()
+    run.status = "REVIEWING"
+    d_pending = AnalysisDiffItem(
+        analysis_run_id=run.id,
+        entity_type="JOB",
+        candidate_path="jobs[0]",
+        change_type="NEW",
+        new_value={"code": "JOB-AI-DEV"},
+        review_status="PENDING",
+    )
+    d_done = AnalysisDiffItem(
+        analysis_run_id=run.id,
+        entity_type="TECH",
+        candidate_path="skills[0]",
+        change_type="NEW",
+        new_value={"code": "TECH-LANG-PYTHON"},
+        review_status="ACCEPTED",
+    )
+    db_session.add_all([d_pending, d_done])
+    db_session.commit()
+    db_session.refresh(d_pending)
+    db_session.refresh(d_done)
+
+    resp = client.post(
+        f"/api/v1/analyses/{analysis_id}/diffs/bulk",
+        headers={"X-CSRF-Token": csrf},
+        json={
+            "diff_ids": [str(d_pending.id), str(d_done.id)],
+            "review_status": "ACCEPTED",
+        },
+    )
+    assert resp.status_code == 409
+    db_session.refresh(d_pending)
+    assert d_pending.review_status == "PENDING"
+
+    # Bulk MODIFIED rejected
+    bad_status = client.post(
+        f"/api/v1/analyses/{analysis_id}/diffs/bulk",
+        headers={"X-CSRF-Token": csrf},
+        json={"diff_ids": [str(d_pending.id)], "review_status": "MODIFIED"},
+    )
+    assert bad_status.status_code == 400
+
+    _cleanup_person(db_session, person.id, admin.id)
+
+
+def test_source_ref_outside_analysis_page_limit_discarded(monkeypatch: pytest.MonkeyPatch):
+    from app.core.config import get_settings
+    from app.modules.analysis.normalize import normalize_candidate
+
+    get_settings.cache_clear()
+    monkeypatch.setenv("ANALYSIS_MAX_PAGES_PER_DOCUMENT", "2")
+    get_settings.cache_clear()
+    settings = get_settings()
+    assert int(settings.analysis_max_pages_per_document) == 2
+
+    doc_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    # Mimic service: only first N pages are allowed for source_ref validation.
+    max_pages = int(settings.analysis_max_pages_per_document)
+    all_pages = {1, 2, 3, 50}
+    allowed = {doc_id: {p for p in all_pages if p <= max_pages}}
+    assert 50 not in allowed[doc_id]
+
+    raw = {
+        "schema_version": "profile-candidate-v1",
+        "profile": {"name": "홍길동"},
+        "jobs": [
+            {
+                "code": None,
+                "raw_value": "Dev",
+                "source_refs": [
+                    {"document_id": doc_id, "page_no": 1, "quote_text": "page1"},
+                    {"document_id": doc_id, "page_no": 50, "quote_text": "page50"},
+                ],
+            }
+        ],
+        "skills": [],
+        "expertise": [],
+        "employment_history": [],
+        "education": [],
+        "certifications": [],
+        "projects": [],
+        "summary": {},
+        "analysis": {},
+    }
+    doc = normalize_candidate(
+        raw,
+        catalog={},
+        allowed_documents=allowed,
+        settings=settings,
+        page_texts={(doc_id, 1): "page1 text", (doc_id, 50): "page50 text"},
+    )
+    pages = {r.page_no for r in doc.jobs[0].source_refs}
+    assert 1 in pages
+    assert 50 not in pages
+    get_settings.cache_clear()
+
+
+def test_code_catalog_includes_aliases():
+    from types import SimpleNamespace
+
+    from app.modules.analysis.service import AnalysisService
+
+    codes = [
+        SimpleNamespace(code="TECH-LANG-PYTHON", code_type="TECH", name="Python"),
+        SimpleNamespace(code="JOB-AI-DEV", code_type="JOB", name="AI Engineer"),
+    ]
+    aliases = {
+        "TECH-LANG-PYTHON": ["Py", "Python3"],
+        "JOB-AI-DEV": ["AI개발"],
+    }
+    # Build without DB session methods — call formatter via unbound style
+    text = AnalysisService._format_code_catalog(
+        SimpleNamespace(
+            settings=SimpleNamespace(analysis_code_context_max_chars=10_000)
+        ),
+        codes,
+        aliases,
+    )
+    assert "TECH-LANG-PYTHON\tPython\tPy|Python3" in text
+    assert "JOB-AI-DEV\tAI Engineer\tAI개발" in text

@@ -374,13 +374,13 @@ def _diff_skills(
 def _diff_expertise(
     candidate: ProfileCandidateDocument, existing: list[dict[str, Any]]
 ) -> list[DiffSpec]:
+    """Match Person EXP by exp_code only (DB unique is person_id + exp_code)."""
     specs: list[DiffSpec] = []
-    existing_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    existing_by_code: dict[str, dict[str, Any]] = {}
     for row in existing:
         code = _norm_str(row.get("exp_code") or row.get("code"))
-        evidence = _norm_str(row.get("evidence_type")) or "EXPLICIT"
-        if code:
-            existing_by_key[(code, evidence)] = row
+        if code and code not in existing_by_code:
+            existing_by_code[code] = row
 
     for idx, exp in enumerate(candidate.expertise):
         path = f"expertise[{idx}]"
@@ -401,9 +401,8 @@ def _diff_expertise(
                 )
             )
             continue
-        old = existing_by_key.get((code, evidence))
+        old = existing_by_code.get(code)
         if old is None:
-            # Same code different evidence_type → still NEW relation row.
             specs.append(
                 DiffSpec(
                     entity_type="EXP",
@@ -415,12 +414,28 @@ def _diff_expertise(
                     source_refs=refs,
                 )
             )
-        else:
+            continue
+        old_evidence = _norm_str(old.get("evidence_type")) or "EXPLICIT"
+        if old_evidence == evidence:
             specs.append(
                 DiffSpec(
                     entity_type="EXP",
                     candidate_path=path,
                     change_type="SAME",
+                    evidence_type=evidence,
+                    old_value=old,
+                    new_value=dump,
+                    confidence=exp.confidence,
+                    source_refs=refs,
+                )
+            )
+        else:
+            # Same code cannot become a second NEW relation — require review.
+            specs.append(
+                DiffSpec(
+                    entity_type="EXP",
+                    candidate_path=path,
+                    change_type="REVIEW",
                     evidence_type=evidence,
                     old_value=old,
                     new_value=dump,
@@ -567,6 +582,15 @@ def _project_match_key(row: Any) -> tuple[str | None, str | None, str | None, st
     )
 
 
+PROJECT_RELATION_FIELDS: tuple[str, ...] = (
+    "jobs",
+    "skills",
+    "expertise",
+    "business_domains",
+    "customer_types",
+)
+
+
 def _diff_projects(
     candidate: ProfileCandidateDocument, existing: list[dict[str, Any]]
 ) -> list[DiffSpec]:
@@ -590,6 +614,16 @@ def _diff_projects(
                     candidate_path=path,
                     change_type="REVIEW",
                     new_value=dump,
+                    confidence=project.confidence,
+                    source_refs=refs,
+                )
+            )
+            specs.extend(
+                _diff_project_relations(
+                    path=path,
+                    old_project=None,
+                    new_project=dump,
+                    existing_target_id=None,
                     confidence=project.confidence,
                     source_refs=refs,
                 )
@@ -645,25 +679,33 @@ def _diff_projects(
                         source_refs=refs,
                     )
                 )
+                # Surface unmapped relation items on NEW projects for review.
+                specs.extend(
+                    _diff_project_relations(
+                        path=path,
+                        old_project=None,
+                        new_project=dump,
+                        existing_target_id=None,
+                        confidence=project.confidence,
+                        source_refs=refs,
+                        additions_only_unmapped=True,
+                    )
+                )
             continue
 
         old = matches[0]
         target_id = _as_uuid(old.get("id"))
-        # Exact name+customer+dates match — compare remaining fields.
         field_changes = _compare_fields(old, dump, PROJECT_COMPARE_FIELDS)
-        # Also compare relation code sets at a coarse level.
-        for rel_field in ("jobs", "skills", "expertise", "business_domains", "customer_types"):
-            old_codes = _code_set(old.get(rel_field))
-            new_codes = _code_set(dump.get(rel_field))
-            if old_codes != new_codes:
-                if not old_codes and new_codes:
-                    field_changes.append((rel_field, "UPDATE", old.get(rel_field), dump.get(rel_field)))
-                elif old_codes and new_codes:
-                    field_changes.append(
-                        (rel_field, "CONFLICT", old.get(rel_field), dump.get(rel_field))
-                    )
+        relation_specs = _diff_project_relations(
+            path=path,
+            old_project=old,
+            new_project=dump,
+            existing_target_id=target_id,
+            confidence=project.confidence,
+            source_refs=refs,
+        )
 
-        if not field_changes:
+        if not field_changes and not relation_specs:
             specs.append(
                 DiffSpec(
                     entity_type="PROJECT",
@@ -679,7 +721,6 @@ def _diff_projects(
             continue
 
         for field_name, change, old_v, new_v in field_changes:
-            # Skip identity fields that already matched the key for SAME-ness.
             if field_name in {"project_name", "customer_name", "start_date", "end_date"}:
                 if change == "SAME":
                     continue
@@ -696,6 +737,100 @@ def _diff_projects(
                     source_refs=refs,
                 )
             )
+        specs.extend(relation_specs)
+    return specs
+
+
+def _relation_item_code(row: dict[str, Any]) -> str | None:
+    return _norm_str(
+        row.get("code")
+        or row.get("job_code")
+        or row.get("tech_code")
+        or row.get("exp_code")
+        or row.get("biz_code")
+        or row.get("customer_type_code")
+    )
+
+
+def _as_relation_dict(row: Any) -> dict[str, Any]:
+    if hasattr(row, "model_dump"):
+        return row.model_dump(mode="json")
+    if isinstance(row, dict):
+        return dict(row)
+    return {}
+
+
+def _diff_project_relations(
+    *,
+    path: str,
+    old_project: dict[str, Any] | None,
+    new_project: dict[str, Any],
+    existing_target_id: UUID | None,
+    confidence: Any,
+    source_refs: list[dict[str, Any]],
+    additions_only_unmapped: bool = False,
+) -> list[DiffSpec]:
+    """Additive Project relation Diffs — never emit removal for omitted codes."""
+    specs: list[DiffSpec] = []
+    for rel_field in PROJECT_RELATION_FIELDS:
+        existing_rows = (old_project or {}).get(rel_field) or []
+        candidate_rows = new_project.get(rel_field) or []
+        existing_codes = {
+            code
+            for row in existing_rows
+            if (code := _relation_item_code(_as_relation_dict(row))) is not None
+        }
+
+        for idx, raw_item in enumerate(candidate_rows):
+            item = _as_relation_dict(raw_item)
+            code = _relation_item_code(item)
+            raw_value = _norm_str(item.get("raw_value") or item.get("name"))
+            item_path = f"{path}.{rel_field}[{idx}]"
+
+            if code is None:
+                if raw_value:
+                    specs.append(
+                        DiffSpec(
+                            entity_type="PROJECT",
+                            candidate_path=item_path,
+                            existing_target_id=existing_target_id,
+                            field_name=rel_field,
+                            change_type="REVIEW",
+                            new_value=item,
+                            confidence=confidence,
+                            source_refs=source_refs,
+                        )
+                    )
+                continue
+
+            if additions_only_unmapped:
+                continue
+
+            if code in existing_codes:
+                continue
+
+            # Valid new code relative to confirmed project → additive UPDATE.
+            new_value = {
+                key: value
+                for key, value in item.items()
+                if key in {"raw_value", "code", "evidence_type", "name"}
+                and value is not None
+                and value != ""
+            }
+            if "code" not in new_value:
+                new_value["code"] = code
+            specs.append(
+                DiffSpec(
+                    entity_type="PROJECT",
+                    candidate_path=item_path,
+                    existing_target_id=existing_target_id,
+                    field_name=rel_field,
+                    change_type="UPDATE",
+                    new_value=new_value,
+                    confidence=confidence,
+                    source_refs=source_refs,
+                )
+            )
     return specs
 
 
@@ -704,10 +839,7 @@ def _code_set(rows: Any) -> set[str]:
         return set()
     out: set[str] = set()
     for row in rows:
-        if isinstance(row, dict):
-            code = _norm_str(row.get("code") or row.get("job_code") or row.get("tech_code"))
-        else:
-            code = _norm_str(getattr(row, "code", None))
+        code = _relation_item_code(_as_relation_dict(row))
         if code:
             out.add(code)
     return out
