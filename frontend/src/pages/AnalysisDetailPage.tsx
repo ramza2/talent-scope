@@ -20,13 +20,17 @@ import type { Key } from 'react'
 import { apiErrorCode, apiErrorMessage } from '@/api/errors'
 import {
   bulkReviewDiffs,
+  buildDefaultModifiedDecision,
+  buildMergeDecisionRequestBody,
+  canConfirmAnalysis,
   confidenceColor,
   confidenceLabel,
   confirmAnalysis,
-  canConfirmAnalysis,
   countPendingActionableDiffs,
   getAnalysis,
+  initialMergeDecidedValueText,
   isActiveAnalysisStatus,
+  isProfileScalarDiff,
   isProjectRootReview,
   listAnalysisDiffs,
   reviewDiff,
@@ -43,22 +47,6 @@ type DiffFilterTab =
   | 'CONFLICT'
   | 'REVIEW'
   | 'reviewed'
-
-const PROFILE_SCALAR_FIELDS = new Set([
-  'name',
-  'birth_year',
-  'phone',
-  'email',
-  'address_region',
-  'affiliation_company',
-  'department',
-  'current_title',
-  'employment_type',
-  'technical_grade',
-  'career_start_date',
-  'career_document_value',
-  'profile_summary',
-])
 
 function formatDate(value?: string | null) {
   if (!value) return '—'
@@ -118,26 +106,6 @@ function reviewStatusTag(status: ReviewStatus) {
           ? 'processing'
           : 'warning'
   return <Tag color={color}>{status}</Tag>
-}
-
-function isProfileScalar(diff: DiffItem): boolean {
-  return (
-    diff.entity_type === 'PROFILE' &&
-    Boolean(diff.field_name) &&
-    PROFILE_SCALAR_FIELDS.has(diff.field_name!)
-  )
-}
-
-function defaultDecidedValue(diff: DiffItem): string {
-  if (diff.new_value === null || diff.new_value === undefined) return ''
-  if (isProfileScalar(diff) && (typeof diff.new_value === 'string' || typeof diff.new_value === 'number')) {
-    return String(diff.new_value)
-  }
-  try {
-    return JSON.stringify(diff.new_value, null, 2)
-  } catch {
-    return String(diff.new_value)
-  }
 }
 
 export function AnalysisDetailPage() {
@@ -270,7 +238,7 @@ export function AnalysisDetailPage() {
 
   const openModify = (diff: DiffItem) => {
     setEditingDiff(diff)
-    editForm.setFieldsValue({ decided_value: defaultDecidedValue(diff) })
+    editForm.setFieldsValue({ decided_value: buildDefaultModifiedDecision(diff) })
     setEditOpen(true)
   }
 
@@ -278,8 +246,7 @@ export function AnalysisDetailPage() {
     setEditingDiff(diff)
     mergeForm.setFieldsValue({
       existing_target_id: diff.existing_target_id ?? '',
-      decided_value:
-        diff.new_value != null ? JSON.stringify(diff.new_value, null, 2) : undefined,
+      decided_value: initialMergeDecidedValueText(),
     })
     setMergeOpen(true)
   }
@@ -287,7 +254,7 @@ export function AnalysisDetailPage() {
   const submitModify = async (values: { decided_value: string }) => {
     if (!editingDiff) return
     let decided: unknown = values.decided_value
-    if (!isProfileScalar(editingDiff)) {
+    if (!isProfileScalarDiff(editingDiff)) {
       try {
         decided = JSON.parse(values.decided_value)
       } catch {
@@ -311,22 +278,23 @@ export function AnalysisDetailPage() {
     decided_value?: string
   }) => {
     if (!editingDiff) return
-    let decided: unknown = undefined
-    if (values.decided_value?.trim()) {
-      try {
-        decided = JSON.parse(values.decided_value)
-      } catch {
-        message.error('decided_value JSON 형식이 올바르지 않습니다.')
-        return
-      }
+    let body: {
+      review_status: 'MERGED'
+      existing_target_id: string
+      decided_value?: unknown
+    }
+    try {
+      body = buildMergeDecisionRequestBody({
+        existing_target_id: values.existing_target_id,
+        decided_value_text: values.decided_value,
+      })
+    } catch {
+      message.error('decided_value JSON 형식이 올바르지 않습니다.')
+      return
     }
     await decisionMutation.mutateAsync({
       diffId: editingDiff.id,
-      body: {
-        review_status: 'MERGED',
-        existing_target_id: values.existing_target_id,
-        decided_value: decided,
-      },
+      body,
     })
   }
 
@@ -626,7 +594,7 @@ export function AnalysisDetailPage() {
             label="decided_value"
             rules={[{ required: true, message: '값을 입력하세요.' }]}
           >
-            {editingDiff && isProfileScalar(editingDiff) ? (
+            {editingDiff && isProfileScalarDiff(editingDiff) ? (
               <Input />
             ) : (
               <Input.TextArea rows={8} style={{ fontFamily: 'monospace' }} />
@@ -647,6 +615,29 @@ export function AnalysisDetailPage() {
         destroyOnHidden
         okText="병합"
       >
+        {editingDiff?.new_value != null ? (
+          <Typography.Paragraph type="secondary" style={{ marginBottom: 8 }}>
+            Candidate (읽기 전용)
+          </Typography.Paragraph>
+        ) : null}
+        {editingDiff?.new_value != null ? (
+          <Typography.Paragraph>
+            <pre
+              style={{
+                margin: 0,
+                marginBottom: 16,
+                maxHeight: 180,
+                overflow: 'auto',
+                padding: 8,
+                background: 'rgba(0,0,0,0.04)',
+                fontFamily: 'monospace',
+                fontSize: 12,
+              }}
+            >
+              {formatValue(editingDiff.new_value)}
+            </pre>
+          </Typography.Paragraph>
+        ) : null}
         <Form form={mergeForm} layout="vertical" onFinish={submitMerge}>
           <Form.Item
             name="existing_target_id"
@@ -655,8 +646,16 @@ export function AnalysisDetailPage() {
           >
             <Input placeholder="기존 Project UUID" />
           </Form.Item>
-          <Form.Item name="decided_value" label="decided_value (JSON, 선택)">
-            <Input.TextArea rows={6} style={{ fontFamily: 'monospace' }} />
+          <Form.Item
+            name="decided_value"
+            label="override JSON (선택 — 명시한 필드만 overwrite)"
+            extra="비우면 null-fill + additive만 적용됩니다. 값이 있을 때만 decided_value를 전송합니다."
+          >
+            <Input.TextArea
+              rows={6}
+              style={{ fontFamily: 'monospace' }}
+              placeholder="비워 두면 decided_value를 보내지 않습니다"
+            />
           </Form.Item>
         </Form>
       </Modal>

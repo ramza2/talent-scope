@@ -291,3 +291,11 @@ export function canConfirmAnalysis(input: {
 export function isActiveAnalysisStatus(status: AnalysisStatus): boolean {
   return status === 'QUEUED' || status === 'PROCESSING'
 }
+
+export {
+  MODIFIED_DEFAULT_STRIP_KEYS,
+  buildDefaultModifiedDecision,
+  buildMergeDecisionRequestBody,
+  initialMergeDecidedValueText,
+  isProfileScalarDiff,
+} from '@/api/analysisDecisions'

@@ -111,6 +111,45 @@ _PROJECT_RELATION_FIELDS = frozenset(
     {"jobs", "skills", "expertise", "business_domains", "customer_types"}
 )
 
+# DB String(n) limits — reject oversize before PostgreSQL DataError/500.
+_PROFILE_STRING_LIMITS: dict[str, int] = {
+    "name": 150,
+    "phone": 50,
+    "email": 255,
+    "address_region": 200,
+    "affiliation_company": 300,
+    "department": 200,
+    "current_title": 200,
+    "employment_type": 50,
+    "technical_grade": 30,
+    "career_document_value": 100,
+}
+_EMPLOYMENT_STRING_LIMITS: dict[str, int] = {
+    "company_name": 300,
+    "department": 200,
+    "title": 200,
+}
+_EDUCATION_STRING_LIMITS: dict[str, int] = {
+    "school_name": 300,
+    "major": 300,
+    "degree": 100,
+    "status": 100,
+}
+_CERTIFICATION_STRING_LIMITS: dict[str, int] = {
+    "certification_name": 300,
+    "issuer": 300,
+    "certificate_no": 200,
+}
+_PROJECT_STRING_LIMITS: dict[str, int] = {
+    "project_name": 500,
+    "customer_name": 300,
+}
+_CAREER_STRING_LIMITS_BY_FIELDS: dict[frozenset[str], dict[str, int]] = {
+    _EMPLOYMENT_FIELDS: _EMPLOYMENT_STRING_LIMITS,
+    _EDUCATION_FIELDS: _EDUCATION_STRING_LIMITS,
+    _CERTIFICATION_FIELDS: _CERTIFICATION_STRING_LIMITS,
+}
+
 _PROJECT_ROOT_RE = re.compile(r"^projects\[(\d+)\]$")
 _PROJECT_CHILD_RE = re.compile(r"^projects\[(\d+)\]\.(.+)$")
 _ENTITY_ROOT_RE = re.compile(
@@ -181,6 +220,31 @@ def _norm_str(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _assert_str_max_len(field: str, value: Any, limit: int) -> str | None:
+    if value is None:
+        return None
+    text = value if isinstance(value, str) else str(value)
+    if len(text) > limit:
+        raise ConfirmValidationError(
+            f"{field} 길이가 허용 한도({limit})를 초과합니다."
+        )
+    return text
+
+
+def _limit_optional_str(
+    field: str, value: Any, limits: dict[str, int]
+) -> Any:
+    if field not in limits:
+        return value
+    if value is None:
+        return None
+    text = value if isinstance(value, str) else str(value)
+    stripped = text.strip()
+    if not stripped:
+        return None
+    return _assert_str_max_len(field, stripped, limits[field])
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -613,7 +677,7 @@ class _ConfirmContext:
             text = _norm_str(value)
             if not text:
                 raise ConfirmValidationError("이름은 비어 있을 수 없습니다.")
-            return text
+            return _assert_str_max_len("name", text, _PROFILE_STRING_LIMITS["name"])
         if field == "birth_year":
             return _as_optional_year(value, field="birth_year")
         if field == "technical_grade":
@@ -625,13 +689,33 @@ class _ConfirmContext:
                 raise ConfirmValidationError(
                     f"허용되지 않은 technical_grade입니다: {text}"
                 )
-            return text
+            return _assert_str_max_len(
+                "technical_grade", text, _PROFILE_STRING_LIMITS["technical_grade"]
+            )
         if field == "career_start_date":
             return _normalize_field_date("career_start_date", value)
         if field == "career_document_value":
             if value is None:
                 return None
+            return _assert_str_max_len(
+                "career_document_value",
+                str(value),
+                _PROFILE_STRING_LIMITS["career_document_value"],
+            )
+        if field == "profile_summary":
+            # Text — no arbitrary length cap.
+            if value is None:
+                return None
+            if isinstance(value, str):
+                return value.strip() or None
             return str(value)
+        if field in _PROFILE_STRING_LIMITS:
+            if value is None or value == "":
+                return None
+            text = value.strip() if isinstance(value, str) else str(value).strip()
+            if not text:
+                return None
+            return _assert_str_max_len(field, text, _PROFILE_STRING_LIMITS[field])
         if isinstance(value, str):
             return value.strip() or None
         return value
@@ -912,6 +996,8 @@ class _ConfirmContext:
         coerced = _normalize_field_date(field, value) if field in _DATE_BOUNDS else value
         if isinstance(coerced, str) and field not in _DATE_BOUNDS:
             coerced = coerced.strip() or None
+        limits = _CAREER_STRING_LIMITS_BY_FIELDS.get(fields, {})
+        coerced = _limit_optional_str(field, coerced, limits)
         setattr(row, field, coerced)
         self._assert_career_dates(row)
         toucher(row)
@@ -919,6 +1005,7 @@ class _ConfirmContext:
     def _career_create_payload(
         self, data: dict[str, Any], *, fields: frozenset[str]
     ) -> dict[str, Any]:
+        limits = _CAREER_STRING_LIMITS_BY_FIELDS.get(fields, {})
         out: dict[str, Any] = {}
         for key in fields:
             if key not in data:
@@ -929,15 +1016,19 @@ class _ConfirmContext:
             if key in _DATE_BOUNDS:
                 out[key] = _normalize_field_date(key, val)
             elif isinstance(val, str):
-                out[key] = val.strip() or None
+                limited = _limit_optional_str(key, val, limits)
+                if limited is not None:
+                    out[key] = limited
             else:
-                out[key] = val
+                limited = _limit_optional_str(key, val, limits)
+                out[key] = limited if key in limits else val
         self._assert_date_pair(out)
         return {k: v for k, v in out.items() if v is not None}
 
     def _null_fill_career(
         self, row: Any, data: dict[str, Any], *, fields: frozenset[str]
     ) -> None:
+        limits = _CAREER_STRING_LIMITS_BY_FIELDS.get(fields, {})
         for key in fields:
             if key not in data:
                 continue
@@ -950,7 +1041,9 @@ class _ConfirmContext:
             if key in _DATE_BOUNDS:
                 val = _normalize_field_date(key, val)
             elif isinstance(val, str):
-                val = val.strip() or None
+                val = _limit_optional_str(key, val.strip() or None, limits)
+            else:
+                val = _limit_optional_str(key, val, limits)
             if val is not None:
                 setattr(row, key, val)
         self._assert_career_dates(row)
@@ -958,13 +1051,16 @@ class _ConfirmContext:
     def _overwrite_career(
         self, row: Any, data: dict[str, Any], *, fields: frozenset[str]
     ) -> None:
+        limits = _CAREER_STRING_LIMITS_BY_FIELDS.get(fields, {})
         for key, val in data.items():
             if key not in fields:
                 continue
             if key in _DATE_BOUNDS:
                 val = _normalize_field_date(key, val)
             elif isinstance(val, str):
-                val = val.strip() or None
+                val = _limit_optional_str(key, val.strip() or None, limits)
+            else:
+                val = _limit_optional_str(key, val, limits)
             setattr(row, key, val)
         self._assert_career_dates(row)
 
@@ -1158,6 +1254,8 @@ class _ConfirmContext:
         if field == "duration_months":
             months = _as_optional_months(value, field="duration_months")
             return months
+        if field in _PROJECT_STRING_LIMITS:
+            return _limit_optional_str(field, value, _PROJECT_STRING_LIMITS)
         if isinstance(value, str):
             return value.strip() or None
         return value

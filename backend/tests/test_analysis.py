@@ -3361,3 +3361,185 @@ def test_frontend_confirm_loading_gate_contract():
     assert can_confirm(status="REVIEWING", diffs_ok=True, pending=1, base_ver=1) is False
     assert can_confirm(status="REVIEWING", diffs_ok=True, pending=0, base_ver=None) is False
     assert can_confirm(status="REVIEWING", diffs_ok=True, pending=0, base_ver=1) is True
+
+
+def test_frontend_explicit_decision_semantics_contract():
+    """Merge/MODIFIED defaults must not auto-send destructive null/false."""
+    import json
+    import subprocess
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2]
+    api = (root / "frontend" / "src" / "api" / "analyses.ts").read_text(encoding="utf-8")
+    page = (
+        root / "frontend" / "src" / "pages" / "AnalysisDetailPage.tsx"
+    ).read_text(encoding="utf-8")
+
+    assert "buildDefaultModifiedDecision" in api
+    assert "buildMergeDecisionRequestBody" in api
+    assert "initialMergeDecidedValueText" in api
+    assert "from '@/api/analysisDecisions'" in api
+    assert "initialMergeDecidedValueText()" in page
+    assert "buildDefaultModifiedDecision(diff)" in page
+    assert "buildMergeDecisionRequestBody" in page
+    assert "Candidate (읽기 전용)" in page
+    # Must not auto-fill merge override from candidate new_value.
+    assert "JSON.stringify(diff.new_value" not in page
+
+    script = r"""
+import {
+  buildDefaultModifiedDecision,
+  buildMergeDecisionRequestBody,
+  initialMergeDecidedValueText,
+} from './src/api/analysisDecisions.ts'
+
+const mergeInit = initialMergeDecidedValueText()
+if (mergeInit !== '') throw new Error('merge init must be empty')
+
+const targetOnly = buildMergeDecisionRequestBody({
+  existing_target_id: 'proj-1',
+  decided_value_text: '',
+})
+if (targetOnly.review_status !== 'MERGED') throw new Error('status')
+if (targetOnly.existing_target_id !== 'proj-1') throw new Error('target')
+if ('decided_value' in targetOnly) throw new Error('decided_value must be omitted')
+
+const withOverride = buildMergeDecisionRequestBody({
+  existing_target_id: 'proj-1',
+  decided_value_text: '{"project_name":"Override"}',
+})
+if (JSON.stringify(withOverride.decided_value) !== '{"project_name":"Override"}') {
+  throw new Error('override missing')
+}
+
+const techDefault = JSON.parse(
+  buildDefaultModifiedDecision({
+    entity_type: 'TECH',
+    new_value: {
+      code: 'TECH-LANG-PYTHON',
+      last_used_year: 2026,
+      experience_months: null,
+      is_representative: false,
+      confidence: 0.9,
+      source_refs: [],
+      raw_value: 'Python',
+    },
+  }),
+)
+if (techDefault.code !== 'TECH-LANG-PYTHON') throw new Error('tech code')
+if (techDefault.last_used_year !== 2026) throw new Error('tech year')
+if ('experience_months' in techDefault) throw new Error('tech months null leaked')
+if ('is_representative' in techDefault) throw new Error('tech false leaked')
+if ('confidence' in techDefault || 'source_refs' in techDefault || 'raw_value' in techDefault) {
+  throw new Error('tech metadata leaked')
+}
+
+const careerDefault = JSON.parse(
+  buildDefaultModifiedDecision({
+    entity_type: 'EMPLOYMENT',
+    new_value: {
+      company_name: 'ABC',
+      department: null,
+      title: 'PL',
+      end_date: null,
+      confidence: 0.8,
+      source_refs: [],
+    },
+  }),
+)
+if (careerDefault.company_name !== 'ABC' || careerDefault.title !== 'PL') {
+  throw new Error('career fields')
+}
+if ('department' in careerDefault || 'end_date' in careerDefault) {
+  throw new Error('career null leaked')
+}
+if ('confidence' in careerDefault) throw new Error('career metadata leaked')
+
+const newEmp = JSON.parse(
+  buildDefaultModifiedDecision({
+    entity_type: 'EMPLOYMENT',
+    new_value: {
+      company_name: 'NewCo',
+      department: null,
+      title: 'Dev',
+      confidence: 0.7,
+    },
+  }),
+)
+if (newEmp.company_name !== 'NewCo' || newEmp.title !== 'Dev') {
+  throw new Error('NEW employment required fields')
+}
+if ('department' in newEmp || 'confidence' in newEmp) {
+  throw new Error('NEW employment null/metadata leaked')
+}
+
+// Explicit user null/false must remain when already in decided JSON text path:
+const explicit = JSON.parse(
+  '{"code":"TECH-LANG-PYTHON","is_representative":false,"experience_months":null}',
+)
+if (explicit.is_representative !== false || explicit.experience_months !== null) {
+  throw new Error('explicit null/false must be preservable')
+}
+
+console.log(JSON.stringify({ ok: true, techDefault, careerDefault, targetOnly, withOverride, newEmp }))
+"""
+    proc = subprocess.run(
+        ["npx", "--yes", "tsx", "-e", script],
+        cwd=str(root / "frontend"),
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
+    )
+    assert proc.returncode == 0, proc.stdout + "\n" + proc.stderr
+    payload = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert payload["ok"] is True
+    assert "decided_value" not in payload["targetOnly"]
+    assert payload["withOverride"]["decided_value"] == {"project_name": "Override"}
+    assert payload["techDefault"] == {
+        "code": "TECH-LANG-PYTHON",
+        "last_used_year": 2026,
+    }
+    assert payload["careerDefault"] == {"company_name": "ABC", "title": "PL"}
+    assert payload["newEmp"] == {"company_name": "NewCo", "title": "Dev"}
+
+    decisions = (
+        root / "frontend" / "src" / "api" / "analysisDecisions.ts"
+    ).read_text(encoding="utf-8")
+    assert "export function buildDefaultModifiedDecision" in decisions
+    assert "export function buildMergeDecisionRequestBody" in decisions
+
+
+def test_confirm_rejects_oversized_profile_string(client: TestClient, db_session):
+    from app.db.models.analysis import AnalysisDiffItem
+
+    admin = _create_user(
+        db_session, login_id=f"sl_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    csrf = _login(client, admin.login_id, "Passw0rd!")
+    person, document = _seed_person_with_ready_doc(db_session, admin.id)
+    analysis_id, run = _start_reviewing_analysis(
+        client, db_session, csrf, person, document
+    )
+    db_session.add(
+        AnalysisDiffItem(
+            analysis_run_id=run.id,
+            entity_type="PROFILE",
+            candidate_path="profile.phone",
+            field_name="phone",
+            change_type="UPDATE",
+            old_value="010",
+            new_value="1" * 51,
+            review_status="ACCEPTED",
+        )
+    )
+    db_session.commit()
+    resp = client.post(
+        f"/api/v1/analyses/{analysis_id}/confirm",
+        headers={"X-CSRF-Token": csrf},
+        json={"expected_profile_version": 1},
+    )
+    assert resp.status_code == 400
+    assert resp.json()["code"] == "CONFIRM_VALIDATION_ERROR"
+
+    _cleanup_person(db_session, person.id, admin.id)
