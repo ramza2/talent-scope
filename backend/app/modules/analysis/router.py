@@ -14,6 +14,7 @@ from app.modules.analysis.schemas import (
     BulkDiffRequest,
     BulkDiffResponse,
     ConfirmAnalysisRequest,
+    ConfirmAnalysisResponse,
     CreateAnalysisRequest,
     CreateAnalysisResponse,
     DiffDecisionRequest,
@@ -131,16 +132,23 @@ def bulk_review(
     )
 
 
-@router.post("/{analysis_id}/confirm")
+@router.post(
+    "/{analysis_id}/confirm",
+    response_model=ConfirmAnalysisResponse,
+)
 def confirm_analysis(
     analysis_id: UUID,
     payload: ConfirmAnalysisRequest,
     _admin: AuthenticatedContext = Depends(require_admin),
     ctx: AuthenticatedContext = Depends(require_csrf),
     service: AnalysisService = Depends(get_analysis_service),
-) -> None:
-    _ = (payload, ctx)
-    service.confirm_analysis(analysis_id)
+) -> ConfirmAnalysisResponse:
+    data = service.confirm_analysis(
+        analysis_id,
+        expected_profile_version=payload.expected_profile_version,
+        actor_user_id=ctx.user.id,
+    )
+    return ConfirmAnalysisResponse(data=data)
 
 
 @router.post(

@@ -345,12 +345,14 @@ class PeopleRepository:
         snapshot: dict[str, Any],
         created_by: UUID | None,
         source_type: str = "USER",
+        source_analysis_run_id: UUID | None = None,
     ) -> ProfileRevision:
         rev = ProfileRevision(
             person_id=person_id,
             revision_no=revision_no,
             snapshot_json=snapshot,
             source_type=source_type,
+            source_analysis_run_id=source_analysis_run_id,
             created_by=created_by,
         )
         self.db.add(rev)

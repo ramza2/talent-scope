@@ -306,6 +306,24 @@ class AnalysisStateConflictError(ConflictError):
         super().__init__(detail or "분석 실행 상태가 요청과 충돌합니다.")
 
 
+class AnalysisReviewIncompleteError(ConflictError):
+    code = "ANALYSIS_REVIEW_INCOMPLETE"
+    title = "Analysis review incomplete"
+
+    def __init__(self, detail: str | None = None) -> None:
+        super().__init__(
+            detail or "미검토 Diff가 남아 있어 확정할 수 없습니다."
+        )
+
+
+class ConfirmValidationError(ValidationAppError):
+    code = "CONFIRM_VALIDATION_ERROR"
+    title = "Confirm validation error"
+
+    def __init__(self, detail: str | None = None) -> None:
+        super().__init__(detail or "확정할 수 없는 검토 결과가 있습니다.")
+
+
 class AIProviderAppError(TalentScopeError):
     code = "AI_PROVIDER_ERROR"
     title = "AI provider error"
