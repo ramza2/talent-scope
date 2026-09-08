@@ -1043,25 +1043,26 @@ def test_char_offsets_present_or_null(client: TestClient, db_session):
     miss = by_quote[missing_quote]
     assert miss.char_start is None
     assert miss.char_end is None
-    assert miss.extraction_method == "TEXT_PARSER"
+    assert miss.extraction_method == "VLM"
 
     _cleanup_person(db_session, person.id, admin.id)
 
 
-def test_vlm_when_needs_vlm_and_quote_missing(client: TestClient, db_session):
+def test_vlm_when_quote_missing_from_parser_text(client: TestClient, db_session):
+    """Quote not in DocumentPage.extracted_text → extraction_method=VLM (even if needs_vlm=false)."""
     quote = "비전모델전용인용"
     admin = _create_user(
         db_session, login_id=f"ev_v_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
     )
     csrf = _login(client, admin.login_id, "Passw0rd!")
     person, document = _seed_person_with_ready_doc(
-        db_session, admin.id, page_text="OCR 텍스트에는 없는 페이지"
+        db_session, admin.id, page_text="짧은 OCR"
     )
     _set_page(
         db_session,
         document,
-        extracted_text="OCR 텍스트에는 없는 페이지",
-        needs_vlm=True,
+        extracted_text="짧은 OCR",
+        needs_vlm=False,
         extraction_method="TEXT_PARSER",
     )
 
@@ -1932,7 +1933,7 @@ def test_old_candidate_without_new_provenance_fields_loads():
 
 
 def test_new_analysis_uses_profile_extract_v2(client: TestClient, db_session):
-    from app.ai.prompts.profile_extract_v2 import PROMPT_VERSION
+    from app.ai.prompts.profile_extract import CURRENT_PROFILE_PROMPT_VERSION
 
     admin = _create_user(
         db_session, login_id=f"ev_pv_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
@@ -1948,8 +1949,8 @@ def test_new_analysis_uses_profile_extract_v2(client: TestClient, db_session):
     analysis_id = create.json()["data"]["analysis_id"]
     detail = client.get(f"/api/v1/analyses/{analysis_id}")
     assert detail.status_code == 200
-    assert detail.json()["data"]["prompt_version"] == PROMPT_VERSION
-    assert PROMPT_VERSION == "profile-extract-v2"
+    assert detail.json()["data"]["prompt_version"] == CURRENT_PROFILE_PROMPT_VERSION
+    assert CURRENT_PROFILE_PROMPT_VERSION == "profile-extract-v2"
 
     _cleanup_person(db_session, person.id, admin.id)
 
@@ -2036,3 +2037,684 @@ def test_profile_extract_v2_template_has_provenance_keys():
     assert '"source_refs": []' in CANDIDATE_JSON_TEMPLATE
     assert "relation" in SYSTEM_PROMPT.lower() or "Project relation" in SYSTEM_PROMPT
     assert "profile.source_refs" in SYSTEM_PROMPT
+
+
+# --------------------------------------------------------------------------- prompt version + nested project + invalidation
+
+
+def test_legacy_v1_run_executes_v1_prompt_not_v2(db_session, monkeypatch: pytest.MonkeyPatch):
+    from app.ai.providers.llm import FakeLLMProvider
+    from app.db.models.analysis import AnalysisRun, AnalysisRunDocument
+    from app.modules.analysis.service import AnalysisService
+    from app.storage.s3 import get_object_storage
+
+    admin = _create_user(
+        db_session, login_id=f"ev_v1p_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    person, document = _seed_person_with_ready_doc(db_session, admin.id)
+    run = AnalysisRun(
+        person_id=person.id,
+        status="QUEUED",
+        base_profile_version=1,
+        prompt_version="profile-extract-v1",
+        schema_version="profile-candidate-v1",
+    )
+    db_session.add(run)
+    db_session.flush()
+    db_session.add(AnalysisRunDocument(analysis_run_id=run.id, document_id=document.id))
+    db_session.commit()
+
+    fake = FakeLLMProvider(
+        profile_json={
+            "schema_version": "profile-candidate-v1",
+            "profile": {"name": "분석대상"},
+            "jobs": [],
+            "skills": [],
+            "expertise": [],
+            "employment_history": [],
+            "education": [],
+            "certifications": [],
+            "projects": [],
+            "summary": {},
+            "analysis": {},
+        }
+    )
+    service = AnalysisService(db_session, storage=get_object_storage(), llm=fake)
+    status = service.run_analysis(run.id, llm=fake)
+    assert status == "REVIEWING"
+    assert fake.last_system_prompt is not None
+    assert "profile.source_refs" not in fake.last_system_prompt
+    db_session.expire_all()
+    refreshed = db_session.get(AnalysisRun, run.id)
+    assert refreshed is not None
+    assert refreshed.prompt_version == "profile-extract-v1"
+
+    _cleanup_person(db_session, person.id, admin.id)
+
+
+def test_v1_retry_stays_on_v1_prompt(client: TestClient, db_session):
+    from app.ai.providers.llm import FakeLLMProvider
+    from app.db.models.analysis import AnalysisRun, AnalysisRunDocument
+    from app.modules.analysis.service import AnalysisService
+    from app.storage.s3 import get_object_storage
+
+    admin = _create_user(
+        db_session, login_id=f"ev_v1r_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    csrf = _login(client, admin.login_id, "Passw0rd!")
+    person, document = _seed_person_with_ready_doc(db_session, admin.id)
+    run = AnalysisRun(
+        person_id=person.id,
+        status="FAILED",
+        base_profile_version=1,
+        prompt_version="profile-extract-v1",
+        schema_version="profile-candidate-v1",
+        error_message="boom",
+    )
+    db_session.add(run)
+    db_session.flush()
+    db_session.add(AnalysisRunDocument(analysis_run_id=run.id, document_id=document.id))
+    db_session.commit()
+
+    retry = client.post(
+        f"/api/v1/analyses/{run.id}/retry",
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert retry.status_code in {200, 202}, retry.text
+    db_session.expire_all()
+    queued = db_session.get(AnalysisRun, run.id)
+    assert queued is not None
+    assert queued.status == "QUEUED"
+    assert queued.prompt_version == "profile-extract-v1"
+
+    fake = FakeLLMProvider(
+        profile_json={
+            "schema_version": "profile-candidate-v1",
+            "profile": {"name": "분석대상"},
+            "jobs": [],
+            "skills": [],
+            "expertise": [],
+            "employment_history": [],
+            "education": [],
+            "certifications": [],
+            "projects": [],
+            "summary": {},
+            "analysis": {},
+        }
+    )
+    status = AnalysisService(
+        db_session, storage=get_object_storage(), llm=fake
+    ).run_analysis(run.id, llm=fake)
+    assert status == "REVIEWING"
+    assert "profile.source_refs" not in (fake.last_system_prompt or "")
+    db_session.expire_all()
+    assert db_session.get(AnalysisRun, run.id).prompt_version == "profile-extract-v1"
+
+    _cleanup_person(db_session, person.id, admin.id)
+
+
+def test_unknown_prompt_version_fails_without_silent_fallback(db_session):
+    from app.ai.providers.llm import FakeLLMProvider
+    from app.db.models.analysis import AnalysisRun, AnalysisRunDocument
+    from app.modules.analysis.service import AnalysisService
+    from app.storage.s3 import get_object_storage
+
+    admin = _create_user(
+        db_session, login_id=f"ev_unk_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    person, document = _seed_person_with_ready_doc(db_session, admin.id)
+    run = AnalysisRun(
+        person_id=person.id,
+        status="QUEUED",
+        base_profile_version=1,
+        prompt_version="profile-extract-v999",
+        schema_version="profile-candidate-v1",
+    )
+    db_session.add(run)
+    db_session.flush()
+    db_session.add(AnalysisRunDocument(analysis_run_id=run.id, document_id=document.id))
+    db_session.commit()
+
+    fake = FakeLLMProvider(profile_json={"schema_version": "profile-candidate-v1", "profile": {}})
+    status = AnalysisService(
+        db_session, storage=get_object_storage(), llm=fake
+    ).run_analysis(run.id, llm=fake)
+    assert status == "FAILED"
+    assert fake.calls == 0
+    db_session.expire_all()
+    refreshed = db_session.get(AnalysisRun, run.id)
+    assert refreshed.status == "FAILED"
+    assert refreshed.prompt_version == "profile-extract-v999"
+
+    _cleanup_person(db_session, person.id, admin.id)
+
+
+def test_new_project_root_nested_relation_evidence_links(client: TestClient, db_session):
+    from app.db.models.project import Project, ProjectExpertise, ProjectSkill
+
+    _ensure_common_codes(db_session)
+    root_quote = "AI 플랫폼 구축"
+    py_quote = "Python/FastAPI 기반 API 개발"
+    rag_quote = "RAG 기반 검색 구현"
+    admin = _create_user(
+        db_session, login_id=f"ev_np_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    csrf = _login(client, admin.login_id, "Passw0rd!")
+    page_text = f"{root_quote}. {py_quote}. {rag_quote}."
+    person, document = _seed_person_with_ready_doc(
+        db_session, admin.id, page_text=page_text
+    )
+
+    analysis, diffs = _seed_reviewing_run(
+        db_session,
+        person=person,
+        document=document,
+        diffs=[
+            {
+                "entity_type": "PROJECT",
+                "candidate_path": "projects[0]",
+                "change_type": "NEW",
+                "new_value": {
+                    "project_name": "AI 플랫폼",
+                    "source_refs": [_source_ref(document, quote_text=root_quote)],
+                    "skills": [
+                        {
+                            "raw_value": "Python",
+                            "code": "TECH-LANG-PYTHON",
+                            "source_refs": [_source_ref(document, quote_text=py_quote)],
+                        }
+                    ],
+                    "expertise": [
+                        {
+                            "raw_value": "RAG",
+                            "code": "EXP-AI-RAG",
+                            "source_refs": [_source_ref(document, quote_text=rag_quote)],
+                        }
+                    ],
+                },
+                "review_status": "ACCEPTED",
+            }
+        ],
+    )
+    assert _confirm(client, csrf, analysis.id).status_code == 200
+
+    db_session.expire_all()
+    project = db_session.execute(
+        select(Project).where(
+            Project.person_id == person.id, Project.project_name == "AI 플랫폼"
+        )
+    ).scalar_one()
+    assert db_session.execute(
+        select(ProjectSkill).where(
+            ProjectSkill.project_id == project.id,
+            ProjectSkill.tech_code == "TECH-LANG-PYTHON",
+        )
+    ).scalar_one_or_none()
+    assert db_session.execute(
+        select(ProjectExpertise).where(
+            ProjectExpertise.project_id == project.id,
+            ProjectExpertise.exp_code == "EXP-AI-RAG",
+        )
+    ).scalar_one_or_none()
+
+    by_quote = {ev.quote_text: ev for ev in _list_evidence_for_doc(db_session, document.id)}
+    assert set(by_quote) >= {root_quote, py_quote, rag_quote}
+    root_links = _links_for_evidence(db_session, by_quote[root_quote].id)
+    assert any(
+        link.target_type == "PROJECT"
+        and link.target_id == project.id
+        and link.field_name is None
+        for link in root_links
+    )
+    py_links = _links_for_evidence(db_session, by_quote[py_quote].id)
+    assert any(link.field_name == "skills:TECH-LANG-PYTHON" for link in py_links)
+    rag_links = _links_for_evidence(db_session, by_quote[rag_quote].id)
+    assert any(link.field_name == "expertise:EXP-AI-RAG" for link in rag_links)
+    # Quotes must not cross-link.
+    assert all(link.field_name != "skills:TECH-LANG-PYTHON" for link in root_links)
+    assert all(link.field_name is not None for link in py_links)
+
+    _cleanup_person(db_session, person.id, admin.id)
+
+
+def test_merged_project_nested_relation_evidence_link(client: TestClient, db_session):
+    from app.db.models.project import Project, ProjectSkill
+
+    _ensure_common_codes(db_session)
+    py_quote = "병합 Python 근거"
+    admin = _create_user(
+        db_session, login_id=f"ev_mp_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    csrf = _login(client, admin.login_id, "Passw0rd!")
+    person, document = _seed_person_with_ready_doc(
+        db_session, admin.id, page_text=f"본문 {py_quote}"
+    )
+    project = Project(
+        person_id=person.id,
+        project_name="병합대상",
+        source_type="USER",
+    )
+    db_session.add(project)
+    db_session.commit()
+    db_session.refresh(project)
+
+    analysis, _diffs = _seed_reviewing_run(
+        db_session,
+        person=person,
+        document=document,
+        diffs=[
+            {
+                "entity_type": "PROJECT",
+                "candidate_path": "projects[0]",
+                "change_type": "REVIEW",
+                "existing_target_id": project.id,
+                "new_value": {
+                    "project_name": "병합대상",
+                    "skills": [
+                        {
+                            "code": "TECH-LANG-PYTHON",
+                            "source_refs": [_source_ref(document, quote_text=py_quote)],
+                        }
+                    ],
+                },
+                "review_status": "MERGED",
+            }
+        ],
+    )
+    assert _confirm(client, csrf, analysis.id).status_code == 200
+
+    db_session.expire_all()
+    assert db_session.execute(
+        select(ProjectSkill).where(
+            ProjectSkill.project_id == project.id,
+            ProjectSkill.tech_code == "TECH-LANG-PYTHON",
+        )
+    ).scalar_one_or_none()
+    ev = _list_evidence_for_doc(db_session, document.id)[0]
+    assert ev.quote_text == py_quote
+    links = _links_for_evidence(db_session, ev.id)
+    assert any(
+        link.target_id == project.id and link.field_name == "skills:TECH-LANG-PYTHON"
+        for link in links
+    )
+
+    _cleanup_person(db_session, person.id, admin.id)
+
+
+def test_manual_profile_invalidates_changed_field_evidence_link(
+    client: TestClient, db_session
+):
+    from app.db.models.analysis import AnalysisDiffEvidence
+    from app.db.models.evidence import Evidence, EvidenceLink
+
+    quote = "전화 근거"
+    admin = _create_user(
+        db_session, login_id=f"ev_invp_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    csrf = _login(client, admin.login_id, "Passw0rd!")
+    person, document = _seed_person_with_ready_doc(
+        db_session, admin.id, page_text=f"연락처 {quote}"
+    )
+    analysis, diffs = _seed_reviewing_run(
+        db_session,
+        person=person,
+        document=document,
+        diffs=[
+            {
+                "entity_type": "PROFILE",
+                "candidate_path": "profile.phone",
+                "field_name": "phone",
+                "change_type": "NEW",
+                "new_value": {
+                    "value": "010-1111-2222",
+                    "source_refs": [_source_ref(document, quote_text=quote)],
+                },
+                "review_status": "ACCEPTED",
+            }
+        ],
+    )
+    assert _confirm(client, csrf, analysis.id).status_code == 200
+    db_session.expire_all()
+    ev = _list_evidence_for_doc(db_session, document.id)[0]
+    assert _links_for_evidence(db_session, ev.id)
+    assert _diff_evidence_for(db_session, diffs[0].id)
+
+    patched = client.patch(
+        f"/api/v1/people/{person.id}/profile",
+        headers={"X-CSRF-Token": csrf},
+        json={"expected_profile_version": 2, "phone": "010-9999-0000"},
+    )
+    assert patched.status_code == 200, patched.text
+
+    db_session.expire_all()
+    assert (
+        db_session.execute(
+            select(func.count())
+            .select_from(EvidenceLink)
+            .where(
+                EvidenceLink.target_type == "PERSON_PROFILE",
+                EvidenceLink.target_id == person.id,
+                EvidenceLink.field_name == "phone",
+            )
+        ).scalar_one()
+        == 0
+    )
+    assert db_session.get(Evidence, ev.id) is not None
+    assert _diff_evidence_for(db_session, diffs[0].id)
+
+    _cleanup_person(db_session, person.id, admin.id)
+
+
+def test_replace_skills_clears_orphan_evidence_links(client: TestClient, db_session):
+    from app.db.models.evidence import EvidenceLink
+    from app.db.models.person import PersonSkill
+
+    _ensure_common_codes(db_session)
+    quote = "스킬 근거"
+    admin = _create_user(
+        db_session, login_id=f"ev_rsk_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    csrf = _login(client, admin.login_id, "Passw0rd!")
+    person, document = _seed_person_with_ready_doc(
+        db_session, admin.id, page_text=f"기술 {quote}"
+    )
+    analysis, _diffs = _seed_reviewing_run(
+        db_session,
+        person=person,
+        document=document,
+        diffs=[
+            {
+                "entity_type": "TECH",
+                "candidate_path": "skills[0]",
+                "change_type": "NEW",
+                "new_value": {
+                    "code": "TECH-LANG-PYTHON",
+                    "source_refs": [_source_ref(document, quote_text=quote)],
+                },
+                "review_status": "ACCEPTED",
+            }
+        ],
+    )
+    assert _confirm(client, csrf, analysis.id).status_code == 200
+    db_session.expire_all()
+    old_skill = db_session.execute(
+        select(PersonSkill).where(
+            PersonSkill.person_id == person.id,
+            PersonSkill.tech_code == "TECH-LANG-PYTHON",
+        )
+    ).scalar_one()
+    old_id = old_skill.id
+    assert (
+        db_session.execute(
+            select(func.count())
+            .select_from(EvidenceLink)
+            .where(
+                EvidenceLink.target_type == "PERSON_SKILL",
+                EvidenceLink.target_id == old_id,
+            )
+        ).scalar_one()
+        == 1
+    )
+
+    replaced = client.put(
+        f"/api/v1/people/{person.id}/skills",
+        headers={"X-CSRF-Token": csrf},
+        json={
+            "expected_profile_version": 2,
+            "skills": [{"tech_code": "TECH-LANG-PYTHON", "is_representative": True}],
+        },
+    )
+    assert replaced.status_code == 200, replaced.text
+
+    db_session.expire_all()
+    assert (
+        db_session.execute(
+            select(func.count())
+            .select_from(EvidenceLink)
+            .where(
+                EvidenceLink.target_type == "PERSON_SKILL",
+                EvidenceLink.target_id == old_id,
+            )
+        ).scalar_one()
+        == 0
+    )
+    new_skill = db_session.execute(
+        select(PersonSkill).where(
+            PersonSkill.person_id == person.id,
+            PersonSkill.tech_code == "TECH-LANG-PYTHON",
+        )
+    ).scalar_one()
+    assert new_skill.id != old_id
+    assert (
+        db_session.execute(
+            select(func.count())
+            .select_from(EvidenceLink)
+            .where(
+                EvidenceLink.target_type == "PERSON_SKILL",
+                EvidenceLink.target_id == new_skill.id,
+            )
+        ).scalar_one()
+        == 0
+    )
+
+    _cleanup_person(db_session, person.id, admin.id)
+
+
+def test_manual_project_update_clears_project_evidence_links(
+    client: TestClient, db_session
+):
+    from app.db.models.analysis import AnalysisDiffEvidence
+    from app.db.models.evidence import Evidence, EvidenceLink
+    from app.db.models.project import Project
+
+    quote = "프로젝트 근거"
+    admin = _create_user(
+        db_session, login_id=f"ev_ipu_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    csrf = _login(client, admin.login_id, "Passw0rd!")
+    person, document = _seed_person_with_ready_doc(
+        db_session, admin.id, page_text=f"본문 {quote}"
+    )
+    analysis, diffs = _seed_reviewing_run(
+        db_session,
+        person=person,
+        document=document,
+        diffs=[
+            {
+                "entity_type": "PROJECT",
+                "candidate_path": "projects[0]",
+                "change_type": "NEW",
+                "new_value": {
+                    "project_name": "수동수정대상",
+                    "source_refs": [_source_ref(document, quote_text=quote)],
+                },
+                "review_status": "ACCEPTED",
+            }
+        ],
+    )
+    assert _confirm(client, csrf, analysis.id).status_code == 200
+    db_session.expire_all()
+    project = db_session.execute(
+        select(Project).where(Project.person_id == person.id)
+    ).scalar_one()
+    ev = _list_evidence_for_doc(db_session, document.id)[0]
+    assert _links_for_evidence(db_session, ev.id)
+
+    updated = client.patch(
+        f"/api/v1/projects/{project.id}",
+        headers={"X-CSRF-Token": csrf},
+        json={"project_summary": "수기 수정"},
+    )
+    assert updated.status_code == 200, updated.text
+
+    db_session.expire_all()
+    assert (
+        db_session.execute(
+            select(func.count())
+            .select_from(EvidenceLink)
+            .where(
+                EvidenceLink.target_type == "PROJECT",
+                EvidenceLink.target_id == project.id,
+            )
+        ).scalar_one()
+        == 0
+    )
+    assert db_session.get(Evidence, ev.id) is not None
+    assert _diff_evidence_for(db_session, diffs[0].id)
+
+    _cleanup_person(db_session, person.id, admin.id)
+
+
+def test_manual_employment_update_clears_links(client: TestClient, db_session):
+    from app.db.models.evidence import EvidenceLink
+    from app.db.models.person import EmploymentHistory
+
+    quote = "근무 근거"
+    admin = _create_user(
+        db_session, login_id=f"ev_emp_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    csrf = _login(client, admin.login_id, "Passw0rd!")
+    person, document = _seed_person_with_ready_doc(
+        db_session, admin.id, page_text=f"경력 {quote}"
+    )
+    analysis, _diffs = _seed_reviewing_run(
+        db_session,
+        person=person,
+        document=document,
+        diffs=[
+            {
+                "entity_type": "EMPLOYMENT",
+                "candidate_path": "employment_history[0]",
+                "change_type": "NEW",
+                "new_value": {
+                    "company_name": "오픈링크",
+                    "source_refs": [_source_ref(document, quote_text=quote)],
+                },
+                "review_status": "ACCEPTED",
+            }
+        ],
+    )
+    assert _confirm(client, csrf, analysis.id).status_code == 200
+    db_session.expire_all()
+    emp = db_session.execute(
+        select(EmploymentHistory).where(EmploymentHistory.person_id == person.id)
+    ).scalar_one()
+    assert (
+        db_session.execute(
+            select(func.count())
+            .select_from(EvidenceLink)
+            .where(
+                EvidenceLink.target_type == "EMPLOYMENT_HISTORY",
+                EvidenceLink.target_id == emp.id,
+            )
+        ).scalar_one()
+        == 1
+    )
+
+    updated = client.patch(
+        f"/api/v1/employment-history/{emp.id}",
+        headers={"X-CSRF-Token": csrf},
+        json={"title": "시니어"},
+    )
+    assert updated.status_code == 200, updated.text
+    db_session.expire_all()
+    assert (
+        db_session.execute(
+            select(func.count())
+            .select_from(EvidenceLink)
+            .where(
+                EvidenceLink.target_type == "EMPLOYMENT_HISTORY",
+                EvidenceLink.target_id == emp.id,
+            )
+        ).scalar_one()
+        == 0
+    )
+
+    _cleanup_person(db_session, person.id, admin.id)
+
+
+def test_invalidation_rolls_back_with_revision_failure(
+    client: TestClient, db_session, monkeypatch: pytest.MonkeyPatch
+):
+    from app.db.models.evidence import EvidenceLink
+    from app.modules.people.repository import PeopleRepository
+
+    quote = "롤백 전화"
+    admin = _create_user(
+        db_session, login_id=f"ev_irb_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    csrf = _login(client, admin.login_id, "Passw0rd!")
+    person, document = _seed_person_with_ready_doc(
+        db_session, admin.id, page_text=f"연락처 {quote}"
+    )
+    analysis, _diffs = _seed_reviewing_run(
+        db_session,
+        person=person,
+        document=document,
+        diffs=[
+            {
+                "entity_type": "PROFILE",
+                "candidate_path": "profile.phone",
+                "field_name": "phone",
+                "change_type": "NEW",
+                "new_value": {
+                    "value": "010-3333-4444",
+                    "source_refs": [_source_ref(document, quote_text=quote)],
+                },
+                "review_status": "ACCEPTED",
+            }
+        ],
+    )
+    assert _confirm(client, csrf, analysis.id).status_code == 200
+    db_session.expire_all()
+    assert (
+        db_session.execute(
+            select(func.count())
+            .select_from(EvidenceLink)
+            .where(
+                EvidenceLink.target_type == "PERSON_PROFILE",
+                EvidenceLink.target_id == person.id,
+                EvidenceLink.field_name == "phone",
+            )
+        ).scalar_one()
+        == 1
+    )
+
+    def boom(self, **_kwargs):  # noqa: ANN001
+        raise RuntimeError("revision boom")
+
+    monkeypatch.setattr(PeopleRepository, "add_revision", boom)
+
+    with pytest.raises(RuntimeError, match="revision boom"):
+        from app.modules.people.schemas import ProfileUpdateRequest
+        from app.modules.people.service import PeopleService
+
+        PeopleService(db_session).update_profile(
+            person.id,
+            ProfileUpdateRequest(expected_profile_version=2, phone="010-0000-1111"),
+            actor_user_id=admin.id,
+        )
+    db_session.rollback()
+
+    db_session.expire_all()
+    assert (
+        db_session.execute(
+            select(func.count())
+            .select_from(EvidenceLink)
+            .where(
+                EvidenceLink.target_type == "PERSON_PROFILE",
+                EvidenceLink.target_id == person.id,
+                EvidenceLink.field_name == "phone",
+            )
+        ).scalar_one()
+        == 1
+    )
+    from app.db.models.person import PersonProfile
+
+    profile = db_session.execute(
+        select(PersonProfile).where(PersonProfile.person_id == person.id)
+    ).scalar_one()
+    assert profile.phone == "010-3333-4444"
+    assert profile.profile_version == 2
+
+    _cleanup_person(db_session, person.id, admin.id)

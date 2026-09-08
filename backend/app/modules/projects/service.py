@@ -277,6 +277,11 @@ class ProjectService:
             project.person_id, for_update=True
         )
         before = self._audit_slice(project)
+        from app.modules.evidence.repository import EvidenceRepository
+
+        EvidenceRepository(self.db).delete_links_for_target(
+            target_type="PROJECT", target_id=project.id
+        )
         fields_set = payload.model_fields_set
 
         scalar_map = {
@@ -348,6 +353,11 @@ class ProjectService:
             project.person_id, for_update=True
         )
         before = self._audit_slice(project)
+        from app.modules.evidence.repository import EvidenceRepository
+
+        EvidenceRepository(self.db).delete_links_for_target(
+            target_type="PROJECT", target_id=project.id
+        )
         self.repo.soft_delete(project)
         finalize_confirmed_profile_change(
             self.people_repo,

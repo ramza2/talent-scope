@@ -380,9 +380,23 @@ class PeopleService:
             "career_confirmed_months": "career_confirmed_months",
             "profile_summary": "profile_summary",
         }
+        changed_fields: list[str] = []
         for key, attr in mapping.items():
             if key in fields_set:
-                setattr(profile, attr, getattr(payload, key))
+                new_val = getattr(payload, key)
+                old_val = getattr(profile, attr)
+                if new_val != old_val:
+                    changed_fields.append(attr)
+                setattr(profile, attr, new_val)
+
+        if changed_fields:
+            from app.modules.evidence.repository import EvidenceRepository
+
+            EvidenceRepository(self.db).delete_links_for_target(
+                target_type="PERSON_PROFILE",
+                target_id=person_id,
+                field_names=set(changed_fields),
+            )
 
         version = self.repo.bump_profile_version(profile)
         self.repo.touch_person(person)
@@ -429,6 +443,19 @@ class PeopleService:
             )
         self._validate_codes([i["job_code"] for i in items], "JOB")
         before = build_confirmed_profile_snapshot(self.db, person_id)
+        from sqlalchemy import select
+
+        from app.db.models.person import PersonJob
+        from app.modules.evidence.repository import EvidenceRepository
+
+        old_ids = list(
+            self.db.execute(
+                select(PersonJob.id).where(PersonJob.person_id == person_id)
+            ).scalars().all()
+        )
+        EvidenceRepository(self.db).delete_links_for_target_ids(
+            target_type="PERSON_JOB", target_ids=old_ids
+        )
         self.repo.replace_jobs(person_id, items)
         version = self.repo.bump_profile_version(profile)
         self.repo.touch_person(person)
@@ -475,6 +502,19 @@ class PeopleService:
             )
         self._validate_codes([i["tech_code"] for i in items], "TECH")
         before = build_confirmed_profile_snapshot(self.db, person_id)
+        from sqlalchemy import select
+
+        from app.db.models.person import PersonSkill
+        from app.modules.evidence.repository import EvidenceRepository
+
+        old_ids = list(
+            self.db.execute(
+                select(PersonSkill.id).where(PersonSkill.person_id == person_id)
+            ).scalars().all()
+        )
+        EvidenceRepository(self.db).delete_links_for_target_ids(
+            target_type="PERSON_SKILL", target_ids=old_ids
+        )
         self.repo.replace_skills(person_id, items)
         version = self.repo.bump_profile_version(profile)
         self.repo.touch_person(person)
@@ -519,6 +559,19 @@ class PeopleService:
             )
         self._validate_codes([i["exp_code"] for i in items], "EXP")
         before = build_confirmed_profile_snapshot(self.db, person_id)
+        from sqlalchemy import select
+
+        from app.db.models.person import PersonExpertise
+        from app.modules.evidence.repository import EvidenceRepository
+
+        old_ids = list(
+            self.db.execute(
+                select(PersonExpertise.id).where(PersonExpertise.person_id == person_id)
+            ).scalars().all()
+        )
+        EvidenceRepository(self.db).delete_links_for_target_ids(
+            target_type="PERSON_EXPERTISE", target_ids=old_ids
+        )
         self.repo.replace_expertise(person_id, items)
         version = self.repo.bump_profile_version(profile)
         self.repo.touch_person(person)

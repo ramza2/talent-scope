@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any
 from uuid import UUID
@@ -29,8 +30,16 @@ logger = logging.getLogger(__name__)
 
 RELATION_TYPE_SUPPORTS = "SUPPORTS"
 
+_PROJECT_ROOT_RE = re.compile(r"^projects\[\d+\]$")
 _PROJECT_RELATION_FIELDS = frozenset(
     {"jobs", "skills", "expertise", "business_domains", "customer_types"}
+)
+_PROJECT_RELATION_FIELD_ORDER: tuple[str, ...] = (
+    "jobs",
+    "skills",
+    "expertise",
+    "business_domains",
+    "customer_types",
 )
 
 
@@ -105,6 +114,69 @@ def project_relation_field_name(relation_field: str, code: str) -> str:
     return f"{relation_field}:{code}"
 
 
+@dataclass(frozen=True)
+class _RefWorkItem:
+    refs: list[dict[str, Any]]
+    """source_refs to materialize."""
+    link_field_override: str | None = None
+    """When set, EvidenceLink.field_name uses this instead of registry field."""
+    require_project_relation: tuple[str, str] | None = None
+    """(relation_field, code) must exist on Confirmed Project before SUPPORTS link."""
+
+
+def _is_project_root_diff(diff: AnalysisDiffItem) -> bool:
+    return (
+        diff.entity_type == "PROJECT"
+        and diff.field_name is None
+        and bool(_PROJECT_ROOT_RE.fullmatch(diff.candidate_path or ""))
+    )
+
+
+def _relation_item_code(item: dict[str, Any]) -> str | None:
+    for key in (
+        "code",
+        "job_code",
+        "tech_code",
+        "exp_code",
+        "biz_code",
+        "customer_type_code",
+    ):
+        raw = item.get(key)
+        if raw is None:
+            continue
+        text = str(raw).strip()
+        if text:
+            return text
+    return None
+
+
+def _iter_nested_project_relation_work(
+    new_value: dict[str, Any],
+) -> list[_RefWorkItem]:
+    items: list[_RefWorkItem] = []
+    for rel_field in _PROJECT_RELATION_FIELD_ORDER:
+        rows = new_value.get(rel_field) or []
+        if not isinstance(rows, list):
+            continue
+        for raw in rows:
+            if not isinstance(raw, dict):
+                continue
+            code = _relation_item_code(raw)
+            if not code:
+                continue
+            refs = extract_source_refs(raw)
+            if not refs:
+                continue
+            items.append(
+                _RefWorkItem(
+                    refs=refs,
+                    link_field_override=project_relation_field_name(rel_field, code),
+                    require_project_relation=(rel_field, code),
+                )
+            )
+    return items
+
+
 def materialize_confirm_evidence(
     db: Session,
     *,
@@ -126,91 +198,111 @@ def materialize_confirm_evidence(
     diff_evidence_count = 0
 
     for diff in diffs:
-        refs = extract_source_refs(diff.new_value)
-        if not refs:
+        work_items: list[_RefWorkItem] = []
+        root_refs = extract_source_refs(diff.new_value)
+        if root_refs:
+            work_items.append(_RefWorkItem(refs=root_refs))
+        if _is_project_root_diff(diff) and isinstance(diff.new_value, dict):
+            work_items.extend(_iter_nested_project_relation_work(diff.new_value))
+        if not work_items:
             continue
 
-        link_target = None
-        if should_create_evidence_link(diff):
-            link_target = registry.get(diff.id) or _resolve_existing_target(
+        allow_links = should_create_evidence_link(diff)
+        base_target = None
+        if allow_links:
+            base_target = registry.get(diff.id) or _resolve_existing_target(
                 db, diff=diff, person_id=person_id
             )
 
-        for ref in refs:
-            validated = _validate_source_ref(
-                repo,
-                ref=ref,
-                allowed_docs=allowed_docs,
-                page_cache=page_cache,
-            )
-            if validated is None:
-                continue
-
-            key = validated["dedupe_key"]
-            evidence = local_evidence.get(key)
-            if evidence is None:
-                evidence = repo.find_exact_evidence(
-                    document_id=validated["document_id"],
-                    document_page_id=validated["document_page_id"],
-                    page_no=validated["page_no"],
-                    quote_text=validated["quote_text"],
-                    char_start=validated["char_start"],
-                    char_end=validated["char_end"],
-                    extraction_method=validated["extraction_method"],
+        for work in work_items:
+            for ref in work.refs:
+                validated = _validate_source_ref(
+                    repo,
+                    ref=ref,
+                    allowed_docs=allowed_docs,
+                    page_cache=page_cache,
                 )
+                if validated is None:
+                    continue
+
+                key = validated["dedupe_key"]
+                evidence = local_evidence.get(key)
                 if evidence is None:
-                    evidence = repo.add_evidence(
-                        Evidence(
-                            document_id=validated["document_id"],
-                            document_page_id=validated["document_page_id"],
-                            page_no=validated["page_no"],
-                            quote_text=validated["quote_text"],
-                            bbox_json=None,
-                            char_start=validated["char_start"],
-                            char_end=validated["char_end"],
-                            extraction_method=validated["extraction_method"],
-                            confidence=None,
+                    evidence = repo.find_exact_evidence(
+                        document_id=validated["document_id"],
+                        document_page_id=validated["document_page_id"],
+                        page_no=validated["page_no"],
+                        quote_text=validated["quote_text"],
+                        char_start=validated["char_start"],
+                        char_end=validated["char_end"],
+                        extraction_method=validated["extraction_method"],
+                    )
+                    if evidence is None:
+                        evidence = repo.add_evidence(
+                            Evidence(
+                                document_id=validated["document_id"],
+                                document_page_id=validated["document_page_id"],
+                                page_no=validated["page_no"],
+                                quote_text=validated["quote_text"],
+                                bbox_json=None,
+                                char_start=validated["char_start"],
+                                char_end=validated["char_end"],
+                                extraction_method=validated["extraction_method"],
+                                confidence=None,
+                            )
+                        )
+                        evidence_count += 1
+                    local_evidence[key] = evidence
+
+                pair = (diff.id, evidence.id)
+                if pair not in diff_pairs:
+                    repo.add_diff_evidence(diff_item_id=diff.id, evidence_id=evidence.id)
+                    diff_pairs.add(pair)
+                    diff_evidence_count += 1
+
+                if not allow_links or base_target is None:
+                    continue
+
+                if work.require_project_relation is not None:
+                    rel_field, code = work.require_project_relation
+                    if not repo.project_has_relation(
+                        project_id=base_target.target_id,
+                        relation_field=rel_field,
+                        code=code,
+                    ):
+                        continue
+                    link_field = work.link_field_override
+                else:
+                    link_field = base_target.field_name
+
+                link_key = (
+                    evidence.id,
+                    base_target.target_type,
+                    base_target.target_id,
+                    link_field,
+                    RELATION_TYPE_SUPPORTS,
+                )
+                if link_key in link_keys:
+                    continue
+                existing_link = repo.find_link(
+                    evidence_id=evidence.id,
+                    target_type=base_target.target_type,
+                    target_id=base_target.target_id,
+                    field_name=link_field,
+                    relation_type=RELATION_TYPE_SUPPORTS,
+                )
+                if existing_link is None:
+                    repo.add_link(
+                        EvidenceLink(
+                            evidence_id=evidence.id,
+                            target_type=base_target.target_type,
+                            target_id=base_target.target_id,
+                            field_name=link_field,
+                            relation_type=RELATION_TYPE_SUPPORTS,
                         )
                     )
-                    evidence_count += 1
-                local_evidence[key] = evidence
-
-            pair = (diff.id, evidence.id)
-            if pair not in diff_pairs:
-                repo.add_diff_evidence(diff_item_id=diff.id, evidence_id=evidence.id)
-                diff_pairs.add(pair)
-                diff_evidence_count += 1
-
-            if link_target is None:
-                continue
-            link_key = (
-                evidence.id,
-                link_target.target_type,
-                link_target.target_id,
-                link_target.field_name,
-                RELATION_TYPE_SUPPORTS,
-            )
-            if link_key in link_keys:
-                continue
-            existing_link = repo.find_link(
-                evidence_id=evidence.id,
-                target_type=link_target.target_type,
-                target_id=link_target.target_id,
-                field_name=link_target.field_name,
-                relation_type=RELATION_TYPE_SUPPORTS,
-            )
-            if existing_link is None:
-                repo.add_link(
-                    EvidenceLink(
-                        evidence_id=evidence.id,
-                        target_type=link_target.target_type,
-                        target_id=link_target.target_id,
-                        field_name=link_target.field_name,
-                        relation_type=RELATION_TYPE_SUPPORTS,
-                    )
-                )
-                link_count += 1
-            link_keys.add(link_key)
+                    link_count += 1
+                link_keys.add(link_key)
 
     logger.info(
         "evidence materialize analysis_id=%s evidence_count=%s link_count=%s "
@@ -261,22 +353,16 @@ def _validate_source_ref(
     if page is None:
         return None
 
-    char_start: int | None = None
-    char_end: int | None = None
-    extraction_method: str | None = page.extraction_method
-
     extracted = page.extracted_text or ""
     if quote_text in extracted:
         char_start = extracted.index(quote_text)
         char_end = char_start + len(quote_text)
-        if not extraction_method:
-            extraction_method = "TEXT_PARSER"
+        extraction_method = page.extraction_method or "TEXT_PARSER"
     else:
-        layout = page.layout_json if isinstance(page.layout_json, dict) else {}
-        if layout.get("needs_vlm") is True:
-            extraction_method = "VLM"
+        # Prompt-normalized quote absent from parser text → VLM provenance.
         char_start = None
         char_end = None
+        extraction_method = "VLM"
 
     return {
         "document_id": document_id,

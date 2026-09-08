@@ -134,6 +134,11 @@ class CareerService:
             raise NotFoundError("근무경력을 찾을 수 없습니다.")
         person, profile = self._require_person_profile(row.person_id, for_update=True)
         before = self._employment_audit(row)
+        from app.modules.evidence.repository import EvidenceRepository
+
+        EvidenceRepository(self.db).delete_links_for_target(
+            target_type="EMPLOYMENT_HISTORY", target_id=row.id
+        )
         fields_set = payload.model_fields_set
         for key in (
             "company_name",
@@ -171,6 +176,11 @@ class CareerService:
         person, profile = self._require_person_profile(row.person_id, for_update=True)
         before = self._employment_audit(row)
         target_id = row.id
+        from app.modules.evidence.repository import EvidenceRepository
+
+        EvidenceRepository(self.db).delete_links_for_target(
+            target_type="EMPLOYMENT_HISTORY", target_id=target_id
+        )
         self.repo.delete_employment(row)
         finalize_confirmed_profile_change(
             self.people_repo,
@@ -257,6 +267,11 @@ class CareerService:
             raise NotFoundError("학력을 찾을 수 없습니다.")
         person, profile = self._require_person_profile(row.person_id, for_update=True)
         before = self._education_audit(row)
+        from app.modules.evidence.repository import EvidenceRepository
+
+        EvidenceRepository(self.db).delete_links_for_target(
+            target_type="EDUCATION", target_id=row.id
+        )
         fields_set = payload.model_fields_set
         for key in (
             "school_name",
@@ -294,6 +309,11 @@ class CareerService:
         person, profile = self._require_person_profile(row.person_id, for_update=True)
         before = self._education_audit(row)
         target_id = row.id
+        from app.modules.evidence.repository import EvidenceRepository
+
+        EvidenceRepository(self.db).delete_links_for_target(
+            target_type="EDUCATION", target_id=target_id
+        )
         self.repo.delete_education(row)
         finalize_confirmed_profile_change(
             self.people_repo,
@@ -385,6 +405,11 @@ class CareerService:
             raise NotFoundError("자격을 찾을 수 없습니다.")
         person, profile = self._require_person_profile(row.person_id, for_update=True)
         before = self._certification_audit(row)
+        from app.modules.evidence.repository import EvidenceRepository
+
+        EvidenceRepository(self.db).delete_links_for_target(
+            target_type="CERTIFICATION", target_id=row.id
+        )
         fields_set = payload.model_fields_set
         for key in (
             "certification_name",
@@ -428,6 +453,11 @@ class CareerService:
         person, profile = self._require_person_profile(row.person_id, for_update=True)
         before = self._certification_audit(row)
         target_id = row.id
+        from app.modules.evidence.repository import EvidenceRepository
+
+        EvidenceRepository(self.db).delete_links_for_target(
+            target_type="CERTIFICATION", target_id=target_id
+        )
         self.repo.delete_certification(row)
         finalize_confirmed_profile_change(
             self.people_repo,

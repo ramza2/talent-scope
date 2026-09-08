@@ -177,3 +177,87 @@ class EvidenceRepository:
             EvidenceLink.id,
         )
         return list(self.db.execute(stmt).all())
+
+    def delete_links_for_target(
+        self,
+        *,
+        target_type: str,
+        target_id: UUID,
+        field_names: set[str | None] | None = None,
+    ) -> int:
+        """Delete operational EvidenceLink rows. Does not commit."""
+        from sqlalchemy import delete, or_
+
+        stmt = delete(EvidenceLink).where(
+            EvidenceLink.target_type == target_type,
+            EvidenceLink.target_id == target_id,
+        )
+        if field_names is not None:
+            named = [name for name in field_names if name is not None]
+            clauses = []
+            if None in field_names:
+                clauses.append(EvidenceLink.field_name.is_(None))
+            if named:
+                clauses.append(EvidenceLink.field_name.in_(named))
+            if not clauses:
+                return 0
+            stmt = stmt.where(or_(*clauses))
+        result = self.db.execute(stmt)
+        return int(result.rowcount or 0)
+
+    def delete_links_for_target_ids(
+        self,
+        *,
+        target_type: str,
+        target_ids: list[UUID],
+    ) -> int:
+        """Delete EvidenceLink rows for many target ids. Does not commit."""
+        from sqlalchemy import delete
+
+        if not target_ids:
+            return 0
+        result = self.db.execute(
+            delete(EvidenceLink).where(
+                EvidenceLink.target_type == target_type,
+                EvidenceLink.target_id.in_(target_ids),
+            )
+        )
+        return int(result.rowcount or 0)
+
+    def project_has_relation(
+        self,
+        *,
+        project_id: UUID,
+        relation_field: str,
+        code: str,
+    ) -> bool:
+        """True when Confirmed Project relation row exists for code."""
+        from app.db.models.project import (
+            ProjectBusinessDomain,
+            ProjectCustomerType,
+            ProjectExpertise,
+            ProjectJob,
+            ProjectSkill,
+        )
+
+        mapping = {
+            "jobs": (ProjectJob, ProjectJob.job_code),
+            "skills": (ProjectSkill, ProjectSkill.tech_code),
+            "expertise": (ProjectExpertise, ProjectExpertise.exp_code),
+            "business_domains": (ProjectBusinessDomain, ProjectBusinessDomain.biz_code),
+            "customer_types": (
+                ProjectCustomerType,
+                ProjectCustomerType.customer_type_code,
+            ),
+        }
+        entry = mapping.get(relation_field)
+        if entry is None or not code:
+            return False
+        model, code_col = entry
+        row = self.db.execute(
+            select(model).where(
+                model.project_id == project_id,
+                code_col == code,
+            )
+        ).scalar_one_or_none()
+        return row is not None
