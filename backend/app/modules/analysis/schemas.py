@@ -178,3 +178,15 @@ class RetryAnalysisResponse(BaseModel):
 
 class ConfirmAnalysisRequest(BaseModel):
     expected_profile_version: int = Field(ge=1)
+
+
+class ConfirmAnalysisResponseData(BaseModel):
+    analysis_id: UUID
+    person_id: UUID
+    profile_version: int
+    status: AnalysisStatus
+    search_index_status: str = "PENDING"
+
+
+class ConfirmAnalysisResponse(BaseModel):
+    data: ConfirmAnalysisResponseData

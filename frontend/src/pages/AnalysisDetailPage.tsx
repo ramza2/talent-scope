@@ -17,13 +17,21 @@ import { useNavigate, useParams } from 'react-router-dom'
 import type { ColumnsType } from 'antd/es/table'
 import type { Key } from 'react'
 
-import { apiErrorMessage } from '@/api/errors'
+import { apiErrorCode, apiErrorMessage } from '@/api/errors'
 import {
   bulkReviewDiffs,
+  buildDefaultModifiedDecision,
+  buildMergeDecisionRequestBody,
+  canConfirmAnalysis,
   confidenceColor,
   confidenceLabel,
+  confirmAnalysis,
+  countPendingActionableDiffs,
   getAnalysis,
+  initialMergeDecidedValueText,
   isActiveAnalysisStatus,
+  isProfileScalarDiff,
+  isProjectRootReview,
   listAnalysisDiffs,
   reviewDiff,
   type AnalysisStatus,
@@ -39,22 +47,6 @@ type DiffFilterTab =
   | 'CONFLICT'
   | 'REVIEW'
   | 'reviewed'
-
-const PROFILE_SCALAR_FIELDS = new Set([
-  'name',
-  'birth_year',
-  'phone',
-  'email',
-  'address_region',
-  'affiliation_company',
-  'department',
-  'current_title',
-  'employment_type',
-  'technical_grade',
-  'career_start_date',
-  'career_document_value',
-  'profile_summary',
-])
 
 function formatDate(value?: string | null) {
   if (!value) return '—'
@@ -116,26 +108,6 @@ function reviewStatusTag(status: ReviewStatus) {
   return <Tag color={color}>{status}</Tag>
 }
 
-function isProfileScalar(diff: DiffItem): boolean {
-  return (
-    diff.entity_type === 'PROFILE' &&
-    Boolean(diff.field_name) &&
-    PROFILE_SCALAR_FIELDS.has(diff.field_name!)
-  )
-}
-
-function defaultDecidedValue(diff: DiffItem): string {
-  if (diff.new_value === null || diff.new_value === undefined) return ''
-  if (isProfileScalar(diff) && (typeof diff.new_value === 'string' || typeof diff.new_value === 'number')) {
-    return String(diff.new_value)
-  }
-  try {
-    return JSON.stringify(diff.new_value, null, 2)
-  } catch {
-    return String(diff.new_value)
-  }
-}
-
 export function AnalysisDetailPage() {
   const { analysisId = '' } = useParams()
   const navigate = useNavigate()
@@ -145,6 +117,7 @@ export function AnalysisDetailPage() {
   const [selectedKeys, setSelectedKeys] = useState<Key[]>([])
   const [editOpen, setEditOpen] = useState(false)
   const [mergeOpen, setMergeOpen] = useState(false)
+  const [confirmOpen, setConfirmOpen] = useState(false)
   const [editingDiff, setEditingDiff] = useState<DiffItem | null>(null)
   const [editForm] = Form.useForm<{ decided_value: string }>()
   const [mergeForm] = Form.useForm<{
@@ -184,6 +157,19 @@ export function AnalysisDetailPage() {
       return listAnalysisDiffs(analysisId, { change_types: filterTab })
     },
     enabled: Boolean(analysisId) && showDiffs,
+  })
+
+  const allDiffsQuery = useQuery({
+    queryKey: ['analyses', analysisId, 'diffs', 'all-for-confirm'],
+    queryFn: () => listAnalysisDiffs(analysisId),
+    enabled: Boolean(analysisId) && showDiffs,
+  })
+  const pendingActionable = countPendingActionableDiffs(allDiffsQuery.data?.data ?? [])
+  const canConfirm = canConfirmAnalysis({
+    status: analysis?.status,
+    diffsQuerySuccess: allDiffsQuery.isSuccess,
+    pendingActionable,
+    baseProfileVersion: analysis?.base_profile_version,
   })
 
   const invalidateDetail = async () => {
@@ -228,9 +214,31 @@ export function AnalysisDetailPage() {
     },
   })
 
+  const confirmMutation = useMutation({
+    mutationFn: () =>
+      confirmAnalysis(analysisId, {
+        expected_profile_version: analysis!.base_profile_version!,
+      }),
+    onSuccess: async (res) => {
+      message.success('AI 분석 결과가 프로필에 반영되었습니다.')
+      setConfirmOpen(false)
+      await invalidateDetail()
+      await queryClient.invalidateQueries({ queryKey: ['people', res.data.person_id] })
+    },
+    onError: (error) => {
+      if (apiErrorCode(error) === 'PROFILE_VERSION_CONFLICT') {
+        message.error(
+          '분석 이후 인력 프로필이 변경되었습니다. 현재 분석 결과를 그대로 확정할 수 없습니다. 최신 프로필 기준으로 다시 분석해 주세요.',
+        )
+        return
+      }
+      message.error(apiErrorMessage(error, '최종 확정에 실패했습니다.'))
+    },
+  })
+
   const openModify = (diff: DiffItem) => {
     setEditingDiff(diff)
-    editForm.setFieldsValue({ decided_value: defaultDecidedValue(diff) })
+    editForm.setFieldsValue({ decided_value: buildDefaultModifiedDecision(diff) })
     setEditOpen(true)
   }
 
@@ -238,8 +246,7 @@ export function AnalysisDetailPage() {
     setEditingDiff(diff)
     mergeForm.setFieldsValue({
       existing_target_id: diff.existing_target_id ?? '',
-      decided_value:
-        diff.new_value != null ? JSON.stringify(diff.new_value, null, 2) : undefined,
+      decided_value: initialMergeDecidedValueText(),
     })
     setMergeOpen(true)
   }
@@ -247,19 +254,18 @@ export function AnalysisDetailPage() {
   const submitModify = async (values: { decided_value: string }) => {
     if (!editingDiff) return
     let decided: unknown = values.decided_value
-    if (!isProfileScalar(editingDiff)) {
+    if (!isProfileScalarDiff(editingDiff)) {
       try {
         decided = JSON.parse(values.decided_value)
       } catch {
         message.error('JSON 형식이 올바르지 않습니다.')
         return
       }
-    } else if (
-      editingDiff.field_name === 'birth_year' ||
-      editingDiff.field_name === 'career_document_value'
-    ) {
+    } else if (editingDiff.field_name === 'birth_year') {
       const n = Number(values.decided_value)
       decided = Number.isNaN(n) ? values.decided_value : n
+    } else {
+      decided = values.decided_value
     }
     await decisionMutation.mutateAsync({
       diffId: editingDiff.id,
@@ -272,22 +278,23 @@ export function AnalysisDetailPage() {
     decided_value?: string
   }) => {
     if (!editingDiff) return
-    let decided: unknown = undefined
-    if (values.decided_value?.trim()) {
-      try {
-        decided = JSON.parse(values.decided_value)
-      } catch {
-        message.error('decided_value JSON 형식이 올바르지 않습니다.')
-        return
-      }
+    let body: {
+      review_status: 'MERGED'
+      existing_target_id: string
+      decided_value?: unknown
+    }
+    try {
+      body = buildMergeDecisionRequestBody({
+        existing_target_id: values.existing_target_id,
+        decided_value_text: values.decided_value,
+      })
+    } catch {
+      message.error('decided_value JSON 형식이 올바르지 않습니다.')
+      return
     }
     await decisionMutation.mutateAsync({
       diffId: editingDiff.id,
-      body: {
-        review_status: 'MERGED',
-        existing_target_id: values.existing_target_id,
-        decided_value: decided,
-      },
+      body,
     })
   }
 
@@ -389,7 +396,7 @@ export function AnalysisDetailPage() {
             <Button type="link" size="small" onClick={() => openModify(row)}>
               수정
             </Button>
-            {row.entity_type === 'PROJECT' && row.change_type === 'REVIEW' ? (
+            {isProjectRootReview(row) ? (
               <Button type="link" size="small" onClick={() => openMerge(row)}>
                 병합
               </Button>
@@ -453,7 +460,15 @@ export function AnalysisDetailPage() {
           <Typography.Text type="secondary">
             생성 {formatDate(analysis.created_at)} · 완료 {formatDate(analysis.completed_at)}
           </Typography.Text>
-          <TooltipConfirmNotice />
+          {analysis.status === 'CONFIRMED' ? (
+            <Button type="primary" onClick={() => navigate(`/people/${analysis.person.id}`)}>
+              인력 상세 보기
+            </Button>
+          ) : analysis.status === 'REVIEWING' ? (
+            <Button type="primary" disabled={!canConfirm} onClick={() => setConfirmOpen(true)}>
+              최종 확정
+            </Button>
+          ) : null}
         </Space>
       </Space>
 
@@ -466,17 +481,22 @@ export function AnalysisDetailPage() {
         />
       ) : (
         <>
-          <Alert
-            type="warning"
-            showIcon
-            style={{ marginBottom: 16 }}
-            message="최종 확정은 다음 단계에서 제공됩니다."
-            action={
-              <Button disabled type="primary">
-                최종 확정
-              </Button>
-            }
-          />
+          {analysis.status === 'REVIEWING' && pendingActionable > 0 ? (
+            <Alert
+              type="warning"
+              showIcon
+              style={{ marginBottom: 16 }}
+              message={`미검토 항목 ${pendingActionable}건 — 모두 결정한 뒤 최종 확정할 수 있습니다.`}
+            />
+          ) : null}
+          {analysis.status === 'CONFIRMED' ? (
+            <Alert
+              type="success"
+              showIcon
+              style={{ marginBottom: 16 }}
+              message="확정 완료 — 검색 인덱스 갱신 대기(PENDING)일 수 있습니다."
+            />
+          ) : null}
 
           <Tabs
             activeKey={filterTab}
@@ -574,7 +594,7 @@ export function AnalysisDetailPage() {
             label="decided_value"
             rules={[{ required: true, message: '값을 입력하세요.' }]}
           >
-            {editingDiff && isProfileScalar(editingDiff) ? (
+            {editingDiff && isProfileScalarDiff(editingDiff) ? (
               <Input />
             ) : (
               <Input.TextArea rows={8} style={{ fontFamily: 'monospace' }} />
@@ -595,6 +615,29 @@ export function AnalysisDetailPage() {
         destroyOnHidden
         okText="병합"
       >
+        {editingDiff?.new_value != null ? (
+          <Typography.Paragraph type="secondary" style={{ marginBottom: 8 }}>
+            Candidate (읽기 전용)
+          </Typography.Paragraph>
+        ) : null}
+        {editingDiff?.new_value != null ? (
+          <Typography.Paragraph>
+            <pre
+              style={{
+                margin: 0,
+                marginBottom: 16,
+                maxHeight: 180,
+                overflow: 'auto',
+                padding: 8,
+                background: 'rgba(0,0,0,0.04)',
+                fontFamily: 'monospace',
+                fontSize: 12,
+              }}
+            >
+              {formatValue(editingDiff.new_value)}
+            </pre>
+          </Typography.Paragraph>
+        ) : null}
         <Form form={mergeForm} layout="vertical" onFinish={submitMerge}>
           <Form.Item
             name="existing_target_id"
@@ -603,19 +646,44 @@ export function AnalysisDetailPage() {
           >
             <Input placeholder="기존 Project UUID" />
           </Form.Item>
-          <Form.Item name="decided_value" label="decided_value (JSON, 선택)">
-            <Input.TextArea rows={6} style={{ fontFamily: 'monospace' }} />
+          <Form.Item
+            name="decided_value"
+            label="override JSON (선택 — 명시한 필드만 overwrite)"
+            extra="비우면 null-fill + additive만 적용됩니다. 값이 있을 때만 decided_value를 전송합니다."
+          >
+            <Input.TextArea
+              rows={6}
+              style={{ fontFamily: 'monospace' }}
+              placeholder="비워 두면 decided_value를 보내지 않습니다"
+            />
           </Form.Item>
         </Form>
       </Modal>
-    </div>
-  )
-}
 
-function TooltipConfirmNotice() {
-  return (
-    <Button disabled title="최종 확정은 다음 단계에서 제공됩니다.">
-      최종 확정
-    </Button>
+      <Modal
+        title="최종 확정"
+        open={confirmOpen}
+        onCancel={() => setConfirmOpen(false)}
+        onOk={() => confirmMutation.mutate()}
+        confirmLoading={confirmMutation.isPending}
+        okText="확정"
+        destroyOnHidden
+      >
+        <Typography.Paragraph>
+          검토 결과를 운영 프로필에 반영합니다.
+        </Typography.Paragraph>
+        <Typography.Paragraph>
+          Base Profile Version:{' '}
+          <strong>
+            {analysis?.base_profile_version != null
+              ? `v${analysis.base_profile_version}`
+              : '—'}
+          </strong>
+        </Typography.Paragraph>
+        <Typography.Paragraph type="secondary">
+          확정 후 Profile Version이 +1 되고, 검색 인덱스 갱신 작업이 대기열에 등록됩니다.
+        </Typography.Paragraph>
+      </Modal>
+    </div>
   )
 }

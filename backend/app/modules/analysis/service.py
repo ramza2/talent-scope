@@ -1,9 +1,10 @@
-"""Detailed AI profile analysis orchestration (no confirm / DB profile mutation)."""
+"""Detailed AI profile analysis orchestration."""
 
 from __future__ import annotations
 
 import logging
 import math
+import re
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
@@ -26,7 +27,6 @@ from app.core.exceptions import (
     AIQueueUnavailableError,
     AnalysisStateConflictError,
     NotFoundError,
-    NotImplementedAppError,
     ValidationAppError,
 )
 from app.db.models.analysis import AnalysisDiffItem, AnalysisRun
@@ -37,6 +37,7 @@ from app.modules.analysis.schemas import (
     AnalysisDetail,
     AnalysisListItem,
     BulkDiffRequest,
+    ConfirmAnalysisResponseData,
     CreateAnalysisRequest,
     CreateAnalysisResponseData,
     DiffCounts,
@@ -586,8 +587,16 @@ class AnalysisService:
                 raise ValidationAppError("MODIFIED에는 decided_value가 필요합니다.")
             diff.decided_value = payload.decided_value
         elif status == "MERGED":
-            if diff.entity_type != "PROJECT":
-                raise ValidationAppError("MERGED는 PROJECT Diff에만 사용할 수 있습니다.")
+            path = diff.candidate_path or ""
+            if (
+                diff.entity_type != "PROJECT"
+                or diff.change_type != "REVIEW"
+                or diff.field_name is not None
+                or not re.fullmatch(r"projects\[\d+\]", path)
+            ):
+                raise ValidationAppError(
+                    "MERGED는 PROJECT root REVIEW Diff에만 사용할 수 있습니다."
+                )
             target_id = payload.existing_target_id or diff.existing_target_id
             if target_id is None:
                 raise ValidationAppError("MERGED에는 existing_target_id가 필요합니다.")
@@ -650,11 +659,35 @@ class AnalysisService:
 
         return CreateAnalysisResponseData(analysis_id=run.id, status="QUEUED")
 
-    def confirm_analysis(self, analysis_id: UUID, **_kwargs: Any) -> None:
-        _ = analysis_id
-        raise NotImplementedAppError(
-            "분석 확정(confirm)은 아직 구현되지 않았습니다."
-        )
+    def confirm_analysis(
+        self,
+        analysis_id: UUID,
+        *,
+        expected_profile_version: int,
+        actor_user_id: UUID,
+    ) -> ConfirmAnalysisResponseData:
+        from sqlalchemy.exc import IntegrityError
+
+        from app.core.exceptions import ConfirmValidationError
+        from app.modules.analysis.confirm import confirm_analysis_run
+
+        try:
+            result = confirm_analysis_run(
+                self.db,
+                analysis_id=analysis_id,
+                expected_profile_version=expected_profile_version,
+                actor_user_id=actor_user_id,
+            )
+            self.db.commit()
+            return result
+        except IntegrityError as exc:
+            self.db.rollback()
+            raise ConfirmValidationError(
+                "확정 중 데이터 제약 조건을 위반했습니다."
+            ) from exc
+        except Exception:
+            self.db.rollback()
+            raise
 
     # ----------------------------------------------------------------- mappers
 

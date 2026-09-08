@@ -236,6 +236,66 @@ export function retryAnalysis(analysisId: string) {
   )
 }
 
+export type ConfirmAnalysisResult = {
+  analysis_id: string
+  person_id: string
+  profile_version: number
+  status: AnalysisStatus
+  search_index_status: string
+}
+
+export function confirmAnalysis(
+  analysisId: string,
+  body: { expected_profile_version: number },
+) {
+  return apiFetch<{ data: ConfirmAnalysisResult }>(`/analyses/${analysisId}/confirm`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  })
+}
+
+/** Project root REVIEW only — relation REVIEW must not show merge. */
+export function isProjectRootReview(diff: DiffItem): boolean {
+  return (
+    diff.entity_type === 'PROJECT' &&
+    diff.change_type === 'REVIEW' &&
+    (diff.field_name == null || diff.field_name === '') &&
+    /^projects\[\d+\]$/.test(diff.candidate_path || '')
+  )
+}
+
+export function countPendingActionableDiffs(diffs: DiffItem[]): number {
+  return diffs.filter(
+    (d) =>
+      d.review_status === 'PENDING' &&
+      d.change_type !== 'SAME' &&
+      ['NEW', 'UPDATE', 'CONFLICT', 'REVIEW'].includes(d.change_type),
+  ).length
+}
+
+/** Confirm CTA gate — require diffs query success so loading ≠ pending 0. */
+export function canConfirmAnalysis(input: {
+  status?: AnalysisStatus | string | null
+  diffsQuerySuccess: boolean
+  pendingActionable: number
+  baseProfileVersion: number | null | undefined
+}): boolean {
+  return (
+    input.status === 'REVIEWING' &&
+    input.diffsQuerySuccess &&
+    input.pendingActionable === 0 &&
+    input.baseProfileVersion != null
+  )
+}
+
 export function isActiveAnalysisStatus(status: AnalysisStatus): boolean {
   return status === 'QUEUED' || status === 'PROCESSING'
 }
+
+export {
+  MODIFIED_DEFAULT_STRIP_KEYS,
+  buildDefaultModifiedDecision,
+  buildMergeDecisionRequestBody,
+  initialMergeDecidedValueText,
+  isProfileScalarDiff,
+} from '@/api/analysisDecisions'

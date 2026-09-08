@@ -13,3 +13,18 @@ export function apiErrorMessage(error: unknown, fallback: string): string {
   }
   return fallback
 }
+
+export function apiErrorCode(error: unknown): string | null {
+  if (
+    error &&
+    typeof error === 'object' &&
+    'body' in error &&
+    error.body &&
+    typeof error.body === 'object' &&
+    'code' in error.body &&
+    typeof (error.body as { code: unknown }).code === 'string'
+  ) {
+    return (error.body as { code: string }).code
+  }
+  return null
+}
