@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react'
 import {
+  Alert,
   Button,
   Card,
   Descriptions,
@@ -312,6 +313,18 @@ export function PeopleDetailPage() {
         <div>
           <Typography.Title level={3} style={{ marginBottom: 4 }}>
             {person.profile.name} <Tag>{person.status}</Tag>
+            {person.pending_analysis &&
+            ['QUEUED', 'PROCESSING', 'REVIEWING'].includes(person.pending_analysis.status) ? (
+              <Tag
+                color={
+                  person.pending_analysis.status === 'REVIEWING' ? 'processing' : 'blue'
+                }
+                style={{ cursor: 'pointer', marginLeft: 4 }}
+                onClick={() => navigate(`/analyses/${person.pending_analysis!.id}`)}
+              >
+                AI {person.pending_analysis.status}
+              </Tag>
+            ) : null}
           </Typography.Title>
           <Typography.Paragraph style={{ marginBottom: 4 }}>
             {primaryJob?.name || '주직무 미지정'} ·{' '}
@@ -325,6 +338,28 @@ export function PeopleDetailPage() {
               .filter(Boolean)
               .join(' · ') || '소속 미정'}
           </Typography.Text>
+          {person.pending_analysis &&
+          ['QUEUED', 'PROCESSING', 'REVIEWING'].includes(person.pending_analysis.status) ? (
+            <Alert
+              style={{ marginTop: 12, maxWidth: 560 }}
+              type={person.pending_analysis.status === 'REVIEWING' ? 'warning' : 'info'}
+              showIcon
+              message={
+                person.pending_analysis.status === 'REVIEWING'
+                  ? 'AI 분석 검토 대기 중입니다.'
+                  : `AI 분석이 ${person.pending_analysis.status} 상태입니다.`
+              }
+              action={
+                <Button
+                  size="small"
+                  type="link"
+                  onClick={() => navigate(`/analyses/${person.pending_analysis!.id}`)}
+                >
+                  분석 보기
+                </Button>
+              }
+            />
+          ) : null}
         </div>
         {isAdmin ? (
           <Space>

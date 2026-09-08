@@ -14,9 +14,12 @@ import {
 } from 'antd'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import type { ColumnsType } from 'antd/es/table'
+import type { Key } from 'react'
 import type { UploadFile } from 'antd/es/upload/interface'
+import { useNavigate } from 'react-router-dom'
 
 import { apiErrorMessage } from '@/api/errors'
+import { createAnalysis } from '@/api/analyses'
 import { listCodes } from '@/api/codes'
 import {
   deleteDocument,
@@ -48,11 +51,13 @@ function statusTag(status: string) {
 }
 
 export function DocumentsTab({ personId, isAdmin, onChanged }: Props) {
+  const navigate = useNavigate()
   const queryClient = useQueryClient()
   const [uploadOpen, setUploadOpen] = useState(false)
   const [docType, setDocType] = useState<string | undefined>()
   const [fileList, setFileList] = useState<UploadFile[]>([])
   const [showDeleted, setShowDeleted] = useState(false)
+  const [selectedKeys, setSelectedKeys] = useState<Key[]>([])
 
   const docsQuery = useQuery({
     queryKey: ['people', personId, 'documents', { showDeleted }],
@@ -134,6 +139,40 @@ export function DocumentsTab({ personId, isAdmin, onChanged }: Props) {
     },
     onError: (error) => message.error(apiErrorMessage(error, '문서 복원에 실패했습니다.')),
   })
+
+  const analysisMutation = useMutation({
+    mutationFn: (documentIds: string[]) =>
+      createAnalysis({
+        person_id: personId,
+        document_ids: documentIds,
+        analysis_type: 'PROFILE',
+      }),
+    onSuccess: async (res) => {
+      message.success('AI 상세 분석을 시작했습니다.')
+      setSelectedKeys([])
+      await invalidateLocal()
+      await queryClient.invalidateQueries({ queryKey: ['analyses'] })
+      navigate(`/analyses/${res.data.analysis_id}`)
+    },
+    onError: (error) =>
+      message.error(apiErrorMessage(error, 'AI 상세 분석 시작에 실패했습니다.')),
+  })
+
+  const selectableDocs = useMemo(() => {
+    const items = docsQuery.data?.data ?? []
+    return items.filter((d) => d.processing_status === 'READY' && !d.deleted_at)
+  }, [docsQuery.data])
+
+  const startAnalysis = () => {
+    const ids = selectedKeys.map(String)
+    Modal.confirm({
+      title: 'AI 상세 분석을 시작할까요?',
+      content: `선택한 문서 ${ids.length}건으로 PROFILE 분석을 요청합니다.`,
+      okText: '시작',
+      cancelText: '취소',
+      onOk: () => analysisMutation.mutateAsync(ids),
+    })
+  }
 
   const onDownload = async (doc: DocumentListItem) => {
     try {
@@ -284,6 +323,15 @@ export function DocumentsTab({ personId, isAdmin, onChanged }: Props) {
             </Space>
           ) : null}
           {isAdmin ? (
+            <Button
+              disabled={selectedKeys.length === 0}
+              loading={analysisMutation.isPending}
+              onClick={startAnalysis}
+            >
+              AI 상세 분석
+            </Button>
+          ) : null}
+          {isAdmin ? (
             <Button type="primary" onClick={() => setUploadOpen(true)}>
               문서 추가
             </Button>
@@ -303,6 +351,26 @@ export function DocumentsTab({ personId, isAdmin, onChanged }: Props) {
         dataSource={docsQuery.data?.data ?? []}
         pagination={false}
         locale={{ emptyText: '등록된 문서가 없습니다.' }}
+        rowSelection={
+          isAdmin
+            ? {
+                selectedRowKeys: selectedKeys,
+                onChange: setSelectedKeys,
+                getCheckboxProps: (row) => ({
+                  disabled:
+                    row.processing_status !== 'READY' || Boolean(row.deleted_at),
+                }),
+                selections: [
+                  {
+                    key: 'ready-all',
+                    text: 'READY 전체 선택',
+                    onSelect: () =>
+                      setSelectedKeys(selectableDocs.map((d) => d.document_id)),
+                  },
+                ],
+              }
+            : undefined
+        }
       />
 
       <Modal

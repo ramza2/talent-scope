@@ -6,6 +6,7 @@ import { PeopleListPage } from '@/pages/PeopleListPage'
 import { PeopleDetailPage } from '@/pages/PeopleDetailPage'
 import { PeopleNewPage } from '@/pages/PeopleNewPage'
 import { AnalysesPage } from '@/pages/AnalysesPage'
+import { AnalysisDetailPage } from '@/pages/AnalysisDetailPage'
 import { SearchPage } from '@/pages/SearchPage'
 import { AdminCodesPage } from '@/pages/AdminCodesPage'
 import { AdminUsersPage } from '@/pages/AdminUsersPage'
@@ -36,6 +37,7 @@ export const router = createBrowserRouter([
             children: [
               { path: 'people/new', element: <PeopleNewPage /> },
               { path: 'analyses', element: <AnalysesPage /> },
+              { path: 'analyses/:analysisId', element: <AnalysisDetailPage /> },
               { path: 'admin/codes', element: <AdminCodesPage /> },
               { path: 'admin/users', element: <AdminUsersPage /> },
               { path: 'admin/analyses', element: <AdminAnalysesPage /> },

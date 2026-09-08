@@ -23,9 +23,17 @@ class LLMProvider(Protocol):
         log_context: dict | None = None,
     ) -> IdentityExtraction: ...
 
+    def complete_json(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        log_context: dict | None = None,
+    ) -> dict: ...
+
 
 class OpenAICompatibleLLMProvider:
-    """Chat Completions LLM for upload identity extraction."""
+    """Chat Completions LLM for identity and profile extraction."""
 
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
@@ -37,6 +45,22 @@ class OpenAICompatibleLLMProvider:
         user_prompt: str,
         log_context: dict | None = None,
     ) -> IdentityExtraction:
+        content = self._chat(system_prompt, user_prompt, log_context)
+        return _parse_identity_content(content, allow_repair=True)
+
+    def complete_json(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        log_context: dict | None = None,
+    ) -> dict:
+        content = self._chat(system_prompt, user_prompt, log_context)
+        return _parse_json_dict(content, allow_repair=True)
+
+    def _chat(
+        self, system_prompt: str, user_prompt: str, log_context: dict | None
+    ) -> str:
         timeout = float(self.settings.ai_request_timeout_seconds)
         payload = {
             "model": self.settings.llm_model,
@@ -58,27 +82,35 @@ class OpenAICompatibleLLMProvider:
             timeout_seconds=timeout,
             log_context=ctx,
         )
-        content = extract_message_content(data)
-        return _parse_identity_content(content, allow_repair=True)
+        return extract_message_content(data)
+
+
+def _parse_json_dict(content: str, *, allow_repair: bool) -> dict:
+    try:
+        obj = parse_json_object(content)
+        if not isinstance(obj, dict):
+            raise AIResponseValidationError("AI JSON root is not an object")
+        return obj
+    except (AIResponseValidationError, ValueError, TypeError) as first_exc:
+        if not allow_repair:
+            raise AIResponseValidationError("JSON validation failed") from first_exc
+        try:
+            obj = parse_json_object(content, aggressive=True)
+            if not isinstance(obj, dict):
+                raise AIResponseValidationError("AI JSON root is not an object")
+            return obj
+        except Exception as exc:
+            raise AIResponseValidationError("JSON validation failed") from exc
 
 
 def _parse_identity_content(
     content: str, *, allow_repair: bool
 ) -> IdentityExtraction:
+    obj = _parse_json_dict(content, allow_repair=allow_repair)
     try:
-        obj = parse_json_object(content)
         return IdentityExtraction.model_validate(obj)
-    except (AIResponseValidationError, ValueError, TypeError) as first_exc:
-        if not allow_repair:
-            raise AIResponseValidationError("identity JSON validation failed") from first_exc
-        # One repair attempt: strip to outermost braces if present and re-parse.
-        try:
-            obj = parse_json_object(content, aggressive=True)
-            return IdentityExtraction.model_validate(obj)
-        except Exception as exc:
-            raise AIResponseValidationError(
-                "identity JSON validation failed"
-            ) from exc
+    except Exception as exc:
+        raise AIResponseValidationError("identity JSON validation failed") from exc
 
 
 class FakeLLMProvider:
@@ -91,6 +123,7 @@ class FakeLLMProvider:
         raw_content: str | None = None,
         fail: bool = False,
         fail_validation: bool = False,
+        profile_json: dict | None = None,
     ) -> None:
         if isinstance(identity, dict):
             self.identity = IdentityExtraction.model_validate(identity)
@@ -104,6 +137,7 @@ class FakeLLMProvider:
         self.raw_content = raw_content
         self.fail = fail
         self.fail_validation = fail_validation
+        self.profile_json = profile_json
         self.calls = 0
 
     def extract_identity(
@@ -122,3 +156,34 @@ class FakeLLMProvider:
         if self.raw_content is not None:
             return _parse_identity_content(self.raw_content, allow_repair=True)
         return self.identity.model_copy()
+
+    def complete_json(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        log_context: dict | None = None,
+    ) -> dict:
+        self.calls += 1
+        _ = (system_prompt, user_prompt, log_context)
+        if self.fail:
+            raise AIProviderError("injected LLM failure")
+        if self.fail_validation:
+            raise AIResponseValidationError("injected validation failure")
+        if self.raw_content is not None:
+            return _parse_json_dict(self.raw_content, allow_repair=True)
+        if self.profile_json is not None:
+            return dict(self.profile_json)
+        return {
+            "schema_version": "profile-candidate-v1",
+            "profile": {"name": self.identity.name},
+            "jobs": [],
+            "skills": [],
+            "expertise": [],
+            "employment_history": [],
+            "education": [],
+            "certifications": [],
+            "projects": [],
+            "summary": {},
+            "analysis": {"overall_confidence": 0.8},
+        }

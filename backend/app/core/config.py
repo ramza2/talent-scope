@@ -50,6 +50,15 @@ class Settings(BaseSettings):
     identify_max_text_chars: int = 20000
     identify_pdf_render_dpi: int = 120
 
+    # Detailed profile analysis limits
+    analysis_max_pages_per_document: int = 10
+    analysis_max_vlm_pages: int = 5
+    analysis_max_total_text_chars: int = 40000
+    analysis_pdf_render_dpi: int = 120
+    analysis_code_context_max_chars: int = 12000
+    analysis_max_quote_chars: int = 400
+    analysis_max_source_refs: int = 5
+
     embedding_base_url: str = "change-me"
     embedding_api_key: str = "change-me"
     embedding_model: str = "bge-m3"
