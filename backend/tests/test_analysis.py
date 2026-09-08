@@ -1,4 +1,4 @@
-"""Tests for Detailed AI Profile Analysis (no confirm)."""
+"""Tests for Detailed AI Profile Analysis."""
 
 from __future__ import annotations
 
@@ -369,13 +369,39 @@ def test_create_run_list_review_retry_confirm(
         )
         assert bad.status_code == 400
 
-    # Confirm not implemented
+    # Reject remaining must-decide diffs, then confirm
+    pending = client.get(
+        f"/api/v1/analyses/{analysis_id}/diffs?review_status=PENDING"
+    ).json()["data"]
+    for row in pending:
+        if row["change_type"] == "SAME":
+            continue
+        decided = client.patch(
+            f"/api/v1/analyses/{analysis_id}/diffs/{row['id']}",
+            headers={"X-CSRF-Token": csrf},
+            json={"review_status": "REJECTED"},
+        )
+        assert decided.status_code == 200, decided.text
+
     confirm = client.post(
         f"/api/v1/analyses/{analysis_id}/confirm",
         headers={"X-CSRF-Token": csrf},
         json={"expected_profile_version": 1},
     )
-    assert confirm.status_code == 501
+    assert confirm.status_code == 200, confirm.text
+    cbody = confirm.json()["data"]
+    assert cbody["status"] == "CONFIRMED"
+    assert cbody["profile_version"] == 2
+    assert cbody["search_index_status"] == "PENDING"
+
+    # Idempotent re-confirm
+    confirm2 = client.post(
+        f"/api/v1/analyses/{analysis_id}/confirm",
+        headers={"X-CSRF-Token": csrf},
+        json={"expected_profile_version": 1},
+    )
+    assert confirm2.status_code == 200, confirm2.text
+    assert confirm2.json()["data"]["profile_version"] == 2
 
     # Force FAILED then retry
     run = db_session.execute(
@@ -2182,3 +2208,212 @@ def test_profile_extract_prompt_nested_schema_keys():
     user = build_user_prompt(code_catalog="TECH-LANG-PYTHON\tPython", document_blocks="[PAGE 1]\nx")
     assert "UNTRUSTED DOCUMENT DATA" in user
     assert "document_id" in user or "source_refs" in user
+
+
+def test_confirm_applies_profile_job_tech_project(
+    client: TestClient, db_session, monkeypatch: pytest.MonkeyPatch
+):
+    """End-to-end confirm: scalars, additive JOB/TECH, NEW project + relation."""
+    from app.ai.providers.llm import FakeLLMProvider
+    from app.db.models.analysis import AnalysisRun
+    from app.db.models.person import PersonJob, PersonProfile, PersonSkill
+    from app.db.models.project import Project, ProjectJob, ProjectSkill
+    from app.db.models.revision import AuditLog, ProfileRevision
+    from app.db.models.search import SearchIndexJob
+    from app.modules.analysis.service import AnalysisService
+    from app.storage.s3 import get_object_storage
+
+    login_id = f"cf_{uuid.uuid4().hex[:10]}"
+    password = "Passw0rd!"
+    user = _create_user(db_session, login_id=login_id, password=password)
+    person, document = _seed_person_with_ready_doc(db_session, user.id)
+    csrf = _login(client, login_id, password)
+
+    resp = client.post(
+        "/api/v1/analyses",
+        headers={"X-CSRF-Token": csrf},
+        json={
+            "person_id": str(person.id),
+            "document_ids": [str(document.id)],
+            "analysis_type": "PROFILE",
+        },
+    )
+    assert resp.status_code == 202, resp.text
+    analysis_id = resp.json()["data"]["analysis_id"]
+
+    profile_json = {
+        "schema_version": "profile-candidate-v1",
+        "profile": {
+            "name": "분석대상",
+            "technical_grade": "EXPERT",
+            "phone": "010-1111-2222",
+            "career_start_date": "2015-03",
+        },
+        "jobs": [
+            {
+                "raw_value": "AI",
+                "code": "JOB-AI-DEV",
+                "job_type": "PRIMARY",
+                "confidence": 0.9,
+                "source_refs": [],
+            }
+        ],
+        "skills": [
+            {
+                "raw_value": "Python",
+                "code": "TECH-LANG-PYTHON",
+                "last_used_year": 2024,
+                "experience_months": 60,
+                "is_representative": True,
+                "confidence": 0.9,
+                "source_refs": [],
+            }
+        ],
+        "expertise": [],
+        "employment_history": [
+            {
+                "company_name": "오픈링크",
+                "department": "R&D",
+                "title": "엔지니어",
+                "start_date": "2018-01",
+                "end_date": "2020-12",
+                "responsibilities": "개발",
+                "confidence": 0.8,
+                "source_refs": [],
+            }
+        ],
+        "education": [],
+        "certifications": [],
+        "projects": [
+            {
+                "project_name": "TalentScope",
+                "customer_name": "내부",
+                "start_date": "2024-01",
+                "end_date": "2024-06",
+                "duration_months": 6,
+                "responsibilities": "백엔드",
+                "project_summary": "분석 시스템",
+                "jobs": [{"code": "JOB-AI-DEV", "raw_value": "AI"}],
+                "skills": [{"code": "TECH-LANG-PYTHON", "raw_value": "Python"}],
+                "expertise": [],
+                "business_domains": [{"code": "BIZ-PUBLIC", "raw_value": "공공"}],
+                "customer_types": [],
+                "confidence": 0.85,
+                "source_refs": [],
+            }
+        ],
+        "summary": {"text": "요약"},
+        "analysis": {"overall_confidence": 0.88},
+    }
+    fake_llm = FakeLLMProvider(profile_json=profile_json)
+    service = AnalysisService(db_session, storage=get_object_storage(), llm=fake_llm)
+    assert service.run_analysis(uuid.UUID(analysis_id), llm=fake_llm) == "REVIEWING"
+
+    diffs = client.get(f"/api/v1/analyses/{analysis_id}/diffs").json()["data"]
+    for row in diffs:
+        if row["review_status"] != "PENDING":
+            continue
+        if row["change_type"] == "SAME":
+            continue
+        patch = client.patch(
+            f"/api/v1/analyses/{analysis_id}/diffs/{row['id']}",
+            headers={"X-CSRF-Token": csrf},
+            json={"review_status": "ACCEPTED"},
+        )
+        assert patch.status_code == 200, patch.text
+
+    # Incomplete guard already satisfied; wrong version → conflict
+    bad_ver = client.post(
+        f"/api/v1/analyses/{analysis_id}/confirm",
+        headers={"X-CSRF-Token": csrf},
+        json={"expected_profile_version": 99},
+    )
+    assert bad_ver.status_code == 409
+
+    confirm = client.post(
+        f"/api/v1/analyses/{analysis_id}/confirm",
+        headers={"X-CSRF-Token": csrf},
+        json={"expected_profile_version": 1},
+    )
+    assert confirm.status_code == 200, confirm.text
+    data = confirm.json()["data"]
+    assert data["profile_version"] == 2
+    assert data["status"] == "CONFIRMED"
+
+    db_session.expire_all()
+    profile = db_session.execute(
+        select(PersonProfile).where(PersonProfile.person_id == person.id)
+    ).scalar_one()
+    assert profile.profile_version == 2
+    assert profile.technical_grade == "EXPERT"
+    assert profile.phone == "010-1111-2222"
+    assert profile.career_start_date is not None
+    assert profile.career_start_date.isoformat() == "2015-03-01"
+
+    jobs = list(
+        db_session.execute(
+            select(PersonJob).where(PersonJob.person_id == person.id)
+        ).scalars()
+    )
+    assert any(j.job_code == "JOB-AI-DEV" and j.source_type == "AI_CONFIRMED" for j in jobs)
+
+    skills = list(
+        db_session.execute(
+            select(PersonSkill).where(PersonSkill.person_id == person.id)
+        ).scalars()
+    )
+    assert any(
+        s.tech_code == "TECH-LANG-PYTHON" and s.is_representative for s in skills
+    )
+
+    projects = list(
+        db_session.execute(
+            select(Project).where(
+                Project.person_id == person.id, Project.deleted_at.is_(None)
+            )
+        ).scalars()
+    )
+    assert any(p.project_name == "TalentScope" and p.source_type == "AI_CONFIRMED" for p in projects)
+    created = next(p for p in projects if p.project_name == "TalentScope")
+    assert created.source_analysis_run_id == uuid.UUID(analysis_id)
+    assert db_session.execute(
+        select(ProjectJob).where(
+            ProjectJob.project_id == created.id, ProjectJob.job_code == "JOB-AI-DEV"
+        )
+    ).scalar_one_or_none()
+    assert db_session.execute(
+        select(ProjectSkill).where(
+            ProjectSkill.project_id == created.id,
+            ProjectSkill.tech_code == "TECH-LANG-PYTHON",
+        )
+    ).scalar_one_or_none()
+
+    rev = db_session.execute(
+        select(ProfileRevision).where(
+            ProfileRevision.person_id == person.id,
+            ProfileRevision.revision_no == 2,
+        )
+    ).scalar_one()
+    assert rev.source_type == "AI_CONFIRMED"
+    assert rev.source_analysis_run_id == uuid.UUID(analysis_id)
+
+    audits = list(
+        db_session.execute(
+            select(AuditLog).where(AuditLog.action_type == "ANALYSIS_CONFIRM")
+        ).scalars()
+    )
+    assert any(a.target_id == uuid.UUID(analysis_id) for a in audits)
+
+    jobs_idx = list(
+        db_session.execute(
+            select(SearchIndexJob).where(SearchIndexJob.person_id == person.id)
+        ).scalars()
+    )
+    assert any(j.status == "PENDING" and j.action == "REBUILD_PERSON" for j in jobs_idx)
+
+    run = db_session.execute(
+        select(AnalysisRun).where(AnalysisRun.id == uuid.UUID(analysis_id))
+    ).scalar_one()
+    assert run.status == "CONFIRMED"
+    assert run.confirmed_by == user.id
+    assert run.confirmed_at is not None
