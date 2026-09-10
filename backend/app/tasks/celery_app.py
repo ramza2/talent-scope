@@ -35,4 +35,13 @@ celery_app.conf.update(
         "app.tasks.analysis_tasks.*": {"queue": "analysis"},
         "app.tasks.index_tasks.*": {"queue": "index"},
     },
+    # Dispatcher only publishes PENDING jobs; SearchIndexJob DB remains SoT.
+    # Beat interval ~15s keeps Confirm→index lag short without Confirm TX .delay().
+    beat_schedule={
+        "dispatch-pending-search-index-jobs": {
+            "task": "app.tasks.index_tasks.dispatch_pending_search_index_jobs",
+            "schedule": 15.0,
+            "kwargs": {"limit": 50},
+        },
+    },
 )

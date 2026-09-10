@@ -237,6 +237,12 @@ LLM은 질의의 `ranking_focus`를 해석할 수 있으나 실제 점수계산�
 - 최근 수행시점
 - EXPLICIT / INFERRED 여부
 
+### Search Index Document (현재)
+
+Confirmed Profile 변경 시 `SearchIndexJob(REBUILD_PERSON)`이 DB에 등록되고,
+index Worker가 live Confirmed Snapshot으로 PROFILE/PROJECT `search_text`를 생성한다.
+embedding은 후속 BGE-M3 Worker가 채운다. Search API / Hybrid Ranking은 아직 미구현이다.
+
 최근성은 보정값으로 사용하며 오래된 경험을 과도하게 감점하지 않는다.
 
 ## 17. 결과 표현
