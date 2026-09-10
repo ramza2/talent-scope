@@ -18,6 +18,7 @@ from app.modules.documents import (
     person_documents_router,
     upload_sessions_router,
 )
+from app.modules.evidence import router as evidence_router
 from app.modules.people import router as people_router
 from app.modules.projects import person_projects_router, projects_router
 from app.modules.users import router as users_router
@@ -39,3 +40,4 @@ api_router.include_router(person_documents_router)
 api_router.include_router(documents_router)
 api_router.include_router(document_groups_router)
 api_router.include_router(analyses_router)
+api_router.include_router(evidence_router)

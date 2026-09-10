@@ -14,6 +14,24 @@ JOB_TYPES = frozenset({"PRIMARY", "SECONDARY", "EXPERIENCE"})
 EVIDENCE_TYPES = frozenset({"EXPLICIT", "INFERRED"})
 DATE_PRECISIONS = frozenset({"YEAR", "MONTH", "DAY"})
 
+# Profile scalar fields that may carry per-field source_refs provenance.
+PROFILE_SCALAR_FIELDS: tuple[str, ...] = (
+    "name",
+    "birth_year",
+    "phone",
+    "email",
+    "address_region",
+    "affiliation_company",
+    "department",
+    "current_title",
+    "employment_type",
+    "technical_grade",
+    "career_start_date",
+    "career_document_value",
+    "profile_summary",
+)
+PROFILE_SCALAR_FIELD_NAMES = frozenset(PROFILE_SCALAR_FIELDS)
+
 
 class SourceRef(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -47,6 +65,22 @@ class ProfileCandidate(BaseModel):
     career_start_date: str | None = None
     career_document_value: str | None = None
     profile_summary: str | None = None
+    # Optional per-field provenance map. Keys limited to PROFILE_SCALAR_FIELDS.
+    source_refs: dict[str, list[SourceRef]] = Field(default_factory=dict)
+
+    @field_validator("source_refs", mode="before")
+    @classmethod
+    def _profile_source_refs(cls, value: object) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            return {}
+        out: dict[str, Any] = {}
+        for key, refs in value.items():
+            field = str(key).strip()
+            if field not in PROFILE_SCALAR_FIELD_NAMES:
+                continue
+            if isinstance(refs, list):
+                out[field] = refs
+        return out
 
     @field_validator("technical_grade", mode="before")
     @classmethod
@@ -157,6 +191,7 @@ class CodeRefCandidate(BaseModel):
 
     raw_value: str | None = None
     code: str | None = None
+    source_refs: list[SourceRef] = Field(default_factory=list)
 
 
 class ProjectCandidate(BaseModel):

@@ -139,6 +139,8 @@ class FakeLLMProvider:
         self.fail_validation = fail_validation
         self.profile_json = profile_json
         self.calls = 0
+        self.last_system_prompt: str | None = None
+        self.last_user_prompt: str | None = None
 
     def extract_identity(
         self,
@@ -165,7 +167,9 @@ class FakeLLMProvider:
         log_context: dict | None = None,
     ) -> dict:
         self.calls += 1
-        _ = (system_prompt, user_prompt, log_context)
+        self.last_system_prompt = system_prompt
+        self.last_user_prompt = user_prompt
+        _ = log_context
         if self.fail:
             raise AIProviderError("injected LLM failure")
         if self.fail_validation:

@@ -12,11 +12,10 @@ from uuid import UUID
 
 from sqlalchemy.orm import Session
 
-from app.ai.prompts.profile_extract_v1 import (
-    PROMPT_VERSION,
-    SCHEMA_VERSION,
-    SYSTEM_PROMPT,
-    build_user_prompt,
+from app.ai.prompts.profile_extract import (
+    UnknownProfilePromptVersionError,
+    current_profile_prompt,
+    resolve_profile_prompt,
 )
 from app.ai.providers.errors import AIProviderError, AIResponseValidationError
 from app.ai.providers.llm import LLMProvider, OpenAICompatibleLLMProvider
@@ -64,6 +63,8 @@ class _RunContext:
     run_id: UUID
     person_id: UUID
     base_profile_version: int | None
+    prompt_version: str | None
+    schema_version: str | None
     documents: tuple[DocumentSnapshot, ...]
     catalog: tuple[tuple[str, str, bool], ...]  # code, type, active
     code_catalog_text: str
@@ -119,13 +120,14 @@ class AnalysisService:
                     f"문서가 READY 상태가 아닙니다: {document.original_filename}"
                 )
 
+        prompt = current_profile_prompt()
         run = self.repo.create_run(
             person_id=payload.person_id,
             base_profile_version=profile.profile_version,
             llm_model=self.settings.llm_model,
             vlm_model=self.settings.vlm_model,
-            prompt_version=PROMPT_VERSION,
-            schema_version=SCHEMA_VERSION,
+            prompt_version=prompt.prompt_version,
+            schema_version=prompt.schema_version,
         )
         self.repo.add_run_documents(run.id, payload.document_ids)
         self.repo.add_audit(
@@ -190,6 +192,11 @@ class AnalysisService:
             if not claimed.documents:
                 raise AIProviderError("no documents for analysis")
 
+            try:
+                prompt = resolve_profile_prompt(claimed.prompt_version)
+            except UnknownProfilePromptVersionError as exc:
+                raise AIProviderError(str(exc)) from exc
+
             bundle = self.source_builder.build(
                 list(claimed.documents),
                 log_context={"analysis_run_id": str(run_id)},
@@ -202,8 +209,8 @@ class AnalysisService:
                 raise AIProviderError("no usable text for profile analysis")
 
             raw = self.llm.complete_json(
-                system_prompt=SYSTEM_PROMPT,
-                user_prompt=build_user_prompt(
+                system_prompt=prompt.system_prompt,
+                user_prompt=prompt.build_user_prompt(
                     code_catalog=claimed.code_catalog_text,
                     document_blocks=blocks,
                 ),
@@ -211,6 +218,7 @@ class AnalysisService:
                     "analysis_run_id": str(run_id),
                     "document_count": len(claimed.documents),
                     "vlm_pages": bundle.total_vlm_pages,
+                    "prompt_version": prompt.prompt_version,
                 },
             )
             if not isinstance(raw, dict):
@@ -314,6 +322,8 @@ class AnalysisService:
             run_id=run_id,
             person_id=claimed.person_id,
             base_profile_version=claimed.base_profile_version,
+            prompt_version=claimed.prompt_version,
+            schema_version=claimed.schema_version,
             documents=tuple(documents),
             catalog=catalog,
             code_catalog_text=catalog_text,
@@ -462,7 +472,28 @@ class AnalysisService:
             review_status=review_status,
             entity_type=entity_type,
         )
-        return [self._to_diff_response(row) for row in rows]
+        evidence_map: dict[UUID, list[EvidenceLite]] | None = None
+        if run.status == "CONFIRMED" and rows:
+            from app.modules.evidence.repository import EvidenceRepository
+
+            by_diff = EvidenceRepository(self.db).list_evidence_by_diff_ids(
+                [row.id for row in rows]
+            )
+            evidence_map = {
+                diff_id: [
+                    EvidenceLite(
+                        id=ev.id,
+                        document_id=ev.document_id,
+                        page_no=ev.page_no,
+                        quote_text=ev.quote_text,
+                    )
+                    for ev in evidences
+                ]
+                for diff_id, evidences in by_diff.items()
+            }
+        return [
+            self._to_diff_response(row, evidence_map=evidence_map) for row in rows
+        ]
 
     # ----------------------------------------------------------------- review
 
@@ -755,7 +786,17 @@ class AnalysisService:
             updated_at=run.updated_at,
         )
 
-    def _to_diff_response(self, row: AnalysisDiffItem) -> DiffItemResponse:
+    def _to_diff_response(
+        self,
+        row: AnalysisDiffItem,
+        *,
+        evidence_map: dict[UUID, list[EvidenceLite]] | None = None,
+    ) -> DiffItemResponse:
+        if evidence_map is not None:
+            # CONFIRMED: only materialized AnalysisDiffEvidence — no raw fallback.
+            evidence = evidence_map.get(row.id, [])
+        else:
+            evidence = _evidence_from_new_value(row.new_value)
         return DiffItemResponse(
             id=row.id,
             entity_type=row.entity_type,
@@ -771,7 +812,7 @@ class AnalysisService:
             decided_value=row.decided_value,
             decided_by=row.decided_by,
             decided_at=row.decided_at,
-            evidence=_evidence_from_new_value(row.new_value),
+            evidence=evidence,
         )
 
 
