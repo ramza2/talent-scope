@@ -188,6 +188,15 @@ class SearchRepository:
         self.db.flush()
         return job
 
+    def mark_job_cancelled(self, job: SearchIndexJob) -> SearchIndexJob:
+        """Cancel without success semantics; does not bump retry_count."""
+        job.status = "CANCELLED"
+        job.completed_at = datetime.now(timezone.utc)
+        job.error_message = None
+        self.db.add(job)
+        self.db.flush()
+        return job
+
     def mark_job_failed_if_pending(
         self,
         job_id: UUID,
@@ -412,11 +421,14 @@ class SearchRepository:
         self.db.flush()
         return item
 
-    def ensure_embedding_job(self, item: SearchIndexItem) -> SearchIndexJob | None:
+    def ensure_embedding_job(
+        self, item: SearchIndexItem
+    ) -> tuple[SearchIndexJob | None, str]:
         """Create or requeue UPSERT Embedding job for one SearchIndexItem.
 
-        Never publishes Celery. Returns None when embedding is already current
-        or the item is not eligible.
+        Never publishes Celery. Returns (job, outcome) where outcome is one of:
+        skipped | created | requeued | already_pending | already_processing |
+        already_completed | exhausted | backoff.
         """
         from app.core.config import get_settings
         from app.modules.search.embedding_policy import (
@@ -426,49 +438,54 @@ class SearchRepository:
             embedding_idempotency_key,
             item_content_hash,
             item_needs_embedding,
+            item_search_document_version,
         )
 
         settings = get_settings()
         if not settings.embedding_enabled:
-            return None
+            return None, "skipped"
         model = current_embedding_model()
         version = effective_embedding_version()
         if not item_needs_embedding(item, model=model, version=version):
-            return None
+            return None, "skipped"
 
         content_hash_value = item_content_hash(item)
+        search_doc_version = item_search_document_version(item)
         key = embedding_idempotency_key(
             search_index_item_id=str(item.id),
             content_hash_value=content_hash_value,
+            search_document_version=search_doc_version,
             embedding_model=model,
             embedding_version=version,
         )
         existing = self.get_job_by_idempotency_key(key)
         now = datetime.now(timezone.utc)
         if existing is not None:
-            if existing.status in {"PENDING", "PROCESSING"}:
-                return existing
+            if existing.status == "PENDING":
+                return existing, "already_pending"
+            if existing.status == "PROCESSING":
+                return existing, "already_processing"
             if existing.status == "COMPLETED":
-                return existing
+                return existing, "already_completed"
             if existing.status == "FAILED":
                 max_retries = int(settings.embedding_max_retries)
                 backoff = int(settings.embedding_retry_backoff_seconds)
                 retry_count = int(existing.retry_count or 0)
                 if retry_count >= max_retries:
-                    return existing
+                    return existing, "exhausted"
                 completed_at = existing.completed_at
                 if completed_at is not None:
                     if completed_at.tzinfo is None:
                         completed_at = completed_at.replace(tzinfo=timezone.utc)
                     if (now - completed_at).total_seconds() < backoff:
-                        return existing
+                        return existing, "backoff"
                 existing.status = "PENDING"
                 existing.started_at = None
                 existing.completed_at = None
                 existing.error_message = None
                 self.db.add(existing)
                 self.db.flush()
-                return existing
+                return existing, "requeued"
             if existing.status == "CANCELLED":
                 existing.status = "PENDING"
                 existing.started_at = None
@@ -476,8 +493,8 @@ class SearchRepository:
                 existing.error_message = None
                 self.db.add(existing)
                 self.db.flush()
-                return existing
-            return existing
+                return existing, "requeued"
+            return existing, "already_pending"
 
         job = SearchIndexJob(
             person_id=item.person_id,
@@ -490,13 +507,15 @@ class SearchRepository:
                 "operation": OPERATION_EMBED_SEARCH_INDEX_ITEM,
                 "search_index_item_id": str(item.id),
                 "expected_content_hash": content_hash_value,
+                "expected_search_document_version": search_doc_version,
                 "embedding_model": model,
                 "embedding_version": version,
             },
         )
         self.db.add(job)
         self.db.flush()
-        return job
+        return job, "created"
+
 
     def list_items_needing_embedding(self, *, limit: int = 100) -> list[SearchIndexItem]:
         """Active PROFILE/PROJECT rows missing current model/version embedding."""

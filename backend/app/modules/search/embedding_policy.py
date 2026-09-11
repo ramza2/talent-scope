@@ -56,6 +56,15 @@ def item_content_hash(item: Any) -> str:
     return content_hash(item.search_text or "")
 
 
+def item_search_document_version(item: Any) -> str:
+    """Resolve search_document_version from metadata_json (empty string if absent)."""
+    meta = item.metadata_json if isinstance(getattr(item, "metadata_json", None), dict) else {}
+    raw = meta.get("search_document_version")
+    if isinstance(raw, str):
+        return raw
+    return ""
+
+
 def prepare_embedding_input(search_text: str, *, max_chars: int | None = None) -> str:
     """Strip and deterministically cap text for the embedding API (DB text unchanged)."""
     settings = get_settings()
@@ -74,6 +83,7 @@ def embedding_fingerprint(
     *,
     search_index_item_id: str,
     content_hash_value: str,
+    search_document_version: str,
     embedding_model: str,
     embedding_version: str,
 ) -> str:
@@ -81,6 +91,7 @@ def embedding_fingerprint(
         [
             str(search_index_item_id),
             content_hash_value,
+            search_document_version,
             embedding_model,
             embedding_version,
         ]
@@ -92,12 +103,14 @@ def embedding_idempotency_key(
     *,
     search_index_item_id: str,
     content_hash_value: str,
+    search_document_version: str,
     embedding_model: str,
     embedding_version: str,
 ) -> str:
     fp = embedding_fingerprint(
         search_index_item_id=search_index_item_id,
         content_hash_value=content_hash_value,
+        search_document_version=search_document_version,
         embedding_model=embedding_model,
         embedding_version=embedding_version,
     )

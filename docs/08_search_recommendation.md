@@ -250,7 +250,7 @@ Search Document 반영 후 embedding이 필요하면 같은 TX에서 `SearchInde
 payload_json.operation = EMBED_SEARCH_INDEX_ITEM
 ```
 
-idempotency는 `search_index_item_id + content_hash + embedding_model + embedding_version`
+idempotency는 `search_index_item_id + content_hash + search_document_version + embedding_model + embedding_version`
 fingerprint 기반이다. DB `SearchIndexJob`이 상태 SoT이며, Embedding Worker만
 OpenAI-compatible BGE-M3 API를 호출해 `VECTOR(1024)`를 검증·저장한다.
 

@@ -238,7 +238,7 @@ class SearchIndexService:
             elif doc.object_type == OBJECT_TYPE_PROJECT:
                 project_count += 1
             if embedding_enabled:
-                self.repo.ensure_embedding_job(item)
+                self.repo.ensure_embedding_job(item)  # (job, outcome); TX-local ensure
 
         active_items = self.repo.list_active_items_for_person(person_id)
         stale = [
@@ -315,6 +315,7 @@ class SearchIndexService:
             current_embedding_model,
             effective_embedding_version,
             item_content_hash,
+            item_search_document_version,
             prepare_embedding_input,
         )
 
@@ -328,8 +329,44 @@ class SearchIndexService:
             return ProcessJobResult(job_id=job.id, status="FAILED", claimed=True)
 
         if not settings.embedding_enabled:
+            # Disabled is not a successful embedding. CANCELLED lets the scanner
+            # requeue the same fingerprint when embedding is re-enabled.
+            self.repo.mark_job_cancelled(job)
+            return ProcessJobResult(job_id=job.id, status="CANCELLED", claimed=True)
+
+        raw_model = payload.get("embedding_model")
+        raw_version = payload.get("embedding_version")
+        if not isinstance(raw_model, str) or not raw_model.strip():
+            self.repo.mark_unsupported_action_failed(
+                job,
+                error_message="invalid embedding job: missing embedding_model",
+            )
+            return ProcessJobResult(job_id=job.id, status="FAILED", claimed=True)
+        if not isinstance(raw_version, str) or not raw_version.strip():
+            self.repo.mark_unsupported_action_failed(
+                job,
+                error_message="invalid embedding job: missing embedding_version",
+            )
+            return ProcessJobResult(job_id=job.id, status="FAILED", claimed=True)
+
+        payload_model = raw_model.strip()
+        payload_version = raw_version.strip()
+        current_model = current_embedding_model()
+        current_version = effective_embedding_version()
+        if payload_model != current_model or payload_version != current_version:
+            # Old-config queued job: never call current provider under old labels.
             self.repo.mark_job_completed(job)
             return ProcessJobResult(job_id=job.id, status="COMPLETED", claimed=True)
+
+        if "expected_search_document_version" not in payload:
+            self.repo.mark_unsupported_action_failed(
+                job,
+                error_message=(
+                    "invalid embedding job: missing expected_search_document_version"
+                ),
+            )
+            return ProcessJobResult(job_id=job.id, status="FAILED", claimed=True)
+        expected_doc_version = str(payload.get("expected_search_document_version") or "")
 
         raw_item_id = payload.get("search_index_item_id")
         try:
@@ -338,10 +375,6 @@ class SearchIndexService:
             raise SearchIndexProcessingError("search index item not found") from exc
 
         expected_hash = str(payload.get("expected_content_hash") or "")
-        desired_model = str(payload.get("embedding_model") or current_embedding_model())
-        desired_version = str(
-            payload.get("embedding_version") or effective_embedding_version()
-        )
 
         item = self.repo.get_item(item_id)
         if item is None or not item.is_active:
@@ -355,20 +388,26 @@ class SearchIndexService:
             return ProcessJobResult(job_id=job.id, status="COMPLETED", claimed=True)
 
         current_hash = item_content_hash(item)
+        current_doc_version = item_search_document_version(item)
         if expected_hash and current_hash != expected_hash:
+            self.repo.mark_job_completed(job)
+            return ProcessJobResult(job_id=job.id, status="COMPLETED", claimed=True)
+        if current_doc_version != expected_doc_version:
             self.repo.mark_job_completed(job)
             return ProcessJobResult(job_id=job.id, status="COMPLETED", claimed=True)
         if (
             item.embedding is not None
-            and (item.embedding_model or "") == desired_model
-            and (item.embedding_version or "") == desired_version
+            and (item.embedding_model or "") == current_model
+            and (item.embedding_version or "") == current_version
             and (not expected_hash or current_hash == expected_hash)
+            and current_doc_version == expected_doc_version
         ):
             self.repo.mark_job_completed(job)
             return ProcessJobResult(job_id=job.id, status="COMPLETED", claimed=True)
 
         snapshot_text = item.search_text or ""
         snapshot_hash = current_hash
+        snapshot_doc_version = current_doc_version
         snapshot_object_type = item.object_type
         self.db.flush()
 
@@ -393,12 +432,15 @@ class SearchIndexService:
         if item_content_hash(locked_item) != snapshot_hash:
             self.repo.mark_job_completed(job)
             return ProcessJobResult(job_id=job.id, status="COMPLETED", claimed=True)
+        if item_search_document_version(locked_item) != snapshot_doc_version:
+            self.repo.mark_job_completed(job)
+            return ProcessJobResult(job_id=job.id, status="COMPLETED", claimed=True)
 
         self.repo.apply_item_embedding(
             locked_item,
             vector=vector,
-            embedding_model=desired_model,
-            embedding_version=desired_version,
+            embedding_model=current_model,
+            embedding_version=current_version,
         )
         self.repo.mark_job_completed(job)
         logger.info(
@@ -414,18 +456,38 @@ class SearchIndexService:
         """Ensure PENDING Embedding UPSERT jobs for missing/outdated items."""
         from app.core.config import get_settings
 
+        empty = {
+            "scanned": 0,
+            "enqueued": 0,
+            "created_or_requeued": 0,
+            "already_pending": 0,
+            "exhausted": 0,
+        }
         if not get_settings().embedding_enabled:
-            return {"scanned": 0, "enqueued": 0}
+            return empty
         items = self.repo.list_items_needing_embedding(
             limit=max(0, min(int(limit), 500))
         )
-        enqueued = 0
+        created_or_requeued = 0
+        already_pending = 0
+        exhausted = 0
         for item in items:
-            job = self.repo.ensure_embedding_job(item)
-            if job is not None and job.status == "PENDING" and job.started_at is None:
-                enqueued += 1
+            _job, outcome = self.repo.ensure_embedding_job(item)
+            if outcome in {"created", "requeued"}:
+                created_or_requeued += 1
+            elif outcome in {"already_pending", "already_processing"}:
+                already_pending += 1
+            elif outcome in {"exhausted", "backoff"}:
+                exhausted += 1
         self.db.commit()
-        return {"scanned": len(items), "enqueued": enqueued}
+        return {
+            "scanned": len(items),
+            "enqueued": created_or_requeued,
+            "created_or_requeued": created_or_requeued,
+            "already_pending": already_pending,
+            "exhausted": exhausted,
+        }
+
 
 
 

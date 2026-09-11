@@ -540,7 +540,9 @@ Embedding 대상:
 - Document Chunk — 아직 미구현
 
 Embedding과 FTS 데이터는 `search_index_item`에 저장한다.
-validity는 embedding_model + embedding_version(pipeline+input-cap) + content_hash로 판단한다.
+validity는 embedding_model + embedding_version(pipeline+input-cap) + content_hash + search_document_version으로 판단한다.
+queued job의 model/version이 현재 Settings와 다르면 provider 호출 없이 COMPLETED(stale no-op) 처리한다.
+EMBEDDING_ENABLED=false로 worker가 실행되면 COMPLETED가 아니라 CANCELLED로 남겨 scanner가 재활성화할 수 있게 한다.
 
 ---
 

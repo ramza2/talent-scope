@@ -140,9 +140,13 @@ def enqueue_missing_search_embeddings(limit: int = 100) -> dict[str, Any]:
     finally:
         db.close()
     logger.info(
-        "search_index embedding enqueue scanned=%s enqueued=%s",
+        "search_index embedding enqueue scanned=%s enqueued=%s "
+        "created_or_requeued=%s already_pending=%s exhausted=%s",
         result.get("scanned"),
         result.get("enqueued"),
+        result.get("created_or_requeued"),
+        result.get("already_pending"),
+        result.get("exhausted"),
     )
     return result
 
