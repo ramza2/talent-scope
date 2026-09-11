@@ -7,7 +7,11 @@ from typing import Any
 from uuid import UUID
 
 from app.db.session import SessionLocal
-from app.modules.search.repository import SearchRepository
+from app.modules.search.errors import (
+    SearchIndexProcessingError,
+    SearchIndexTaskError,
+    safe_search_job_error,
+)
 from app.modules.search.service import SearchIndexService
 from app.tasks.celery_app import celery_app
 
@@ -16,7 +20,10 @@ logger = logging.getLogger(__name__)
 
 @celery_app.task(name="app.tasks.index_tasks.process_search_index_job")
 def process_search_index_job(job_id: str) -> dict[str, Any]:
-    """Process one SearchIndexJob using a dedicated SQLAlchemy session."""
+    """Process one SearchIndexJob using a dedicated SQLAlchemy session.
+
+    Celery boundary never re-raises the original exception (SQL/params/PII).
+    """
     db = SessionLocal()
     try:
         service = SearchIndexService(db)
@@ -30,33 +37,91 @@ def process_search_index_job(job_id: str) -> dict[str, Any]:
             "upserted_count": result.upserted_count,
             "deactivated_count": result.deactivated_count,
         }
+    except SearchIndexProcessingError as exc:
+        logger.error(
+            "search_index task failed job_id=%s exc_class=%s error=%s",
+            job_id,
+            type(exc).__name__,
+            str(exc),
+        )
+        raise SearchIndexTaskError("search index processing failed") from None
+    except Exception as exc:
+        safe = safe_search_job_error(exc)
+        logger.error(
+            "search_index task failed job_id=%s exc_class=%s error=%s",
+            job_id,
+            type(exc).__name__,
+            safe,
+        )
+        raise SearchIndexTaskError("search index processing failed") from None
     finally:
         db.close()
 
 
 @celery_app.task(name="app.tasks.index_tasks.dispatch_pending_search_index_jobs")
 def dispatch_pending_search_index_jobs(limit: int = 50) -> dict[str, Any]:
-    """Publish PENDING SearchIndexJob ids without mutating status.
+    """Reserve PENDING jobs (PROCESSING + commit) then publish Celery tasks.
 
-    Business transactions only insert SearchIndexJob rows. This dispatcher is the
-    sole Celery publish path so Confirm/update TX never calls .delay().
-    Duplicate publishes are safe thanks to atomic claim in process_search_index_job.
+    PROCESSING means "dispatcher reserved; not yet terminal". Duplicate dispatch
+    cycles do not re-publish the same job while it remains PROCESSING.
     """
     db = SessionLocal()
+    reserved_ids: list[str] = []
+    published: list[str] = []
+    restored: list[str] = []
     try:
-        repo = SearchRepository(db)
-        job_ids = repo.list_pending_job_ids(limit=max(1, min(int(limit), 500)))
+        service = SearchIndexService(db)
+        reserved = service.reserve_pending_jobs(limit=max(1, min(int(limit), 500)))
+        reserved_ids = [str(job.id) for job in reserved]
+
+        for job in reserved:
+            job_id = str(job.id)
+            try:
+                process_search_index_job.delay(job_id)
+                published.append(job_id)
+            except Exception as exc:
+                logger.warning(
+                    "search_index publish failed job_id=%s exc_class=%s",
+                    job_id,
+                    type(exc).__name__,
+                )
+                if service.release_reserved_job(job.id):
+                    restored.append(job_id)
     finally:
         db.close()
 
-    published: list[str] = []
-    for job_id in job_ids:
-        process_search_index_job.delay(str(job_id))
-        published.append(str(job_id))
-
     logger.info(
-        "search_index dispatcher published=%s limit=%s",
+        "search_index dispatcher reserved=%s published=%s restored=%s limit=%s",
+        len(reserved_ids),
         len(published),
+        len(restored),
         limit,
     )
-    return {"published": len(published), "job_ids": published}
+    return {
+        "reserved": len(reserved_ids),
+        "published": len(published),
+        "restored": len(restored),
+        "job_ids": published,
+        "restored_job_ids": restored,
+    }
+
+
+@celery_app.task(name="app.tasks.index_tasks.recover_stale_search_index_jobs")
+def recover_stale_search_index_jobs(limit: int = 100) -> dict[str, Any]:
+    """Return stuck PROCESSING jobs to PENDING. Does not rebuild or publish."""
+    db = SessionLocal()
+    try:
+        service = SearchIndexService(db)
+        recovered = service.recover_stale_processing_jobs(
+            limit=max(1, min(int(limit), 500))
+        )
+    finally:
+        db.close()
+
+    recovered_ids = [str(job_id) for job_id in recovered]
+    logger.info(
+        "search_index stale recovery count=%s job_ids=%s",
+        len(recovered_ids),
+        recovered_ids[:20],
+    )
+    return {"recovered": len(recovered_ids), "job_ids": recovered_ids}

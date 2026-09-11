@@ -337,14 +337,20 @@ index
 Confirmed Profile mutation
   → SearchIndexJob(REBUILD_PERSON / PENDING)   # DB SoT, Confirm TX 내 Celery.delay 금지
   → Celery Beat dispatcher (~15s)
-  → process_search_index_job (index queue)
-  → atomic claim (PENDING → PROCESSING)
+  → atomic reserve (PENDING → PROCESSING, started_at) + COMMIT
+  → process_search_index_job.delay (index queue)
+  → worker: PROCESSING row FOR UPDATE SKIP LOCKED
   → PersonProfile FOR UPDATE + live Confirmed Snapshot
   → deterministic PROFILE / PROJECT Search Document
   → search_index_item upsert (search_text / metadata_json / source_weight)
   → embedding NULL (또는 동일 search_text+search_document_version이면 기존 embedding 보존)
   → SearchIndexJob COMPLETED
 ```
+
+PROCESSING 의미 (MVP): dispatcher가 처리 예약한 뒤 아직 terminal이 아닌 상태.
+publish 실패 시 조건부 PROCESSING→PENDING 복구. stale PROCESSING은 Beat(~60s)가
+started_at 기준으로 PENDING 복구(retry_count += 1)하며 rebuild는 하지 않는다.
+job.error_message / Celery failure는 sanitization helper로 SQL·search_text·PII를 저장하지 않는다.
 
 정책 요약:
 

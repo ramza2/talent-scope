@@ -37,11 +37,19 @@ celery_app.conf.update(
     },
     # Dispatcher only publishes PENDING jobs; SearchIndexJob DB remains SoT.
     # Beat interval ~15s keeps Confirm→index lag short without Confirm TX .delay().
+    # Dispatcher atomically reserves PENDING→PROCESSING then publishes.
+    # Stale PROCESSING recovery returns stuck reservations to PENDING (~60s).
+    # SearchIndexJob DB remains SoT; Confirm TX never calls .delay().
     beat_schedule={
         "dispatch-pending-search-index-jobs": {
             "task": "app.tasks.index_tasks.dispatch_pending_search_index_jobs",
             "schedule": 15.0,
             "kwargs": {"limit": 50},
+        },
+        "recover-stale-search-index-jobs": {
+            "task": "app.tasks.index_tasks.recover_stale_search_index_jobs",
+            "schedule": 60.0,
+            "kwargs": {"limit": 100},
         },
     },
 )

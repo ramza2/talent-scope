@@ -12,6 +12,8 @@ from app.db.models.person import PersonProfile
 from app.db.models.search import SearchIndexItem, SearchIndexJob
 from app.modules.search.schemas import SearchDocument
 
+TERMINAL_JOB_STATUSES = frozenset({"COMPLETED", "FAILED", "CANCELLED"})
+
 
 class SearchRepository:
     def __init__(self, db: Session) -> None:
@@ -33,6 +35,7 @@ class SearchRepository:
                 status="PROCESSING",
                 started_at=now,
                 error_message=None,
+                completed_at=None,
             )
             .returning(SearchIndexJob.id)
         )
@@ -42,7 +45,113 @@ class SearchRepository:
         self.db.flush()
         return self.get_job(job_id)
 
+
+    def reserve_pending_jobs(self, *, limit: int = 50) -> list[SearchIndexJob]:
+        """Atomically reserve PENDING jobs for dispatch (FOR UPDATE SKIP LOCKED).
+
+        Sets status=PROCESSING and started_at. Caller must COMMIT before Celery publish.
+        Concurrent dispatchers never reserve the same job.
+        """
+        if limit <= 0:
+            return []
+        stmt = (
+            select(SearchIndexJob)
+            .where(SearchIndexJob.status == "PENDING")
+            .order_by(SearchIndexJob.created_at.asc(), SearchIndexJob.id.asc())
+            .limit(limit)
+            .with_for_update(skip_locked=True)
+        )
+        jobs = list(self.db.scalars(stmt).all())
+        now = datetime.now(timezone.utc)
+        for job in jobs:
+            job.status = "PROCESSING"
+            job.started_at = now
+            job.error_message = None
+            job.completed_at = None
+            self.db.add(job)
+        if jobs:
+            self.db.flush()
+        return jobs
+
+    def release_reserved_job(self, job_id: UUID) -> bool:
+        """Conditional PROCESSING → PENDING after Celery publish failure.
+
+        Never reverts COMPLETED / FAILED / CANCELLED.
+        """
+        stmt = (
+            update(SearchIndexJob)
+            .where(
+                SearchIndexJob.id == job_id,
+                SearchIndexJob.status == "PROCESSING",
+            )
+            .values(
+                status="PENDING",
+                started_at=None,
+                completed_at=None,
+                error_message=None,
+            )
+            .returning(SearchIndexJob.id)
+        )
+        result = self.db.execute(stmt)
+        released = result.first() is not None
+        if released:
+            self.db.flush()
+        return released
+
+    def lock_processing_job(self, job_id: UUID) -> SearchIndexJob | None:
+        """Exclusive lock on a PROCESSING job row (SKIP LOCKED).
+
+        Returns None when another worker holds the lock or status != PROCESSING.
+        """
+        stmt = (
+            select(SearchIndexJob)
+            .where(
+                SearchIndexJob.id == job_id,
+                SearchIndexJob.status == "PROCESSING",
+            )
+            .with_for_update(skip_locked=True)
+        )
+        return self.db.scalars(stmt).first()
+
+    def recover_stale_processing_jobs(
+        self,
+        *,
+        older_than: datetime,
+        limit: int = 100,
+    ) -> list[UUID]:
+        """Return stale PROCESSING jobs to PENDING (dispatcher can re-publish).
+
+        Policy: retry_count += 1 so hard-kill / stuck-dispatch cycles are visible.
+        """
+        if limit <= 0:
+            return []
+        stmt = (
+            select(SearchIndexJob)
+            .where(
+                SearchIndexJob.status == "PROCESSING",
+                SearchIndexJob.started_at.is_not(None),
+                SearchIndexJob.started_at < older_than,
+            )
+            .order_by(SearchIndexJob.started_at.asc(), SearchIndexJob.id.asc())
+            .limit(limit)
+            .with_for_update(skip_locked=True)
+        )
+        jobs = list(self.db.scalars(stmt).all())
+        recovered: list[UUID] = []
+        for job in jobs:
+            job.status = "PENDING"
+            job.started_at = None
+            job.completed_at = None
+            job.error_message = None
+            job.retry_count = int(job.retry_count or 0) + 1
+            self.db.add(job)
+            recovered.append(job.id)
+        if recovered:
+            self.db.flush()
+        return recovered
+
     def list_pending_job_ids(self, *, limit: int = 50) -> list[UUID]:
+        """Debug/admin helper — dispatcher must use reserve_pending_jobs instead."""
         stmt: Select[tuple[UUID]] = (
             select(SearchIndexJob.id)
             .where(SearchIndexJob.status == "PENDING")
@@ -92,6 +201,36 @@ class SearchRepository:
         self.db.flush()
         return self.get_job(job_id)
 
+
+    def mark_job_failed_if_processing(
+        self,
+        job_id: UUID,
+        *,
+        error_message: str,
+    ) -> SearchIndexJob | None:
+        """Mark FAILED only when still PROCESSING (after work TX rollback)."""
+        now = datetime.now(timezone.utc)
+        safe = (error_message or "search index processing failed")[:500]
+        stmt = (
+            update(SearchIndexJob)
+            .where(
+                SearchIndexJob.id == job_id,
+                SearchIndexJob.status == "PROCESSING",
+            )
+            .values(
+                status="FAILED",
+                completed_at=now,
+                error_message=safe,
+                retry_count=SearchIndexJob.retry_count + 1,
+            )
+            .returning(SearchIndexJob.id)
+        )
+        result = self.db.execute(stmt)
+        if result.first() is None:
+            return None
+        self.db.flush()
+        return self.get_job(job_id)
+
     def mark_unsupported_action_failed(
         self,
         job: SearchIndexJob,
@@ -100,7 +239,7 @@ class SearchRepository:
     ) -> SearchIndexJob:
         job.status = "FAILED"
         job.completed_at = datetime.now(timezone.utc)
-        job.error_message = (error_message or "unsupported action")[:500]
+        job.error_message = (error_message or "unsupported search index action")[:500]
         job.retry_count = int(job.retry_count or 0) + 1
         self.db.add(job)
         self.db.flush()

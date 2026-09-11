@@ -777,21 +777,36 @@ def test_failed_job_rolls_back_partial_mutations(db_session) -> None:
 
         job = _enqueue_job(db_session, person.id, 3, key_suffix="fail")
         service = SearchIndexService(db_session)
+        from app.modules.search.errors import SearchIndexProcessingError
+
         with patch.object(
             service.repo,
             "upsert_search_document",
-            side_effect=RuntimeError("injected upsert failure"),
+            side_effect=RuntimeError(
+                "injected upsert failure secret@example.com 홍길동 SEARCH-TEXT-SECRET"
+            ),
         ):
-            with pytest.raises(RuntimeError, match="injected upsert failure"):
+            with pytest.raises(SearchIndexProcessingError) as raised:
                 service.process_job(job.id)
+
+        safe = str(raised.value)
+        assert "secret@example.com" not in safe
+        assert "홍길동" not in safe
+        assert "SEARCH-TEXT-SECRET" not in safe
+        assert "injected upsert failure" not in safe
 
         db_session.expire_all()
         job_row = db_session.get(SearchIndexJob, job.id)
         assert job_row is not None
         assert job_row.status == "FAILED"
         assert job_row.retry_count == 1
-        assert "injected upsert failure" in (job_row.error_message or "")
-        assert "Traceback" not in (job_row.error_message or "")
+        err = job_row.error_message or ""
+        assert "secret@example.com" not in err
+        assert "홍길동" not in err
+        assert "SEARCH-TEXT-SECRET" not in err
+        assert "injected upsert failure" not in err
+        assert "Traceback" not in err
+        assert "search index processing failed" in err
 
         kept = db_session.get(SearchIndexItem, existing_id)
         assert kept is not None
@@ -826,8 +841,9 @@ def test_unsupported_action_fails(db_session) -> None:
         _cleanup_person(db_session, person.id)
 
 
-def test_dispatcher_publishes_oldest_pending_only(db_session) -> None:
+def test_dispatcher_reserves_and_publishes(db_session) -> None:
     from app.db.models.search import SearchIndexJob
+    from app.modules.search.repository import SearchRepository
     from app.tasks.index_tasks import dispatch_pending_search_index_jobs
 
     seeded = _seed_person(db_session)
@@ -842,29 +858,43 @@ def test_dispatcher_publishes_oldest_pending_only(db_session) -> None:
         db_session.add(j4)
         db_session.commit()
 
-        # Isolate from other tests' PENDING jobs in the shared DB.
+        target_ids = {j1.id, j2.id}
+        original_reserve = SearchRepository.reserve_pending_jobs
+        original_release = SearchRepository.release_reserved_job
+
+        def reserve_only_targets(self, *, limit: int = 50):
+            jobs = original_reserve(self, limit=500)
+            selected = [job for job in jobs if job.id in target_ids][:limit]
+            # Release any non-target jobs that were reserved from the shared DB.
+            for job in jobs:
+                if job.id not in {s.id for s in selected}:
+                    original_release(self, job.id)
+            self.db.flush()
+            return selected
+
         with (
-            patch(
-                "app.tasks.index_tasks.SearchRepository.list_pending_job_ids",
-                return_value=[j1.id, j2.id],
-            ),
+            patch.object(SearchRepository, "reserve_pending_jobs", reserve_only_targets),
             patch("app.tasks.index_tasks.process_search_index_job.delay") as delay_mock,
         ):
             delay_mock.return_value = MagicMock()
             out = dispatch_pending_search_index_jobs(limit=2)
 
+        assert out["reserved"] == 2
         assert out["published"] == 2
-        assert out["job_ids"] == [str(j1.id), str(j2.id)]
+        assert set(out["job_ids"]) == {str(j1.id), str(j2.id)}
         assert delay_mock.call_count == 2
 
+        db_session.expire_all()
         for job_id, expected in (
-            (j1.id, "PENDING"),
-            (j2.id, "PENDING"),
+            (j1.id, "PROCESSING"),
+            (j2.id, "PROCESSING"),
             (j3.id, "PENDING"),
             (j4.id, "COMPLETED"),
         ):
             row = db_session.get(SearchIndexJob, job_id)
             assert row is not None and row.status == expected
+            if expected == "PROCESSING":
+                assert row.started_at is not None
     finally:
         _cleanup_person(db_session, person.id)
 
@@ -939,3 +969,345 @@ def test_status_mutation_enqueues_rebuild_without_version_bump(
         _cleanup_person(db_session, person.id)
         db_session.execute(delete(AppUser).where(AppUser.id == admin.id))
         db_session.commit()
+
+
+def test_processing_visible_after_reserve_before_worker(db_session) -> None:
+    from app.db.models.search import SearchIndexJob
+    from app.db.session import SessionLocal
+    from app.modules.search.service import SearchIndexService
+
+    seeded = _seed_person(db_session)
+    person = seeded["person"]
+    try:
+        job = _enqueue_job(db_session, person.id, 3, key_suffix="visibility")
+        claimed = SearchIndexService(db_session).repo.claim_pending_job(job.id)
+        assert claimed is not None
+        db_session.commit()
+
+        other = SessionLocal()
+        try:
+            row = other.get(SearchIndexJob, job.id)
+            assert row is not None
+            assert row.status == "PROCESSING"
+            assert row.started_at is not None
+        finally:
+            other.close()
+    finally:
+        _cleanup_person(db_session, person.id)
+
+
+def test_duplicate_dispatch_does_not_republish(db_session) -> None:
+    from app.modules.search.repository import SearchRepository
+    from app.modules.search.service import SearchIndexService
+    from app.tasks.index_tasks import dispatch_pending_search_index_jobs
+
+    seeded = _seed_person(db_session)
+    person = seeded["person"]
+    try:
+        job = _enqueue_job(db_session, person.id, 3, key_suffix="dup-dispatch")
+        target = {job.id}
+        original_reserve = SearchRepository.reserve_pending_jobs
+        original_release = SearchRepository.release_reserved_job
+
+        def reserve_only_target(self, *, limit: int = 50):
+            jobs = original_reserve(self, limit=500)
+            selected = [j for j in jobs if j.id in target][:limit]
+            for j in jobs:
+                if j.id not in target:
+                    original_release(self, j.id)
+            self.db.flush()
+            return selected
+
+        with (
+            patch.object(SearchRepository, "reserve_pending_jobs", reserve_only_target),
+            patch("app.tasks.index_tasks.process_search_index_job.delay") as delay_mock,
+        ):
+            delay_mock.return_value = MagicMock()
+            first = dispatch_pending_search_index_jobs(limit=10)
+            second = dispatch_pending_search_index_jobs(limit=10)
+
+        assert first["published"] == 1
+        assert second["published"] == 0
+        assert delay_mock.call_count == 1
+    finally:
+        _cleanup_person(db_session, person.id)
+
+
+def test_concurrent_dispatcher_reservation(db_session) -> None:
+    import threading
+
+    from app.db.session import SessionLocal
+    from app.modules.search.service import SearchIndexService
+
+    seeded = _seed_person(db_session)
+    person = seeded["person"]
+    try:
+        jobs = [
+            _enqueue_job(db_session, person.id, i, key_suffix=f"conc-d{i}")
+            for i in range(1, 4)
+        ]
+        our_ids = {j.id for j in jobs}
+        barrier = threading.Barrier(2)
+        results: list[set] = []
+        errors: list[BaseException] = []
+
+        def worker() -> None:
+            db = SessionLocal()
+            try:
+                barrier.wait(timeout=5)
+                reserved = SearchIndexService(db).reserve_pending_jobs(limit=500)
+                results.append({j.id for j in reserved} & our_ids)
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+            finally:
+                db.close()
+
+        t1 = threading.Thread(target=worker)
+        t2 = threading.Thread(target=worker)
+        t1.start()
+        t2.start()
+        t1.join(timeout=10)
+        t2.join(timeout=10)
+        assert not errors
+        assert len(results) == 2
+        assert results[0].isdisjoint(results[1])
+        assert results[0] | results[1] == our_ids
+    finally:
+        _cleanup_person(db_session, person.id)
+
+
+def test_concurrent_worker_lock_single_rebuild(db_session) -> None:
+    import threading
+    import time
+
+    from app.db.session import SessionLocal
+    from app.modules.search.service import SearchIndexService
+
+    seeded = _seed_person(db_session)
+    person = seeded["person"]
+    try:
+        job = _enqueue_job(db_session, person.id, 3, key_suffix="conc-worker")
+        assert SearchIndexService(db_session).repo.claim_pending_job(job.id) is not None
+        db_session.commit()
+
+        entered = threading.Event()
+        release = threading.Event()
+        rebuild_calls: list[int] = []
+        results: list[str] = []
+        errors: list[BaseException] = []
+        original = SearchIndexService._rebuild_person
+
+        def slow_rebuild(self, locked_job):
+            rebuild_calls.append(1)
+            entered.set()
+            assert release.wait(timeout=5)
+            return original(self, locked_job)
+
+        def worker_a() -> None:
+            db = SessionLocal()
+            try:
+                with patch.object(SearchIndexService, "_rebuild_person", slow_rebuild):
+                    result = SearchIndexService(db).process_job(job.id)
+                results.append(result.status)
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+            finally:
+                db.close()
+
+        def worker_b() -> None:
+            assert entered.wait(timeout=5)
+            db = SessionLocal()
+            try:
+                with patch.object(SearchIndexService, "_rebuild_person", slow_rebuild):
+                    result = SearchIndexService(db).process_job(job.id)
+                results.append(f"skip:{result.status}:{result.claimed}")
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+            finally:
+                release.set()
+                db.close()
+
+        t1 = threading.Thread(target=worker_a)
+        t2 = threading.Thread(target=worker_b)
+        t1.start()
+        t2.start()
+        t1.join(timeout=15)
+        t2.join(timeout=15)
+        assert not errors
+        assert rebuild_calls == [1]
+        assert "COMPLETED" in results
+        assert any(r.startswith("skip:") and ":False" in r for r in results)
+    finally:
+        _cleanup_person(db_session, person.id)
+
+
+def test_stale_processing_recovery_and_redispatch(db_session) -> None:
+    from datetime import timedelta
+
+    from app.db.models.search import SearchIndexJob
+    from app.modules.search.service import SearchIndexService
+    from app.tasks.index_tasks import (
+        dispatch_pending_search_index_jobs,
+        recover_stale_search_index_jobs,
+    )
+
+    seeded = _seed_person(db_session)
+    person = seeded["person"]
+    try:
+        stale = _enqueue_job(db_session, person.id, 3, key_suffix="stale")
+        fresh = _enqueue_job(db_session, person.id, 3, key_suffix="fresh")
+        now = datetime.now(UTC)
+        stale.status = "PROCESSING"
+        stale.started_at = now - timedelta(minutes=10)
+        fresh.status = "PROCESSING"
+        fresh.started_at = now
+        db_session.add_all([stale, fresh])
+        db_session.commit()
+        stale_retry = stale.retry_count or 0
+
+        out = recover_stale_search_index_jobs(limit=100)
+        assert str(stale.id) in out["job_ids"]
+        assert str(fresh.id) not in out["job_ids"]
+
+        db_session.expire_all()
+        stale_row = db_session.get(SearchIndexJob, stale.id)
+        fresh_row = db_session.get(SearchIndexJob, fresh.id)
+        assert stale_row is not None and stale_row.status == "PENDING"
+        assert stale_row.started_at is None
+        assert stale_row.retry_count == stale_retry + 1
+        assert fresh_row is not None and fresh_row.status == "PROCESSING"
+
+        target = {stale.id}
+        from app.modules.search.repository import SearchRepository as _SR
+
+        original_reserve = _SR.reserve_pending_jobs
+        original_release = _SR.release_reserved_job
+
+        def reserve_only_stale(self, *, limit: int = 50):
+            jobs = original_reserve(self, limit=500)
+            selected = [j for j in jobs if j.id in target][:limit]
+            for j in jobs:
+                if j.id not in target:
+                    original_release(self, j.id)
+            self.db.flush()
+            return selected
+
+        with (
+            patch.object(_SR, "reserve_pending_jobs", reserve_only_stale),
+            patch("app.tasks.index_tasks.process_search_index_job.delay") as delay_mock,
+        ):
+            delay_mock.return_value = MagicMock()
+            dispatched = dispatch_pending_search_index_jobs(limit=10)
+
+        assert dispatched["published"] == 1
+        assert dispatched["job_ids"] == [str(stale.id)]
+
+        result = SearchIndexService(db_session).process_job(stale.id)
+        assert result.status == "COMPLETED"
+        assert result.claimed is True
+    finally:
+        _cleanup_person(db_session, person.id)
+
+
+def test_publish_failure_restores_pending(db_session) -> None:
+    from app.db.models.search import SearchIndexJob
+    from app.modules.search.repository import SearchRepository
+    from app.modules.search.service import SearchIndexService
+    from app.tasks.index_tasks import dispatch_pending_search_index_jobs
+
+    seeded = _seed_person(db_session)
+    person = seeded["person"]
+    try:
+        job = _enqueue_job(db_session, person.id, 3, key_suffix="pub-fail")
+        terminal = _enqueue_job(db_session, person.id, 3, key_suffix="pub-term")
+        terminal.status = "COMPLETED"
+        terminal.completed_at = datetime.now(UTC)
+        db_session.add(terminal)
+        db_session.commit()
+        target = {job.id}
+        original_reserve = SearchRepository.reserve_pending_jobs
+        original_release = SearchRepository.release_reserved_job
+
+        def reserve_only_target(self, *, limit: int = 50):
+            jobs = original_reserve(self, limit=500)
+            selected = [j for j in jobs if j.id in target][:limit]
+            for j in jobs:
+                if j.id not in target:
+                    original_release(self, j.id)
+            self.db.flush()
+            return selected
+
+        with (
+            patch.object(SearchRepository, "reserve_pending_jobs", reserve_only_target),
+            patch(
+                "app.tasks.index_tasks.process_search_index_job.delay",
+                side_effect=RuntimeError("broker down"),
+            ),
+        ):
+            out = dispatch_pending_search_index_jobs(limit=10)
+
+        assert out["reserved"] == 1
+        assert out["published"] == 0
+        assert out["restored"] == 1
+
+        db_session.expire_all()
+        row = db_session.get(SearchIndexJob, job.id)
+        assert row is not None and row.status == "PENDING"
+        assert row.started_at is None
+        term = db_session.get(SearchIndexJob, terminal.id)
+        assert term is not None and term.status == "COMPLETED"
+
+        # Terminal job must not be reverted by release_reserved_job.
+        assert SearchIndexService(db_session).release_reserved_job(terminal.id) is False
+        db_session.expire_all()
+        term2 = db_session.get(SearchIndexJob, terminal.id)
+        assert term2 is not None and term2.status == "COMPLETED"
+    finally:
+        _cleanup_person(db_session, person.id)
+
+
+def test_safe_error_sanitizes_dbapi_and_task_boundary(db_session) -> None:
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from app.db.models.search import SearchIndexJob
+    from app.modules.search.errors import (
+        SearchIndexTaskError,
+        safe_search_job_error,
+    )
+    from app.modules.search.service import SearchIndexService
+    from app.tasks.index_tasks import process_search_index_job
+
+    seeded = _seed_person(db_session)
+    person = seeded["person"]
+    try:
+        secret = "secret@example.com 홍길동 SEARCH-TEXT-SECRET"
+        assert "secret@example.com" not in safe_search_job_error(
+            SQLAlchemyError(secret)
+        )
+        assert "SEARCH-TEXT-SECRET" not in safe_search_job_error(RuntimeError(secret))
+
+        job = _enqueue_job(db_session, person.id, 3, key_suffix="sanitize")
+        assert SearchIndexService(db_session).repo.claim_pending_job(job.id) is not None
+        db_session.commit()
+
+        with patch.object(
+            SearchIndexService,
+            "_rebuild_person",
+            side_effect=SQLAlchemyError(secret),
+        ):
+            with pytest.raises(SearchIndexTaskError) as raised:
+                process_search_index_job(str(job.id))
+
+        assert "secret@example.com" not in str(raised.value)
+        assert "홍길동" not in str(raised.value)
+        assert "SEARCH-TEXT-SECRET" not in str(raised.value)
+
+        db_session.expire_all()
+        row = db_session.get(SearchIndexJob, job.id)
+        assert row is not None and row.status == "FAILED"
+        err = row.error_message or ""
+        assert err == "search index persistence failed"
+        assert "secret@example.com" not in err
+        assert "SEARCH-TEXT-SECRET" not in err
+    finally:
+        _cleanup_person(db_session, person.id)

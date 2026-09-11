@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 from sqlalchemy.orm import Session
@@ -13,9 +14,13 @@ from app.db.models.search import SearchIndexJob
 from app.db.session import SessionLocal
 from app.modules.people.snapshot import build_confirmed_profile_snapshot
 from app.modules.search.document_builder import build_search_documents_for_person
-from app.modules.search.repository import SearchRepository, lock_person_profile_for_update
+from app.modules.search.errors import SearchIndexProcessingError, safe_search_job_error
+from app.modules.search.repository import (
+    TERMINAL_JOB_STATUSES,
+    SearchRepository,
+    lock_person_profile_for_update,
+)
 from app.modules.search.schemas import (
-    ERROR_MESSAGE_MAX_CHARS,
     OBJECT_TYPE_PROFILE,
     OBJECT_TYPE_PROJECT,
 )
@@ -23,6 +28,11 @@ from app.modules.search.schemas import (
 logger = logging.getLogger(__name__)
 
 SUPPORTED_ACTIONS = frozenset({"REBUILD_PERSON"})
+
+# External APIs are not used in REBUILD_PERSON; 5 minutes is a conservative stuck timeout.
+STALE_PROCESSING_TIMEOUT = timedelta(minutes=5)
+DEFAULT_RESERVE_LIMIT = 50
+DEFAULT_RECOVER_LIMIT = 100
 
 
 @dataclass(frozen=True)
@@ -39,77 +49,144 @@ class ProcessJobResult:
 class SearchIndexService:
     """Process SearchIndexJob rows against live Confirmed Profile state.
 
-    Transaction policy (single TX, no intermediate commit):
-      claim → lock profile → snapshot → build → upsert/deactivate → COMPLETED → COMMIT
-
-    Hard-kill before COMMIT rolls the claim back to PENDING (dispatcher recoverable).
-    Handled exceptions roll back, then mark FAILED in a separate short transaction.
+    Lifecycle:
+      Dispatcher: PENDING → PROCESSING (reserve + commit) → Celery publish
+      Worker: lock PROCESSING → rebuild SearchIndexItem → COMPLETED (work TX)
+      Direct call: PENDING → PROCESSING commit, then same worker path
+      Failure: work TX rollback; short TX marks PROCESSING → FAILED (sanitized error)
+      Stale: PROCESSING with old started_at → PENDING (retry_count += 1)
     """
 
     def __init__(self, db: Session) -> None:
         self.db = db
         self.repo = SearchRepository(db)
 
-    def process_job(self, job_id: UUID) -> ProcessJobResult:
-        try:
-            return self._process_job_in_transaction(job_id)
-        except Exception as exc:
-            self.db.rollback()
-            self._mark_failed_after_rollback(job_id, exc)
-            raise
+    def reserve_pending_jobs(self, limit: int = DEFAULT_RESERVE_LIMIT) -> list[SearchIndexJob]:
+        """Atomic PENDING→PROCESSING reserve and COMMIT (dispatch visibility)."""
+        jobs = self.repo.reserve_pending_jobs(limit=max(0, min(int(limit), 500)))
+        self.db.commit()
+        for job in jobs:
+            self.db.refresh(job)
+        return jobs
 
-    def _process_job_in_transaction(self, job_id: UUID) -> ProcessJobResult:
+    def release_reserved_job(self, job_id: UUID) -> bool:
+        """Publish-failure recovery: PROCESSING→PENDING when still reserved."""
+        released = self.repo.release_reserved_job(job_id)
+        self.db.commit()
+        return released
+
+    def recover_stale_processing_jobs(
+        self,
+        *,
+        older_than: datetime | None = None,
+        limit: int = DEFAULT_RECOVER_LIMIT,
+    ) -> list[UUID]:
+        threshold = older_than or (datetime.now(timezone.utc) - STALE_PROCESSING_TIMEOUT)
+        recovered = self.repo.recover_stale_processing_jobs(
+            older_than=threshold,
+            limit=max(0, min(int(limit), 500)),
+        )
+        self.db.commit()
+        return recovered
+
+    def process_job(self, job_id: UUID) -> ProcessJobResult:
         existing = self.repo.get_job(job_id)
         if existing is None:
-            raise ValueError(f"SearchIndexJob not found: {job_id}")
+            raise SearchIndexProcessingError("search index job not found")
 
-        claimed = self.repo.claim_pending_job(job_id)
-        if claimed is None:
+        if existing.status in TERMINAL_JOB_STATUSES:
+            return ProcessJobResult(
+                job_id=job_id,
+                status=existing.status,
+                claimed=False,
+            )
+
+        # Backward-compatible direct/manual call: PENDING → PROCESSING then work path.
+        if existing.status == "PENDING":
+            claimed = self.repo.claim_pending_job(job_id)
+            if claimed is None:
+                self.db.rollback()
+                current = self.repo.get_job(job_id)
+                if current is None:
+                    raise SearchIndexProcessingError("search index job not found")
+                if current.status in TERMINAL_JOB_STATUSES or current.status != "PROCESSING":
+                    return ProcessJobResult(
+                        job_id=job_id,
+                        status=current.status,
+                        claimed=False,
+                    )
+            else:
+                self.db.commit()
+
+        try:
+            return self._process_processing_job(job_id)
+        except SearchIndexProcessingError:
+            raise
+        except Exception as exc:
+            self.db.rollback()
+            safe = safe_search_job_error(exc)
+            self._mark_failed_after_rollback(job_id, safe, exc_class=type(exc).__name__)
+            raise SearchIndexProcessingError(safe) from None
+
+    def _process_processing_job(self, job_id: UUID) -> ProcessJobResult:
+        locked = self.repo.lock_processing_job(job_id)
+        if locked is None:
+            self.db.rollback()
             current = self.repo.get_job(job_id)
-            assert current is not None
+            if current is None:
+                raise SearchIndexProcessingError("search index job not found")
             return ProcessJobResult(
                 job_id=job_id,
                 status=current.status,
                 claimed=False,
             )
 
-        if claimed.action not in SUPPORTED_ACTIONS:
+        if locked.action not in SUPPORTED_ACTIONS:
             self.repo.mark_unsupported_action_failed(
-                claimed,
-                error_message=(
-                    f"unsupported SearchIndexJob.action={claimed.action!r}; "
-                    "only REBUILD_PERSON is implemented"
-                ),
+                locked,
+                error_message="unsupported search index action",
             )
             self.db.commit()
             return ProcessJobResult(job_id=job_id, status="FAILED", claimed=True)
 
-        if claimed.person_id is None:
+        if locked.person_id is None:
             self.repo.mark_unsupported_action_failed(
-                claimed,
-                error_message="REBUILD_PERSON requires person_id",
+                locked,
+                error_message="rebuild person requires person_id",
             )
             self.db.commit()
             return ProcessJobResult(job_id=job_id, status="FAILED", claimed=True)
 
-        result = self._rebuild_person(claimed)
-        self.db.commit()
-        return result
+        try:
+            result = self._rebuild_person(locked)
+            self.db.commit()
+            return result
+        except SearchIndexProcessingError as exc:
+            self.db.rollback()
+            safe = safe_search_job_error(exc)
+            self._mark_failed_after_rollback(job_id, safe, exc_class=type(exc).__name__)
+            raise SearchIndexProcessingError(safe) from None
+        except Exception as exc:
+            self.db.rollback()
+            safe = safe_search_job_error(exc)
+            logger.warning(
+                "search_index work failed job_id=%s person_id=%s exc_class=%s",
+                job_id,
+                locked.person_id,
+                type(exc).__name__,
+            )
+            self._mark_failed_after_rollback(job_id, safe, exc_class=type(exc).__name__)
+            raise SearchIndexProcessingError(safe) from None
 
     def _rebuild_person(self, job: SearchIndexJob) -> ProcessJobResult:
         person_id = job.person_id
         assert person_id is not None
 
-        # Lock PersonProfile only (no Project/Career FOR UPDATE).
         lock_person_profile_for_update(self.db, person_id)
 
         person = self.db.get(Person, person_id)
         if person is None:
-            self.repo.mark_unsupported_action_failed(
-                job,
-                error_message="person not found for REBUILD_PERSON",
-            )
-            return ProcessJobResult(job_id=job.id, status="FAILED", claimed=True)
+            raise SearchIndexProcessingError("person not found for search index rebuild")
 
         if person.status == "DELETED" or person.deleted_at is not None:
             deactivated = self.repo.deactivate_all_profile_project_for_person(person_id)
@@ -127,13 +204,15 @@ class SearchIndexService:
                 deactivated_count=deactivated,
             )
 
-        # Always rebuild from live Confirmed state (ignore stale payload version).
         snapshot = build_confirmed_profile_snapshot(self.db, person_id)
-        documents = build_search_documents_for_person(
-            person_id=person_id,
-            person_status=person.status,
-            snapshot=snapshot,
-        )
+        try:
+            documents = build_search_documents_for_person(
+                person_id=person_id,
+                person_status=person.status,
+                snapshot=snapshot,
+            )
+        except Exception as exc:
+            raise SearchIndexProcessingError("search document build failed") from exc
 
         desired_keys: set[tuple[str, UUID]] = set()
         upserted = 0
@@ -181,19 +260,29 @@ class SearchIndexService:
             deactivated_count=deactivated,
         )
 
-    def _mark_failed_after_rollback(self, job_id: UUID, exc: BaseException) -> None:
-        message = _safe_error_message(exc)
+    def _mark_failed_after_rollback(
+        self,
+        job_id: UUID,
+        safe_message: str,
+        *,
+        exc_class: str,
+    ) -> None:
         fail_db = SessionLocal()
         try:
             repo = SearchRepository(fail_db)
-            marked = repo.mark_job_failed_if_pending(job_id, error_message=message)
+            marked = repo.mark_job_failed_if_processing(
+                job_id, error_message=safe_message
+            )
             fail_db.commit()
             if marked is not None:
                 logger.warning(
-                    "search_index job failed job_id=%s retry_count=%s error=%s",
+                    "search_index job failed job_id=%s status=%s retry_count=%s "
+                    "exc_class=%s error=%s",
                     job_id,
+                    marked.status,
                     marked.retry_count,
-                    message,
+                    exc_class,
+                    safe_message,
                 )
         except Exception:
             fail_db.rollback()
@@ -202,13 +291,6 @@ class SearchIndexService:
             )
         finally:
             fail_db.close()
-
-
-def _safe_error_message(exc: BaseException) -> str:
-    text = f"{type(exc).__name__}: {exc}".replace("\n", " ").strip()
-    if len(text) > ERROR_MESSAGE_MAX_CHARS:
-        text = text[:ERROR_MESSAGE_MAX_CHARS].rstrip()
-    return text or "unknown error"
 
 
 def process_search_index_job_id(job_id: UUID | str) -> ProcessJobResult:
