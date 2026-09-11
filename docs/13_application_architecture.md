@@ -331,6 +331,35 @@ index
 - Document Chunk Embedding
 - `search_index_item` UPSERT/DELETE
 
+#### Search Index Worker (현재 구현 범위)
+
+```text
+Confirmed Profile mutation
+  → SearchIndexJob(REBUILD_PERSON / PENDING)   # DB SoT, Confirm TX 내 Celery.delay 금지
+  → Celery Beat dispatcher (~15s)
+  → atomic reserve (PENDING → PROCESSING, started_at) + COMMIT
+  → process_search_index_job.delay (index queue)
+  → worker: PROCESSING row FOR UPDATE SKIP LOCKED
+  → PersonProfile FOR UPDATE + live Confirmed Snapshot
+  → deterministic PROFILE / PROJECT Search Document
+  → search_index_item upsert (search_text / metadata_json / source_weight)
+  → embedding NULL (또는 동일 search_text+search_document_version이면 기존 embedding 보존)
+  → SearchIndexJob COMPLETED
+```
+
+PROCESSING 의미 (MVP): dispatcher가 처리 예약한 뒤 아직 terminal이 아닌 상태.
+publish 실패 시 조건부 PROCESSING→PENDING 복구. stale PROCESSING은 Beat(~60s)가
+started_at 기준으로 PENDING 복구(retry_count += 1)하며 rebuild는 하지 않는다.
+job.error_message / Celery failure는 sanitization helper로 SQL·search_text·PII를 저장하지 않는다.
+
+정책 요약:
+
+- Search Document SoT는 현재 Confirmed 운영 DB이다 (Candidate/Revision 재생 금지).
+- Out-of-order job도 항상 live Confirmed 최신 상태로 rebuild한다.
+- `DOCUMENT_CHUNK` row는 REBUILD_PERSON에서 건드리지 않는다.
+- UPSERT / DELETE / REBUILD_ALL action은 아직 FAILED + error_message로 남긴다.
+- Embedding(BGE-M3) 생성은 후속 Worker 단계이다.
+
 초기에는 Worker Container 하나가 세 Queue를 모두 소비할 수 있다.
 
 운영 중 부하가 증가하면 동일 Image로 다음처럼 분리한다.

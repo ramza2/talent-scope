@@ -340,6 +340,18 @@ class PeopleService:
         else:
             person.deleted_at = None
         self.repo.touch_person(person)
+        profile = self.repo.get_profile(person_id)
+        if profile is None:
+            raise NotFoundError("Person profile not found")
+        # Status change does not bump profile_version / ProfileRevision.
+        # Distinct idempotency key avoids colliding with profile:{version}:rebuild.
+        updated_at_iso = person.updated_at.isoformat()
+        self.repo.enqueue_rebuild_person(
+            person.id,
+            profile.profile_version,
+            reason="PERSON_STATUS",
+            idempotency_suffix=f"status:{person.status}:{updated_at_iso}",
+        )
         self.repo.add_audit(
             action_type="PERSON_STATUS_UPDATE",
             actor_user_id=actor_user_id,

@@ -384,20 +384,42 @@ class PeopleRepository:
             )
         )
 
-    def enqueue_rebuild_person(self, person_id: UUID, profile_version: int) -> None:
-        key = f"people:{person_id}:profile:{profile_version}:rebuild"
+    def enqueue_rebuild_person(
+        self,
+        person_id: UUID,
+        profile_version: int,
+        *,
+        reason: str | None = None,
+        idempotency_suffix: str | None = None,
+    ) -> None:
+        """Enqueue REBUILD_PERSON without Celery publish (DB SoT + dispatcher).
+
+        Default idempotency key (profile mutations):
+          people:{person_id}:profile:{profile_version}:rebuild
+
+        Status mutations may pass idempotency_suffix so the same profile_version
+        can still enqueue a distinct job, e.g.:
+          people:{person_id}:status:DELETED:{updated_at}:rebuild
+        """
+        if idempotency_suffix:
+            key = f"people:{person_id}:{idempotency_suffix}:rebuild"
+        else:
+            key = f"people:{person_id}:profile:{profile_version}:rebuild"
         existing = self.db.execute(
             select(SearchIndexJob).where(SearchIndexJob.idempotency_key == key)
         ).scalar_one_or_none()
         if existing is not None:
             return
+        payload: dict[str, Any] = {"profile_version": profile_version}
+        if reason:
+            payload["reason"] = reason
         self.db.add(
             SearchIndexJob(
                 person_id=person_id,
                 action="REBUILD_PERSON",
                 status="PENDING",
                 idempotency_key=key,
-                payload_json={"profile_version": profile_version},
+                payload_json=payload,
             )
         )
 
