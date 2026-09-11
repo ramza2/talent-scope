@@ -1179,6 +1179,9 @@ def test_ready_hook_ensures_sync_job_only(db_session, monkeypatch):
 
 
 def test_concurrent_ensure_sync_job_one_row(db_session, monkeypatch):
+    """Two sessions racing ensure_sync_job must yield exactly one job row."""
+    import threading
+
     from app.db.models.search import SearchIndexJob
     from app.db.session import SessionLocal
     from app.modules.search.document_chunk_policy import OPERATION_SYNC_DOCUMENT_CHUNKS
@@ -1187,27 +1190,52 @@ def test_concurrent_ensure_sync_job_one_row(db_session, monkeypatch):
     seeded = _seed_person_group(
         db_session, pages=[(1, "race text", "TEXT_PARSER")]
     )
+    group_id = seeded["group"].id
+    person_id = seeded["person"].id
     try:
         _enable_embedding(monkeypatch)
-        outcomes = []
+        barrier = threading.Barrier(2)
+        outcomes: list[str] = []
+        job_ids: list = []
+        errors: list[BaseException] = []
+        commits_ok: list[bool] = []
 
-        def worker():
+        def worker() -> None:
             s = SessionLocal()
             try:
-                _job, outcome = DocumentChunkSyncService(s).ensure_sync_job(
-                    seeded["group"].id
-                )
+                barrier.wait(timeout=5)
+                job, outcome = DocumentChunkSyncService(s).ensure_sync_job(group_id)
+                assert job is not None
                 s.commit()
                 outcomes.append(outcome)
+                job_ids.append(job.id)
+                commits_ok.append(True)
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+                try:
+                    s.rollback()
+                except Exception:  # noqa: BLE001
+                    pass
             finally:
                 s.close()
 
-        worker()
-        worker()
+        t1 = threading.Thread(target=worker)
+        t2 = threading.Thread(target=worker)
+        t1.start()
+        t2.start()
+        t1.join(timeout=15)
+        t2.join(timeout=15)
+        assert errors == []
+        assert commits_ok == [True, True]
+        assert len(outcomes) == 2
+        assert outcomes.count("created") == 1
+        assert any(o in {"already_pending", "created"} for o in outcomes)
+        assert len(set(job_ids)) == 1
+
         jobs = list(
             db_session.scalars(
                 select(SearchIndexJob).where(
-                    SearchIndexJob.person_id == seeded["person"].id,
+                    SearchIndexJob.person_id == person_id,
                     SearchIndexJob.action == "UPSERT",
                     SearchIndexJob.object_type == "DOCUMENT_CHUNK",
                 )
@@ -1219,7 +1247,409 @@ def test_concurrent_ensure_sync_job_one_row(db_session, monkeypatch):
             if (j.payload_json or {}).get("operation") == OPERATION_SYNC_DOCUMENT_CHUNKS
         ]
         assert len(sync_jobs) == 1
-        assert "created" in outcomes
-        assert any(o in {"already_pending", "already_completed", "created"} for o in outcomes)
+        assert sync_jobs[0].idempotency_key
+        assert {j.idempotency_key for j in sync_jobs} == {sync_jobs[0].idempotency_key}
+    finally:
+        _cleanup_person(db_session, person_id)
+
+
+def test_source_mutation_waits_for_sync_group_lock(db_session, monkeypatch):
+    """v2 READY+ensure cannot commit while old sync holds DocumentGroup lock."""
+    import threading
+    import time
+
+    from app.db.models.document import Document
+    from app.db.models.search import SearchIndexItem, SearchIndexJob
+    from app.db.session import SessionLocal
+    from app.modules.search.document_chunk_policy import OPERATION_SYNC_DOCUMENT_CHUNKS
+    from app.modules.search.document_chunk_sync import DocumentChunkSyncService
+    from app.modules.search.service import SearchIndexService
+
+    seeded = _seed_person_group(
+        db_session, pages=[(1, "version one text", "TEXT_PARSER")], version_no=1
+    )
+    try:
+        _enable_embedding(monkeypatch)
+        _sync_group(db_session, seeded["group"].id, monkeypatch)
+        v1 = seeded["document"]
+        v2 = _add_document_version(
+            db_session,
+            seeded["group"],
+            version_no=2,
+            pages=[(1, "version two text", "TEXT_PARSER")],
+            processing_status="PROCESSING",
+        )
+        group_id = seeded["group"].id
+        person_id = seeded["person"].id
+
+        # Fresh PENDING sync job that will still see v1 until v2 becomes READY.
+        job_v1, outcome = DocumentChunkSyncService(db_session).ensure_sync_job(group_id)
+        assert job_v1 is not None
+        if outcome == "already_completed" or job_v1.status != "PENDING":
+            # Force a live re-process under Group lock for the race window.
+            job_v1.status = "PENDING"
+            job_v1.started_at = None
+            job_v1.completed_at = None
+            job_v1.error_message = None
+            db_session.add(job_v1)
+        db_session.commit()
+        job_v1_id = job_v1.id
+        assert db_session.get(type(job_v1), job_v1_id).status == "PENDING"
+
+        entered = threading.Event()
+        release = threading.Event()
+        mutation_done = threading.Event()
+        mutation_started = threading.Event()
+        errors: list[BaseException] = []
+        seen_effective: list[int] = []
+
+        def after_locks(self, *, person, group, effective):
+            if effective is not None:
+                seen_effective.append(int(effective.version_no))
+            entered.set()
+            assert release.wait(timeout=10)
+
+        monkeypatch.setattr(
+            DocumentChunkSyncService, "_after_source_locks", after_locks
+        )
+
+        def sync_worker() -> None:
+            db = SessionLocal()
+            try:
+                SearchIndexService(db).process_job(job_v1_id)
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+            finally:
+                db.close()
+
+        def mutation_worker() -> None:
+            db = SessionLocal()
+            try:
+                assert entered.wait(timeout=10)
+                mutation_started.set()
+                doc = db.get(Document, v2.id)
+                assert doc is not None
+                doc.processing_status = "READY"
+                doc.updated_at = datetime.now(UTC)
+                db.add(doc)
+                DocumentChunkSyncService(db).ensure_sync_job(group_id)
+                db.commit()
+                mutation_done.set()
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+                try:
+                    db.rollback()
+                except Exception:  # noqa: BLE001
+                    pass
+            finally:
+                db.close()
+
+        t_sync = threading.Thread(target=sync_worker)
+        t_mut = threading.Thread(target=mutation_worker)
+        t_sync.start()
+        assert entered.wait(timeout=10)
+        t_mut.start()
+        assert mutation_started.wait(timeout=5)
+        # While sync holds Group lock, mutation must not finish ensure+commit.
+        time.sleep(0.4)
+        assert not mutation_done.is_set()
+        db_session.expire_all()
+        still = db_session.get(Document, v2.id)
+        assert still is not None
+        assert still.processing_status == "PROCESSING"
+
+        release.set()
+        t_sync.join(timeout=15)
+        t_mut.join(timeout=15)
+        assert errors == []
+        assert mutation_done.is_set()
+        assert seen_effective and seen_effective[0] == 1
+
+        db_session.expire_all()
+        v2_row = db_session.get(Document, v2.id)
+        assert v2_row is not None and v2_row.processing_status == "READY"
+
+        # Process the v2 sync job created by mutation.
+        pending = list(
+            db_session.scalars(
+                select(SearchIndexJob).where(
+                    SearchIndexJob.person_id == person_id,
+                    SearchIndexJob.status == "PENDING",
+                    SearchIndexJob.action == "UPSERT",
+                )
+            ).all()
+        )
+        for job in pending:
+            if (job.payload_json or {}).get("operation") == OPERATION_SYNC_DOCUMENT_CHUNKS:
+                SearchIndexService(db_session).process_job(job.id)
+
+        active = list(
+            db_session.scalars(
+                select(SearchIndexItem).where(
+                    SearchIndexItem.person_id == person_id,
+                    SearchIndexItem.object_type == "DOCUMENT_CHUNK",
+                    SearchIndexItem.is_active.is_(True),
+                )
+            ).all()
+        )
+        assert len(active) == 1
+        assert active[0].search_text == "version two text"
+        assert (active[0].metadata_json or {}).get("document_id") == str(v2.id)
+        assert (active[0].metadata_json or {}).get("document_version_no") == 2
     finally:
         _cleanup_person(db_session, seeded["person"].id)
+
+
+def test_concurrent_different_fingerprint_sync_jobs_serialize(db_session, monkeypatch):
+    """Two SYNC jobs for the same group serialize on Group lock; final=live effective."""
+    import threading
+
+    from app.db.models.search import SearchIndexItem, SearchIndexJob
+    from app.db.session import SessionLocal
+    from app.modules.search.document_chunk_policy import OPERATION_SYNC_DOCUMENT_CHUNKS
+    from app.modules.search.document_chunk_sync import DocumentChunkSyncService
+    from app.modules.search.service import SearchIndexService
+
+    seeded = _seed_person_group(
+        db_session, pages=[(1, "v1 live text", "TEXT_PARSER")], version_no=1
+    )
+    try:
+        _enable_embedding(monkeypatch)
+        job_v1, _ = DocumentChunkSyncService(db_session).ensure_sync_job(
+            seeded["group"].id
+        )
+        db_session.commit()
+        v2 = _add_document_version(
+            db_session,
+            seeded["group"],
+            version_no=2,
+            pages=[(1, "v2 live text", "TEXT_PARSER")],
+        )
+        job_v2, _ = DocumentChunkSyncService(db_session).ensure_sync_job(
+            seeded["group"].id
+        )
+        db_session.commit()
+        assert job_v1 is not None and job_v2 is not None
+        assert job_v1.id != job_v2.id
+        job_ids = [job_v1.id, job_v2.id]
+
+        in_critical = 0
+        max_in_critical = 0
+        lock = threading.Lock()
+        errors: list[BaseException] = []
+        started = threading.Event()
+
+        def after_locks(self, *, person, group, effective):
+            nonlocal in_critical, max_in_critical
+            import time
+
+            with lock:
+                in_critical += 1
+                max_in_critical = max(max_in_critical, in_critical)
+            started.set()
+            try:
+                # Hold critical section so a concurrent peer would overlap
+                # without Group serialization.
+                time.sleep(0.25)
+            finally:
+                with lock:
+                    in_critical -= 1
+
+        monkeypatch.setattr(
+            DocumentChunkSyncService, "_after_source_locks", after_locks
+        )
+
+        def worker(jid) -> None:
+            db = SessionLocal()
+            try:
+                SearchIndexService(db).process_job(jid)
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+            finally:
+                db.close()
+
+        t1 = threading.Thread(target=worker, args=(job_ids[0],))
+        t2 = threading.Thread(target=worker, args=(job_ids[1],))
+        t1.start()
+        t2.start()
+        t1.join(timeout=20)
+        t2.join(timeout=20)
+        assert errors == []
+        # Group lock: materialization critical section must not overlap.
+        assert max_in_critical == 1
+        assert started.is_set()
+
+        db_session.expire_all()
+        active = list(
+            db_session.scalars(
+                select(SearchIndexItem).where(
+                    SearchIndexItem.person_id == seeded["person"].id,
+                    SearchIndexItem.object_type == "DOCUMENT_CHUNK",
+                    SearchIndexItem.is_active.is_(True),
+                )
+            ).all()
+        )
+        assert len(active) == 1
+        assert active[0].search_text == "v2 live text"
+        assert (active[0].metadata_json or {}).get("document_id") == str(v2.id)
+
+        terminals = list(
+            db_session.scalars(
+                select(SearchIndexJob).where(SearchIndexJob.id.in_(job_ids))
+            ).all()
+        )
+        assert all(j.status == "COMPLETED" for j in terminals)
+        assert all(
+            (j.payload_json or {}).get("operation") == OPERATION_SYNC_DOCUMENT_CHUNKS
+            for j in terminals
+        )
+    finally:
+        _cleanup_person(db_session, seeded["person"].id)
+
+
+def test_person_delete_waits_for_sync_person_lock(db_session, monkeypatch):
+    """Person DELETE cannot commit while ACTIVE sync holds Person FOR UPDATE."""
+    import threading
+    import time
+
+    from app.db.models.person import Person
+    from app.db.models.search import SearchIndexItem, SearchIndexJob
+    from app.db.session import SessionLocal
+    from app.modules.people.schemas import PersonStatusUpdateRequest
+    from app.modules.people.service import PeopleService
+    from app.modules.search.document_chunk_policy import OPERATION_SYNC_DOCUMENT_CHUNKS
+    from app.modules.search.document_chunk_sync import DocumentChunkSyncService
+    from app.modules.search.service import SearchIndexService
+
+    admin = _create_user(db_session)
+    seeded = _seed_person_group(
+        db_session, pages=[(1, "person chunk", "TEXT_PARSER")]
+    )
+    try:
+        _enable_embedding(monkeypatch)
+        job, _ = DocumentChunkSyncService(db_session).ensure_sync_job(seeded["group"].id)
+        db_session.commit()
+        assert job is not None
+        job_id = job.id
+        person_id = seeded["person"].id
+
+        entered = threading.Event()
+        release = threading.Event()
+        delete_done = threading.Event()
+        delete_started = threading.Event()
+        errors: list[BaseException] = []
+
+        def after_locks(self, *, person, group, effective):
+            entered.set()
+            assert release.wait(timeout=10)
+
+        monkeypatch.setattr(
+            DocumentChunkSyncService, "_after_source_locks", after_locks
+        )
+
+        def sync_worker() -> None:
+            db = SessionLocal()
+            try:
+                SearchIndexService(db).process_job(job_id)
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+            finally:
+                db.close()
+
+        def delete_worker() -> None:
+            db = SessionLocal()
+            try:
+                assert entered.wait(timeout=10)
+                delete_started.set()
+                PeopleService(db).update_status(
+                    person_id,
+                    PersonStatusUpdateRequest(status="DELETED"),
+                    admin.id,
+                )
+                delete_done.set()
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+                try:
+                    db.rollback()
+                except Exception:  # noqa: BLE001
+                    pass
+            finally:
+                db.close()
+
+        t_sync = threading.Thread(target=sync_worker)
+        t_del = threading.Thread(target=delete_worker)
+        t_sync.start()
+        assert entered.wait(timeout=10)
+        t_del.start()
+        assert delete_started.wait(timeout=5)
+        time.sleep(0.4)
+        assert not delete_done.is_set()
+        db_session.expire_all()
+        person_row = db_session.get(Person, person_id)
+        assert person_row is not None
+        assert person_row.status == "ACTIVE"
+
+        release.set()
+        t_sync.join(timeout=15)
+        t_del.join(timeout=15)
+        assert errors == []
+        assert delete_done.is_set()
+
+        db_session.expire_all()
+        assert db_session.get(Person, person_id).status == "DELETED"
+
+        pending = list(
+            db_session.scalars(
+                select(SearchIndexJob).where(
+                    SearchIndexJob.person_id == person_id,
+                    SearchIndexJob.status == "PENDING",
+                    SearchIndexJob.action == "UPSERT",
+                )
+            ).all()
+        )
+        for j in pending:
+            if (j.payload_json or {}).get("operation") == OPERATION_SYNC_DOCUMENT_CHUNKS:
+                SearchIndexService(db_session).process_job(j.id)
+
+        active = list(
+            db_session.scalars(
+                select(SearchIndexItem).where(
+                    SearchIndexItem.person_id == person_id,
+                    SearchIndexItem.object_type == "DOCUMENT_CHUNK",
+                    SearchIndexItem.is_active.is_(True),
+                )
+            ).all()
+        )
+        assert active == []
+
+        # Restore + sync → current READY chunks active again.
+        PeopleService(db_session).update_status(
+            person_id,
+            PersonStatusUpdateRequest(status="ACTIVE"),
+            admin.id,
+        )
+        pending2 = list(
+            db_session.scalars(
+                select(SearchIndexJob).where(
+                    SearchIndexJob.person_id == person_id,
+                    SearchIndexJob.status == "PENDING",
+                    SearchIndexJob.action == "UPSERT",
+                )
+            ).all()
+        )
+        for j in pending2:
+            if (j.payload_json or {}).get("operation") == OPERATION_SYNC_DOCUMENT_CHUNKS:
+                SearchIndexService(db_session).process_job(j.id)
+        restored = list(
+            db_session.scalars(
+                select(SearchIndexItem).where(
+                    SearchIndexItem.person_id == person_id,
+                    SearchIndexItem.object_type == "DOCUMENT_CHUNK",
+                    SearchIndexItem.is_active.is_(True),
+                )
+            ).all()
+        )
+        assert len(restored) == 1
+        assert restored[0].search_text == "person chunk"
+    finally:
+        _cleanup_person(db_session, seeded["person"].id, user_id=admin.id)

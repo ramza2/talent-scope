@@ -34,10 +34,73 @@ logger = logging.getLogger(__name__)
 
 
 class DocumentChunkSyncService:
-    """Materialize DocumentChunks and sync DOCUMENT_CHUNK SearchIndexItems."""
+    """Materialize DocumentChunks and sync DOCUMENT_CHUNK SearchIndexItems.
+
+    Source-state serialization (lock order):
+      SearchIndexJob (worker) → Person → DocumentGroup
+
+    ``ensure_sync_job`` acquires DocumentGroup FOR UPDATE in the caller TX
+    (no commit) so READY/delete/restore/status mutations share the same
+    serialization point as the sync worker.
+    """
 
     def __init__(self, db: Session) -> None:
         self.db = db
+
+    # ------------------------------------------------------------------
+    # Shared locks
+    # ------------------------------------------------------------------
+
+    def lock_person_for_update(self, person_id: UUID) -> Person | None:
+        stmt = (
+            select(Person)
+            .where(Person.id == person_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        return self.db.scalars(stmt).first()
+
+    def lock_document_group_for_update(
+        self, document_group_id: UUID
+    ) -> DocumentGroup | None:
+        stmt = (
+            select(DocumentGroup)
+            .where(DocumentGroup.id == document_group_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        return self.db.scalars(stmt).first()
+
+    def _person_after_group_lock(self, person_id: UUID) -> Person | None:
+        """Load Person under Group lock without wiping uncommitted local mutations.
+
+        PeopleService.update_status() holds dirty Person.status in the same TX
+        before ensure_sync_job. ``populate_existing`` / blind refresh would reload
+        the last committed row and undo DELETED/ACTIVE transitions.
+        """
+        from sqlalchemy import inspect as sa_inspect
+
+        person = self.db.get(Person, person_id)
+        if person is None:
+            return self.db.scalars(
+                select(Person).where(Person.id == person_id)
+            ).first()
+        insp = sa_inspect(person)
+        if insp.modified or insp.pending:
+            return person
+        # Not mutated in this TX — refresh committed state after Group lock.
+        self.db.refresh(person)
+        return person
+
+    def _after_source_locks(
+        self,
+        *,
+        person: Person,
+        group: DocumentGroup,
+        effective: Document | None,
+    ) -> None:
+        """Extension point after Person+Group locks (tests may monkeypatch)."""
+        return None
 
     # ------------------------------------------------------------------
     # Job ensure (caller TX; no commit / no Celery)
@@ -47,11 +110,15 @@ class DocumentChunkSyncService:
         self,
         document_group_id: UUID,
     ) -> tuple[SearchIndexJob | None, str]:
-        group = self.db.get(DocumentGroup, document_group_id)
+        # Group FOR UPDATE held until caller commits — serializes with sync worker.
+        group = self.lock_document_group_for_update(document_group_id)
         if group is None:
             return None, "skipped"
 
-        person = self.db.get(Person, group.person_id)
+        # Same-TX Document READY/delete mutations must be visible to effective SELECT.
+        self.db.flush()
+
+        person = self._person_after_group_lock(group.person_id)
         person_searchable = self._person_group_searchable(person, group)
 
         effective = self.get_effective_ready_document(document_group_id)
@@ -148,11 +215,21 @@ class DocumentChunkSyncService:
     def sync_document_group(self, document_group_id: UUID) -> dict[str, int]:
         from app.modules.search.repository import SearchRepository
 
-        group = self.db.get(DocumentGroup, document_group_id)
+        # A. Plain probe for person_id only (do not trust this for source state).
+        probe = self.db.get(DocumentGroup, document_group_id)
+        if probe is None:
+            return {"chunks": 0, "upserted": 0, "deactivated": 0, "embedding_jobs": 0}
+        person_id = probe.person_id
+
+        # B/C. Lock order: Person → DocumentGroup (matches PeopleService status TX).
+        person = self.lock_person_for_update(person_id)
+        group = self.lock_document_group_for_update(document_group_id)
         if group is None:
             return {"chunks": 0, "upserted": 0, "deactivated": 0, "embedding_jobs": 0}
+        if person is None:
+            person = self._person_after_group_lock(group.person_id)
 
-        person = self.db.get(Person, group.person_id)
+        # D. Recompute searchable / effective from post-lock populated rows.
         if not self._person_group_searchable(person, group):
             deactivated = self.deactivate_group_search_items(document_group_id)
             logger.info(
@@ -170,6 +247,8 @@ class DocumentChunkSyncService:
             }
 
         effective = self.get_effective_ready_document(document_group_id)
+        self._after_source_locks(person=person, group=group, effective=effective)
+
         if effective is None:
             deactivated = self.deactivate_group_search_items(document_group_id)
             logger.info(
@@ -184,6 +263,7 @@ class DocumentChunkSyncService:
                 "embedding_jobs": 0,
             }
 
+        # Plain SELECTs under Group lock — Document mutation serializes via ensure.
         pages = self.list_pages(effective.id)
         specs, source_fp = build_chunk_specs_for_pages(pages)
 
@@ -301,6 +381,7 @@ class DocumentChunkSyncService:
             )
             .order_by(Document.version_no.desc(), Document.id.asc())
             .limit(1)
+            .execution_options(populate_existing=True)
         )
         return self.db.scalars(stmt).first()
 
@@ -309,6 +390,7 @@ class DocumentChunkSyncService:
             select(DocumentPage)
             .where(DocumentPage.document_id == document_id)
             .order_by(DocumentPage.page_no.asc(), DocumentPage.id.asc())
+            .execution_options(populate_existing=True)
         )
         return list(self.db.scalars(stmt).all())
 
