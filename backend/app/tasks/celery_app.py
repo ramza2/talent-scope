@@ -51,5 +51,10 @@ celery_app.conf.update(
             "schedule": 60.0,
             "kwargs": {"limit": 100},
         },
+        "enqueue-missing-search-embeddings": {
+            "task": "app.tasks.index_tasks.enqueue_missing_search_embeddings",
+            "schedule": 60.0,
+            "kwargs": {"limit": 100},
+        },
     },
 )

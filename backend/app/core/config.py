@@ -65,8 +65,14 @@ class Settings(BaseSettings):
 
     talentscope_host: str = "localhost"
 
-    # Embedding dimension fixed by db/schema.sql (BGE-M3)
+    # Embedding dimension fixed by db/schema.sql (BGE-M3 / VECTOR(1024))
     embedding_dimensions: int = 1024
+    # Keep false until a real OpenAI-compatible embedding endpoint is configured.
+    embedding_enabled: bool = False
+    embedding_request_timeout_seconds: float = 60.0
+    embedding_max_input_chars: int = 8000
+    embedding_max_retries: int = 3
+    embedding_retry_backoff_seconds: int = 60
 
     # Browser server-session auth (docs/15)
     session_cookie_name: str = "ts_session"

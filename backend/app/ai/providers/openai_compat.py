@@ -113,3 +113,101 @@ def extract_message_content(data: dict[str, Any]) -> str:
         if texts:
             return "\n".join(texts)
     raise AIProviderError("AI provider response missing text content")
+
+
+def normalize_embeddings_url(base_url: str) -> str:
+    """Normalize provider base URL to ``.../v1/embeddings``."""
+    raw = (base_url or "").strip().rstrip("/")
+    if not raw:
+        raise AIProviderError("embedding base URL이 비어 있습니다.")
+    parsed = urlparse(raw)
+    if parsed.scheme not in {"http", "https"}:
+        raise AIProviderError("embedding base URL scheme이 올바르지 않습니다.")
+    path = parsed.path.rstrip("/")
+    if path.endswith("/embeddings"):
+        return raw
+    if path.endswith("/v1"):
+        return f"{raw}/embeddings"
+    return f"{raw}/v1/embeddings"
+
+
+def post_embeddings(
+    *,
+    base_url: str,
+    api_key: str,
+    payload: dict[str, Any],
+    timeout_seconds: float,
+    log_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """POST OpenAI-compatible embeddings. Never logs API keys, input text, or vectors."""
+    url = normalize_embeddings_url(base_url)
+    headers = {"Content-Type": "application/json"}
+    key = (api_key or "").strip()
+    if key and key not in {"change-me", ""}:
+        headers["Authorization"] = f"Bearer {key}"
+
+    inputs = payload.get("input")
+    if isinstance(inputs, list):
+        input_count = len(inputs)
+        total_chars = sum(len(x) for x in inputs if isinstance(x, str))
+    elif isinstance(inputs, str):
+        input_count = 1
+        total_chars = len(inputs)
+    else:
+        input_count = 0
+        total_chars = 0
+
+    ctx = dict(log_context or {})
+    started = time.perf_counter()
+    try:
+        with httpx.Client(timeout=timeout_seconds) as client:
+            response = client.post(url, headers=headers, json=payload)
+    except httpx.TimeoutException as exc:
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        logger.warning(
+            "embedding_request timeout model=%s input_count=%s total_chars=%s "
+            "elapsed_ms=%s context=%s",
+            payload.get("model"),
+            input_count,
+            total_chars,
+            elapsed_ms,
+            ctx,
+        )
+        raise AIProviderError("embedding provider timeout") from exc
+    except httpx.HTTPError as exc:
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        logger.warning(
+            "embedding_request http_error model=%s input_count=%s total_chars=%s "
+            "elapsed_ms=%s context=%s",
+            payload.get("model"),
+            input_count,
+            total_chars,
+            elapsed_ms,
+            ctx,
+        )
+        raise AIProviderError("embedding provider request failed") from exc
+
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    status = response.status_code
+    logger.info(
+        "embedding_request model=%s input_count=%s total_chars=%s "
+        "http_status=%s elapsed_ms=%s context=%s",
+        payload.get("model"),
+        input_count,
+        total_chars,
+        status,
+        elapsed_ms,
+        ctx,
+    )
+    if status >= 400:
+        # Never include response body (may echo request text).
+        raise AIProviderError(f"embedding provider HTTP {status}")
+
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise AIProviderError("embedding response invalid") from exc
+    if not isinstance(data, dict):
+        raise AIProviderError("embedding response invalid")
+    return data
+

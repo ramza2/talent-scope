@@ -343,22 +343,29 @@ Confirmed Profile mutation
   → PersonProfile FOR UPDATE + live Confirmed Snapshot
   → deterministic PROFILE / PROJECT Search Document
   → search_index_item upsert (search_text / metadata_json / source_weight)
-  → embedding NULL (또는 동일 search_text+search_document_version이면 기존 embedding 보존)
-  → SearchIndexJob COMPLETED
+  → embedding NULL 유지 또는 동일 search_text+version이면 기존 embedding 보존
+  → 필요 시 SearchIndexJob(UPSERT, operation=EMBED_SEARCH_INDEX_ITEM) PENDING 생성
+  → REBUILD_PERSON COMPLETED
+  → (별도) Embedding UPSERT Worker
+  → OpenAI-compatible BGE-M3 → VECTOR(1024) 검증
+  → search_index_item.embedding / embedding_model / embedding_version 저장
 ```
 
 PROCESSING 의미 (MVP): dispatcher가 처리 예약한 뒤 아직 terminal이 아닌 상태.
 publish 실패 시 조건부 PROCESSING→PENDING 복구. stale PROCESSING은 Beat(~60s)가
 started_at 기준으로 PENDING 복구(retry_count += 1)하며 rebuild는 하지 않는다.
-job.error_message / Celery failure는 sanitization helper로 SQL·search_text·PII를 저장하지 않는다.
+Embedding UPSERT stale timeout은 REBUILD보다 길게(약 30분) 적용한다.
+job.error_message / Celery failure는 sanitization helper로 SQL·search_text·PII·vector를 저장하지 않는다.
 
 정책 요약:
 
 - Search Document SoT는 현재 Confirmed 운영 DB이다 (Candidate/Revision 재생 금지).
 - Out-of-order job도 항상 live Confirmed 최신 상태로 rebuild한다.
-- `DOCUMENT_CHUNK` row는 REBUILD_PERSON에서 건드리지 않는다.
-- UPSERT / DELETE / REBUILD_ALL action은 아직 FAILED + error_message로 남긴다.
-- Embedding(BGE-M3) 생성은 후속 Worker 단계이다.
+- `DOCUMENT_CHUNK` row는 REBUILD_PERSON / Embedding scanner에서 건드리지 않는다.
+- UPSERT는 `payload_json.operation=EMBED_SEARCH_INDEX_ITEM`만 지원한다.
+- Embedding API는 REBUILD TX 밖에서만 호출한다. mid-call content 변경 시 vector write 금지.
+- `EMBEDDING_ENABLED=false`이면 Search Document만 수행하고 Embedding Job은 만들지 않는다.
+- missing/outdated embedding scanner는 PENDING Job ensure만 하고 publish/provider 호출은 하지 않는다.
 
 초기에는 Worker Container 하나가 세 Queue를 모두 소비할 수 있다.
 
@@ -524,14 +531,18 @@ EmbeddingProvider
 TalentScope의 기본 Embedding Model은 기존 ALZI에서 사용 중인 **BGE-M3 계열 재사용을 우선**한다.
 
 실제 Endpoint는 배포환경에서 설정하고 Backend 코드에는 고정하지 않는다.
+`EMBEDDING_ENABLED` / `EMBEDDING_BASE_URL` / `EMBEDDING_MODEL` / `EMBEDDING_DIMENSIONS=1024` 로 제어한다.
 
 Embedding 대상:
 
-- Confirmed Person Profile
-- Confirmed Project
-- Document Chunk
+- Confirmed Person Profile (`search_index_item` PROFILE) — 현재 구현
+- Confirmed Project (`search_index_item` PROJECT) — 현재 구현
+- Document Chunk — 아직 미구현
 
 Embedding과 FTS 데이터는 `search_index_item`에 저장한다.
+validity는 embedding_model + embedding_version(pipeline+input-cap) + content_hash + search_document_version으로 판단한다.
+queued job의 model/version이 현재 Settings와 다르면 provider 호출 없이 COMPLETED(stale no-op) 처리한다.
+EMBEDDING_ENABLED=false로 worker가 실행되면 COMPLETED가 아니라 CANCELLED로 남겨 scanner가 재활성화할 수 있게 한다.
 
 ---
 

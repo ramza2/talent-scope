@@ -125,3 +125,28 @@ def recover_stale_search_index_jobs(limit: int = 100) -> dict[str, Any]:
         recovered_ids[:20],
     )
     return {"recovered": len(recovered_ids), "job_ids": recovered_ids}
+
+
+@celery_app.task(name="app.tasks.index_tasks.enqueue_missing_search_embeddings")
+def enqueue_missing_search_embeddings(limit: int = 100) -> dict[str, Any]:
+    """Ensure PENDING Embedding UPSERT jobs for missing/outdated PROFILE/PROJECT rows.
+
+    Does not call the embedding provider and does not Celery-publish process tasks.
+    """
+    db = SessionLocal()
+    try:
+        service = SearchIndexService(db)
+        result = service.enqueue_missing_embeddings(limit=max(1, min(int(limit), 500)))
+    finally:
+        db.close()
+    logger.info(
+        "search_index embedding enqueue scanned=%s enqueued=%s "
+        "created_or_requeued=%s already_pending=%s exhausted=%s",
+        result.get("scanned"),
+        result.get("enqueued"),
+        result.get("created_or_requeued"),
+        result.get("already_pending"),
+        result.get("exhausted"),
+    )
+    return result
+

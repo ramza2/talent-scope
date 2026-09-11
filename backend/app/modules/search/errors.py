@@ -40,6 +40,32 @@ def safe_search_job_error(exc: BaseException) -> str:
         if "requires person_id" in lower:
             return "rebuild person requires person_id"
 
+    try:
+        from app.ai.providers.errors import AIProviderError, AIResponseValidationError
+    except Exception:  # pragma: no cover
+        AIProviderError = ()  # type: ignore[assignment,misc]
+        AIResponseValidationError = ()  # type: ignore[assignment,misc]
+
+    if AIResponseValidationError and isinstance(exc, AIResponseValidationError):
+        msg = str(exc).lower()
+        if "dimension" in msg:
+            return "embedding dimension mismatch"
+        return "embedding response invalid"
+    if AIProviderError and isinstance(exc, AIProviderError):
+        text = str(exc).replace("\n", " ").strip()
+        lower = text.lower()
+        if "timeout" in lower:
+            return "embedding provider timeout"
+        if "http" in lower:
+            parts = text.split()
+            code = parts[-1] if parts and parts[-1].isdigit() else None
+            return (
+                f"embedding provider HTTP {code}"
+                if code
+                else "embedding provider request failed"
+            )
+        return "embedding provider request failed"
+
     name = type(exc).__name__
     if "Document" in name or "Builder" in name:
         return "search document build failed"
