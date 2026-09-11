@@ -512,7 +512,12 @@ class SearchIndexService:
         return ProcessJobResult(job_id=job.id, status="COMPLETED", claimed=True)
 
     def enqueue_missing_embeddings(self, *, limit: int = 100) -> dict[str, int]:
-        """Ensure PENDING Embedding UPSERT jobs for missing/outdated items."""
+        """Ensure PENDING Embedding UPSERT jobs for missing/outdated items.
+
+        Uses DB-filtered keyset scans so completed embeddings do not occupy the
+        LIMIT window. Exhausted/backoff outcomes are skipped by advancing the
+        cursor so they cannot permanently starve later missing items.
+        """
         from app.core.config import get_settings
 
         empty = {
@@ -524,23 +529,45 @@ class SearchIndexService:
         }
         if not get_settings().embedding_enabled:
             return empty
-        items = self.repo.list_items_needing_embedding(
-            limit=max(0, min(int(limit), 500))
-        )
+
+        target = max(0, min(int(limit), 500))
+        if target <= 0:
+            return empty
+
         created_or_requeued = 0
         already_pending = 0
         exhausted = 0
-        for item in items:
-            _job, outcome = self.repo.ensure_embedding_job(item)
-            if outcome in {"created", "requeued"}:
-                created_or_requeued += 1
-            elif outcome in {"already_pending", "already_processing"}:
-                already_pending += 1
-            elif outcome in {"exhausted", "backoff"}:
-                exhausted += 1
+        scanned = 0
+        after_id = None
+        # Bound work: allow skipping many exhausted/backoff rows without hanging.
+        max_scan = max(target * 50, target)
+
+        while (created_or_requeued + already_pending) < target and scanned < max_scan:
+            remaining = target - (created_or_requeued + already_pending)
+            batch = self.repo.list_items_needing_embedding(
+                limit=remaining,
+                after_id=after_id,
+            )
+            if not batch:
+                break
+            for item in batch:
+                scanned += 1
+                after_id = item.id
+                _job, outcome = self.repo.ensure_embedding_job(item)
+                if outcome in {"created", "requeued"}:
+                    created_or_requeued += 1
+                elif outcome in {"already_pending", "already_processing"}:
+                    already_pending += 1
+                elif outcome in {"exhausted", "backoff"}:
+                    exhausted += 1
+                if (created_or_requeued + already_pending) >= target:
+                    break
+            if len(batch) < remaining:
+                break
+
         self.db.commit()
         return {
-            "scanned": len(items),
+            "scanned": scanned,
             "enqueued": created_or_requeued,
             "created_or_requeued": created_or_requeued,
             "already_pending": already_pending,
