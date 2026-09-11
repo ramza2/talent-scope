@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
 from sqlalchemy import Select, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from app.db.models.person import PersonProfile
@@ -421,12 +422,60 @@ class SearchRepository:
         self.db.flush()
         return item
 
+
+    def _embedding_job_outcome_for_existing(
+        self,
+        existing: SearchIndexJob,
+        *,
+        settings,
+        now: datetime,
+    ) -> tuple[SearchIndexJob, str]:
+        """Apply current status semantics for an already-persisted Embedding job."""
+        if existing.status == "PENDING":
+            return existing, "already_pending"
+        if existing.status == "PROCESSING":
+            return existing, "already_processing"
+        if existing.status == "COMPLETED":
+            return existing, "already_completed"
+        if existing.status == "FAILED":
+            max_retries = int(settings.embedding_max_retries)
+            backoff = int(settings.embedding_retry_backoff_seconds)
+            retry_count = int(existing.retry_count or 0)
+            if retry_count >= max_retries:
+                return existing, "exhausted"
+            completed_at = existing.completed_at
+            if completed_at is not None:
+                if completed_at.tzinfo is None:
+                    completed_at = completed_at.replace(tzinfo=timezone.utc)
+                if (now - completed_at).total_seconds() < backoff:
+                    return existing, "backoff"
+            existing.status = "PENDING"
+            existing.started_at = None
+            existing.completed_at = None
+            existing.error_message = None
+            self.db.add(existing)
+            self.db.flush()
+            return existing, "requeued"
+        if existing.status == "CANCELLED":
+            existing.status = "PENDING"
+            existing.started_at = None
+            existing.completed_at = None
+            existing.error_message = None
+            self.db.add(existing)
+            self.db.flush()
+            return existing, "requeued"
+        return existing, "already_pending"
+
     def ensure_embedding_job(
         self, item: SearchIndexItem
     ) -> tuple[SearchIndexJob | None, str]:
         """Create or requeue UPSERT Embedding job for one SearchIndexItem.
 
-        Never publishes Celery. Returns (job, outcome) where outcome is one of:
+        Never publishes Celery. Never commits. Concurrent creates are race-safe via
+        PostgreSQL ``INSERT ... ON CONFLICT (idempotency_key) DO NOTHING`` so a
+        UNIQUE violation cannot abort the caller's transaction (e.g. REBUILD_PERSON).
+
+        Returns (job, outcome) where outcome is one of:
         skipped | created | requeued | already_pending | already_processing |
         already_completed | exhausted | backoff.
         """
@@ -458,64 +507,61 @@ class SearchRepository:
             embedding_model=model,
             embedding_version=version,
         )
-        existing = self.get_job_by_idempotency_key(key)
         now = datetime.now(timezone.utc)
+        existing = self.get_job_by_idempotency_key(key)
         if existing is not None:
-            if existing.status == "PENDING":
-                return existing, "already_pending"
-            if existing.status == "PROCESSING":
-                return existing, "already_processing"
-            if existing.status == "COMPLETED":
-                return existing, "already_completed"
-            if existing.status == "FAILED":
-                max_retries = int(settings.embedding_max_retries)
-                backoff = int(settings.embedding_retry_backoff_seconds)
-                retry_count = int(existing.retry_count or 0)
-                if retry_count >= max_retries:
-                    return existing, "exhausted"
-                completed_at = existing.completed_at
-                if completed_at is not None:
-                    if completed_at.tzinfo is None:
-                        completed_at = completed_at.replace(tzinfo=timezone.utc)
-                    if (now - completed_at).total_seconds() < backoff:
-                        return existing, "backoff"
-                existing.status = "PENDING"
-                existing.started_at = None
-                existing.completed_at = None
-                existing.error_message = None
-                self.db.add(existing)
-                self.db.flush()
-                return existing, "requeued"
-            if existing.status == "CANCELLED":
-                existing.status = "PENDING"
-                existing.started_at = None
-                existing.completed_at = None
-                existing.error_message = None
-                self.db.add(existing)
-                self.db.flush()
-                return existing, "requeued"
-            return existing, "already_pending"
+            return self._embedding_job_outcome_for_existing(
+                existing, settings=settings, now=now
+            )
 
-        job = SearchIndexJob(
-            person_id=item.person_id,
-            object_type=item.object_type,
-            object_id=item.object_id,
-            action="UPSERT",
-            status="PENDING",
-            idempotency_key=key,
-            payload_json={
-                "operation": OPERATION_EMBED_SEARCH_INDEX_ITEM,
-                "search_index_item_id": str(item.id),
-                "expected_content_hash": content_hash_value,
-                "expected_search_document_version": search_doc_version,
-                "embedding_model": model,
-                "embedding_version": version,
-            },
+        payload = {
+            "operation": OPERATION_EMBED_SEARCH_INDEX_ITEM,
+            "search_index_item_id": str(item.id),
+            "expected_content_hash": content_hash_value,
+            "expected_search_document_version": search_doc_version,
+            "embedding_model": model,
+            "embedding_version": version,
+        }
+        # Race-safe create: do not use ORM flush (IntegrityError would poison
+        # the caller's transaction). ON CONFLICT DO NOTHING keeps the TX alive.
+        stmt = (
+            pg_insert(SearchIndexJob)
+            .values(
+                person_id=item.person_id,
+                object_type=item.object_type,
+                object_id=item.object_id,
+                action="UPSERT",
+                status="PENDING",
+                idempotency_key=key,
+                payload_json=payload,
+            )
+            .on_conflict_do_nothing(index_elements=["idempotency_key"])
+            .returning(SearchIndexJob.id)
         )
-        self.db.add(job)
-        self.db.flush()
-        return job, "created"
+        inserted_id = self.db.execute(stmt).scalar_one_or_none()
+        if inserted_id is not None:
+            job = self.get_job(inserted_id)
+            if job is None:
+                # RETURNING succeeded but row not visible via ORM get — reload.
+                job = self.get_job_by_idempotency_key(key)
+            if job is None:
+                raise RuntimeError(
+                    "embedding job insert returned id but row is not readable"
+                )
+            return job, "created"
 
+        existing = self.get_job_by_idempotency_key(key)
+        if existing is None:
+            # Conflict loser should always see the winner; one retry for visibility.
+            self.db.flush()
+            existing = self.get_job_by_idempotency_key(key)
+        if existing is None:
+            raise RuntimeError(
+                "embedding job conflict occurred but existing row was not found"
+            )
+        return self._embedding_job_outcome_for_existing(
+            existing, settings=settings, now=now
+        )
 
     def list_items_needing_embedding(self, *, limit: int = 100) -> list[SearchIndexItem]:
         """Active PROFILE/PROJECT rows missing current model/version embedding."""

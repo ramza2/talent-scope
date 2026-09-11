@@ -1316,3 +1316,261 @@ def test_scanner_enqueued_counts_only_created_or_requeued(db_session, monkeypatc
         assert second["already_pending"] >= 1
     finally:
         _cleanup_person(db_session, person.id)
+
+
+def test_concurrent_ensure_embedding_job_unique_idempotency(db_session, monkeypatch):
+    """Two sessions racing ensure_embedding_job must yield exactly one job row."""
+    import threading
+
+    from sqlalchemy import func, select
+
+    from app.db.models.search import SearchIndexItem, SearchIndexJob
+    from app.db.session import SessionLocal
+    from app.modules.search.document_builder import content_hash
+    from app.modules.search.embedding_policy import embedding_idempotency_key
+    from app.modules.search.repository import SearchRepository
+    from app.modules.search.service import SearchIndexService
+    from tests.test_search_index import _cleanup_person, _seed_person
+
+    _enable_embedding(monkeypatch)
+    seeded = _seed_person(db_session)
+    person = seeded["person"]
+    try:
+        text = "concurrent embed target"
+        item = SearchIndexItem(
+            id=uuid.uuid4(),
+            person_id=person.id,
+            object_type="PROFILE",
+            object_id=person.id,
+            search_text=text,
+            embedding=None,
+            source_weight=Decimal("1.000"),
+            metadata_json={
+                "content_hash": content_hash(text),
+                "search_document_version": "search-doc-v1",
+            },
+            is_active=True,
+        )
+        db_session.add(item)
+        db_session.commit()
+        item_id = item.id
+
+        barrier = threading.Barrier(2)
+        outcomes: list[str] = []
+        job_ids: list[uuid.UUID] = []
+        errors: list[BaseException] = []
+        commits_ok: list[bool] = []
+
+        def worker() -> None:
+            db = SessionLocal()
+            try:
+                local_item = db.get(SearchIndexItem, item_id)
+                assert local_item is not None
+                barrier.wait(timeout=5)
+                job, outcome = SearchRepository(db).ensure_embedding_job(local_item)
+                assert job is not None
+                db.commit()
+                outcomes.append(outcome)
+                job_ids.append(job.id)
+                commits_ok.append(True)
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+                try:
+                    db.rollback()
+                except Exception:  # noqa: BLE001
+                    pass
+            finally:
+                db.close()
+
+        t1 = threading.Thread(target=worker)
+        t2 = threading.Thread(target=worker)
+        t1.start()
+        t2.start()
+        t1.join(timeout=15)
+        t2.join(timeout=15)
+
+        assert errors == [], f"unexpected errors: {errors!r}"
+        assert commits_ok == [True, True]
+        assert len(outcomes) == 2
+        assert "created" in outcomes
+        assert outcomes.count("created") == 1
+        other = [o for o in outcomes if o != "created"]
+        assert other == ["already_pending"]
+
+        db_session.expire_all()
+        rows = list(
+            db_session.scalars(
+                select(SearchIndexJob).where(
+                    SearchIndexJob.person_id == person.id,
+                    SearchIndexJob.action == "UPSERT",
+                )
+            ).all()
+        )
+        assert len(rows) == 1
+        assert rows[0].status == "PENDING"
+        assert rows[0].idempotency_key is not None
+        assert job_ids[0] == job_ids[1] == rows[0].id
+
+        # Fingerprint material still includes search_document_version.
+        from app.modules.search.embedding_policy import (
+            current_embedding_model,
+            effective_embedding_version,
+            item_content_hash,
+            item_search_document_version,
+        )
+
+        expected_key = embedding_idempotency_key(
+            search_index_item_id=str(item_id),
+            content_hash_value=item_content_hash(rows[0] and db_session.get(SearchIndexItem, item_id)),
+            search_document_version=item_search_document_version(
+                db_session.get(SearchIndexItem, item_id)
+            ),
+            embedding_model=current_embedding_model(),
+            embedding_version=effective_embedding_version(),
+        )
+        assert rows[0].idempotency_key == expected_key
+        assert rows[0].payload_json["operation"] == "EMBED_SEARCH_INDEX_ITEM"
+        assert rows[0].payload_json["expected_search_document_version"] == "search-doc-v1"
+        assert rows[0].payload_json["embedding_model"] == current_embedding_model()
+        assert rows[0].payload_json["embedding_version"] == effective_embedding_version()
+
+        # Scanner must not create a second row for the same fingerprint.
+        scanned = SearchIndexService(db_session).enqueue_missing_embeddings(limit=50)
+        assert scanned["enqueued"] == 0
+        count = db_session.scalar(
+            select(func.count()).select_from(SearchIndexJob).where(
+                SearchIndexJob.idempotency_key == expected_key
+            )
+        )
+        assert count == 1
+    finally:
+        _cleanup_person(db_session, person.id)
+
+
+def test_ensure_embedding_conflict_does_not_rollback_caller_tx(db_session, monkeypatch):
+    """UNIQUE race must not abort an open caller transaction (REBUILD-like)."""
+    import threading
+
+    from sqlalchemy import select
+
+    from app.db.models.search import SearchIndexItem, SearchIndexJob
+    from app.db.session import SessionLocal
+    from app.modules.search.document_builder import content_hash
+    from app.modules.search.repository import SearchRepository
+    from tests.test_search_index import _cleanup_person, _seed_person
+
+    _enable_embedding(monkeypatch)
+    seeded = _seed_person(db_session)
+    person = seeded["person"]
+    try:
+        text = "rebuild race text"
+        item = SearchIndexItem(
+            id=uuid.uuid4(),
+            person_id=person.id,
+            object_type="PROFILE",
+            object_id=person.id,
+            search_text=text,
+            embedding=None,
+            source_weight=Decimal("1.000"),
+            metadata_json={
+                "content_hash": content_hash(text),
+                "search_document_version": "search-doc-v1",
+            },
+            is_active=True,
+        )
+        db_session.add(item)
+        db_session.commit()
+        item_id = item.id
+
+        barrier = threading.Barrier(2)
+        errors: list[BaseException] = []
+        outcomes: dict[str, str] = {}
+        marker = "mutated-by-rebuild-tx-UNIQUE-XYZ"
+
+        def rebuild_like_worker() -> None:
+            db = SessionLocal()
+            try:
+                local = db.get(SearchIndexItem, item_id)
+                assert local is not None
+                # Simulate REBUILD_PERSON mutations already in the same TX.
+                local.search_text = marker
+                meta = dict(local.metadata_json or {})
+                meta["content_hash"] = content_hash(marker)
+                # Keep search_document_version identical so fingerprint race is on
+                # the *pre-mutation* item loaded by the scanner thread; rebuild
+                # ensure uses post-mutation fingerprint. To force same key, ensure
+                # after barrier using the original snapshot fields via scanner,
+                # while rebuild ensures the mutated item (different key).
+                #
+                # Instead: both ensure the same committed snapshot. Rebuild TX
+                # only flips a non-fingerprint field (source_weight) so the
+                # UNIQUE key still collides, proving TX survival.
+                local.search_text = text
+                meta["content_hash"] = content_hash(text)
+                local.metadata_json = meta
+                local.source_weight = Decimal("0.500")
+                db.flush()
+                barrier.wait(timeout=5)
+                job, outcome = SearchRepository(db).ensure_embedding_job(local)
+                assert job is not None
+                db.commit()
+                outcomes["rebuild"] = outcome
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+                try:
+                    db.rollback()
+                except Exception:  # noqa: BLE001
+                    pass
+            finally:
+                db.close()
+
+        def scanner_worker() -> None:
+            db = SessionLocal()
+            try:
+                local = db.get(SearchIndexItem, item_id)
+                assert local is not None
+                barrier.wait(timeout=5)
+                job, outcome = SearchRepository(db).ensure_embedding_job(local)
+                assert job is not None
+                db.commit()
+                outcomes["scanner"] = outcome
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+                try:
+                    db.rollback()
+                except Exception:  # noqa: BLE001
+                    pass
+            finally:
+                db.close()
+
+        t_rebuild = threading.Thread(target=rebuild_like_worker)
+        t_scanner = threading.Thread(target=scanner_worker)
+        t_rebuild.start()
+        t_scanner.start()
+        t_rebuild.join(timeout=15)
+        t_scanner.join(timeout=15)
+
+        assert errors == [], f"unexpected errors: {errors!r}"
+        assert set(outcomes) == {"rebuild", "scanner"}
+        assert "created" in outcomes.values()
+        assert outcomes["rebuild"] in {"created", "already_pending"}
+        assert outcomes["scanner"] in {"created", "already_pending"}
+        assert outcomes["rebuild"] != outcomes["scanner"] or outcomes["rebuild"] == "already_pending"
+
+        db_session.expire_all()
+        item2 = db_session.get(SearchIndexItem, item_id)
+        assert item2 is not None
+        # Rebuild-like TX mutations survived the UNIQUE race.
+        assert item2.source_weight == Decimal("0.500")
+        jobs = list(
+            db_session.scalars(
+                select(SearchIndexJob).where(
+                    SearchIndexJob.person_id == person.id,
+                    SearchIndexJob.action == "UPSERT",
+                )
+            ).all()
+        )
+        assert len(jobs) == 1
+        assert jobs[0].status == "PENDING"
+    finally:
+        _cleanup_person(db_session, person.id)
