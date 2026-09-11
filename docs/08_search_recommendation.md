@@ -237,13 +237,25 @@ LLM은 질의의 `ranking_focus`를 해석할 수 있으나 실제 점수계산�
 - 최근 수행시점
 - EXPLICIT / INFERRED 여부
 
-### Search Index Document (현재)
+### Search Index Document + Embedding (현재)
 
-Confirmed Profile 변경 시 `SearchIndexJob(REBUILD_PERSON)`이 DB에 등록되고,
+Confirmed Profile/Project 변경 시 `SearchIndexJob(REBUILD_PERSON)`이 DB에 등록되고,
 Beat dispatcher가 PENDING→PROCESSING으로 atomic reserve한 뒤 index Worker에 publish한다.
 Worker는 PROCESSING row를 exclusive lock한 뒤 live Confirmed Snapshot으로 PROFILE/PROJECT
-`search_text`를 생성한다. stale PROCESSING은 started_at 기준으로 PENDING 복구한다.
-embedding은 후속 BGE-M3 Worker가 채운다. Search API / Hybrid Ranking은 아직 미구현이다.
+`search_text`를 생성해 `search_index_item`에 반영한다.
+
+Search Document 반영 후 embedding이 필요하면 같은 TX에서 `SearchIndexJob(UPSERT)`를 생성한다.
+
+```text
+payload_json.operation = EMBED_SEARCH_INDEX_ITEM
+```
+
+idempotency는 `search_index_item_id + content_hash + embedding_model + embedding_version`
+fingerprint 기반이다. DB `SearchIndexJob`이 상태 SoT이며, Embedding Worker만
+OpenAI-compatible BGE-M3 API를 호출해 `VECTOR(1024)`를 검증·저장한다.
+
+content_hash / model / version이 바뀌면 재Embedding하고, mid-call stale write는 폐기한다.
+`DOCUMENT_CHUNK` Embedding·Search API / Hybrid Ranking은 아직 미구현이다.
 
 최근성은 보정값으로 사용하며 오래된 경험을 과도하게 감점하지 않는다.
 
