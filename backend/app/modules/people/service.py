@@ -352,6 +352,19 @@ class PeopleService:
             reason="PERSON_STATUS",
             idempotency_suffix=f"status:{person.status}:{updated_at_iso}",
         )
+        from sqlalchemy import select
+
+        from app.db.models.document import DocumentGroup
+        from app.modules.search.document_chunk_sync import DocumentChunkSyncService
+
+        sync = DocumentChunkSyncService(self.db)
+        group_ids = list(
+            self.db.scalars(
+                select(DocumentGroup.id).where(DocumentGroup.person_id == person.id)
+            ).all()
+        )
+        for gid in group_ids:
+            sync.ensure_sync_job(gid)
         self.repo.add_audit(
             action_type="PERSON_STATUS_UPDATE",
             actor_user_id=actor_user_id,

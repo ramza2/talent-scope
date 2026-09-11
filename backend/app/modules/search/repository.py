@@ -564,7 +564,7 @@ class SearchRepository:
         )
 
     def list_items_needing_embedding(self, *, limit: int = 100) -> list[SearchIndexItem]:
-        """Active PROFILE/PROJECT rows missing current model/version embedding."""
+        """Active PROFILE/PROJECT/DOCUMENT_CHUNK rows missing current embedding."""
         from app.core.config import get_settings
         from app.modules.search.embedding_policy import (
             current_embedding_model,
@@ -580,7 +580,7 @@ class SearchRepository:
             select(SearchIndexItem)
             .where(
                 SearchIndexItem.is_active.is_(True),
-                SearchIndexItem.object_type.in_(("PROFILE", "PROJECT")),
+                SearchIndexItem.object_type.in_(("PROFILE", "PROJECT", "DOCUMENT_CHUNK")),
                 SearchIndexItem.search_text.is_not(None),
                 SearchIndexItem.search_text != "",
             )

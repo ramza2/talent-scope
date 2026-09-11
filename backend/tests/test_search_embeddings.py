@@ -619,7 +619,7 @@ def test_scanner_backfill_and_exclusions(db_session, monkeypatch):
 
         first = SearchIndexService(db_session).enqueue_missing_embeddings(limit=50)
         second = SearchIndexService(db_session).enqueue_missing_embeddings(limit=50)
-        assert first["enqueued"] >= 2
+        assert first["enqueued"] >= 3
         assert first["created_or_requeued"] == first["enqueued"]
         pending = list(
             db_session.scalars(
@@ -632,9 +632,11 @@ def test_scanner_backfill_and_exclusions(db_session, monkeypatch):
         )
         keys = {j.idempotency_key for j in pending}
         assert len(keys) == len(pending)
-        assert all(j.object_type in {"PROFILE", "PROJECT"} for j in pending)
+        assert all(
+            j.object_type in {"PROFILE", "PROJECT", "DOCUMENT_CHUNK"} for j in pending
+        )
         item_ids = {j.payload_json.get("search_index_item_id") for j in pending}
-        assert str(chunk.id) not in item_ids
+        assert str(chunk.id) in item_ids
         assert str(inactive.id) not in item_ids
         assert second["enqueued"] == 0
         assert second["already_pending"] >= 2
