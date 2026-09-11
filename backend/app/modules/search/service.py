@@ -516,7 +516,8 @@ class SearchIndexService:
 
         Uses DB-filtered keyset scans so completed embeddings do not occupy the
         LIMIT window. Exhausted/backoff outcomes are skipped by advancing the
-        cursor so they cannot permanently starve later missing items.
+        cursor until ``target`` work is secured or the keyspace ends (no
+        per-invocation hard scan cap that could starve later rows).
         """
         from app.core.config import get_settings
 
@@ -539,13 +540,11 @@ class SearchIndexService:
         exhausted = 0
         scanned = 0
         after_id = None
-        # Bound work: allow skipping many exhausted/backoff rows without hanging.
-        max_scan = max(target * 50, target)
+        page_size = min(100, max(target, 1))
 
-        while (created_or_requeued + already_pending) < target and scanned < max_scan:
-            remaining = target - (created_or_requeued + already_pending)
+        while (created_or_requeued + already_pending) < target:
             batch = self.repo.list_items_needing_embedding(
-                limit=remaining,
+                limit=page_size,
                 after_id=after_id,
             )
             if not batch:
@@ -562,7 +561,7 @@ class SearchIndexService:
                     exhausted += 1
                 if (created_or_requeued + already_pending) >= target:
                     break
-            if len(batch) < remaining:
+            if len(batch) < page_size:
                 break
 
         self.db.commit()

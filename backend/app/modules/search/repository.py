@@ -436,7 +436,16 @@ class SearchRepository:
         if existing.status == "PROCESSING":
             return existing, "already_processing"
         if existing.status == "COMPLETED":
-            return existing, "already_completed"
+            # ensure_embedding_job only reaches here when item_needs_embedding is
+            # true (e.g. inactive stale COMPLETED, then item reactivated with
+            # embedding still NULL). Requeue the same fingerprint row.
+            existing.status = "PENDING"
+            existing.started_at = None
+            existing.completed_at = None
+            existing.error_message = None
+            self.db.add(existing)
+            self.db.flush()
+            return existing, "requeued"
         if existing.status == "FAILED":
             max_retries = int(settings.embedding_max_retries)
             backoff = int(settings.embedding_retry_backoff_seconds)
@@ -477,7 +486,10 @@ class SearchRepository:
 
         Returns (job, outcome) where outcome is one of:
         skipped | created | requeued | already_pending | already_processing |
-        already_completed | exhausted | backoff.
+        exhausted | backoff.
+
+        Note: COMPLETED + current item still needing embedding → requeued
+        (same fingerprint). Successful embeddings skip via item_needs_embedding.
         """
         from app.core.config import get_settings
         from app.modules.search.embedding_policy import (

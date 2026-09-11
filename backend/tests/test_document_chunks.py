@@ -1653,3 +1653,126 @@ def test_person_delete_waits_for_sync_person_lock(db_session, monkeypatch):
         assert restored[0].search_text == "person chunk"
     finally:
         _cleanup_person(db_session, seeded["person"].id, user_id=admin.id)
+
+
+def test_version_fallback_requeues_stale_completed_embedding_job(
+    db_session, monkeypatch
+):
+    """Inactive stale COMPLETED embed job is requeued when v1 item is reactivated."""
+    from unittest.mock import patch
+
+    from app.db.models.search import SearchIndexItem, SearchIndexJob
+    from app.modules.search.document_chunk_policy import OPERATION_SYNC_DOCUMENT_CHUNKS
+    from app.modules.search.document_chunk_sync import DocumentChunkSyncService
+    from app.modules.search.service import SearchIndexService
+
+    seeded = _seed_person_group(
+        db_session, pages=[(1, "version one embed text", "TEXT_PARSER")], version_no=1
+    )
+    try:
+        _enable_embedding(monkeypatch)
+        _sync_group(db_session, seeded["group"].id, monkeypatch)
+        v1 = seeded["document"]
+        v1_item = db_session.scalars(
+            select(SearchIndexItem).where(
+                SearchIndexItem.person_id == seeded["person"].id,
+                SearchIndexItem.object_type == "DOCUMENT_CHUNK",
+                SearchIndexItem.is_active.is_(True),
+            )
+        ).one()
+        assert v1_item.embedding is None
+        j1 = db_session.scalars(
+            select(SearchIndexJob).where(
+                SearchIndexJob.person_id == seeded["person"].id,
+                SearchIndexJob.action == "UPSERT",
+                SearchIndexJob.status == "PENDING",
+                SearchIndexJob.object_type == "DOCUMENT_CHUNK",
+            )
+        ).first()
+        assert j1 is not None
+        assert (j1.payload_json or {}).get("operation") == "EMBED_SEARCH_INDEX_ITEM"
+        assert (j1.payload_json or {}).get("search_index_item_id") == str(v1_item.id)
+        j1_id = j1.id
+        j1_key = j1.idempotency_key
+        v1_item_id = v1_item.id
+
+        v2 = _add_document_version(
+            db_session,
+            seeded["group"],
+            version_no=2,
+            pages=[(1, "version two embed text", "TEXT_PARSER")],
+        )
+        job_sync, _ = DocumentChunkSyncService(db_session).ensure_sync_job(
+            seeded["group"].id
+        )
+        db_session.commit()
+        SearchIndexService(db_session).process_job(job_sync.id)
+
+        db_session.refresh(v1_item)
+        assert v1_item.is_active is False
+        v2_items = list(
+            db_session.scalars(
+                select(SearchIndexItem).where(
+                    SearchIndexItem.person_id == seeded["person"].id,
+                    SearchIndexItem.object_type == "DOCUMENT_CHUNK",
+                    SearchIndexItem.is_active.is_(True),
+                )
+            ).all()
+        )
+        assert len(v2_items) == 1
+        assert v2_items[0].search_text == "version two embed text"
+
+        # Late J1 run against inactive v1 → COMPLETED stale no-op (no provider).
+        fake_idle = _FakeProvider()
+        with patch(
+            "app.ai.providers.embedding.get_embedding_provider", return_value=fake_idle
+        ):
+            result = SearchIndexService(db_session).process_job(j1_id)
+        assert result.status == "COMPLETED"
+        assert fake_idle.calls == []
+        db_session.refresh(v1_item)
+        assert v1_item.embedding is None
+
+        # Soft-delete v2 → v1 fallback sync reactivates same SearchIndexItem id.
+        v2.deleted_at = datetime.now(UTC)
+        v2.is_latest = False
+        db_session.add(v2)
+        db_session.flush()
+        v1.is_latest = True
+        db_session.add(v1)
+        db_session.commit()
+        job_fb, _ = DocumentChunkSyncService(db_session).ensure_sync_job(
+            seeded["group"].id
+        )
+        db_session.commit()
+        SearchIndexService(db_session).process_job(job_fb.id)
+
+        db_session.expire_all()
+        reactivated = db_session.get(SearchIndexItem, v1_item_id)
+        assert reactivated is not None
+        assert reactivated.is_active is True
+        assert reactivated.embedding is None
+        assert reactivated.search_text == "version one embed text"
+
+        jobs_same_key = list(
+            db_session.scalars(
+                select(SearchIndexJob).where(SearchIndexJob.idempotency_key == j1_key)
+            ).all()
+        )
+        assert len(jobs_same_key) == 1
+        assert jobs_same_key[0].id == j1_id
+        assert jobs_same_key[0].status == "PENDING"
+
+        fake = _FakeProvider(_vector(fill=0.19))
+        with patch(
+            "app.ai.providers.embedding.get_embedding_provider", return_value=fake
+        ):
+            result2 = SearchIndexService(db_session).process_job(j1_id)
+        assert result2.status == "COMPLETED"
+        db_session.refresh(reactivated)
+        assert reactivated.embedding is not None
+        assert reactivated.embedding_model == "bge-m3"
+        assert reactivated.embedding_version is not None
+        assert fake.calls and fake.calls[0] == "version one embed text"
+    finally:
+        _cleanup_person(db_session, seeded["person"].id)
