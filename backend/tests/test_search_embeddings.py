@@ -619,7 +619,7 @@ def test_scanner_backfill_and_exclusions(db_session, monkeypatch):
 
         first = SearchIndexService(db_session).enqueue_missing_embeddings(limit=50)
         second = SearchIndexService(db_session).enqueue_missing_embeddings(limit=50)
-        assert first["enqueued"] >= 2
+        assert first["enqueued"] >= 3
         assert first["created_or_requeued"] == first["enqueued"]
         pending = list(
             db_session.scalars(
@@ -632,9 +632,11 @@ def test_scanner_backfill_and_exclusions(db_session, monkeypatch):
         )
         keys = {j.idempotency_key for j in pending}
         assert len(keys) == len(pending)
-        assert all(j.object_type in {"PROFILE", "PROJECT"} for j in pending)
+        assert all(
+            j.object_type in {"PROFILE", "PROJECT", "DOCUMENT_CHUNK"} for j in pending
+        )
         item_ids = {j.payload_json.get("search_index_item_id") for j in pending}
-        assert str(chunk.id) not in item_ids
+        assert str(chunk.id) in item_ids
         assert str(inactive.id) not in item_ids
         assert second["enqueued"] == 0
         assert second["already_pending"] >= 2
@@ -1572,5 +1574,694 @@ def test_ensure_embedding_conflict_does_not_rollback_caller_tx(db_session, monke
         )
         assert len(jobs) == 1
         assert jobs[0].status == "PENDING"
+    finally:
+        _cleanup_person(db_session, person.id)
+
+
+def test_list_items_needing_embedding_skips_completed_prefix(db_session, monkeypatch):
+    """>500 completed leading rows must not hide later embedding=NULL items."""
+    from app.db.models.search import SearchIndexItem
+    from app.modules.search.document_builder import content_hash
+    from app.modules.search.embedding_policy import (
+        current_embedding_model,
+        effective_embedding_version,
+    )
+    from app.modules.search.repository import SearchRepository
+    from tests.test_search_index import _cleanup_person, _seed_person
+
+    _enable_embedding(monkeypatch)
+    seeded = _seed_person(db_session)
+    person = seeded["person"]
+    try:
+        # Isolate from leftover embedding=NULL rows in the shared test DB.
+        from sqlalchemy import delete
+
+        from app.db.models.search import SearchIndexJob
+
+        model = current_embedding_model()
+        version = effective_embedding_version()
+        null_ids = list(
+            db_session.scalars(
+                select(SearchIndexItem.id).where(SearchIndexItem.embedding.is_(None))
+            ).all()
+        )
+        if null_ids:
+            db_session.execute(
+                delete(SearchIndexJob).where(
+                    SearchIndexJob.action == "UPSERT",
+                    SearchIndexJob.object_type.in_(
+                        ("PROFILE", "PROJECT", "DOCUMENT_CHUNK")
+                    ),
+                )
+            )
+            db_session.execute(
+                delete(SearchIndexItem).where(SearchIndexItem.id.in_(null_ids))
+            )
+            db_session.commit()
+
+        ids = sorted(uuid.uuid4() for _ in range(520))
+        completed_ids = ids[:500]
+        missing_ids = ids[500:]
+        rows = []
+        for i, item_id in enumerate(completed_ids):
+            rows.append(
+                SearchIndexItem(
+                    id=item_id,
+                    person_id=person.id,
+                    object_type="DOCUMENT_CHUNK" if i % 3 == 0 else ("PROFILE" if i % 3 == 1 else "PROJECT"),
+                    object_id=uuid.uuid4(),
+                    search_text=f"completed corpus {i}",
+                    embedding=_vector(fill=0.01),
+                    embedding_model=model,
+                    embedding_version=version,
+                    source_weight=Decimal("0.700"),
+                    metadata_json={
+                        "content_hash": content_hash(f"completed corpus {i}"),
+                        "search_document_version": "search-doc-v1",
+                    },
+                    is_active=True,
+                )
+            )
+        for i, item_id in enumerate(missing_ids):
+            rows.append(
+                SearchIndexItem(
+                    id=item_id,
+                    person_id=person.id,
+                    object_type="DOCUMENT_CHUNK",
+                    object_id=uuid.uuid4(),
+                    search_text=f"missing corpus {i}",
+                    embedding=None,
+                    source_weight=Decimal("0.700"),
+                    metadata_json={
+                        "content_hash": content_hash(f"missing corpus {i}"),
+                        "search_document_version": "document-chunk-search-v1",
+                    },
+                    is_active=True,
+                )
+            )
+        db_session.add_all(rows)
+        db_session.commit()
+
+        repo = SearchRepository(db_session)
+        needed = repo.list_items_needing_embedding(limit=10)
+        assert len(needed) == 10
+        assert {item.id for item in needed} == set(missing_ids[:10])
+        assert [item.id for item in needed] == missing_ids[:10]
+
+        all_needed = repo.list_items_needing_embedding(limit=2000)
+        assert {item.id for item in all_needed} == set(missing_ids)
+    finally:
+        _cleanup_person(db_session, person.id)
+
+
+def test_scanner_multi_cycle_finite_progress_over_large_corpus(db_session, monkeypatch):
+    """Scanner cycles through all missing rows despite a large completed prefix."""
+    from app.db.models.search import SearchIndexItem, SearchIndexJob
+    from app.modules.search.document_builder import content_hash
+    from app.modules.search.embedding_policy import (
+        current_embedding_model,
+        effective_embedding_version,
+    )
+    from app.modules.search.repository import SearchRepository
+    from app.modules.search.service import SearchIndexService
+    from tests.test_search_index import _cleanup_person, _seed_person
+
+    _enable_embedding(monkeypatch)
+    seeded = _seed_person(db_session)
+    person = seeded["person"]
+    try:
+        from sqlalchemy import delete
+
+        model = current_embedding_model()
+        version = effective_embedding_version()
+        null_ids = list(
+            db_session.scalars(
+                select(SearchIndexItem.id).where(SearchIndexItem.embedding.is_(None))
+            ).all()
+        )
+        if null_ids:
+            db_session.execute(
+                delete(SearchIndexJob).where(
+                    SearchIndexJob.action == "UPSERT",
+                    SearchIndexJob.object_type.in_(
+                        ("PROFILE", "PROJECT", "DOCUMENT_CHUNK")
+                    ),
+                )
+            )
+            db_session.execute(
+                delete(SearchIndexItem).where(SearchIndexItem.id.in_(null_ids))
+            )
+            db_session.commit()
+
+        ids = sorted(uuid.uuid4() for _ in range(525))
+        completed_ids = ids[:500]
+        missing_ids = ids[500:]  # 25
+        rows = []
+        for i, item_id in enumerate(completed_ids):
+            rows.append(
+                SearchIndexItem(
+                    id=item_id,
+                    person_id=person.id,
+                    object_type="PROJECT" if i % 2 else "PROFILE",
+                    object_id=uuid.uuid4(),
+                    search_text=f"done {i}",
+                    embedding=_vector(),
+                    embedding_model=model,
+                    embedding_version=version,
+                    source_weight=Decimal("1.000"),
+                    metadata_json={
+                        "content_hash": content_hash(f"done {i}"),
+                        "search_document_version": "search-doc-v1",
+                    },
+                    is_active=True,
+                )
+            )
+        for i, item_id in enumerate(missing_ids):
+            rows.append(
+                SearchIndexItem(
+                    id=item_id,
+                    person_id=person.id,
+                    object_type="DOCUMENT_CHUNK",
+                    object_id=uuid.uuid4(),
+                    search_text=f"todo {i}",
+                    embedding=None,
+                    source_weight=Decimal("0.700"),
+                    metadata_json={
+                        "content_hash": content_hash(f"todo {i}"),
+                        "search_document_version": "document-chunk-search-v1",
+                    },
+                    is_active=True,
+                )
+            )
+        db_session.add_all(rows)
+        db_session.commit()
+
+        reached: list = []
+        for _cycle in range(8):
+            result = SearchIndexService(db_session).enqueue_missing_embeddings(limit=10)
+            pending = list(
+                db_session.scalars(
+                    select(SearchIndexJob).where(
+                        SearchIndexJob.person_id == person.id,
+                        SearchIndexJob.action == "UPSERT",
+                        SearchIndexJob.status == "PENDING",
+                    )
+                ).all()
+            )
+            if not pending:
+                if result["enqueued"] == 0 and result["already_pending"] == 0:
+                    break
+                continue
+            batch_item_ids = []
+            for job in pending:
+                item_id = uuid.UUID(str(job.payload_json.get("search_index_item_id")))
+                batch_item_ids.append(item_id)
+                item = db_session.get(SearchIndexItem, item_id)
+                assert item is not None
+                item.embedding = _vector(fill=0.02)
+                item.embedding_model = model
+                item.embedding_version = version
+                db_session.add(item)
+                db_session.delete(job)
+            db_session.commit()
+            reached.extend(batch_item_ids)
+
+        assert set(reached) == set(missing_ids)
+        assert len(reached) == 25
+        leftover = [
+            item.id
+            for item in SearchRepository(db_session).list_items_needing_embedding(
+                limit=2000
+            )
+            if item.person_id == person.id
+        ]
+        assert leftover == []
+        final = SearchIndexService(db_session).enqueue_missing_embeddings(limit=10)
+        assert final["enqueued"] == 0
+    finally:
+        _cleanup_person(db_session, person.id)
+
+
+def test_list_items_needing_embedding_includes_model_version_mismatch(
+    db_session, monkeypatch
+):
+    from app.db.models.search import SearchIndexItem
+    from app.modules.search.document_builder import content_hash
+    from app.modules.search.embedding_policy import (
+        current_embedding_model,
+        effective_embedding_version,
+    )
+    from app.modules.search.repository import SearchRepository
+    from tests.test_search_index import _cleanup_person, _seed_person
+
+    _enable_embedding(monkeypatch, model="new-model")
+    seeded = _seed_person(db_session)
+    person = seeded["person"]
+    try:
+        current_model = current_embedding_model()
+        current_version = effective_embedding_version()
+        assert current_model == "new-model"
+
+        old_model = SearchIndexItem(
+            id=uuid.uuid4(),
+            person_id=person.id,
+            object_type="PROFILE",
+            object_id=person.id,
+            search_text="old model vector",
+            embedding=_vector(),
+            embedding_model="old-model",
+            embedding_version=current_version,
+            source_weight=Decimal("1.000"),
+            metadata_json={
+                "content_hash": content_hash("old model vector"),
+                "search_document_version": "search-doc-v1",
+            },
+            is_active=True,
+        )
+        null_model = SearchIndexItem(
+            id=uuid.uuid4(),
+            person_id=person.id,
+            object_type="PROJECT",
+            object_id=seeded["project_a"].id,
+            search_text="null model vector",
+            embedding=_vector(),
+            embedding_model=None,
+            embedding_version=None,
+            source_weight=Decimal("1.000"),
+            metadata_json={
+                "content_hash": content_hash("null model vector"),
+                "search_document_version": "search-doc-v1",
+            },
+            is_active=True,
+        )
+        current = SearchIndexItem(
+            id=uuid.uuid4(),
+            person_id=person.id,
+            object_type="DOCUMENT_CHUNK",
+            object_id=uuid.uuid4(),
+            search_text="already current",
+            embedding=_vector(),
+            embedding_model=current_model,
+            embedding_version=current_version,
+            source_weight=Decimal("0.700"),
+            metadata_json={
+                "content_hash": content_hash("already current"),
+                "search_document_version": "document-chunk-search-v1",
+            },
+            is_active=True,
+        )
+        blank = SearchIndexItem(
+            id=uuid.uuid4(),
+            person_id=person.id,
+            object_type="PROFILE",
+            object_id=uuid.uuid4(),
+            search_text="   ",
+            embedding=None,
+            source_weight=Decimal("1.000"),
+            metadata_json={"content_hash": content_hash("   ")},
+            is_active=True,
+        )
+        db_session.add_all([old_model, null_model, current, blank])
+        db_session.commit()
+
+        needed = SearchRepository(db_session).list_items_needing_embedding(limit=50)
+        needed_ids = {item.id for item in needed}
+        assert old_model.id in needed_ids
+        assert null_model.id in needed_ids
+        assert current.id not in needed_ids
+        assert blank.id not in needed_ids
+    finally:
+        _cleanup_person(db_session, person.id)
+
+
+def test_scanner_skips_exhausted_jobs_to_reach_later_missing(db_session, monkeypatch):
+    """Exhausted FAILED jobs must not permanently occupy scanner progress."""
+    from datetime import UTC, datetime
+
+    from app.db.models.search import SearchIndexItem, SearchIndexJob
+    from app.modules.search.document_builder import content_hash
+    from app.modules.search.embedding_policy import (
+        current_embedding_model,
+        effective_embedding_version,
+        embedding_idempotency_key,
+        item_content_hash,
+        item_search_document_version,
+    )
+    from app.modules.search.service import SearchIndexService
+    from tests.test_search_index import _cleanup_person, _seed_person
+
+    _enable_embedding(monkeypatch, max_retries=2)
+    seeded = _seed_person(db_session)
+    person = seeded["person"]
+    try:
+        model = current_embedding_model()
+        version = effective_embedding_version()
+        ids = sorted(uuid.uuid4() for _ in range(15))
+        exhausted_ids = ids[:12]
+        fresh_ids = ids[12:]
+        items_by_id = {}
+        for i, item_id in enumerate(ids):
+            item = SearchIndexItem(
+                id=item_id,
+                person_id=person.id,
+                object_type="DOCUMENT_CHUNK",
+                object_id=uuid.uuid4(),
+                search_text=f"exhaust corpus {i}",
+                embedding=None,
+                source_weight=Decimal("0.700"),
+                metadata_json={
+                    "content_hash": content_hash(f"exhaust corpus {i}"),
+                    "search_document_version": "document-chunk-search-v1",
+                },
+                is_active=True,
+            )
+            items_by_id[item_id] = item
+            db_session.add(item)
+        db_session.flush()
+
+        for item_id in exhausted_ids:
+            item = items_by_id[item_id]
+            key = embedding_idempotency_key(
+                search_index_item_id=str(item.id),
+                content_hash_value=item_content_hash(item),
+                search_document_version=item_search_document_version(item),
+                embedding_model=model,
+                embedding_version=version,
+            )
+            db_session.add(
+                SearchIndexJob(
+                    person_id=person.id,
+                    object_type="DOCUMENT_CHUNK",
+                    object_id=item.object_id,
+                    action="UPSERT",
+                    status="FAILED",
+                    retry_count=2,
+                    completed_at=datetime.now(UTC),
+                    idempotency_key=key,
+                    payload_json={
+                        "operation": "EMBED_SEARCH_INDEX_ITEM",
+                        "search_index_item_id": str(item.id),
+                    },
+                    error_message="embedding failed",
+                )
+            )
+        db_session.commit()
+
+        result = SearchIndexService(db_session).enqueue_missing_embeddings(limit=5)
+        assert result["exhausted"] >= 1
+        assert result["enqueued"] == len(fresh_ids)
+        pending = list(
+            db_session.scalars(
+                select(SearchIndexJob).where(
+                    SearchIndexJob.person_id == person.id,
+                    SearchIndexJob.action == "UPSERT",
+                    SearchIndexJob.status == "PENDING",
+                )
+            ).all()
+        )
+        pending_item_ids = {
+            uuid.UUID(str(j.payload_json.get("search_index_item_id"))) for j in pending
+        }
+        assert pending_item_ids == set(fresh_ids)
+    finally:
+        _cleanup_person(db_session, person.id)
+
+
+def test_ensure_embedding_requeues_completed_when_item_still_needs(db_session, monkeypatch):
+    """COMPLETED same-fingerprint job requeues when embedding is still missing."""
+    from datetime import UTC, datetime
+
+    from app.db.models.search import SearchIndexItem, SearchIndexJob
+    from app.modules.search.document_builder import content_hash
+    from app.modules.search.embedding_policy import (
+        current_embedding_model,
+        effective_embedding_version,
+        embedding_idempotency_key,
+        item_content_hash,
+        item_search_document_version,
+    )
+    from app.modules.search.repository import SearchRepository
+    from tests.test_search_index import _cleanup_person, _seed_person
+
+    _enable_embedding(monkeypatch)
+    seeded = _seed_person(db_session)
+    person = seeded["person"]
+    try:
+        text = "reactivated chunk"
+        item = SearchIndexItem(
+            id=uuid.uuid4(),
+            person_id=person.id,
+            object_type="DOCUMENT_CHUNK",
+            object_id=uuid.uuid4(),
+            search_text=text,
+            embedding=None,
+            source_weight=Decimal("0.700"),
+            metadata_json={
+                "content_hash": content_hash(text),
+                "search_document_version": "document-chunk-search-v1",
+            },
+            is_active=True,
+        )
+        db_session.add(item)
+        db_session.flush()
+        key = embedding_idempotency_key(
+            search_index_item_id=str(item.id),
+            content_hash_value=item_content_hash(item),
+            search_document_version=item_search_document_version(item),
+            embedding_model=current_embedding_model(),
+            embedding_version=effective_embedding_version(),
+        )
+        job = SearchIndexJob(
+            person_id=person.id,
+            object_type="DOCUMENT_CHUNK",
+            object_id=item.object_id,
+            action="UPSERT",
+            status="COMPLETED",
+            retry_count=1,
+            completed_at=datetime.now(UTC),
+            idempotency_key=key,
+            payload_json={
+                "operation": "EMBED_SEARCH_INDEX_ITEM",
+                "search_index_item_id": str(item.id),
+            },
+        )
+        db_session.add(job)
+        db_session.commit()
+        job_id = job.id
+        retry_before = job.retry_count
+
+        out_job, outcome = SearchRepository(db_session).ensure_embedding_job(item)
+        db_session.commit()
+        assert outcome == "requeued"
+        assert out_job is not None
+        assert out_job.id == job_id
+        assert out_job.status == "PENDING"
+        assert out_job.retry_count == retry_before
+        assert out_job.started_at is None
+        assert out_job.completed_at is None
+        assert out_job.error_message is None
+
+        # Successful current embedding → skipped (no COMPLETED→PENDING churn).
+        item.embedding = _vector()
+        item.embedding_model = current_embedding_model()
+        item.embedding_version = effective_embedding_version()
+        db_session.add(item)
+        out_job.status = "COMPLETED"
+        out_job.completed_at = datetime.now(UTC)
+        db_session.add(out_job)
+        db_session.commit()
+        skipped, skip_outcome = SearchRepository(db_session).ensure_embedding_job(item)
+        assert skip_outcome == "skipped"
+        assert skipped is None
+    finally:
+        _cleanup_person(db_session, person.id)
+
+
+def test_scanner_requeues_completed_stale_missing_embedding(db_session, monkeypatch):
+    from datetime import UTC, datetime
+
+    from app.db.models.search import SearchIndexItem, SearchIndexJob
+    from app.modules.search.document_builder import content_hash
+    from app.modules.search.embedding_policy import (
+        current_embedding_model,
+        effective_embedding_version,
+        embedding_idempotency_key,
+        item_content_hash,
+        item_search_document_version,
+    )
+    from app.modules.search.service import SearchIndexService
+    from tests.test_search_index import _cleanup_person, _seed_person
+
+    _enable_embedding(monkeypatch)
+    seeded = _seed_person(db_session)
+    person = seeded["person"]
+    try:
+        text = "scanner stale completed"
+        item = SearchIndexItem(
+            id=uuid.uuid4(),
+            person_id=person.id,
+            object_type="DOCUMENT_CHUNK",
+            object_id=uuid.uuid4(),
+            search_text=text,
+            embedding=None,
+            source_weight=Decimal("0.700"),
+            metadata_json={
+                "content_hash": content_hash(text),
+                "search_document_version": "document-chunk-search-v1",
+            },
+            is_active=True,
+        )
+        db_session.add(item)
+        db_session.flush()
+        key = embedding_idempotency_key(
+            search_index_item_id=str(item.id),
+            content_hash_value=item_content_hash(item),
+            search_document_version=item_search_document_version(item),
+            embedding_model=current_embedding_model(),
+            embedding_version=effective_embedding_version(),
+        )
+        job = SearchIndexJob(
+            person_id=person.id,
+            object_type="DOCUMENT_CHUNK",
+            object_id=item.object_id,
+            action="UPSERT",
+            status="COMPLETED",
+            completed_at=datetime.now(UTC),
+            idempotency_key=key,
+            payload_json={
+                "operation": "EMBED_SEARCH_INDEX_ITEM",
+                "search_index_item_id": str(item.id),
+            },
+        )
+        db_session.add(job)
+        db_session.commit()
+        job_id = job.id
+
+        first = SearchIndexService(db_session).enqueue_missing_embeddings(limit=10)
+        assert first["enqueued"] >= 1
+        assert first["created_or_requeued"] >= 1
+        db_session.refresh(job)
+        assert job.id == job_id
+        assert job.status == "PENDING"
+
+        second = SearchIndexService(db_session).enqueue_missing_embeddings(limit=10)
+        assert second["enqueued"] == 0
+        assert second["already_pending"] >= 1
+        jobs = list(
+            db_session.scalars(
+                select(SearchIndexJob).where(SearchIndexJob.idempotency_key == key)
+            ).all()
+        )
+        assert len(jobs) == 1
+    finally:
+        _cleanup_person(db_session, person.id)
+
+
+def test_scanner_past_exhausted_beyond_old_hard_cap(db_session, monkeypatch):
+    """Exhausted rows beyond former target*50 cap must not starve later missing."""
+    from datetime import UTC, datetime
+
+    from app.db.models.search import SearchIndexItem, SearchIndexJob
+    from app.modules.search.document_builder import content_hash
+    from app.modules.search.embedding_policy import (
+        current_embedding_model,
+        effective_embedding_version,
+        embedding_idempotency_key,
+        item_content_hash,
+        item_search_document_version,
+    )
+    from app.modules.search.service import SearchIndexService
+    from tests.test_search_index import _cleanup_person, _seed_person
+
+    _enable_embedding(monkeypatch, max_retries=2)
+    seeded = _seed_person(db_session)
+    person = seeded["person"]
+    try:
+        from sqlalchemy import delete
+
+        null_ids = list(
+            db_session.scalars(
+                select(SearchIndexItem.id).where(SearchIndexItem.embedding.is_(None))
+            ).all()
+        )
+        if null_ids:
+            db_session.execute(
+                delete(SearchIndexJob).where(SearchIndexJob.action == "UPSERT")
+            )
+            db_session.execute(
+                delete(SearchIndexItem).where(SearchIndexItem.id.in_(null_ids))
+            )
+            db_session.commit()
+
+        model = current_embedding_model()
+        version = effective_embedding_version()
+        # target=5 → old max_scan=250; place 260 exhausted ahead of 3 fresh.
+        ids = sorted(uuid.uuid4() for _ in range(263))
+        exhausted_ids = ids[:260]
+        fresh_ids = ids[260:]
+        items_by_id = {}
+        for i, item_id in enumerate(ids):
+            item = SearchIndexItem(
+                id=item_id,
+                person_id=person.id,
+                object_type="DOCUMENT_CHUNK",
+                object_id=uuid.uuid4(),
+                search_text=f"hardcap corpus {i}",
+                embedding=None,
+                source_weight=Decimal("0.700"),
+                metadata_json={
+                    "content_hash": content_hash(f"hardcap corpus {i}"),
+                    "search_document_version": "document-chunk-search-v1",
+                },
+                is_active=True,
+            )
+            items_by_id[item_id] = item
+            db_session.add(item)
+        db_session.flush()
+        for item_id in exhausted_ids:
+            item = items_by_id[item_id]
+            key = embedding_idempotency_key(
+                search_index_item_id=str(item.id),
+                content_hash_value=item_content_hash(item),
+                search_document_version=item_search_document_version(item),
+                embedding_model=model,
+                embedding_version=version,
+            )
+            db_session.add(
+                SearchIndexJob(
+                    person_id=person.id,
+                    object_type="DOCUMENT_CHUNK",
+                    object_id=item.object_id,
+                    action="UPSERT",
+                    status="FAILED",
+                    retry_count=2,
+                    completed_at=datetime.now(UTC),
+                    idempotency_key=key,
+                    payload_json={
+                        "operation": "EMBED_SEARCH_INDEX_ITEM",
+                        "search_index_item_id": str(item.id),
+                    },
+                    error_message="embedding failed",
+                )
+            )
+        db_session.commit()
+
+        result = SearchIndexService(db_session).enqueue_missing_embeddings(limit=5)
+        assert result["exhausted"] >= 250
+        assert result["scanned"] >= 260
+        assert result["enqueued"] == len(fresh_ids)
+        pending = list(
+            db_session.scalars(
+                select(SearchIndexJob).where(
+                    SearchIndexJob.person_id == person.id,
+                    SearchIndexJob.action == "UPSERT",
+                    SearchIndexJob.status == "PENDING",
+                )
+            ).all()
+        )
+        pending_item_ids = {
+            uuid.UUID(str(j.payload_json.get("search_index_item_id"))) for j in pending
+        }
+        assert pending_item_ids == set(fresh_ids)
     finally:
         _cleanup_person(db_session, person.id)

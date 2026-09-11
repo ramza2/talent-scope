@@ -129,7 +129,7 @@ def recover_stale_search_index_jobs(limit: int = 100) -> dict[str, Any]:
 
 @celery_app.task(name="app.tasks.index_tasks.enqueue_missing_search_embeddings")
 def enqueue_missing_search_embeddings(limit: int = 100) -> dict[str, Any]:
-    """Ensure PENDING Embedding UPSERT jobs for missing/outdated PROFILE/PROJECT rows.
+    """Ensure PENDING Embedding UPSERT jobs for missing/outdated PROFILE/PROJECT/DOCUMENT_CHUNK rows.
 
     Does not call the embedding provider and does not Celery-publish process tasks.
     """
@@ -150,3 +150,28 @@ def enqueue_missing_search_embeddings(limit: int = 100) -> dict[str, Any]:
     )
     return result
 
+
+
+@celery_app.task(name="app.tasks.index_tasks.enqueue_missing_document_chunk_sync_jobs")
+def enqueue_missing_document_chunk_sync_jobs(limit: int = 100) -> dict[str, Any]:
+    """Ensure PENDING SYNC_DOCUMENT_CHUNKS jobs for groups needing sync.
+
+    Does not materialize chunks or call embedding providers.
+    """
+    db = SessionLocal()
+    try:
+        service = SearchIndexService(db)
+        result = service.enqueue_missing_document_chunk_syncs(
+            limit=max(1, min(int(limit), 500))
+        )
+    finally:
+        db.close()
+    logger.info(
+        "search_index document_chunk enqueue scanned=%s enqueued=%s "
+        "created_or_requeued=%s already_pending=%s",
+        result.get("scanned"),
+        result.get("enqueued"),
+        result.get("created_or_requeued"),
+        result.get("already_pending"),
+    )
+    return result

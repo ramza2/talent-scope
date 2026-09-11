@@ -946,6 +946,9 @@ class DocumentService:
             before=before,
             after={"deleted_at": "set"},
         )
+        from app.modules.search.document_chunk_sync import DocumentChunkSyncService
+
+        DocumentChunkSyncService(self.db).ensure_sync_job(group_id)
         self.db.commit()
 
     def restore(self, document_id: UUID, actor_user_id: UUID) -> DocumentDetail:
@@ -962,6 +965,9 @@ class DocumentService:
             target_id=document_id,
             after={"deleted_at": None},
         )
+        from app.modules.search.document_chunk_sync import DocumentChunkSyncService
+
+        DocumentChunkSyncService(self.db).ensure_sync_job(doc.document_group_id)
         self.db.commit()
         return self.get_document(document_id, is_admin=True)
 

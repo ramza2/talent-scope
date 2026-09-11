@@ -56,5 +56,10 @@ celery_app.conf.update(
             "schedule": 60.0,
             "kwargs": {"limit": 100},
         },
+        "enqueue-missing-document-chunk-sync-jobs": {
+            "task": "app.tasks.index_tasks.enqueue_missing_document_chunk_sync_jobs",
+            "schedule": 60.0,
+            "kwargs": {"limit": 100},
+        },
     },
 )

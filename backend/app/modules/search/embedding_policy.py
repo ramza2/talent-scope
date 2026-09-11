@@ -121,7 +121,7 @@ def embedding_idempotency_key(
 def item_needs_embedding(item: Any, *, model: str, version: str) -> bool:
     if not bool(getattr(item, "is_active", False)):
         return False
-    if getattr(item, "object_type", None) not in {"PROFILE", "PROJECT"}:
+    if getattr(item, "object_type", None) not in {"PROFILE", "PROJECT", "DOCUMENT_CHUNK"}:
         return False
     if not (getattr(item, "search_text", None) or "").strip():
         return False
