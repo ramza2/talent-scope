@@ -288,7 +288,14 @@ Document READY
 - `POST /search/interpret`(자연어 → Search Query JSON)는 구현됨. Qwen3-14B + Active Code Catalog/Alias 정규화 + `SearchPeopleRequest` 호환 검증. Interpret는 검색/Embedding을 실행하지 않으며 DB에 이력을 저장하지 않는다.
 - Search Result Evidence / Match `evidence_count` / Top Projects / Project·Evidence·Document Drill-down ID는 구현됨.
 - Persistent Evidence(Confirm) + DOCUMENT_CHUNK derived evidence를 Search Response에 제공 (검색 중 Evidence INSERT 없음, read-only).
-- 남은 TODO: 조건완화(relaxations), Search explanation(`POST /search/explain`), Reranker, Search UI, 대규모 성능 튜닝.
+- Integrated Search UI(`/search`)는 구현됨.
+  - 자연어 → `POST /search/interpret` → editable Structured Condition → `POST /search/people`
+  - `previous_query` follow-up refinement UI
+  - Required / Preferred, Top Projects, Persistent·DOCUMENT_CHUNK Evidence
+  - Project / Evidence / Document Drill-down (기존 API 재사용)
+  - Search → Person Detail → Back 시 React Router state로 조건 복원
+  - 적합도는 `적합도 N점`(probability/% 아님)
+- 남은 TODO: 조건완화(relaxations), Search explanation(`POST /search/explain`), Reranker, 대규모 Hybrid Search 성능 튜닝 / EXPLAIN ANALYZE.
 
 
 최근성은 보정값으로 사용하며 오래된 경험을 과도하게 감점하지 않는다.

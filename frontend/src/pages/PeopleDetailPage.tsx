@@ -19,7 +19,7 @@ import {
   message,
 } from 'antd'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { useNavigate, useParams } from 'react-router-dom'
+import { useLocation, useNavigate, useParams } from 'react-router-dom'
 import type { ColumnsType } from 'antd/es/table'
 
 import { apiErrorMessage } from '@/api/errors'
@@ -66,6 +66,10 @@ function mergeCodeOptions(
 export function PeopleDetailPage() {
   const { personId = '' } = useParams()
   const navigate = useNavigate()
+  const location = useLocation()
+  const fromSearch = Boolean(
+    (location.state as { fromSearch?: boolean } | null)?.fromSearch,
+  )
   const queryClient = useQueryClient()
   const { data: me } = useAuthMe()
   const isAdmin = me?.role === 'ADMIN'
@@ -305,8 +309,12 @@ export function PeopleDetailPage() {
 
   return (
     <div>
-      <Button type="link" onClick={() => navigate('/people')} style={{ paddingLeft: 0 }}>
-        ← 목록
+      <Button
+        type="link"
+        onClick={() => (fromSearch ? navigate(-1) : navigate('/people'))}
+        style={{ paddingLeft: 0 }}
+      >
+        {fromSearch ? '← 검색결과' : '← 목록'}
       </Button>
 
       <Space style={{ width: '100%', justifyContent: 'space-between', marginBottom: 12 }} align="start">
