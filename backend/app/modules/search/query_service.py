@@ -23,6 +23,7 @@ from app.modules.search.query_schemas import (
     SearchPersonResult,
     SearchPersonSummary,
 )
+from app.modules.search.schemas import GRADE_LABELS
 from app.modules.search.ranking import (
     EXPERTISE_DISPLAY_CAP,
     SKILL_DISPLAY_CAP,
@@ -341,6 +342,7 @@ class SearchQueryService:
             )
         return results
 
+
     def _build_matches(
         self,
         *,
@@ -353,11 +355,20 @@ class SearchQueryService:
         preferred_biz_by_code: dict[str, set[UUID]],
         preferred_cust_by_code: dict[str, set[UUID]],
     ) -> list[MatchItem]:
+        """Build match scaffold.
+
+        Required same-field OR values are aggregated into one MATCH condition
+        (candidate already passed hard filters). Preferred stays per-code.
+        skill_match_mode=ALL keeps per-skill REQUIRED MATCH items.
+        """
         items: list[MatchItem] = []
         req = request.required
 
         def _label(code: str) -> str:
             return code_names.get(code) or code
+
+        def _grade_label(grade: str) -> str:
+            return GRADE_LABELS.get(grade, grade)
 
         def _req(condition: str) -> None:
             items.append(
@@ -369,31 +380,35 @@ class SearchQueryService:
                 )
             )
 
-        for code in req.jobs:
-            _req(_label(code))
-        for code in req.skills:
-            _req(_label(code))
-        for code in req.expertise:
-            _req(_label(code))
-        for code in req.business_domains:
-            _req(_label(code))
-        for code in req.customer_types:
-            _req(_label(code))
+        def _req_or_group(labels: list[str]) -> None:
+            if not labels:
+                return
+            if len(labels) == 1:
+                _req(labels[0])
+            else:
+                _req(" OR ".join(labels))
+
+        # Same-field OR → single aggregated REQUIRED MATCH.
+        _req_or_group([_label(c) for c in req.jobs])
+        if request.skill_match_mode == "ALL":
+            for code in req.skills:
+                _req(_label(code))
+        else:
+            _req_or_group([_label(c) for c in req.skills])
+        _req_or_group([_label(c) for c in req.expertise])
+        _req_or_group([_label(c) for c in req.business_domains])
+        _req_or_group([_label(c) for c in req.customer_types])
         if req.grade and req.grade.values:
-            for grade in req.grade.values:
-                _req(grade)
+            _req_or_group([_grade_label(g) for g in req.grade.values])
         if req.career and (
             req.career.min_months is not None or req.career.max_months is not None
         ):
             lo = req.career.min_months
             hi = req.career.max_months
             _req(f"career:{lo or ''}-{hi if hi is not None else ''}")
-        for aff in req.affiliations:
-            _req(aff)
-        for cert in req.certifications:
-            _req(cert)
-        for kw in req.project_keywords:
-            _req(kw)
+        _req_or_group(list(req.affiliations))
+        _req_or_group(list(req.certifications))
+        _req_or_group(list(req.project_keywords))
 
         pref = request.preferred
         for code in pref.jobs:

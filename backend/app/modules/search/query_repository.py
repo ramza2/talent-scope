@@ -7,7 +7,7 @@ from datetime import date
 from typing import Any, Sequence
 from uuid import UUID
 
-from sqlalchemy import Select, and_, case, exists, func, or_, select, text, true
+from sqlalchemy import Float, Select, and_, case, cast, exists, func, literal, or_, select, text, true
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import SearchInvalidCodeError
@@ -41,7 +41,6 @@ from app.modules.search.query_schemas import (
 from app.modules.search.ranking import (
     KEYWORD_TRIGRAM_THRESHOLD,
     ChannelHit,
-    cosine_similarity_from_distance,
 )
 
 CODE_TYPE_JOB = "JOB"
@@ -595,6 +594,7 @@ class SearchQueryRepository:
         )
 
     # ----------------------------------------------------- keyword channel
+
     def keyword_channel_hits(
         self,
         *,
@@ -602,6 +602,18 @@ class SearchQueryRepository:
         eligible_subq: Any,
         limit: int,
     ) -> tuple[list[ChannelHit], bool]:
+        """Person-level keyword hits: best item per person, then LIMIT persons.
+
+        Ordering (item → person best):
+        1) substring/exact indicator
+        2) FTS rank
+        3) trigram similarity
+        4) source_weight
+        5) item id
+        """
+        if limit <= 0:
+            return [], False
+
         tsquery = func.websearch_to_tsquery("simple", keyword)
         fts_match = SearchIndexItem.search_tsv.op("@@")(tsquery)
         ilike_match = SearchIndexItem.search_text.ilike(f"%{keyword}%")
@@ -614,51 +626,65 @@ class SearchQueryRepository:
             else_=0.0,
         )
 
-        fetch_limit = min(max(limit * 3, limit), limit * 5)
-        stmt = (
+        item_order = (
+            exact_flag.desc(),
+            fts_rank.desc(),
+            trigram_sim.desc(),
+            SearchIndexItem.source_weight.desc(),
+            SearchIndexItem.id.asc(),
+        )
+        ranked = (
             select(
-                SearchIndexItem.id,
-                SearchIndexItem.person_id,
-                SearchIndexItem.object_type,
-                SearchIndexItem.object_id,
+                SearchIndexItem.id.label("id"),
+                SearchIndexItem.person_id.label("person_id"),
+                SearchIndexItem.object_type.label("object_type"),
+                SearchIndexItem.object_id.label("object_id"),
                 exact_flag.label("exact_flag"),
                 fts_rank.label("fts_rank"),
                 trigram_sim.label("trigram_sim"),
-                SearchIndexItem.source_weight,
+                SearchIndexItem.source_weight.label("source_weight"),
+                func.row_number()
+                .over(partition_by=SearchIndexItem.person_id, order_by=item_order)
+                .label("rn"),
             )
             .where(
                 SearchIndexItem.is_active.is_(True),
                 SearchIndexItem.person_id.in_(select(eligible_subq.c.person_id)),
                 or_(fts_match, ilike_match, trigram_match),
             )
-            .order_by(
-                exact_flag.desc(),
-                fts_rank.desc(),
-                trigram_sim.desc(),
-                SearchIndexItem.source_weight.desc(),
-                SearchIndexItem.id.asc(),
+        ).subquery("keyword_ranked_items")
+
+        # Fetch limit+1 person-best rows to detect person-level truncation.
+        stmt = (
+            select(
+                ranked.c.id,
+                ranked.c.person_id,
+                ranked.c.object_type,
+                ranked.c.object_id,
+                ranked.c.exact_flag,
+                ranked.c.fts_rank,
+                ranked.c.trigram_sim,
+                ranked.c.source_weight,
             )
-            .limit(fetch_limit)
+            .where(ranked.c.rn == 1)
+            .order_by(
+                ranked.c.exact_flag.desc(),
+                ranked.c.fts_rank.desc(),
+                ranked.c.trigram_sim.desc(),
+                ranked.c.source_weight.desc(),
+                ranked.c.id.asc(),
+            )
+            .limit(limit + 1)
         )
         rows = self.db.execute(stmt).all()
+        truncated = len(rows) > limit
+        rows = rows[:limit]
 
-        best_by_person: dict[UUID, Any] = {}
-        order: list[UUID] = []
-        for row in rows:
-            if row.person_id in best_by_person:
-                continue
-            best_by_person[row.person_id] = row
-            order.append(row.person_id)
-            if len(order) >= limit:
-                break
-
-        truncated = len(rows) >= fetch_limit or len(order) >= limit
         hits: list[ChannelHit] = []
-        for rank, pid in enumerate(order, start=1):
-            row = best_by_person[pid]
+        for rank, row in enumerate(rows, start=1):
             hits.append(
                 ChannelHit(
-                    person_id=pid,
+                    person_id=row.person_id,
                     rank=rank,
                     item_id=row.id,
                     object_type=row.object_type,
@@ -669,7 +695,7 @@ class SearchQueryRepository:
             )
         return hits, truncated
 
-    # ---------------------------------------------------- semantic channel
+
     def semantic_channel_hits(
         self,
         *,
@@ -677,19 +703,34 @@ class SearchQueryRepository:
         eligible_subq: Any,
         limit: int,
     ) -> tuple[list[ChannelHit], bool]:
+        """Person-level semantic hits: best item per person in SQL, then LIMIT.
+
+        Best item score = cosine_similarity * source_weight
+        (computed in PostgreSQL via pgvector cosine_distance; no Python vector math).
+        """
+        if limit <= 0:
+            return [], False
+
         model = current_embedding_model()
         version = effective_embedding_version()
         distance = SearchIndexItem.embedding.cosine_distance(query_vector)
+        # similarity in [0,1] approx via 1 - distance; clamp at 0 for safety.
+        similarity = func.greatest(literal(0.0), literal(1.0) - distance)
+        effective_score = similarity * cast(SearchIndexItem.source_weight, Float)
 
-        fetch_limit = min(max(limit * 3, limit), limit * 5)
-        stmt = (
+        item_order = (effective_score.desc(), SearchIndexItem.id.asc())
+        ranked = (
             select(
-                SearchIndexItem.id,
-                SearchIndexItem.person_id,
-                SearchIndexItem.object_type,
-                SearchIndexItem.object_id,
+                SearchIndexItem.id.label("id"),
+                SearchIndexItem.person_id.label("person_id"),
+                SearchIndexItem.object_type.label("object_type"),
+                SearchIndexItem.object_id.label("object_id"),
                 distance.label("distance"),
-                SearchIndexItem.source_weight,
+                effective_score.label("effective_score"),
+                SearchIndexItem.source_weight.label("source_weight"),
+                func.row_number()
+                .over(partition_by=SearchIndexItem.person_id, order_by=item_order)
+                .label("rn"),
             )
             .where(
                 SearchIndexItem.is_active.is_(True),
@@ -698,40 +739,36 @@ class SearchQueryRepository:
                 SearchIndexItem.embedding_version == version,
                 SearchIndexItem.person_id.in_(select(eligible_subq.c.person_id)),
             )
-            .order_by(distance.asc(), SearchIndexItem.id.asc())
-            .limit(fetch_limit)
+        ).subquery("semantic_ranked_items")
+
+        stmt = (
+            select(
+                ranked.c.id,
+                ranked.c.person_id,
+                ranked.c.object_type,
+                ranked.c.object_id,
+                ranked.c.distance,
+                ranked.c.effective_score,
+                ranked.c.source_weight,
+            )
+            .where(ranked.c.rn == 1)
+            .order_by(ranked.c.effective_score.desc(), ranked.c.id.asc())
+            .limit(limit + 1)
         )
         rows = self.db.execute(stmt).all()
+        truncated = len(rows) > limit
+        rows = rows[:limit]
 
-        scored: list[tuple[float, Any]] = []
-        for row in rows:
-            sim = cosine_similarity_from_distance(float(row.distance))
-            weight = float(row.source_weight or 1.0)
-            scored.append((sim * weight, row))
-        scored.sort(key=lambda t: (-t[0], str(t[1].id)))
-
-        best_by_person: dict[UUID, tuple[float, Any]] = {}
-        order: list[UUID] = []
-        for score, row in scored:
-            if row.person_id in best_by_person:
-                continue
-            best_by_person[row.person_id] = (score, row)
-            order.append(row.person_id)
-            if len(order) >= limit:
-                break
-
-        truncated = len(rows) >= fetch_limit or len(order) >= limit
         hits: list[ChannelHit] = []
-        for rank, pid in enumerate(order, start=1):
-            score, row = best_by_person[pid]
+        for rank, row in enumerate(rows, start=1):
             hits.append(
                 ChannelHit(
-                    person_id=pid,
+                    person_id=row.person_id,
                     rank=rank,
                     item_id=row.id,
                     object_type=row.object_type,
                     object_id=row.object_id,
-                    raw_score=float(score),
+                    raw_score=float(row.effective_score or 0.0),
                     source_weight=float(row.source_weight or 1.0),
                 )
             )

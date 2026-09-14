@@ -973,3 +973,356 @@ def test_matches_scaffold_required_preferred(client: TestClient, db_session) -> 
     finally:
         _cleanup_person(db_session, seeded["person"].id)
         _cleanup_user(db_session, user.id)
+
+
+# ---------------------------------------------------------------------------
+# Correctness fixes: person-level channel best + required OR matches
+# ---------------------------------------------------------------------------
+
+
+def _eligible_subq(db, request=None):
+    from app.modules.search.query_repository import SearchQueryRepository
+    from app.modules.search.query_schemas import SearchPeopleRequest
+
+    repo = SearchQueryRepository(db)
+    req = request or SearchPeopleRequest()
+    expanded = repo.validate_and_expand_codes(req)
+    return repo.eligible_person_ids_subquery(
+        required=req.required,
+        expanded=expanded,
+        skill_match_mode=req.skill_match_mode,
+    ), repo
+
+
+def test_keyword_many_items_one_person_does_not_crowd_out(db_session) -> None:
+    """Person A with 6 strong keyword items must not crowd out Person B at limit=2."""
+    import uuid
+
+    suffix = uuid.uuid4().hex[:8]
+    a = _seed_person(db_session, suffix=f"ka{suffix}")
+    b = _seed_person(db_session, suffix=f"kb{suffix}")
+    try:
+        # A: 6 strong exact matches (would fill old item-level LIMIT=6)
+        for i in range(6):
+            _add_index_item(
+                db_session,
+                person_id=a["person"].id,
+                object_type="DOCUMENT_CHUNK",
+                object_id=uuid.uuid4(),
+                search_text=f"UNIQUEKW{suffix} chunk-{i} detailed content",
+                source_weight="0.700",
+            )
+        # B: one slightly weaker but valid keyword hit
+        _add_index_item(
+            db_session,
+            person_id=b["person"].id,
+            object_type="PROJECT",
+            object_id=b["project_a"].id,
+            search_text=f"notes about UNIQUEKW{suffix} briefly",
+            source_weight="1.000",
+        )
+
+        eligible_subq, repo = _eligible_subq(db_session)
+        hits, truncated = repo.keyword_channel_hits(
+            keyword=f"UNIQUEKW{suffix}",
+            eligible_subq=eligible_subq,
+            limit=2,
+        )
+        person_ids = {h.person_id for h in hits}
+        assert a["person"].id in person_ids
+        assert b["person"].id in person_ids
+        assert len(hits) == 2
+        # One best item per person
+        assert len({h.person_id for h in hits}) == 2
+    finally:
+        _cleanup_person(db_session, a["person"].id)
+        _cleanup_person(db_session, b["person"].id)
+
+
+def test_semantic_many_items_one_person_does_not_crowd_out(db_session, monkeypatch) -> None:
+    """Person A with many near DOCUMENT_CHUNK vectors must not crowd out Person B."""
+    import uuid
+
+    _enable_embedding(monkeypatch)
+    suffix = uuid.uuid4().hex[:8]
+    a = _seed_person(db_session, suffix=f"sa{suffix}")
+    b = _seed_person(db_session, suffix=f"sb{suffix}")
+    try:
+        # Query-like vector on dim 0
+        near = _unit_vector(index=0, value=1.0)
+        mid = _unit_vector(index=0, value=0.8)
+        # A: many near DOCUMENT_CHUNK items
+        for i in range(6):
+            _add_index_item(
+                db_session,
+                person_id=a["person"].id,
+                object_type="DOCUMENT_CHUNK",
+                object_id=uuid.uuid4(),
+                search_text=f"chunk-{i}",
+                source_weight="0.700",
+                embedding=near,
+            )
+        # B: one PROJECT with next-best vector
+        _add_index_item(
+            db_session,
+            person_id=b["person"].id,
+            object_type="PROJECT",
+            object_id=b["project_a"].id,
+            search_text="project mid",
+            source_weight="1.000",
+            embedding=mid,
+        )
+
+        eligible_subq, repo = _eligible_subq(db_session)
+        hits, truncated = repo.semantic_channel_hits(
+            query_vector=near,
+            eligible_subq=eligible_subq,
+            limit=2,
+        )
+        person_ids = {h.person_id for h in hits}
+        assert a["person"].id in person_ids
+        assert b["person"].id in person_ids
+        assert len(hits) == 2
+    finally:
+        _cleanup_person(db_session, a["person"].id)
+        _cleanup_person(db_session, b["person"].id)
+
+
+def test_semantic_source_weight_chooses_project_over_perfect_chunk(
+    db_session, monkeypatch
+) -> None:
+    """Within one person: PROJECT .90*1.0 beats DOCUMENT_CHUNK 1.0*0.7."""
+    import uuid
+
+    _enable_embedding(monkeypatch)
+    suffix = uuid.uuid4().hex[:8]
+    seeded = _seed_person(db_session, suffix=suffix)
+    try:
+        query = _unit_vector(index=1, value=1.0)
+        # Perfect chunk similarity (=1.0) but weight 0.7 → effective 0.7
+        _add_index_item(
+            db_session,
+            person_id=seeded["person"].id,
+            object_type="DOCUMENT_CHUNK",
+            object_id=uuid.uuid4(),
+            search_text="chunk perfect",
+            source_weight="0.700",
+            embedding=query,
+        )
+        # Near-project similarity 0.9 * 1.0 = 0.9 wins
+        project_vec = _unit_vector(index=1, value=0.9)
+        # normalize-ish: cosine with unit query on same axis ≈ 0.9 if we use single-axis vectors
+        _add_index_item(
+            db_session,
+            person_id=seeded["person"].id,
+            object_type="PROJECT",
+            object_id=seeded["project_a"].id,
+            search_text="project near",
+            source_weight="1.000",
+            embedding=project_vec,
+        )
+
+        eligible_subq, repo = _eligible_subq(db_session)
+        hits, _ = repo.semantic_channel_hits(
+            query_vector=query,
+            eligible_subq=eligible_subq,
+            limit=5,
+        )
+        assert len(hits) == 1
+        assert hits[0].person_id == seeded["person"].id
+        assert hits[0].object_type == "PROJECT"
+        assert hits[0].raw_score > 0.7  # effective score of winning PROJECT
+    finally:
+        _cleanup_person(db_session, seeded["person"].id)
+
+
+def _mix_vector(*, primary: int, secondary: int, primary_w: float, secondary_w: float) -> list[float]:
+    """Build a unit-ish 2-axis mix so cosine distances differ by angle, not magnitude."""
+    import math
+
+    vec = [0.0] * 1024
+    vec[primary % 1024] = float(primary_w)
+    vec[secondary % 1024] = float(secondary_w)
+    norm = math.sqrt(sum(v * v for v in vec)) or 1.0
+    return [v / norm for v in vec]
+
+
+def test_document_rich_person_ranking_uses_best_hit_not_count(
+    db_session, monkeypatch
+) -> None:
+    """Chunk count must not accumulate score or crowd candidate slots."""
+    import uuid
+
+    _enable_embedding(monkeypatch)
+    suffix = uuid.uuid4().hex[:8]
+    a = _seed_person(db_session, suffix=f"da{suffix}")
+    b = _seed_person(db_session, suffix=f"db{suffix}")
+    c = _seed_person(db_session, suffix=f"dc{suffix}")
+    try:
+        query = _unit_vector(index=2, value=1.0)
+        # A: many weak/far DOCUMENT_CHUNK hits (orthogonal-ish)
+        for i in range(10):
+            _add_index_item(
+                db_session,
+                person_id=a["person"].id,
+                object_type="DOCUMENT_CHUNK",
+                object_id=uuid.uuid4(),
+                search_text=f"doc-{i}",
+                source_weight="0.700",
+                embedding=_mix_vector(primary=5, secondary=6, primary_w=1.0, secondary_w=0.1),
+            )
+        # B: strong PROJECT near query
+        _add_index_item(
+            db_session,
+            person_id=b["person"].id,
+            object_type="PROJECT",
+            object_id=b["project_a"].id,
+            search_text="strong project",
+            source_weight="1.000",
+            embedding=_mix_vector(primary=2, secondary=3, primary_w=1.0, secondary_w=0.05),
+        )
+        # C: medium PROFILE
+        _add_index_item(
+            db_session,
+            person_id=c["person"].id,
+            object_type="PROFILE",
+            object_id=c["person"].id,
+            search_text="profile",
+            source_weight="1.000",
+            embedding=_mix_vector(primary=2, secondary=4, primary_w=0.6, secondary_w=0.8),
+        )
+
+        eligible_subq, repo = _eligible_subq(db_session)
+        hits, _ = repo.semantic_channel_hits(
+            query_vector=query,
+            eligible_subq=eligible_subq,
+            limit=3,
+        )
+        ordered = [h.person_id for h in hits]
+        assert ordered[0] == b["person"].id
+        assert set(ordered) == {a["person"].id, b["person"].id, c["person"].id}
+        # Still one hit per person despite A's 10 chunks
+        assert len(hits) == 3
+    finally:
+        _cleanup_person(db_session, a["person"].id)
+        _cleanup_person(db_session, b["person"].id)
+        _cleanup_person(db_session, c["person"].id)
+
+
+def test_required_grade_or_matches_not_false_individual(
+    client: TestClient, db_session
+) -> None:
+    suffix = uuid.uuid4().hex[:8]
+    user = _create_user(db_session, login_id=f"mg_{suffix}", password="Secret123!")
+    seeded = _seed_person(db_session, suffix=suffix)
+    # seed person is EXPERT
+    try:
+        _login(client, user.login_id)
+        resp = _search(
+            client,
+            {"required": {"grade": {"values": ["ADVANCED", "EXPERT"]}}},
+        )
+        assert resp.status_code == 200, resp.text
+        row = next(
+            r for r in resp.json()["data"] if r["person_id"] == str(seeded["person"].id)
+        )
+        required = [m for m in row["matches"] if m["type"] == "REQUIRED"]
+        conditions = [m["condition"] for m in required]
+        # Must not claim ADVANCED alone as MATCH
+        assert "ADVANCED" not in conditions
+        assert "고급" not in conditions or any("OR" in c for c in conditions)
+        assert any("OR" in c for c in conditions)
+        assert all(m["status"] == "MATCH" for m in required)
+    finally:
+        _cleanup_person(db_session, seeded["person"].id)
+        _cleanup_user(db_session, user.id)
+
+
+def test_required_skill_any_matches_aggregated(
+    client: TestClient, db_session
+) -> None:
+    suffix = uuid.uuid4().hex[:8]
+    user = _create_user(db_session, login_id=f"msa_{suffix}", password="Secret123!")
+    seeded = _seed_person(db_session, suffix=suffix)
+    codes = seeded["codes"]
+    other = f"TECH-OTHER-{suffix}"
+    _ensure_code(db_session, other, "TECH", "OtherTech")
+    try:
+        _login(client, user.login_id)
+        resp = _search(
+            client,
+            {
+                "required": {"skills": [codes["tech"], other]},
+                "skill_match_mode": "ANY",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        row = next(
+            r for r in resp.json()["data"] if r["person_id"] == str(seeded["person"].id)
+        )
+        required = [m for m in row["matches"] if m["type"] == "REQUIRED"]
+        # OtherTech must not appear as a standalone MATCH
+        assert all("OtherTech" not in m["condition"] or " OR " in m["condition"] for m in required)
+        assert any(" OR " in m["condition"] for m in required)
+    finally:
+        _cleanup_person(db_session, seeded["person"].id)
+        _cleanup_user(db_session, user.id)
+
+
+def test_required_skill_all_matches_per_skill(
+    client: TestClient, db_session
+) -> None:
+    suffix = uuid.uuid4().hex[:8]
+    user = _create_user(db_session, login_id=f"msl_{suffix}", password="Secret123!")
+    seeded = _seed_person(db_session, suffix=suffix)
+    codes = seeded["codes"]
+    # seed person already has tech and tech2 via person/project in base seed?
+    # Ensure both skills exist on person via seed codes tech + tech2
+    t1, t2 = codes["tech"], codes["tech2"]
+    try:
+        _login(client, user.login_id)
+        resp = _search(
+            client,
+            {"required": {"skills": [t1, t2]}, "skill_match_mode": "ALL"},
+        )
+        assert resp.status_code == 200, resp.text
+        row = next(
+            r for r in resp.json()["data"] if r["person_id"] == str(seeded["person"].id)
+        )
+        required = [m for m in row["matches"] if m["type"] == "REQUIRED"]
+        # ALL → individual MATCH items, no OR aggregation
+        assert not any(" OR " in m["condition"] for m in required)
+        assert len(required) >= 2
+        assert all(m["status"] == "MATCH" for m in required)
+    finally:
+        _cleanup_person(db_session, seeded["person"].id)
+        _cleanup_user(db_session, user.id)
+
+
+def test_required_jobs_or_matches_aggregated(
+    client: TestClient, db_session
+) -> None:
+    suffix = uuid.uuid4().hex[:8]
+    user = _create_user(db_session, login_id=f"mj_{suffix}", password="Secret123!")
+    seeded = _seed_person(db_session, suffix=suffix)
+    codes = seeded["codes"]
+    other = f"JOB-OTHER-{suffix}"
+    _ensure_code(db_session, other, "JOB", "OtherJob")
+    try:
+        _login(client, user.login_id)
+        resp = _search(
+            client,
+            {"required": {"jobs": [codes["job"], other]}},
+        )
+        assert resp.status_code == 200, resp.text
+        row = next(
+            r for r in resp.json()["data"] if r["person_id"] == str(seeded["person"].id)
+        )
+        required = [m for m in row["matches"] if m["type"] == "REQUIRED"]
+        assert any(" OR " in m["condition"] for m in required)
+        assert all(
+            "OtherJob" not in m["condition"] or " OR " in m["condition"] for m in required
+        )
+    finally:
+        _cleanup_person(db_session, seeded["person"].id)
+        _cleanup_user(db_session, user.id)
