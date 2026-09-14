@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from typing import Any
 
@@ -314,17 +315,40 @@ class SearchInterpretService:
         return None
 
     @staticmethod
-    def _tokens_from_text(text: str) -> set[str]:
-        parts: list[str] = [normalize_alias(text)]
-        for raw in text.replace(",", " ").replace("|", " ").split():
-            cleaned = raw.strip()
-            if cleaned:
-                parts.append(normalize_alias(cleaned))
-        return set(parts)
+    def _phrase_tokens(text: str) -> list[str]:
+        """Deterministic tokenize for direct phrase mention matching.
+
+        - normalize_alias for casefold/whitespace
+        - split on non-alphanumeric boundaries (no external tokenizer)
+        - keeps Korean/ASCII word tokens; rejects bare substring matches
+        """
+        normalized = normalize_alias(text)
+        if not normalized:
+            return []
+        return re.findall(r"\w+", normalized, flags=re.UNICODE)
 
     @staticmethod
-    def _catalog_line(item: CatalogCode, *, max_len: int) -> str | None:
-        """Build one catalog line; shrink aliases deterministically to fit max_len."""
+    def _contains_phrase(haystack: list[str], needle: list[str]) -> bool:
+        """True when needle is a contiguous token subsequence of haystack."""
+        if not needle:
+            return False
+        n = len(needle)
+        limit = len(haystack) - n + 1
+        for i in range(max(limit, 0)):
+            if haystack[i : i + n] == needle:
+                return True
+        return False
+
+    @classmethod
+    def _tokens_from_text(cls, text: str) -> list[str]:
+        """Ordered phrase tokens from user text (direct-mention matching)."""
+        return cls._phrase_tokens(text)
+
+    @staticmethod
+    def _catalog_line(
+        item: CatalogCode, *, max_len: int
+    ) -> tuple[str, tuple[str, ...]] | None:
+        """Build one catalog line; return line + aliases actually rendered."""
         aliases = list(item.aliases)
         while True:
             alias_part = "|".join(aliases)
@@ -334,7 +358,7 @@ class SearchInterpretService:
                 else f"{item.code}\t{item.name}"
             )
             if len(line) <= max_len:
-                return line
+                return line, tuple(aliases)
             if not aliases:
                 return None
             aliases.pop()  # aliases are already sorted; drop last for determinism
@@ -343,23 +367,27 @@ class SearchInterpretService:
         self,
         catalog: list[CatalogCode],
         *,
-        text_tokens: set[str],
+        text_tokens: list[str],
         priority_codes: set[str],
         max_chars: int | None = None,
     ) -> tuple[str, bool, int, list[CatalogCode]]:
-        """Format prompt catalog and return the exact included CatalogCode subset."""
+        """Format prompt catalog and return the exact included CatalogCode subset.
+
+        Included items are sanitized so aliases match what was actually rendered
+        into the prompt line (after deterministic alias shrinking).
+        """
         budget = (
             SEARCH_INTERPRET_MAX_CODE_CONTEXT_CHARS if max_chars is None else max_chars
         )
 
         def mentions(item: CatalogCode) -> bool:
-            # Direct mention only: exact token equality against code/name/alias.
-            # Avoid short substring hits (e.g. "ai") flooding tier-2 and
-            # crowding out higher-priority codes under the context budget.
-            cands = {normalize_alias(item.code), normalize_alias(item.name)}
-            cands.update(normalize_alias(a) for a in item.aliases)
-            cands.discard("")
-            return bool(cands & text_tokens)
+            # Direct phrase mention: candidate token sequence appears contiguously
+            # in the user token sequence (code / standard name / alias).
+            for cand in (item.code, item.name, *item.aliases):
+                needle = SearchInterpretService._phrase_tokens(cand)
+                if SearchInterpretService._contains_phrase(text_tokens, needle):
+                    return True
+            return False
 
         # Preserve priority: previous_query codes → text mentions → remainder.
         tier1 = [c for c in catalog if c.code in priority_codes]
@@ -389,10 +417,11 @@ class SearchInterpretService:
                 truncated = True
                 break
 
-            line = self._catalog_line(item, max_len=remaining)
-            if line is None:
+            rendered = self._catalog_line(item, max_len=remaining)
+            if rendered is None:
                 truncated = True
                 break
+            line, kept_aliases = rendered
 
             if header is not None:
                 if used + header_cost > budget:
@@ -408,6 +437,15 @@ class SearchInterpretService:
                 break
             lines.append(line)
             used += need
-            included_items.append(item)
+            # Store only aliases that actually appeared in the prompt line.
+            included_items.append(
+                CatalogCode(
+                    code=item.code,
+                    code_type=item.code_type,
+                    name=item.name,
+                    sort_order=item.sort_order,
+                    aliases=kept_aliases,
+                )
+            )
 
         return "\n".join(lines), truncated, len(included_items), included_items

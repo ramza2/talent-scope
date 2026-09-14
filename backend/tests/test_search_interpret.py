@@ -970,10 +970,229 @@ def test_interpret_priority_previous_codes_survive_truncation(db_session, monkey
     svc = SearchInterpretService(db_session)
     _text, _trunc, _count, included = svc._format_catalog(
         catalog,
-        text_tokens=set(),
+        text_tokens=[],
         priority_codes={"JOB-AI-DEV", "EXP-AI-RAG"},
         max_chars=120,
     )
     included_codes = {c.code for c in included}
     assert "JOB-AI-DEV" in included_codes
     assert "EXP-AI-RAG" in included_codes
+def test_interpret_alias_shrink_visible_ok_removed_502(client, db_session, monkeypatch):
+    """Aliases dropped from the prompt line must not resolve (502)."""
+    from app.ai.providers.llm import FakeLLMProvider
+    from app.modules.search import interpret_policy
+    from app.modules.search.interpret_repository import SearchInterpretRepository
+    from app.modules.search.interpret_service import SearchInterpretService
+
+    user = _create_user(db_session, login_id=f"as_{uuid.uuid4().hex[:8]}")
+    try:
+        _seed_catalog(db_session)
+        # AA-* sorts before ZZ-* so shrinking pops the long removed alias first.
+        _ensure_code(
+            db_session,
+            "TECH-SHRINK",
+            "TECH",
+            "ShrinkTech",
+            aliases=[
+                "AA-VISIBLE-ALIAS",
+                "ZZ-REMOVED-ALIAS-VERY-LONG-PADDING-XXXXXXXXXXXXXXXX",
+            ],
+        )
+        _login(client, user.login_id)
+
+        # Tiny budget: force alias shrink while still including TECH-SHRINK via priority.
+        monkeypatch.setattr(
+            interpret_policy, "SEARCH_INTERPRET_MAX_CODE_CONTEXT_CHARS", 80
+        )
+        monkeypatch.setattr(
+            "app.modules.search.interpret_service.SEARCH_INTERPRET_MAX_CODE_CONTEXT_CHARS",
+            80,
+        )
+
+        repo = SearchInterpretRepository(db_session)
+        catalog = repo.load_active_catalog()
+        svc = SearchInterpretService(db_session)
+
+        # Choose a max_chars that includes TECH-SHRINK with only the visible alias.
+        text, truncated, count, included = svc._format_catalog(
+            catalog,
+            text_tokens=[],
+            priority_codes={"TECH-SHRINK"},
+            max_chars=80,
+        )
+        shrink = next(c for c in included if c.code == "TECH-SHRINK")
+        assert "AA-VISIBLE-ALIAS" in shrink.aliases
+        assert "ZZ-REMOVED-ALIAS-VERY-LONG-PADDING-XXXXXXXXXXXXXXXX" not in shrink.aliases
+        assert "AA-VISIBLE-ALIAS" in text
+        assert "ZZ-REMOVED-ALIAS-VERY-LONG-PADDING-XXXXXXXXXXXXXXXX" not in text
+
+        # Keep TECH-SHRINK in prompt via previous_query priority under tiny budget.
+        previous = {
+            "query_version": "1.0",
+            "required": _empty_required(skills=["TECH-SHRINK"]),
+            "preferred": _empty_preferred(),
+            "skill_match_mode": "ANY",
+            "semantic_query": None,
+            "keyword_query": None,
+            "sort": "RELEVANCE",
+            "assumptions": [],
+        }
+
+        # Visible alias resolves.
+        payload_ok = _llm_payload(
+            required=_empty_required(skills=["AA-VISIBLE-ALIAS"]),
+            preferred=_empty_preferred(),
+            semantic_query=None,
+        )
+        llm_ok = FakeLLMProvider(profile_json=payload_ok)
+        _install_llm(client, llm_ok)
+        try:
+            resp = _interpret(
+                client, {"text": "shrink visible", "previous_query": previous}
+            )
+            assert resp.status_code == 200, resp.text
+            assert resp.json()["data"]["required"]["skills"] == ["TECH-SHRINK"]
+        finally:
+            _clear_llm(client)
+
+        # Removed alias must 502 (not in prompt / included aliases).
+        payload_bad = _llm_payload(
+            required=_empty_required(
+                skills=["ZZ-REMOVED-ALIAS-VERY-LONG-PADDING-XXXXXXXXXXXXXXXX"]
+            ),
+            preferred=_empty_preferred(),
+            semantic_query=None,
+        )
+        llm_bad = FakeLLMProvider(profile_json=payload_bad)
+        _install_llm(client, llm_bad)
+        try:
+            resp = _interpret(
+                client, {"text": "shrink removed", "previous_query": previous}
+            )
+            assert resp.status_code == 502, resp.text
+            assert resp.json()["code"] == "SEARCH_INTERPRETATION_INVALID"
+        finally:
+            _clear_llm(client)
+    finally:
+        _cleanup_user(db_session, user.id)
+
+
+def test_interpret_multiword_name_priority_under_truncation(db_session, monkeypatch):
+    """Multi-word standard name must enter tier-2 mention priority."""
+    from app.modules.search import interpret_policy
+    from app.modules.search.interpret_repository import SearchInterpretRepository
+    from app.modules.search.interpret_service import SearchInterpretService
+
+    _seed_catalog(db_session)
+    for i in range(30):
+        _ensure_code(db_session, f"TECH-FILL-{i:02d}", "TECH", f"Filler{i:02d}")
+    _ensure_code(db_session, "TECH-SPRING-BOOT", "TECH", "Spring Boot")
+
+    monkeypatch.setattr(
+        interpret_policy, "SEARCH_INTERPRET_MAX_CODE_CONTEXT_CHARS", 120
+    )
+    monkeypatch.setattr(
+        "app.modules.search.interpret_service.SEARCH_INTERPRET_MAX_CODE_CONTEXT_CHARS",
+        120,
+    )
+
+    repo = SearchInterpretRepository(db_session)
+    catalog = repo.load_active_catalog()
+    svc = SearchInterpretService(db_session)
+    text, truncated, count, included = svc._format_catalog(
+        catalog,
+        text_tokens=svc._tokens_from_text("Spring Boot 경험 있는 사람"),
+        priority_codes=set(),
+        max_chars=120,
+    )
+    included_codes = {c.code for c in included}
+    assert "TECH-SPRING-BOOT" in included_codes
+    assert "TECH-SPRING-BOOT" in text
+    assert truncated
+
+
+def test_interpret_multiword_alias_priority_under_truncation(db_session, monkeypatch):
+    """Multi-word alias must enter tier-2 mention priority."""
+    from app.modules.search import interpret_policy
+    from app.modules.search.interpret_repository import SearchInterpretRepository
+    from app.modules.search.interpret_service import SearchInterpretService
+
+    _seed_catalog(db_session)
+    for i in range(30):
+        _ensure_code(db_session, f"TECH-FILL-{i:02d}", "TECH", f"Filler{i:02d}")
+    _ensure_code(
+        db_session,
+        "JOB-AI-DEV-ALIAS",
+        "JOB",
+        "인공지능 개발",
+        aliases=["AI Developer"],
+    )
+
+    monkeypatch.setattr(
+        interpret_policy, "SEARCH_INTERPRET_MAX_CODE_CONTEXT_CHARS", 120
+    )
+    monkeypatch.setattr(
+        "app.modules.search.interpret_service.SEARCH_INTERPRET_MAX_CODE_CONTEXT_CHARS",
+        120,
+    )
+
+    repo = SearchInterpretRepository(db_session)
+    catalog = repo.load_active_catalog()
+    svc = SearchInterpretService(db_session)
+    text, truncated, count, included = svc._format_catalog(
+        catalog,
+        text_tokens=svc._tokens_from_text("AI Developer 경험 있는 사람"),
+        priority_codes=set(),
+        max_chars=120,
+    )
+    included_codes = {c.code for c in included}
+    assert "JOB-AI-DEV-ALIAS" in included_codes
+    assert "JOB-AI-DEV-ALIAS" in text
+    assert truncated
+
+
+def test_interpret_short_substring_does_not_flood_priority(db_session, monkeypatch):
+    """Short substring must not promote unrelated codes into tier-2."""
+    from app.modules.search.interpret_repository import SearchInterpretRepository
+    from app.modules.search.interpret_service import SearchInterpretService
+
+    _seed_catalog(db_session)
+    _ensure_code(db_session, "TECH-AI", "TECH", "AI")
+    _ensure_code(db_session, "TECH-AI-PLATFORM", "TECH", "AI Platform")
+    _ensure_code(db_session, "TECH-RAIL", "TECH", "Rail")
+    _ensure_code(db_session, "TECH-MAINFRAME", "TECH", "Mainframe")
+
+    repo = SearchInterpretRepository(db_session)
+    catalog = repo.load_active_catalog()
+    svc = SearchInterpretService(db_session)
+
+    # "Railway" contains letters of "Rail" / "ai" but must not token-match them.
+    text_tokens = svc._tokens_from_text("Railway 시스템 운영 경험")
+    _text, _trunc, _count, included = svc._format_catalog(
+        catalog,
+        text_tokens=text_tokens,
+        priority_codes=set(),
+        max_chars=10_000,
+    )
+    # Without truncation, all are "included" as tier3; check mention tier via
+    # formatting with tiny budget where only tier2 mentions would survive first.
+    text2, trunc2, count2, included2 = svc._format_catalog(
+        catalog,
+        text_tokens=text_tokens,
+        priority_codes=set(),
+        max_chars=80,
+    )
+    included2_codes = {c.code for c in included2}
+    assert "TECH-AI" not in included2_codes
+    assert "TECH-RAIL" not in included2_codes
+    assert "TECH-AI-PLATFORM" not in included2_codes
+
+    # Standalone Mainframe mention should promote that code.
+    text3, trunc3, count3, included3 = svc._format_catalog(
+        catalog,
+        text_tokens=svc._tokens_from_text("Mainframe 전문가 찾아줘"),
+        priority_codes=set(),
+        max_chars=80,
+    )
+    assert "TECH-MAINFRAME" in {c.code for c in included3}
+    assert "TECH-AI" not in {c.code for c in included3}
