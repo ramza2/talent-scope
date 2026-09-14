@@ -114,22 +114,29 @@ AI Engineer / AI Developer / 인공지능개발
     "business_domains": [],
     "customer_types": [],
     "grade": null,
-    "career": null
+    "career": null,
+    "affiliations": [],
+    "certifications": [],
+    "project_keywords": []
   },
   "preferred": {
     "jobs": [],
     "skills": [],
     "expertise": [],
     "business_domains": [],
-    "customer_types": [],
-    "recent_experience": null
+    "customer_types": []
   },
+  "skill_match_mode": "ANY",
   "semantic_query": null,
   "keyword_query": null,
-  "ranking_focus": [],
-  "sort": "relevance"
+  "sort": "RELEVANCE",
+  "assumptions": []
 }
 ```
+
+현재 실행 계약은 `SearchPeopleRequest`와 동일한 executable field다.
+`query_version` / `assumptions`는 interpret 응답 전용이다.
+`ranking_focus`, `recent_experience` 등은 현재 API 계약에 없으며 향후 확장 후보로만 둔다.
 
 ## 8. Required / Preferred
 
@@ -226,7 +233,8 @@ Vector 대상:
 
 실제 가중치는 테스트를 통해 조정한다.
 
-LLM은 질의의 `ranking_focus`를 해석할 수 있으나 실제 점수계산은 Backend가 수행한다.
+LLM은 자연어를 Search Query JSON으로만 변환하며, 실제 점수계산·인력검색은 Backend `/search/people`가 수행한다.
+(`ranking_focus` 같은 미지원 Soft Ranking 힌트는 현재 계약에 포함하지 않는다.)
 
 ## 16. 프로젝트 경험 반영
 
@@ -272,7 +280,8 @@ Document READY
 - effective highest READY Document version만 active DOCUMENT_CHUNK index를 갖는다.
 - `POST /search/people` Hybrid Search(Structured Hard Filter + Keyword FTS/trgm + pgvector)와 결정적 RRF Ranking은 구현됨.
 - Query Embedding은 검색 요청 시 Embedding Provider로 수행한다(`EMBEDDING_ENABLED` 필요).
-- `POST /search/interpret`(자연어 조건해석), Evidence/top_projects 상세 연결, 조건완화(relaxations), Reranker는 아직 TODO다.
+- `POST /search/interpret`(자연어 → Search Query JSON)는 구현됨. Qwen3-14B + Active Code Catalog/Alias 정규화 + `SearchPeopleRequest` 호환 검증. Interpret는 검색/Embedding을 실행하지 않으며 DB에 이력을 저장하지 않는다.
+- Evidence/top_projects 상세 연결, 조건완화(relaxations), Reranker, Search UI는 아직 TODO다.
 
 최근성은 보정값으로 사용하며 오래된 경험을 과도하게 감점하지 않는다.
 

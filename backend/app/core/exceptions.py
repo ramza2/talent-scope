@@ -357,3 +357,25 @@ class SearchEmbeddingUnavailableError(TalentScopeError):
 
     def __init__(self, detail: str | None = None) -> None:
         super().__init__(detail or "검색 임베딩 서비스를 사용할 수 없습니다.")
+
+
+class SearchInterpretationUnavailableError(TalentScopeError):
+    code = "SEARCH_INTERPRETATION_UNAVAILABLE"
+    title = "Search interpretation unavailable"
+    status_code = 503
+
+    def __init__(self, detail: str | None = None) -> None:
+        super().__init__(
+            detail or "자연어 검색 조건 해석 서비스를 사용할 수 없습니다."
+        )
+
+
+class SearchInterpretationInvalidError(TalentScopeError):
+    code = "SEARCH_INTERPRETATION_INVALID"
+    title = "Search interpretation invalid"
+    status_code = 502
+
+    def __init__(self, detail: str | None = None) -> None:
+        super().__init__(
+            detail or "자연어 검색 조건 해석 결과를 검증할 수 없습니다."
+        )
