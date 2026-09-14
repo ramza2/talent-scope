@@ -307,8 +307,11 @@ def test_keyword_only_and_fts(client: TestClient, db_session) -> None:
         assert "embedding" not in row
         assert "phone" not in row.get("person", {})
         assert "email" not in row.get("person", {})
-        assert row["evidence"] == []
-        assert row["top_projects"] == []
+        assert isinstance(row["evidence"], list)
+        assert isinstance(row["top_projects"], list)
+        assert len(row["top_projects"]) <= 3
+        # PROFILE search_text must never leak into response snippets.
+        assert unique_token not in str(row.get("evidence"))
         assert body["relaxations"] == []
     finally:
         _cleanup_person(db_session, a["person"].id)

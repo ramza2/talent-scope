@@ -218,9 +218,16 @@ class TopProjectItem(BaseModel):
 
 
 class EvidenceItem(BaseModel):
-    evidence_id: UUID
+    evidence_id: UUID | None = None
     source_level: str
+    target_type: str | None = None
+    target_id: UUID | None = None
+    field_name: str | None = None
+    relation_type: str | None = None
     document_id: UUID | None = None
+    document_title: str | None = None
+    original_filename: str | None = None
+    version_no: int | None = None
     page_no: int | None = None
     snippet: str | None = None
 

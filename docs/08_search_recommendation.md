@@ -218,20 +218,25 @@ Vector 대상:
 
 점수는 LLM이 임의로 정하지 않고 Backend 규칙으로 계산한다.
 
-초기 기본 가중치 예:
+### rank-v2 Backend Policy (현재 구현)
 
-| 평가요소 | 기본 가중치 |
-|---|---:|
-| 직무 일치 | 20 |
-| 기술 일치 | 20 |
-| 전문분야 일치 | 15 |
-| 관련 프로젝트 경험 | 20 |
-| 사업분야/고객유형 | 10 |
-| 경력/등급 | 5 |
-| Semantic 유사도 | 5 |
-| 최근성 | 5 |
+최종 적합도는 LLM이 아니라 Backend deterministic rule로 계산한다.
+정책 버전: `rank-v2` (응답 필드 아님, 내부/로그용).
 
-실제 가중치는 테스트를 통해 조정한다.
+| Component | Weight | Notes |
+|---|---:|---|
+| Required baseline | 20% | Hard Filter 통과 시 1.0. required 없으면 inactive |
+| Retrieval RRF | 45% | Keyword RRF + Semantic RRF (동등, `RRF_K=60`) |
+| Preferred | 10% | preferred_match_ratio |
+| Project relevance | 20% | best(70%) + count cap3(20%) + duration cap36mo(10%) |
+| Related recency | 5% | related project 최근성 bucket (minor bias) |
+
+- 존재하지 않는 component weight는 0으로 강제하지 않고, active component만 normalize한다.
+- Evidence count는 Ranking에 사용하지 않는다 (설명/Drill-down 전용).
+- ProjectExpertise ranking factor: EXPLICIT=1.0, INFERRED=0.70 (Hard Filter semantics 불변).
+- Query Embedding은 semantic_query당 1회만 호출하고 Person/Project semantic에 재사용한다.
+
+초기 설계 표(직무20/기술20/…)는 개념 예시였으며, 현재 구현은 위 rank-v2를 따른다.
 
 LLM은 자연어를 Search Query JSON으로만 변환하며, 실제 점수계산·인력검색은 Backend `/search/people`가 수행한다.
 (`ranking_focus` 같은 미지원 Soft Ranking 힌트는 현재 계약에 포함하지 않는다.)
@@ -281,7 +286,10 @@ Document READY
 - `POST /search/people` Hybrid Search(Structured Hard Filter + Keyword FTS/trgm + pgvector)와 결정적 RRF Ranking은 구현됨.
 - Query Embedding은 검색 요청 시 Embedding Provider로 수행한다(`EMBEDDING_ENABLED` 필요).
 - `POST /search/interpret`(자연어 → Search Query JSON)는 구현됨. Qwen3-14B + Active Code Catalog/Alias 정규화 + `SearchPeopleRequest` 호환 검증. Interpret는 검색/Embedding을 실행하지 않으며 DB에 이력을 저장하지 않는다.
-- Evidence/top_projects 상세 연결, 조건완화(relaxations), Reranker, Search UI는 아직 TODO다.
+- Search Result Evidence / Match `evidence_count` / Top Projects / Project·Evidence·Document Drill-down ID는 구현됨.
+- Persistent Evidence(Confirm) + DOCUMENT_CHUNK derived evidence를 Search Response에 제공 (검색 중 Evidence INSERT 없음, read-only).
+- 남은 TODO: 조건완화(relaxations), Search explanation(`POST /search/explain`), Reranker, Search UI, 대규모 성능 튜닝.
+
 
 최근성은 보정값으로 사용하며 오래된 경험을 과도하게 감점하지 않는다.
 

@@ -895,7 +895,7 @@ POST /search/people
 |---|---|
 | `POST /search/people` | 구현됨 — Structured Hard Filter + Keyword(FTS/`pg_trgm`) + pgvector Semantic, Person 병합, 결정적 RRF Ranking |
 | `POST /search/interpret` | 구현됨 — NL→Query JSON (Qwen3), Code/Alias 정규화, SearchPeopleRequest 호환 검증 |
-| Evidence / `top_projects` 상세 연결 | TODO — 응답 scaffold만 (`evidence=[]`, `top_projects=[]`) |
+| Evidence / `top_projects` 상세 연결 | 구현됨 — Match `evidence_count`, Top Projects(≤3), persistent Evidence + DOCUMENT_CHUNK derived evidence, Drill-down ID |
 | `relaxations` 조건완화 | TODO — 항상 `[]` |
 | `POST /search/explain` | TODO |
 
@@ -1082,6 +1082,15 @@ Evidence/Project 연결
 ```
 
 점수는 `94%`가 아니라 **적합도 94점**으로 표시한다.
+
+Drill-down:
+- `top_projects[].project_id` → `GET /api/v1/projects/{project_id}`
+- `evidence[].evidence_id` → `GET /api/v1/evidence/{evidence_id}`
+- `evidence[].document_id` + `page_no` → `GET /api/v1/documents/{document_id}` / `.../preview`
+- Search Response는 signed MinIO URL을 반환하지 않는다.
+- `source_level`: `CONFIRMED_PROFILE` | `CONFIRMED_PROJECT` | `DOCUMENT_CHUNK`
+- Ranking policy: rank-v2 (Evidence count는 점수에 미사용, Search는 read-only).
+
 
 ### 0건 조건완화
 

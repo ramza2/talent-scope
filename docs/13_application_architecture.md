@@ -602,10 +602,11 @@ Qwen3 Query Parser
 - 최종 적합도는 Backend Rule로 계산한다.
 
 **현재 구현:**
-- `POST /api/v1/search/people` — Structured Hard Filter + Keyword(FTS/trgm) + pgvector Semantic + 결정적 RRF Hybrid Ranking
+- `POST /api/v1/search/people` — Structured Hard Filter + Keyword(FTS/trgm) + pgvector Semantic + 결정적 RRF Retrieval + rank-v2 Final Ranking (Project relevance/recency)
 - `POST /api/v1/search/interpret` — 자연어 → Search Query JSON (Qwen3-14B, Code Catalog/Alias, Backend Validation). LLM은 검색/Ranking을 수행하지 않으며 Interpret 내부에서 `/search/people`·Embedding을 호출하지 않는다.
 
-Evidence/`top_projects` 상세 연결, 조건완화(relaxations), Search Explanation, Search UI는 아직 TODO다.
+Search Result Evidence / Top Projects / Drill-down ID / rank-v2 Project relevance는 구현됨.
+남은 TODO: 조건완화(relaxations), Search Explanation, Reranker, Search UI, Hybrid/Project Ranking 성능 튜닝.
 
 별도 Elasticsearch/OpenSearch/Vector DB는 검색 규모가 PostgreSQL 단독 운영한계를 넘을 때 검토한다.
 
