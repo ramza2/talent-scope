@@ -34,6 +34,7 @@ from app.modules.search.project_ranking import (
     JobConditionGroup,
     PersonProjectSummary,
     format_project_period,
+    project_recent_sort_key,
 )
 from app.modules.search.query_schemas import (
     EvidenceItem,
@@ -354,14 +355,11 @@ class SearchResultEnricher:
             if summary and summary.top_project_ids:
                 chosen[pid] = list(summary.top_project_ids)[:TOP_PROJECTS_LIMIT]
             else:
+                # No project signal → context recent projects.
+                # COALESCE(end_date, start_date) DESC — ongoing (end NULL) is not demoted.
                 recent = sorted(
                     projects_by_person.get(pid, []),
-                    key=lambda p: (
-                        p.end_date is None,
-                        -(p.end_date.toordinal() if p.end_date else 0),
-                        -(p.start_date.toordinal() if p.start_date else 0),
-                        str(p.id),
-                    ),
+                    key=project_recent_sort_key,
                 )
                 chosen[pid] = [p.id for p in recent[:TOP_PROJECTS_LIMIT]]
 
@@ -603,8 +601,16 @@ class SearchResultEnricher:
 
         if cat == "certifications":
             for cert in cert_rows.get(person_id, []):
-                if self._cert_matches_tokens(cert, spec.requested):
-                    keys.append(EvidenceTargetKey("CERTIFICATION", cert.id, None))
+                matched_fields = self._cert_matched_fields(cert, spec.requested)
+                if not matched_fields:
+                    continue
+                # Matched searchable fields only (name / issuer) — not any-field wildcard.
+                for field_name in sorted(matched_fields):
+                    keys.append(
+                        EvidenceTargetKey("CERTIFICATION", cert.id, field_name)
+                    )
+                # Root NULL: NEW/SAME row-level Evidence fallback (exact NULL semantics).
+                keys.append(EvidenceTargetKey("CERTIFICATION", cert.id, None))
             return keys
 
         if cat == "project_keywords":
@@ -634,14 +640,31 @@ class SearchResultEnricher:
         return []
 
     @staticmethod
-    def _cert_matches_tokens(cert: Certification, tokens: Sequence[str]) -> bool:
+    def _cert_matched_fields(
+        cert: Certification, tokens: Sequence[str]
+    ) -> set[str]:
+        """Return certification_name / issuer fields that substring-match tokens.
+
+        certificate_no is never searched (same as hard filter).
+        """
+        matched: set[str] = set()
         name = (cert.certification_name or "").casefold()
         issuer = (cert.issuer or "").casefold()
         for token in tokens:
             needle = token.casefold()
-            if needle and (needle in name or needle in issuer):
-                return True
-        return False
+            if not needle:
+                continue
+            if needle in name:
+                matched.add("certification_name")
+            if needle in issuer:
+                matched.add("issuer")
+        return matched
+
+    @staticmethod
+    def _cert_matches_tokens(cert: Certification, tokens: Sequence[str]) -> bool:
+        return bool(
+            SearchResultEnricher._cert_matched_fields(cert, tokens)
+        )
 
     @staticmethod
     def _project_keyword_targets(

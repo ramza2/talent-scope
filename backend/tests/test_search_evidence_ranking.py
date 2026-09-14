@@ -361,8 +361,28 @@ def test_rank_v2_component_normalization_and_caps() -> None:
     )
     assert required_hit is not None and preferred_hit is not None
     assert required_hit > preferred_hit
+    # Both categories active in query: only-required match → (1.0+0.0)/2 = 0.50
+    # only-preferred match → (0.0+0.5)/2 = 0.25
+    assert required_hit == pytest.approx(0.50)
+    assert preferred_hit == pytest.approx(0.25)
 
-    # required project signal beats preferred-only signal
+    both_hit = compute_project_structured_score(
+        signals=split_signals,
+        job_codes=set(),
+        skill_codes={"Python", "Java"},
+        expertise_rows=[],
+        biz_codes=set(),
+        customer_codes=set(),
+        project_name="P3",
+        customer_name=None,
+        responsibilities=None,
+        project_summary=None,
+    )
+    assert both_hit == pytest.approx(0.75)
+    # Mixed both-match is below required-only (when required is the sole active category).
+    assert both_hit < 1.0
+
+    # required-only perfect structured > preferred-only perfect
     req_only = ProjectQuerySignals(required_skills=("Python",))
     pref_only = ProjectQuerySignals(preferred_skills=("Python",))
     req_score = compute_project_structured_score(
@@ -389,10 +409,39 @@ def test_rank_v2_component_normalization_and_caps() -> None:
         responsibilities=None,
         project_summary=None,
     )
-    # Both saturate their own channel to 1.0; required/preferred weight differs
-    # only when mixed. Prefer asserting base score with shared keyword active-zero.
-    assert req_score == 1.0
-    assert pref_score == 1.0
+    assert req_score == pytest.approx(1.0)
+    assert pref_score == pytest.approx(0.5)
+    assert req_score > pref_score
+
+    # preferred EXPLICIT > preferred INFERRED (priority × expertise factor)
+    pref_exp = ProjectQuerySignals(preferred_expertise=("EXP-RAG",))
+    pref_explicit = compute_project_structured_score(
+        signals=pref_exp,
+        job_codes=set(),
+        skill_codes=set(),
+        expertise_rows=[("EXP-RAG", "EXPLICIT")],
+        biz_codes=set(),
+        customer_codes=set(),
+        project_name="PE",
+        customer_name=None,
+        responsibilities=None,
+        project_summary=None,
+    )
+    pref_inferred = compute_project_structured_score(
+        signals=pref_exp,
+        job_codes=set(),
+        skill_codes=set(),
+        expertise_rows=[("EXP-RAG", "INFERRED")],
+        biz_codes=set(),
+        customer_codes=set(),
+        project_name="PI",
+        customer_name=None,
+        responsibilities=None,
+        project_summary=None,
+    )
+    assert pref_explicit == pytest.approx(0.5)
+    assert pref_inferred == pytest.approx(0.5 * 0.70)
+    assert pref_explicit > pref_inferred
 
     # JOB root hierarchy: descendant count is not the denominator
     many = frozenset({f"JOB-AI-{i}" for i in range(10)} | {"JOB-AI", "JOB-AI-DEV"})
@@ -453,6 +502,8 @@ def test_rank_v2_component_normalization_and_caps() -> None:
     )
     assert explicit is not None and inferred is not None
     assert explicit > inferred
+    assert explicit == pytest.approx(1.0)
+    assert inferred == pytest.approx(0.70)
 
 
 def test_hard_filter_not_overridden_by_project_relevance(client: TestClient, db_session) -> None:
@@ -1100,15 +1151,23 @@ def test_certification_and_project_keyword_evidence_filter(
     db_session.commit()
     db_session.refresh(aws)
     db_session.refresh(pmp)
-    _add_evidence(
-        db_session,
-        person_id=seeded["person"].id,
-        target_type="CERTIFICATION",
-        target_id=aws.id,
-        field_name=None,
-        quote="AWS cert evidence",
-        page_no=1,
-    )
+
+    # Root + field-specific Evidence (expiry_date must NOT count for AWS name query)
+    for field_name, quote, page in [
+        (None, "AWS root evidence", 1),
+        ("certification_name", "AWS name evidence", 2),
+        ("issuer", "AWS issuer evidence", 3),
+        ("expiry_date", "AWS expiry evidence", 4),
+    ]:
+        _add_evidence(
+            db_session,
+            person_id=seeded["person"].id,
+            target_type="CERTIFICATION",
+            target_id=aws.id,
+            field_name=field_name,
+            quote=quote,
+            page_no=page,
+        )
     _add_evidence(
         db_session,
         person_id=seeded["person"].id,
@@ -1116,7 +1175,7 @@ def test_certification_and_project_keyword_evidence_filter(
         target_id=pmp.id,
         field_name=None,
         quote="PMP cert evidence",
-        page_no=2,
+        page_no=5,
     )
     demis = _add_project(
         db_session,
@@ -1137,7 +1196,7 @@ def test_certification_and_project_keyword_evidence_filter(
         target_id=demis.id,
         field_name="project_name",
         quote="DEMIS name evidence",
-        page_no=3,
+        page_no=6,
     )
     _add_evidence(
         db_session,
@@ -1146,10 +1205,12 @@ def test_certification_and_project_keyword_evidence_filter(
         target_id=unrelated.id,
         field_name="project_name",
         quote="ERP unrelated evidence",
-        page_no=4,
+        page_no=7,
     )
     try:
         _login(client, user.login_id)
+
+        # Query by certification_name token → root + name only (not issuer/expiry)
         resp = _search(
             client,
             {
@@ -1165,21 +1226,112 @@ def test_certification_and_project_keyword_evidence_filter(
             r for r in resp.json()["data"] if r["person_id"] == str(seeded["person"].id)
         )
         snippets = " ".join(e.get("snippet") or "" for e in row["evidence"])
-        assert "AWS cert evidence" in snippets or any(
-            m["evidence_count"] >= 1 for m in row["matches"] if m["type"] == "REQUIRED"
-        )
         cert_match = next(
             m for m in row["matches"] if m["type"] == "REQUIRED" and "AWS" in m["condition"]
         )
-        assert cert_match["evidence_count"] == 1
+        assert cert_match["evidence_count"] == 2  # root + certification_name
+        assert "AWS root evidence" in snippets or cert_match["evidence_count"] == 2
+        assert "AWS expiry evidence" not in snippets
+        assert "PMP cert evidence" not in snippets
         kw_match = next(
             m
             for m in row["matches"]
             if m["type"] == "REQUIRED" and "DEMIS" in m["condition"]
         )
         assert kw_match["evidence_count"] >= 1
-        assert "PMP cert evidence" not in snippets
         assert "ERP unrelated evidence" not in snippets
+
+        # Query by issuer token → root + issuer only
+        resp2 = _search(
+            client,
+            {"required": {"certifications": ["Amazon"]}, "page_size": 50},
+        )
+        assert resp2.status_code == 200, resp2.text
+        row2 = next(
+            r
+            for r in resp2.json()["data"]
+            if r["person_id"] == str(seeded["person"].id)
+        )
+        cert_match2 = next(
+            m
+            for m in row2["matches"]
+            if m["type"] == "REQUIRED" and "Amazon" in m["condition"]
+        )
+        assert cert_match2["evidence_count"] == 2  # root + issuer
+        snippets2 = " ".join(e.get("snippet") or "" for e in row2["evidence"])
+        assert "AWS expiry evidence" not in snippets2
+        assert "AWS name evidence" not in snippets2 or cert_match2["evidence_count"] == 2
+    finally:
+        _cleanup_person(db_session, seeded["person"].id)
+        _cleanup_user(db_session, user.id)
+
+
+def test_ongoing_project_recent_fallback_ordering(client: TestClient, db_session) -> None:
+    """No project signal → top_projects by COALESCE(end, start) DESC (ongoing not demoted)."""
+    from app.db.models.project import Project
+    from app.modules.search.project_ranking import (
+        format_project_period,
+        project_recent_sort_key,
+    )
+
+    suffix = uuid.uuid4().hex[:8]
+    user = _create_user(db_session, login_id=f"rf_{suffix}")
+    seeded = _seed_person(db_session, suffix=suffix)
+
+    # Soft-delete seed projects so ordering is deterministic from fixtures below.
+    for project in db_session.execute(
+        select(Project).where(Project.person_id == seeded["person"].id)
+    ).scalars():
+        project.deleted_at = datetime.now(UTC)
+    db_session.commit()
+
+    ongoing = _add_project(
+        db_session,
+        person_id=seeded["person"].id,
+        name="Ongoing 2025",
+        start=date(2025, 1, 1),
+        end=None,
+        duration_months=None,
+    )
+    mid = _add_project(
+        db_session,
+        person_id=seeded["person"].id,
+        name="Finished 2024",
+        start=date(2023, 1, 1),
+        end=date(2024, 1, 1),
+        duration_months=12,
+    )
+    old = _add_project(
+        db_session,
+        person_id=seeded["person"].id,
+        name="Finished 2022",
+        start=date(2022, 1, 1),
+        end=date(2022, 12, 1),
+        duration_months=11,
+    )
+
+    # Unit: sort key itself
+    ordered = sorted([ongoing, mid, old], key=project_recent_sort_key)
+    assert [p.id for p in ordered] == [ongoing.id, mid.id, old.id]
+    assert format_project_period(ongoing.start_date, ongoing.end_date) == "2025.01 ~ 현재"
+
+    try:
+        _login(client, user.login_id)
+        # Grade-only query → no project ranking signal → recent fallback.
+        resp = _search(
+            client,
+            {
+                "required": {"grade": {"values": ["EXPERT"]}},
+                "page_size": 50,
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        row = next(
+            r for r in resp.json()["data"] if r["person_id"] == str(seeded["person"].id)
+        )
+        top_ids = [p["project_id"] for p in row["top_projects"]]
+        assert top_ids[:3] == [str(ongoing.id), str(mid.id), str(old.id)]
+        assert row["top_projects"][0]["period"] == "2025.01 ~ 현재"
     finally:
         _cleanup_person(db_session, seeded["person"].id)
         _cleanup_user(db_session, user.id)

@@ -245,113 +245,105 @@ def compute_project_structured_score(
     responsibilities: str | None,
     project_summary: str | None,
 ) -> float | None:
+    """Absolute required/preferred quality factors, then unweighted mean.
+
+    Priority is applied to each active category's match ratio *before* averaging
+    so preferred-only perfect match stays 0.5 (not renormalized back to 1.0).
+
+    Examples:
+    - required-only perfect → 1.0
+    - preferred-only perfect → 0.5
+    - required + preferred both perfect → (1.0 + 0.5) / 2 = 0.75
+    - preferred EXP INFERRED → 0.5 * 0.70
+    """
     if not signals.has_structured:
         return None
 
-    parts: list[tuple[float, float]] = []
+    # Absolute qualities (priority already folded in); mean — not weight-normalize.
+    parts: list[float] = []
 
     if signals.required_job_groups:
         parts.append(
-            (
-                REQUIRED_CONDITION_WEIGHT,
-                clamp01(_job_group_ratio(signals.required_job_groups, job_codes)),
-            )
+            REQUIRED_CONDITION_WEIGHT
+            * clamp01(_job_group_ratio(signals.required_job_groups, job_codes))
         )
     if signals.preferred_job_groups:
         parts.append(
-            (
-                PREFERRED_CONDITION_WEIGHT,
-                clamp01(_job_group_ratio(signals.preferred_job_groups, job_codes)),
-            )
+            PREFERRED_CONDITION_WEIGHT
+            * clamp01(_job_group_ratio(signals.preferred_job_groups, job_codes))
         )
 
     if signals.required_skills:
         parts.append(
-            (
-                REQUIRED_CONDITION_WEIGHT,
-                clamp01(_code_set_ratio(skill_codes, signals.required_skills)),
-            )
+            REQUIRED_CONDITION_WEIGHT
+            * clamp01(_code_set_ratio(skill_codes, signals.required_skills))
         )
     if signals.preferred_skills:
         parts.append(
-            (
-                PREFERRED_CONDITION_WEIGHT,
-                clamp01(_code_set_ratio(skill_codes, signals.preferred_skills)),
-            )
+            PREFERRED_CONDITION_WEIGHT
+            * clamp01(_code_set_ratio(skill_codes, signals.preferred_skills))
         )
 
     if signals.required_expertise:
         parts.append(
-            (
-                REQUIRED_CONDITION_WEIGHT,
-                clamp01(_expertise_ratio(signals.required_expertise, expertise_rows)),
-            )
+            REQUIRED_CONDITION_WEIGHT
+            * clamp01(_expertise_ratio(signals.required_expertise, expertise_rows))
         )
     if signals.preferred_expertise:
         parts.append(
-            (
-                PREFERRED_CONDITION_WEIGHT,
-                clamp01(_expertise_ratio(signals.preferred_expertise, expertise_rows)),
-            )
+            PREFERRED_CONDITION_WEIGHT
+            * clamp01(_expertise_ratio(signals.preferred_expertise, expertise_rows))
         )
 
     if signals.required_business_domains:
         parts.append(
-            (
-                REQUIRED_CONDITION_WEIGHT,
-                clamp01(
-                    _code_set_ratio(biz_codes, signals.required_business_domains)
-                ),
-            )
+            REQUIRED_CONDITION_WEIGHT
+            * clamp01(_code_set_ratio(biz_codes, signals.required_business_domains))
         )
     if signals.preferred_business_domains:
         parts.append(
-            (
-                PREFERRED_CONDITION_WEIGHT,
-                clamp01(
-                    _code_set_ratio(biz_codes, signals.preferred_business_domains)
-                ),
-            )
+            PREFERRED_CONDITION_WEIGHT
+            * clamp01(_code_set_ratio(biz_codes, signals.preferred_business_domains))
         )
 
     if signals.required_customer_types:
         parts.append(
-            (
-                REQUIRED_CONDITION_WEIGHT,
-                clamp01(
-                    _code_set_ratio(customer_codes, signals.required_customer_types)
-                ),
+            REQUIRED_CONDITION_WEIGHT
+            * clamp01(
+                _code_set_ratio(customer_codes, signals.required_customer_types)
             )
         )
     if signals.preferred_customer_types:
         parts.append(
-            (
-                PREFERRED_CONDITION_WEIGHT,
-                clamp01(
-                    _code_set_ratio(customer_codes, signals.preferred_customer_types)
-                ),
+            PREFERRED_CONDITION_WEIGHT
+            * clamp01(
+                _code_set_ratio(customer_codes, signals.preferred_customer_types)
             )
         )
 
     if signals.project_keywords:
         parts.append(
-            (
-                REQUIRED_CONDITION_WEIGHT,
-                clamp01(
-                    _keyword_blob_ratio(
-                        signals.project_keywords,
-                        project_name=project_name,
-                        customer_name=customer_name,
-                        responsibilities=responsibilities,
-                        project_summary=project_summary,
-                    )
-                ),
+            REQUIRED_CONDITION_WEIGHT
+            * clamp01(
+                _keyword_blob_ratio(
+                    signals.project_keywords,
+                    project_name=project_name,
+                    customer_name=customer_name,
+                    responsibilities=responsibilities,
+                    project_summary=project_summary,
+                )
             )
         )
 
     if not parts:
         return None
-    return normalize_weighted_parts(parts)
+    return sum(parts) / len(parts)
+
+
+def project_recent_sort_key(project: Project) -> tuple:
+    """Context top-project fallback: COALESCE(end_date, start_date) DESC, id ASC."""
+    recent = project.end_date or project.start_date or date.min
+    return (-recent.toordinal(), str(project.id))
 
 
 def compute_project_base_score(
