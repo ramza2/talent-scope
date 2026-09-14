@@ -6,6 +6,7 @@ from app.modules.search.document_builder import (
     build_search_documents_for_person,
     content_hash,
 )
+from app.modules.search.router import router
 from app.modules.search.schemas import SEARCH_DOCUMENT_VERSION, SearchDocument
 from app.modules.search.service import SearchIndexService
 
@@ -17,4 +18,5 @@ __all__ = [
     "build_project_search_document",
     "build_search_documents_for_person",
     "content_hash",
+    "router",
 ]

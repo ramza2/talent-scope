@@ -270,7 +270,9 @@ Document READY
 - Search Document version: `document-chunk-search-v1` (PROFILE/PROJECT의 `search-doc-v1`과 분리).
 - Embedding 대상 object_type: `PROFILE` / `PROJECT` / `DOCUMENT_CHUNK`.
 - effective highest READY Document version만 active DOCUMENT_CHUNK index를 갖는다.
-- Search API / Hybrid Ranking / Query Embedding / Reranker는 아직 미구현이다.
+- `POST /search/people` Hybrid Search(Structured Hard Filter + Keyword FTS/trgm + pgvector)와 결정적 RRF Ranking은 구현됨.
+- Query Embedding은 검색 요청 시 Embedding Provider로 수행한다(`EMBEDDING_ENABLED` 필요).
+- `POST /search/interpret`(자연어 조건해석), Evidence/top_projects 상세 연결, 조건완화(relaxations), Reranker는 아직 TODO다.
 
 최근성은 보정값으로 사용하며 오래된 경험을 과도하게 감점하지 않는다.
 

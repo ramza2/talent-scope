@@ -549,7 +549,7 @@ Embedding 대상:
 
 - Confirmed Person Profile (`search_index_item` PROFILE) — 현재 구현
 - Confirmed Project (`search_index_item` PROJECT) — 현재 구현
-- Document Chunk — 아직 미구현
+- Document Chunk (`search_index_item` DOCUMENT_CHUNK) — 현재 구현
 
 Embedding과 FTS 데이터는 `search_index_item`에 저장한다.
 validity는 embedding_model + embedding_version(pipeline+input-cap) + content_hash + search_document_version으로 판단한다.
@@ -600,6 +600,9 @@ Qwen3 Query Parser
 - 여러 Project/Chunk 결과를 `person_id` 기준으로 병합한다.
 - LLM이 인력 전체를 읽고 임의 점수를 부여하지 않는다.
 - 최종 적합도는 Backend Rule로 계산한다.
+
+**현재 구현:** `POST /api/v1/search/people`가 Structured Hard Filter + Keyword(FTS/trgm) + pgvector Semantic + 결정적 RRF Hybrid Ranking을 수행한다.
+자연어 조건해석(`POST /search/interpret`), Evidence/`top_projects` 상세 연결, 조건완화(relaxations)는 아직 TODO다.
 
 별도 Elasticsearch/OpenSearch/Vector DB는 검색 규모가 PostgreSQL 단독 운영한계를 넘을 때 검토한다.
 
