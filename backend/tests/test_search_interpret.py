@@ -149,6 +149,28 @@ def _ensure_code(
 
 
 def _seed_catalog(db) -> None:
+    """Seed interpret codes and isolate from polluted shared DB catalog rows."""
+    from sqlalchemy import text as sql_text
+
+    # Deactivate hex-suffixed / filler pollution so FakeLLM seed codes remain
+    # inside the prompt subset under SEARCH_INTERPRET_MAX_CODE_CONTEXT_CHARS.
+    db.execute(
+        sql_text(
+            r"""
+            UPDATE code_master SET is_active = false
+            WHERE is_active = true
+              AND code_type IN ('JOB','TECH','EXP','BIZ','CUSTOMER_TYPE')
+              AND (
+                code ~ '-[0-9a-f]{6,}$'
+                OR code LIKE 'TECH-FILL-%'
+                OR (code LIKE 'JOB-AI-%' AND code <> 'JOB-AI-DEV')
+                OR code LIKE 'EXP-RAG-%'
+                OR code IN ('TECH-OMITTED', 'TECH-TEMP')
+              )
+            """
+        )
+    )
+    db.commit()
     _ensure_code(db, "JOB-AI-DEV", "JOB", "AI 개발자", aliases=["AI Engineer"])
     _ensure_code(db, "JOB-DBA", "JOB", "DBA")
     _ensure_code(db, "TECH-LANG-PYTHON", "TECH", "Python", aliases=["파이썬"])
@@ -770,3 +792,188 @@ def test_interpret_assumptions_bounds(client, db_session):
             _clear_llm(client)
     finally:
         _cleanup_user(db_session, user.id)
+
+
+def test_interpret_nested_extra_fields_502(client, db_session):
+    """Nested unknown keys in LLM JSON must 502 (no silent drop)."""
+    from app.ai.providers.llm import FakeLLMProvider
+
+    user = _create_user(db_session, login_id=f"nx_{uuid.uuid4().hex[:8]}")
+    try:
+        _seed_catalog(db_session)
+        _login(client, user.login_id)
+
+        cases = [
+            {
+                **_llm_payload(preferred=_empty_preferred(), semantic_query=None),
+                "required": {**_empty_required(), "person_ids": ["x"]},
+            },
+            {
+                **_llm_payload(preferred=_empty_preferred(), semantic_query=None),
+                "required": {
+                    **_empty_required(),
+                    "excluded_skills": ["Java"],
+                },
+            },
+            {
+                **_llm_payload(semantic_query=None),
+                "preferred": {
+                    **_empty_preferred(),
+                    "certifications": ["CISSP"],
+                },
+            },
+            {
+                **_llm_payload(preferred=_empty_preferred(), semantic_query=None),
+                "required": {
+                    **_empty_required(),
+                    "career": {"min_months": 120, "recent_years": 3},
+                },
+            },
+            {
+                **_llm_payload(preferred=_empty_preferred(), semantic_query=None),
+                "required": {
+                    **_empty_required(),
+                    "grade": {"values": ["EXPERT"], "min_level": 4},
+                },
+            },
+        ]
+
+        for payload in cases:
+            llm = FakeLLMProvider(profile_json=payload)
+            _install_llm(client, llm)
+            try:
+                resp = _interpret(client, {"text": "nested extra"})
+                assert resp.status_code == 502, (payload, resp.text)
+                assert resp.json()["code"] == "SEARCH_INTERPRETATION_INVALID"
+                assert llm.calls == 1
+            finally:
+                _clear_llm(client)
+    finally:
+        _cleanup_user(db_session, user.id)
+
+
+def test_interpret_previous_query_nested_extra_4xx_no_provider(client, db_session):
+    from app.ai.providers.llm import FakeLLMProvider
+
+    user = _create_user(db_session, login_id=f"np_{uuid.uuid4().hex[:8]}")
+    try:
+        _seed_catalog(db_session)
+        _login(client, user.login_id)
+        llm = FakeLLMProvider(profile_json=_llm_payload())
+        _install_llm(client, llm)
+        try:
+            previous = {
+                "query_version": "1.0",
+                "required": {
+                    **_empty_required(jobs=["JOB-AI-DEV"]),
+                    "excluded_skills": ["Java"],
+                },
+                "preferred": _empty_preferred(),
+                "skill_match_mode": "ANY",
+                "semantic_query": None,
+                "keyword_query": None,
+                "sort": "RELEVANCE",
+                "assumptions": [],
+            }
+            resp = _interpret(
+                client, {"text": "이어서", "previous_query": previous}
+            )
+            assert resp.status_code in {400, 422}, resp.text
+            assert llm.calls == 0
+        finally:
+            _clear_llm(client)
+    finally:
+        _cleanup_user(db_session, user.id)
+
+
+def test_interpret_prompt_omitted_code_and_alias_502(client, db_session, monkeypatch):
+    """Active DB codes omitted from prompt catalog must not resolve (502)."""
+    from app.ai.providers.llm import FakeLLMProvider
+    from app.modules.search import interpret_policy
+    from app.modules.search.interpret_repository import SearchInterpretRepository
+    from app.modules.search.interpret_service import SearchInterpretService
+
+    user = _create_user(db_session, login_id=f"om_{uuid.uuid4().hex[:8]}")
+    try:
+        _seed_catalog(db_session)
+        # Fill catalog so TECH-OMITTED is crowded out under a small budget.
+        for i in range(20):
+            _ensure_code(db_session, f"TECH-FILL-{i:02d}", "TECH", f"Filler{i:02d}")
+        _ensure_code(
+            db_session,
+            "TECH-OMITTED",
+            "TECH",
+            "HiddenTech",
+            aliases=["히든기술"],
+        )
+        _login(client, user.login_id)
+
+        monkeypatch.setattr(
+            interpret_policy, "SEARCH_INTERPRET_MAX_CODE_CONTEXT_CHARS", 80
+        )
+        monkeypatch.setattr(
+            "app.modules.search.interpret_service.SEARCH_INTERPRET_MAX_CODE_CONTEXT_CHARS",
+            80,
+        )
+
+        repo = SearchInterpretRepository(db_session)
+        catalog = repo.load_active_catalog()
+        svc = SearchInterpretService(db_session)
+        text, truncated, count, included = svc._format_catalog(
+            catalog,
+            text_tokens=svc._tokens_from_text("특급 AI 개발자"),
+            priority_codes=set(),
+            max_chars=80,
+        )
+        included_codes = {c.code for c in included}
+        assert "TECH-OMITTED" not in included_codes
+        assert truncated or "TECH-OMITTED" not in text
+
+        for skill_token in ("TECH-OMITTED", "HiddenTech", "히든기술"):
+            payload = _llm_payload(
+                required=_empty_required(skills=[skill_token]),
+                preferred=_empty_preferred(),
+                semantic_query=None,
+            )
+            llm = FakeLLMProvider(profile_json=payload)
+            _install_llm(client, llm)
+            try:
+                resp = _interpret(client, {"text": "특급 AI 개발자"})
+                assert resp.status_code == 502, (skill_token, resp.text)
+                assert resp.json()["code"] == "SEARCH_INTERPRETATION_INVALID"
+            finally:
+                _clear_llm(client)
+    finally:
+        _cleanup_user(db_session, user.id)
+
+
+def test_interpret_priority_previous_codes_survive_truncation(db_session, monkeypatch):
+    """previous_query codes must be included even when catalog budget is tiny."""
+    from app.modules.search import interpret_policy
+    from app.modules.search.interpret_repository import SearchInterpretRepository
+    from app.modules.search.interpret_service import SearchInterpretService
+
+    _seed_catalog(db_session)
+    for i in range(30):
+        _ensure_code(db_session, f"TECH-FILL-{i:02d}", "TECH", f"Filler{i:02d}")
+
+    monkeypatch.setattr(
+        interpret_policy, "SEARCH_INTERPRET_MAX_CODE_CONTEXT_CHARS", 120
+    )
+    monkeypatch.setattr(
+        "app.modules.search.interpret_service.SEARCH_INTERPRET_MAX_CODE_CONTEXT_CHARS",
+        120,
+    )
+
+    repo = SearchInterpretRepository(db_session)
+    catalog = repo.load_active_catalog()
+    svc = SearchInterpretService(db_session)
+    _text, _trunc, _count, included = svc._format_catalog(
+        catalog,
+        text_tokens=set(),
+        priority_codes={"JOB-AI-DEV", "EXP-AI-RAG"},
+        max_chars=120,
+    )
+    included_codes = {c.code for c in included}
+    assert "JOB-AI-DEV" in included_codes
+    assert "EXP-AI-RAG" in included_codes

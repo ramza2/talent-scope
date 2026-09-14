@@ -85,3 +85,89 @@ def collect_codes_from_query_dict(data: dict[str, Any]) -> set[str]:
                     if isinstance(v, str) and v.strip():
                         codes.add(v.strip())
     return codes
+
+
+# Nested allowlists for recursive strict validation (interpret-only).
+# /search/people schemas intentionally keep extra="ignore" for API compat;
+# interpret LLM/previous_query payloads must not silently drop unknown keys.
+REQUIRED_BLOCK_KEYS = frozenset(
+    {
+        "jobs",
+        "skills",
+        "expertise",
+        "business_domains",
+        "customer_types",
+        "grade",
+        "career",
+        "affiliations",
+        "certifications",
+        "project_keywords",
+    }
+)
+PREFERRED_BLOCK_KEYS = frozenset(
+    {
+        "jobs",
+        "skills",
+        "expertise",
+        "business_domains",
+        "customer_types",
+    }
+)
+GRADE_KEYS = frozenset({"values"})
+CAREER_KEYS = frozenset({"min_months", "max_months"})
+LLM_ROOT_KEYS = frozenset(
+    {
+        "required",
+        "preferred",
+        "skill_match_mode",
+        "semantic_query",
+        "keyword_query",
+        "sort",
+        "assumptions",
+    }
+)
+INTERPRET_DATA_ROOT_KEYS = LLM_ROOT_KEYS | frozenset({"query_version"})
+
+
+def _forbid_unknown_keys(
+    obj: dict[str, Any], allowed: frozenset[str], *, path: str
+) -> None:
+    unknown = sorted(set(obj.keys()) - allowed)
+    if unknown:
+        raise ValueError(f"unknown fields at {path}: {', '.join(unknown)}")
+
+
+def assert_strict_interpret_payload(
+    payload: Any, *, include_query_version: bool
+) -> None:
+    """Recursively reject unknown nested keys before nested Pydantic models run.
+
+    Raises ValueError on any non-allowlisted key (no silent drop).
+    """
+    if not isinstance(payload, dict):
+        raise ValueError("payload must be an object")
+
+    root_allowed = INTERPRET_DATA_ROOT_KEYS if include_query_version else LLM_ROOT_KEYS
+    _forbid_unknown_keys(payload, root_allowed, path="root")
+
+    required = payload.get("required")
+    if required is not None:
+        if not isinstance(required, dict):
+            raise ValueError("required must be an object")
+        _forbid_unknown_keys(required, REQUIRED_BLOCK_KEYS, path="required")
+        grade = required.get("grade")
+        if grade is not None:
+            if not isinstance(grade, dict):
+                raise ValueError("required.grade must be an object")
+            _forbid_unknown_keys(grade, GRADE_KEYS, path="required.grade")
+        career = required.get("career")
+        if career is not None:
+            if not isinstance(career, dict):
+                raise ValueError("required.career must be an object")
+            _forbid_unknown_keys(career, CAREER_KEYS, path="required.career")
+
+    preferred = payload.get("preferred")
+    if preferred is not None:
+        if not isinstance(preferred, dict):
+            raise ValueError("preferred must be an object")
+        _forbid_unknown_keys(preferred, PREFERRED_BLOCK_KEYS, path="preferred")

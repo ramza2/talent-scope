@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from app.modules.search.interpret_policy import (
     SEARCH_INTERPRET_MAX_TEXT_CHARS,
     SEARCH_QUERY_VERSION,
+    assert_strict_interpret_payload,
     normalize_assumptions,
 )
 from app.modules.search.query_schemas import (
@@ -39,7 +40,7 @@ class SearchInterpretRequest(BaseModel):
 
 
 class SearchInterpretLLMOutput(BaseModel):
-    """Strict LLM JSON shape — extra fields forbidden."""
+    """Strict LLM JSON shape — root and nested extra fields forbidden."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -50,6 +51,13 @@ class SearchInterpretLLMOutput(BaseModel):
     keyword_query: str | None = None
     sort: SearchSort = "RELEVANCE"
     assumptions: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_nested_unknown_fields(cls, value: Any) -> Any:
+        # Shared SearchConditionBlock allows extra=ignore; enforce allowlist here.
+        assert_strict_interpret_payload(value, include_query_version=False)
+        return value
 
     @field_validator("assumptions", mode="before")
     @classmethod
@@ -85,6 +93,20 @@ class SearchInterpretData(BaseModel):
     keyword_query: str | None = None
     sort: SearchSort = "RELEVANCE"
     assumptions: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_nested_unknown_fields(cls, value: Any) -> Any:
+        # previous_query JSON must reject nested extras. When constructing from
+        # already-validated model instances (service success path), skip.
+        if isinstance(value, dict):
+            required = value.get("required")
+            preferred = value.get("preferred")
+            if (required is None or isinstance(required, dict)) and (
+                preferred is None or isinstance(preferred, dict)
+            ):
+                assert_strict_interpret_payload(value, include_query_version=True)
+        return value
 
     @field_validator("assumptions", mode="before")
     @classmethod

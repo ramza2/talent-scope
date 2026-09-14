@@ -74,7 +74,12 @@ class SearchInterpretService:
             if previous is not None
             else set()
         )
-        catalog_text, catalog_truncated, catalog_code_count = self._format_catalog(
+        (
+            catalog_text,
+            catalog_truncated,
+            catalog_code_count,
+            included_catalog,
+        ) = self._format_catalog(
             catalog,
             text_tokens=text_tokens,
             priority_codes=priority_codes,
@@ -108,9 +113,10 @@ class SearchInterpretService:
             )
             raise SearchInterpretationInvalidError() from None
 
+        # Resolve only against codes actually present in the prompt subset.
         resolved = self._resolve_ai_codes(
             llm_out.model_dump(mode="python"),
-            catalog=catalog,
+            catalog=included_catalog,
         )
 
         try:
@@ -316,24 +322,46 @@ class SearchInterpretService:
                 parts.append(normalize_alias(cleaned))
         return set(parts)
 
+    @staticmethod
+    def _catalog_line(item: CatalogCode, *, max_len: int) -> str | None:
+        """Build one catalog line; shrink aliases deterministically to fit max_len."""
+        aliases = list(item.aliases)
+        while True:
+            alias_part = "|".join(aliases)
+            line = (
+                f"{item.code}\t{item.name}\t{alias_part}"
+                if alias_part
+                else f"{item.code}\t{item.name}"
+            )
+            if len(line) <= max_len:
+                return line
+            if not aliases:
+                return None
+            aliases.pop()  # aliases are already sorted; drop last for determinism
+
     def _format_catalog(
         self,
         catalog: list[CatalogCode],
         *,
         text_tokens: set[str],
         priority_codes: set[str],
-    ) -> tuple[str, bool, int]:
-        def mentions(item: CatalogCode) -> bool:
-            cands = [normalize_alias(item.code), normalize_alias(item.name)]
-            cands.extend(normalize_alias(a) for a in item.aliases)
-            for token in text_tokens:
-                if not token:
-                    continue
-                for cand in cands:
-                    if cand and (token == cand or token in cand or cand in token):
-                        return True
-            return False
+        max_chars: int | None = None,
+    ) -> tuple[str, bool, int, list[CatalogCode]]:
+        """Format prompt catalog and return the exact included CatalogCode subset."""
+        budget = (
+            SEARCH_INTERPRET_MAX_CODE_CONTEXT_CHARS if max_chars is None else max_chars
+        )
 
+        def mentions(item: CatalogCode) -> bool:
+            # Direct mention only: exact token equality against code/name/alias.
+            # Avoid short substring hits (e.g. "ai") flooding tier-2 and
+            # crowding out higher-priority codes under the context budget.
+            cands = {normalize_alias(item.code), normalize_alias(item.name)}
+            cands.update(normalize_alias(a) for a in item.aliases)
+            cands.discard("")
+            return bool(cands & text_tokens)
+
+        # Preserve priority: previous_query codes → text mentions → remainder.
         tier1 = [c for c in catalog if c.code in priority_codes]
         tier1_set = {c.code for c in tier1}
         tier2 = [c for c in catalog if c.code not in tier1_set and mentions(c)]
@@ -344,31 +372,42 @@ class SearchInterpretService:
         ordered = tier1 + tier2 + tier3
 
         lines: list[str] = []
+        included_items: list[CatalogCode] = []
         used = 0
-        included = 0
         truncated = False
         current_type: str | None = None
         for item in ordered:
+            header: str | None = None
+            header_cost = 0
             if item.code_type != current_type:
                 header = f"[{item.code_type}]"
-                need = len(header) + (1 if lines else 0)
-                if used + need > SEARCH_INTERPRET_MAX_CODE_CONTEXT_CHARS:
+                header_cost = len(header) + (1 if lines else 0)
+
+            newline_before_line = 1 if (lines or header) else 0
+            remaining = budget - used - header_cost - newline_before_line
+            if remaining <= 0:
+                truncated = True
+                break
+
+            line = self._catalog_line(item, max_len=remaining)
+            if line is None:
+                truncated = True
+                break
+
+            if header is not None:
+                if used + header_cost > budget:
                     truncated = True
                     break
                 lines.append(header)
-                used += need
+                used += header_cost
                 current_type = item.code_type
-            alias_part = "|".join(item.aliases)
-            line = (
-                f"{item.code}\t{item.name}\t{alias_part}"
-                if alias_part
-                else f"{item.code}\t{item.name}"
-            )
+
             need = len(line) + 1
-            if used + need > SEARCH_INTERPRET_MAX_CODE_CONTEXT_CHARS:
+            if used + need > budget:
                 truncated = True
                 break
             lines.append(line)
             used += need
-            included += 1
-        return "\n".join(lines), truncated, included
+            included_items.append(item)
+
+        return "\n".join(lines), truncated, len(included_items), included_items
