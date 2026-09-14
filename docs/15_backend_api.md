@@ -894,7 +894,7 @@ POST /search/people
 | Endpoint | 상태 |
 |---|---|
 | `POST /search/people` | 구현됨 — Structured Hard Filter + Keyword(FTS/`pg_trgm`) + pgvector Semantic, Person 병합, 결정적 RRF Ranking |
-| `POST /search/interpret` | TODO — 자연어 조건해석 |
+| `POST /search/interpret` | 구현됨 — NL→Query JSON (Qwen3), Code/Alias 정규화, SearchPeopleRequest 호환 검증 |
 | Evidence / `top_projects` 상세 연결 | TODO — 응답 scaffold만 (`evidence=[]`, `top_projects=[]`) |
 | `relaxations` 조건완화 | TODO — 항상 `[]` |
 | `POST /search/explain` | TODO |
@@ -904,6 +904,9 @@ POST /search/people
 
 ### `POST /search/interpret`
 
+인증된 USER/ADMIN이 호출한다. 읽기 전용 AI 변환 POST이므로 CSRF를 요구하지 않는다.
+DB mutation / AuditLog / Celery / Embedding / 실제 검색 실행이 없다.
+
 Request:
 
 ```json
@@ -912,6 +915,9 @@ Request:
   "previous_query": null
 }
 ```
+
+- `text`: trim, blank 금지, max 2000 chars
+- `previous_query`: null 또는 직전 interpret `data`(typed). Client untrusted input으로 재검증. 잘못된 코드는 LLM 호출 전 `400 SEARCH_INVALID_CODE`. 알 수 없는 `query_version`은 422.
 
 Response:
 
@@ -926,7 +932,10 @@ Response:
       "business_domains": [],
       "customer_types": [],
       "grade": {"values": ["EXPERT"]},
-      "career": null
+      "career": null,
+      "affiliations": [],
+      "certifications": [],
+      "project_keywords": []
     },
     "preferred": {
       "jobs": [],
@@ -935,6 +944,7 @@ Response:
       "business_domains": [],
       "customer_types": []
     },
+    "skill_match_mode": "ANY",
     "semantic_query": "LLM/RAG 기반 AI 시스템 개발 경험",
     "keyword_query": null,
     "sort": "RELEVANCE",
@@ -945,7 +955,16 @@ Response:
 }
 ```
 
-AI는 Code Alias를 가능한 표준코드로 정규화하며 임의의 인력 ID나 적합도 점수를 생성하지 않는다.
+구현 요약:
+
+- Prompt version `search-interpret-v1`, Query version `1.0` (Backend 고정)
+- Active Code Catalog만 제공 (JOB/TECH/EXP/BIZ/CUSTOMER_TYPE). DOC_TYPE 제외
+- Alias exact normalize 후 표준 `CodeMaster.code`만 반환
+- 최종 executable field는 `SearchPeopleRequest`로 재검증
+- Provider 실패: `503 SEARCH_INTERPRETATION_UNAVAILABLE`
+- Invalid AI output: `502 SEARCH_INTERPRETATION_INVALID`
+- LLM은 인력 ID/점수/SQL/검색결과를 생성하지 않으며 Prompt Injection 지시를 실행하지 않는다
+- 미지원 조건(Negative Hard Filter, 프로젝트 기간 Hard Filter 등)은 임의 Hard Filter로 바꾸지 않고 assumptions에 남긴다
 
 ### Search Query
 
