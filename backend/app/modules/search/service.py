@@ -21,6 +21,7 @@ from app.modules.search.repository import (
     lock_person_profile_for_update,
 )
 from app.modules.search.schemas import (
+    OBJECT_TYPE_DOCUMENT_CHUNK,
     OBJECT_TYPE_PROFILE,
     OBJECT_TYPE_PROJECT,
 )
@@ -166,7 +167,19 @@ class SearchIndexService:
                     return ProcessJobResult(job_id=job_id, status="FAILED", claimed=True)
                 result = self._rebuild_person(locked)
             else:
-                result = self._embed_search_index_item(locked)
+                payload = locked.payload_json if isinstance(locked.payload_json, dict) else {}
+                operation = payload.get("operation")
+                if operation == "SYNC_DOCUMENT_CHUNKS":
+                    result = self._sync_document_chunks(locked)
+                elif operation == "EMBED_SEARCH_INDEX_ITEM":
+                    result = self._embed_search_index_item(locked)
+                else:
+                    self.repo.mark_unsupported_action_failed(
+                        locked,
+                        error_message="unsupported upsert operation",
+                    )
+                    self.db.commit()
+                    return ProcessJobResult(job_id=job_id, status="FAILED", claimed=True)
             self.db.commit()
             return result
         except SearchIndexProcessingError as exc:
@@ -305,6 +318,52 @@ class SearchIndexService:
         finally:
             fail_db.close()
 
+
+    def _sync_document_chunks(self, job: SearchIndexJob) -> ProcessJobResult:
+        """Process UPSERT + SYNC_DOCUMENT_CHUNKS using live DocumentGroup state."""
+        from app.modules.search.document_chunk_policy import OPERATION_SYNC_DOCUMENT_CHUNKS
+        from app.modules.search.document_chunk_sync import DocumentChunkSyncService
+
+        payload = job.payload_json if isinstance(job.payload_json, dict) else {}
+        if payload.get("operation") != OPERATION_SYNC_DOCUMENT_CHUNKS:
+            self.repo.mark_unsupported_action_failed(
+                job,
+                error_message="unsupported upsert operation",
+            )
+            return ProcessJobResult(job_id=job.id, status="FAILED", claimed=True)
+
+        raw_group_id = payload.get("document_group_id") or job.object_id
+        try:
+            group_id = UUID(str(raw_group_id))
+        except Exception as exc:
+            raise SearchIndexProcessingError("document chunk synchronization failed") from exc
+
+        try:
+            counts = DocumentChunkSyncService(self.db).sync_document_group(group_id)
+        except SearchIndexProcessingError:
+            raise
+        except Exception as exc:
+            raise SearchIndexProcessingError("document chunk synchronization failed") from None
+
+        self.repo.mark_job_completed(job)
+        logger.info(
+            "search_index document_chunk sync completed job_id=%s group_id=%s "
+            "chunks=%s upserted=%s deactivated=%s embedding_jobs=%s",
+            job.id,
+            group_id,
+            counts.get("chunks"),
+            counts.get("upserted"),
+            counts.get("deactivated"),
+            counts.get("embedding_jobs"),
+        )
+        return ProcessJobResult(
+            job_id=job.id,
+            status="COMPLETED",
+            claimed=True,
+            upserted_count=int(counts.get("upserted") or 0),
+            deactivated_count=int(counts.get("deactivated") or 0),
+        )
+
     def _embed_search_index_item(self, job: SearchIndexJob) -> ProcessJobResult:
         """Process UPSERT + EMBED_SEARCH_INDEX_ITEM without item lock during API call."""
         from app.ai.providers.embedding import get_embedding_provider
@@ -380,7 +439,7 @@ class SearchIndexService:
         if item is None or not item.is_active:
             self.repo.mark_job_completed(job)
             return ProcessJobResult(job_id=job.id, status="COMPLETED", claimed=True)
-        if item.object_type not in {OBJECT_TYPE_PROFILE, OBJECT_TYPE_PROJECT}:
+        if item.object_type not in {OBJECT_TYPE_PROFILE, OBJECT_TYPE_PROJECT, OBJECT_TYPE_DOCUMENT_CHUNK}:
             self.repo.mark_job_completed(job)
             return ProcessJobResult(job_id=job.id, status="COMPLETED", claimed=True)
         if not (item.search_text or "").strip():
@@ -453,7 +512,13 @@ class SearchIndexService:
         return ProcessJobResult(job_id=job.id, status="COMPLETED", claimed=True)
 
     def enqueue_missing_embeddings(self, *, limit: int = 100) -> dict[str, int]:
-        """Ensure PENDING Embedding UPSERT jobs for missing/outdated items."""
+        """Ensure PENDING Embedding UPSERT jobs for missing/outdated items.
+
+        Uses DB-filtered keyset scans so completed embeddings do not occupy the
+        LIMIT window. Exhausted/backoff outcomes are skipped by advancing the
+        cursor until ``target`` work is secured or the keyspace ends (no
+        per-invocation hard scan cap that could starve later rows).
+        """
         from app.core.config import get_settings
 
         empty = {
@@ -465,23 +530,43 @@ class SearchIndexService:
         }
         if not get_settings().embedding_enabled:
             return empty
-        items = self.repo.list_items_needing_embedding(
-            limit=max(0, min(int(limit), 500))
-        )
+
+        target = max(0, min(int(limit), 500))
+        if target <= 0:
+            return empty
+
         created_or_requeued = 0
         already_pending = 0
         exhausted = 0
-        for item in items:
-            _job, outcome = self.repo.ensure_embedding_job(item)
-            if outcome in {"created", "requeued"}:
-                created_or_requeued += 1
-            elif outcome in {"already_pending", "already_processing"}:
-                already_pending += 1
-            elif outcome in {"exhausted", "backoff"}:
-                exhausted += 1
+        scanned = 0
+        after_id = None
+        page_size = min(100, max(target, 1))
+
+        while (created_or_requeued + already_pending) < target:
+            batch = self.repo.list_items_needing_embedding(
+                limit=page_size,
+                after_id=after_id,
+            )
+            if not batch:
+                break
+            for item in batch:
+                scanned += 1
+                after_id = item.id
+                _job, outcome = self.repo.ensure_embedding_job(item)
+                if outcome in {"created", "requeued"}:
+                    created_or_requeued += 1
+                elif outcome in {"already_pending", "already_processing"}:
+                    already_pending += 1
+                elif outcome in {"exhausted", "backoff"}:
+                    exhausted += 1
+                if (created_or_requeued + already_pending) >= target:
+                    break
+            if len(batch) < page_size:
+                break
+
         self.db.commit()
         return {
-            "scanned": len(items),
+            "scanned": scanned,
             "enqueued": created_or_requeued,
             "created_or_requeued": created_or_requeued,
             "already_pending": already_pending,
@@ -490,6 +575,33 @@ class SearchIndexService:
 
 
 
+
+
+    def enqueue_missing_document_chunk_syncs(self, *, limit: int = 100) -> dict[str, int]:
+        """Ensure PENDING SYNC_DOCUMENT_CHUNKS jobs for groups needing sync."""
+        from app.modules.search.document_chunk_sync import DocumentChunkSyncService
+
+        sync = DocumentChunkSyncService(self.db)
+        group_ids = sync.list_groups_needing_chunk_sync(limit=max(0, min(int(limit), 500)))
+        created_or_requeued = 0
+        already_pending = 0
+        already_completed = 0
+        for group_id in group_ids:
+            _job, outcome = sync.ensure_sync_job(group_id)
+            if outcome in {"created", "requeued"}:
+                created_or_requeued += 1
+            elif outcome in {"already_pending", "already_processing"}:
+                already_pending += 1
+            elif outcome == "already_completed":
+                already_completed += 1
+        self.db.commit()
+        return {
+            "scanned": len(group_ids),
+            "enqueued": created_or_requeued,
+            "created_or_requeued": created_or_requeued,
+            "already_pending": already_pending,
+            "already_completed": already_completed,
+        }
 
 
 def process_search_index_job_id(job_id: UUID | str) -> ProcessJobResult:

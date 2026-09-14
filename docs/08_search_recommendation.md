@@ -255,7 +255,22 @@ fingerprint 기반이다. DB `SearchIndexJob`이 상태 SoT이며, Embedding Wor
 OpenAI-compatible BGE-M3 API를 호출해 `VECTOR(1024)`를 검증·저장한다.
 
 content_hash / model / version이 바뀌면 재Embedding하고, mid-call stale write는 폐기한다.
-`DOCUMENT_CHUNK` Embedding·Search API / Hybrid Ranking은 아직 미구현이다.
+
+### DocumentChunk → DOCUMENT_CHUNK Embedding (현재)
+
+```text
+Document READY
+  → DocumentPage
+  → DocumentChunk (deterministic, page-local)
+  → DOCUMENT_CHUNK SearchIndexItem (source_weight=0.700)
+  → Embedding UPSERT Job
+  → BGE-M3 VECTOR(1024)
+```
+
+- Search Document version: `document-chunk-search-v1` (PROFILE/PROJECT의 `search-doc-v1`과 분리).
+- Embedding 대상 object_type: `PROFILE` / `PROJECT` / `DOCUMENT_CHUNK`.
+- effective highest READY Document version만 active DOCUMENT_CHUNK index를 갖는다.
+- Search API / Hybrid Ranking / Query Embedding / Reranker는 아직 미구현이다.
 
 최근성은 보정값으로 사용하며 오래된 경험을 과도하게 감점하지 않는다.
 

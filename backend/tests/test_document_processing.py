@@ -121,10 +121,10 @@ def _cleanup_codes(db_session, codes: list[str]) -> None:
 
 
 def _cleanup_person(db_session, person_id) -> None:
-    from app.db.models.document import Document, DocumentGroup, DocumentPage
+    from app.db.models.document import Document, DocumentChunk, DocumentGroup, DocumentPage
     from app.db.models.person import Person, PersonProfile
     from app.db.models.revision import AuditLog, ProfileRevision
-    from app.db.models.search import SearchIndexJob
+    from app.db.models.search import SearchIndexItem, SearchIndexJob
     from app.db.models.upload import UploadSession, UploadTempFile
 
     group_ids = list(
@@ -144,6 +144,7 @@ def _cleanup_person(db_session, person_id) -> None:
             .all()
         )
     for did in doc_ids:
+        db_session.execute(delete(DocumentChunk).where(DocumentChunk.document_id == did))
         db_session.execute(delete(DocumentPage).where(DocumentPage.document_id == did))
     for gid in group_ids:
         db_session.execute(delete(Document).where(Document.document_group_id == gid))
@@ -151,6 +152,7 @@ def _cleanup_person(db_session, person_id) -> None:
     db_session.execute(
         delete(UploadSession).where(UploadSession.resolved_person_id == person_id)
     )
+    db_session.execute(delete(SearchIndexItem).where(SearchIndexItem.person_id == person_id))
     db_session.execute(delete(SearchIndexJob).where(SearchIndexJob.person_id == person_id))
     db_session.execute(delete(ProfileRevision).where(ProfileRevision.person_id == person_id))
     db_session.execute(delete(AuditLog).where(AuditLog.target_id == person_id))

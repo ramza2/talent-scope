@@ -436,7 +436,16 @@ class SearchRepository:
         if existing.status == "PROCESSING":
             return existing, "already_processing"
         if existing.status == "COMPLETED":
-            return existing, "already_completed"
+            # ensure_embedding_job only reaches here when item_needs_embedding is
+            # true (e.g. inactive stale COMPLETED, then item reactivated with
+            # embedding still NULL). Requeue the same fingerprint row.
+            existing.status = "PENDING"
+            existing.started_at = None
+            existing.completed_at = None
+            existing.error_message = None
+            self.db.add(existing)
+            self.db.flush()
+            return existing, "requeued"
         if existing.status == "FAILED":
             max_retries = int(settings.embedding_max_retries)
             backoff = int(settings.embedding_retry_backoff_seconds)
@@ -477,7 +486,10 @@ class SearchRepository:
 
         Returns (job, outcome) where outcome is one of:
         skipped | created | requeued | already_pending | already_processing |
-        already_completed | exhausted | backoff.
+        exhausted | backoff.
+
+        Note: COMPLETED + current item still needing embedding → requeued
+        (same fingerprint). Successful embeddings skip via item_needs_embedding.
         """
         from app.core.config import get_settings
         from app.modules.search.embedding_policy import (
@@ -563,12 +575,25 @@ class SearchRepository:
             existing, settings=settings, now=now
         )
 
-    def list_items_needing_embedding(self, *, limit: int = 100) -> list[SearchIndexItem]:
-        """Active PROFILE/PROJECT rows missing current model/version embedding."""
+    def list_items_needing_embedding(
+        self,
+        *,
+        limit: int = 100,
+        after_id: UUID | None = None,
+    ) -> list[SearchIndexItem]:
+        """Active PROFILE/PROJECT/DOCUMENT_CHUNK rows missing current embedding.
+
+        Filters embedding-needed predicates in PostgreSQL (not a fixed leading
+        window + Python post-filter) so completed embeddings cannot starve later
+        NULL/outdated rows. Supports keyset pagination via ``after_id``.
+        """
+        from sqlalchemy import func, or_
+
         from app.core.config import get_settings
         from app.modules.search.embedding_policy import (
             current_embedding_model,
             effective_embedding_version,
+            item_needs_embedding,
         )
 
         settings = get_settings()
@@ -576,32 +601,32 @@ class SearchRepository:
             return []
         model = current_embedding_model()
         version = effective_embedding_version()
+        predicates = [
+            SearchIndexItem.is_active.is_(True),
+            SearchIndexItem.object_type.in_(("PROFILE", "PROJECT", "DOCUMENT_CHUNK")),
+            SearchIndexItem.search_text.is_not(None),
+            func.btrim(SearchIndexItem.search_text) != "",
+            or_(
+                SearchIndexItem.embedding.is_(None),
+                SearchIndexItem.embedding_model.is_distinct_from(model),
+                SearchIndexItem.embedding_version.is_distinct_from(version),
+            ),
+        ]
+        if after_id is not None:
+            predicates.append(SearchIndexItem.id > after_id)
         stmt = (
             select(SearchIndexItem)
-            .where(
-                SearchIndexItem.is_active.is_(True),
-                SearchIndexItem.object_type.in_(("PROFILE", "PROJECT")),
-                SearchIndexItem.search_text.is_not(None),
-                SearchIndexItem.search_text != "",
-            )
-            .order_by(SearchIndexItem.updated_at.asc(), SearchIndexItem.id.asc())
-            .limit(max(limit * 5, limit))
+            .where(*predicates)
+            .order_by(SearchIndexItem.id.asc())
+            .limit(limit)
         )
         rows = list(self.db.scalars(stmt).all())
-        needed: list[SearchIndexItem] = []
-        for item in rows:
-            if not (item.search_text or "").strip():
-                continue
-            if item.embedding is None:
-                needed.append(item)
-            elif (item.embedding_model or "") != model:
-                needed.append(item)
-            elif (item.embedding_version or "") != version:
-                needed.append(item)
-            if len(needed) >= limit:
-                break
-        return needed
-
+        # Defensive Python check (blank / type) — DB already filtered needs.
+        return [
+            item
+            for item in rows
+            if item_needs_embedding(item, model=model, version=version)
+        ]
 
 
 

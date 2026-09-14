@@ -185,7 +185,31 @@ Document Group
 
 문서 삭제는 기본적으로 Soft Delete를 사용한다. 관리자만 삭제/복원할 수 있고, 물리삭제 정책은 운영단계에서 별도로 정한다.
 
-## 14. 검색결과 연결
+## 14. DocumentChunk Materialization (현재)
+
+Document가 `READY`가 되면 동일 DB transaction에서 `SearchIndexJob(UPSERT, operation=SYNC_DOCUMENT_CHUNKS)`만 생성한다.
+Chunk materialization / Embedding API 호출은 Document processing TX 안에서 하지 않는다.
+
+```text
+Document READY
+  → DocumentPage.extracted_text (Chunk SoT)
+  → deterministic page-local DocumentChunk (chunk-v1)
+  → DOCUMENT_CHUNK SearchIndexItem
+  → Embedding UPSERT Job
+  → BGE-M3 VECTOR(1024)
+```
+
+정책 요약:
+
+- Chunk source는 persisted `DocumentPage.extracted_text`만 사용한다 (raw file 재파싱 / Candidate JSON / runtime VLM 금지).
+- page-local: `page_from == page_to`. character 기반 max/overlap (tokenizer 미도입).
+- `extracted_text`가 blank/null인 page(VLM-only image 등)는 Chunk를 만들지 않는다.
+- DocumentGroup 단위 sync. Job.object_id = document_group_id, SearchIndexItem.object_id = DocumentChunk.id.
+- 검색 가능한 effective Document = `deleted_at IS NULL` + `processing_status=READY` 중 최고 `version_no`.
+  새 version이 PROCESSING/FAILED여도 이전 READY version index를 유지한다.
+- SearchIndexJob DB가 SoT이며 raw chunk/page text는 log/error_message에 남기지 않는다.
+
+## 15. 검색결과 연결
 
 검색결과나 추천근거에서 관련 원본문서를 바로 확인할 수 있어야 한다.
 

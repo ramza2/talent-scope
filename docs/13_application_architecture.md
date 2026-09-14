@@ -244,8 +244,10 @@ backend/
    │  │  ├ pptx.py
    │  │  ├ hwp.py
    │  │  └ hwpx.py
-   │  ├ preview.py
-   │  └ chunker.py
+   │  └ preview.py
+   │
+   ├ modules/document_processing/
+   │  └ chunker.py   # DocumentPage → deterministic DocumentChunk specs
    │
    ├ tasks/
    │  ├ celery_app.py
@@ -349,6 +351,13 @@ Confirmed Profile mutation
   → (별도) Embedding UPSERT Worker
   → OpenAI-compatible BGE-M3 → VECTOR(1024) 검증
   → search_index_item.embedding / embedding_model / embedding_version 저장
+
+Document READY / Document delete·restore / Person status
+  → SearchIndexJob(UPSERT, operation=SYNC_DOCUMENT_CHUNKS, object_id=document_group_id)
+  → index Worker: live DocumentGroup state
+  → effective READY Document + DocumentPage
+  → DocumentChunk upsert (preserve id by chunk_index)
+  → DOCUMENT_CHUNK SearchIndexItem sync + Embedding Job ensure
 ```
 
 PROCESSING 의미 (MVP): dispatcher가 처리 예약한 뒤 아직 terminal이 아닌 상태.
@@ -361,11 +370,14 @@ job.error_message / Celery failure는 sanitization helper로 SQL·search_text·P
 
 - Search Document SoT는 현재 Confirmed 운영 DB이다 (Candidate/Revision 재생 금지).
 - Out-of-order job도 항상 live Confirmed 최신 상태로 rebuild한다.
-- `DOCUMENT_CHUNK` row는 REBUILD_PERSON / Embedding scanner에서 건드리지 않는다.
-- UPSERT는 `payload_json.operation=EMBED_SEARCH_INDEX_ITEM`만 지원한다.
-- Embedding API는 REBUILD TX 밖에서만 호출한다. mid-call content 변경 시 vector write 금지.
-- `EMBEDDING_ENABLED=false`이면 Search Document만 수행하고 Embedding Job은 만들지 않는다.
-- missing/outdated embedding scanner는 PENDING Job ensure만 하고 publish/provider 호출은 하지 않는다.
+- REBUILD_PERSON은 PROFILE/PROJECT만 다루며 DOCUMENT_CHUNK row를 건드리지 않는다.
+- UPSERT operation: `EMBED_SEARCH_INDEX_ITEM` | `SYNC_DOCUMENT_CHUNKS`.
+- Document READY / delete·restore / Person status 변경 시 `SYNC_DOCUMENT_CHUNKS` Job만 ensure한다.
+- DocumentChunk SoT는 `DocumentPage.extracted_text`. VLM-only blank page는 0 chunk.
+- Embedding scanner는 active PROFILE/PROJECT/DOCUMENT_CHUNK를 포함한다.
+- Embedding API는 REBUILD/SYNC TX 밖에서만 호출한다. mid-call content 변경 시 vector write 금지.
+- `EMBEDDING_ENABLED=false`이면 Search Document/Chunk sync만 수행하고 Embedding Job은 만들지 않는다.
+- missing embedding / missing document-chunk sync scanner는 PENDING Job ensure만 하고 publish/provider 호출은 하지 않는다.
 
 초기에는 Worker Container 하나가 세 Queue를 모두 소비할 수 있다.
 

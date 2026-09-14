@@ -134,6 +134,10 @@ class DocumentProcessingService:
                 preview_storage_key=final_preview_key,
                 preview_page_count=result.page_count,
             )
+            # SearchIndexJob SoT only — no chunk materialization / embedding in this TX.
+            from app.modules.search.document_chunk_sync import DocumentChunkSyncService
+
+            DocumentChunkSyncService(self.db).ensure_sync_job(group.id)
             self.db.commit()
 
             # After READY is committed, remove obsolete previous preview if replaced.
