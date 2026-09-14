@@ -26,14 +26,21 @@ from app.modules.search.query_schemas import (
 from app.modules.search.schemas import GRADE_LABELS
 from app.modules.search.ranking import (
     EXPERTISE_DISPLAY_CAP,
+    SEARCH_RANKING_POLICY_VERSION,
     SKILL_DISPLAY_CAP,
     ChannelHit,
     MergedCandidate,
     channel_candidate_limit,
-    compute_hybrid_relevance,
+    compute_final_relevance,
+    compute_retrieval_relevance,
     merge_channel_hits,
     relevance_to_score,
 )
+from app.modules.search.project_ranking import (
+    ProjectRankingRepository,
+    build_project_query_signals,
+)
+from app.modules.search.result_enrichment import SearchResultEnricher
 
 
 class SearchQueryService:
@@ -41,10 +48,13 @@ class SearchQueryService:
         self.db = db
         self.repo = SearchQueryRepository(db)
         self.people_repo = PeopleRepository(db)
+        self.project_ranker = ProjectRankingRepository(db)
+        self.enricher = SearchResultEnricher(db)
 
     def search_people(self, request: SearchPeopleRequest) -> SearchPeopleResponse:
         expanded = self.repo.validate_and_expand_codes(request)
         preferred_present = self._preferred_present(request.preferred)
+        required_present = self._required_present(request)
 
         eligible_subq = self.repo.eligible_person_ids_subquery(
             required=request.required,
@@ -63,6 +73,7 @@ class SearchQueryService:
 
         keyword_hits: list[ChannelHit] = []
         semantic_hits: list[ChannelHit] = []
+        query_vector: list[float] | None = None
 
         if request.keyword_query:
             keyword_hits, kw_trunc = self.repo.keyword_channel_hits(
@@ -86,7 +97,6 @@ class SearchQueryService:
                 keyword_hits=keyword_hits,
                 semantic_hits=semantic_hits,
             )
-            # Drop anyone who slipped past eligibility (defensive).
             merged = {
                 pid: cand
                 for pid, cand in merged.items()
@@ -104,18 +114,56 @@ class SearchQueryService:
             expanded_preferred_jobs=expanded["preferred_jobs"],
         )
 
+        project_signals = build_project_query_signals(
+            request,
+            expanded_required_jobs=expanded["required_jobs"],
+            expanded_preferred_jobs=expanded["preferred_jobs"],
+        )
+        project_summaries = self.project_ranker.summarize_persons(
+            person_ids,
+            request=request,
+            signals=project_signals,
+            query_vector=query_vector,
+        )
+
+        no_query = (
+            not required_present
+            and not preferred_present
+            and not request.keyword_query
+            and not request.semantic_query
+        )
+
         for pid, cand in merged.items():
             row = eligible_by_id[pid]
             ratio = preferred_ratios.get(pid, 0.0)
             cand.preferred_match_ratio = ratio
             kw_rank = cand.keyword_hit.rank if cand.keyword_hit else None
             sem_rank = cand.semantic_hit.rank if cand.semantic_hit else None
-            relevance = compute_hybrid_relevance(
+            retrieval = compute_retrieval_relevance(
                 keyword_rank=kw_rank,
                 semantic_rank=sem_rank,
-                preferred_match_ratio=ratio,
-                preferred_present=preferred_present,
             )
+            summary = project_summaries.get(pid)
+            project_score = (
+                None
+                if not project_signals.active
+                else (summary.project_relevance if summary else 0.0)
+            )
+            recency_score = (
+                None
+                if not project_signals.active
+                else (summary.recency_score if summary else 0.60)
+            )
+            if no_query:
+                relevance = 0.0
+            else:
+                relevance = compute_final_relevance(
+                    required_score=1.0 if required_present else None,
+                    retrieval_score=retrieval,
+                    preferred_score=ratio if preferred_present else None,
+                    project_score=project_score,
+                    recency_score=recency_score,
+                )
             cand.relevance = relevance
             cand.score = relevance_to_score(relevance)
             cand.sort_keys = {
@@ -126,6 +174,7 @@ class SearchQueryService:
                 "preferred_match_ratio": ratio,
                 "score": cand.score,
                 "person_id": pid,
+                "ranking_policy": SEARCH_RANKING_POLICY_VERSION,
             }
 
         ordered = self._sort_candidates(list(merged.values()), sort=request.sort)
@@ -138,6 +187,10 @@ class SearchQueryService:
             page_slice,
             eligible_by_id=eligible_by_id,
             request=request,
+            project_summaries=project_summaries,
+            keyword_hits=keyword_hits,
+            semantic_hits=semantic_hits,
+            expanded=expanded,
         )
 
         return SearchPeopleResponse(
@@ -183,6 +236,25 @@ class SearchQueryService:
             or preferred.expertise
             or preferred.business_domains
             or preferred.customer_types
+        )
+
+    @staticmethod
+    def _required_present(request: SearchPeopleRequest) -> bool:
+        req = request.required
+        return bool(
+            req.jobs
+            or req.skills
+            or req.expertise
+            or req.business_domains
+            or req.customer_types
+            or (req.grade and req.grade.values)
+            or (
+                req.career
+                and (req.career.min_months is not None or req.career.max_months is not None)
+            )
+            or req.affiliations
+            or req.certifications
+            or req.project_keywords
         )
 
     def _sort_candidates(
@@ -247,6 +319,10 @@ class SearchQueryService:
         *,
         eligible_by_id: dict[UUID, EligiblePersonRow],
         request: SearchPeopleRequest,
+        project_summaries: dict,
+        keyword_hits: list[ChannelHit],
+        semantic_hits: list[ChannelHit],
+        expanded: dict[str, Any],
     ) -> list[SearchPersonResult]:
         person_ids = [c.person_id for c in page_slice]
         if not person_ids:
@@ -301,6 +377,34 @@ class SearchQueryService:
             )
         )
 
+        scaffold_matches: dict[UUID, list[MatchItem]] = {}
+        for cand in page_slice:
+            scaffold_matches[cand.person_id] = self._build_matches(
+                person_id=cand.person_id,
+                request=request,
+                code_names=code_names,
+                preferred_job_root_hits=preferred_job_root_hits,
+                preferred_skill_by_code=preferred_skill_by_code,
+                preferred_exp_by_code=preferred_exp_by_code,
+                preferred_biz_by_code=preferred_biz_by_code,
+                preferred_cust_by_code=preferred_cust_by_code,
+            )
+
+        channel_hits: dict[UUID, list[ChannelHit]] = {pid: [] for pid in person_ids}
+        for hit in [*keyword_hits, *semantic_hits]:
+            if hit.person_id in channel_hits:
+                channel_hits[hit.person_id].append(hit)
+
+        enriched = self.enricher.enrich(
+            person_ids=person_ids,
+            request=request,
+            scaffold_matches=scaffold_matches,
+            project_summaries=project_summaries,
+            channel_hits=channel_hits,
+            expanded_required_jobs=expanded.get("required_jobs", []),
+            expanded_preferred_jobs=expanded.get("preferred_jobs", []),
+        )
+
         results: list[SearchPersonResult] = []
         for cand in page_slice:
             row = eligible_by_id[cand.person_id]
@@ -320,24 +424,15 @@ class SearchQueryService:
                 skills=[name for _, name in skills_map.get(cand.person_id, [])],
                 expertise=[name for _, name in exp_map.get(cand.person_id, [])],
             )
-            matches = self._build_matches(
-                person_id=cand.person_id,
-                request=request,
-                code_names=code_names,
-                preferred_job_root_hits=preferred_job_root_hits,
-                preferred_skill_by_code=preferred_skill_by_code,
-                preferred_exp_by_code=preferred_exp_by_code,
-                preferred_biz_by_code=preferred_biz_by_code,
-                preferred_cust_by_code=preferred_cust_by_code,
-            )
+            enrichment = enriched.get(cand.person_id)
             results.append(
                 SearchPersonResult(
                     person_id=cand.person_id,
                     score=cand.score,
                     person=summary,
-                    matches=matches,
-                    top_projects=[],
-                    evidence=[],
+                    matches=enrichment.matches if enrichment else scaffold_matches[cand.person_id],
+                    top_projects=enrichment.top_projects if enrichment else [],
+                    evidence=enrichment.evidence if enrichment else [],
                 )
             )
         return results
