@@ -856,8 +856,8 @@ def test_deleted_project_excluded_from_top_and_relevance(client: TestClient, db_
 
 
 def test_project_required_preferred_and_recency_semantics(db_session) -> None:
+    from app.db.models.project import Project
     from app.modules.search.project_ranking import (
-        JobConditionGroup,
         ProjectQuerySignals,
         ProjectRankingRepository,
         build_project_query_signals,
@@ -873,14 +873,21 @@ def test_project_required_preferred_and_recency_semantics(db_session) -> None:
     suffix = uuid.uuid4().hex[:8]
     seeded = _seed_person(db_session, suffix=suffix)
     tech = seeded["codes"]["tech"]
-    # Person with no related projects under preferred-only Java signal
     lonely = _seed_person(db_session, suffix=f"l{suffix}")
     undated = _seed_person(db_session, suffix=f"u{suffix}")
+    unique_tech = f"TECH-UNDATED-{suffix}"
+    _ensure_code(db_session, unique_tech, "TECH", "UndatedOnly")
+    # Soft-delete seed projects so only the undated related project remains.
+    for project in db_session.execute(
+        select(Project).where(Project.person_id == undated["person"].id)
+    ).scalars():
+        project.deleted_at = datetime.now(UTC)
+    db_session.commit()
     _add_project(
         db_session,
         person_id=undated["person"].id,
         name="Undated related",
-        skill_code=undated["codes"]["tech"],
+        skill_code=unique_tech,
         start=None,
         end=None,
         duration_months=None,
@@ -900,7 +907,6 @@ def test_project_required_preferred_and_recency_semantics(db_session) -> None:
         assert signals.preferred_skills == ("NOPE-TECH",)
         assert signals.keyword_query == "DEMIS"
 
-        # active-zero: keyword miss must pull score below structured-only drop bug
         a = compute_project_base_score(structured=1.0, keyword=0.0, semantic=None)
         b = compute_project_base_score(structured=1.0, keyword=0.5, semantic=None)
         assert b > a
@@ -912,15 +918,16 @@ def test_project_required_preferred_and_recency_semantics(db_session) -> None:
         summaries = repo.summarize_persons(
             [lonely["person"].id, undated["person"].id],
             request=SearchPeopleRequest(
-                required=SearchConditionBlock(skills=[undated["codes"]["tech"]])
+                required=SearchConditionBlock(skills=[unique_tech])
             ),
-            signals=ProjectQuerySignals(required_skills=(undated["codes"]["tech"],)),
+            signals=ProjectQuerySignals(required_skills=(unique_tech,)),
             query_vector=None,
             as_of=as_of,
         )
         assert summaries[lonely["person"].id].related_count == 0
         assert summaries[lonely["person"].id].recency_score is None
         assert summaries[undated["person"].id].related_count >= 1
+        assert summaries[undated["person"].id].latest_related_date is None
         assert summaries[undated["person"].id].recency_score == 0.60
     finally:
         _cleanup_person(db_session, seeded["person"].id)
