@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import delete, select, text
+from sqlalchemy import delete, text
 
 os.environ.setdefault(
     "DATABASE_URL",
@@ -255,13 +255,6 @@ def test_search_user_and_admin_no_csrf(client: TestClient, db_session) -> None:
         assert resp.status_code == 200, resp.text
         assert "data" in resp.json()
 
-        client.post("/api/v1/auth/logout")  # may need csrf — ignore failure
-        # Fresh client session for admin
-        from app.core.config import get_settings
-        from app.core.redis import get_redis
-        from app.main import create_app
-
-        # reuse same client after re-login as admin
         client.cookies.clear()
         csrf = _login(client, admin.login_id)
         resp2 = _search(
@@ -327,25 +320,35 @@ def test_trigram_fuzzy_keyword(client: TestClient, db_session) -> None:
     suffix = uuid.uuid4().hex[:8]
     user = _create_user(db_session, login_id=f"tr_{suffix}", password="Secret123!")
     seeded = _seed_person(db_session, suffix=suffix)
-    # Long enough for trigram; slight misspelling of a distinctive phrase
-    phrase = f"FastAPIFramework{suffix}"
+    # Distinctive token long enough for trigram; query is a near-miss (no ILIKE).
+    phrase = f"ZxqFastAPIFramework{suffix}"
+    # One character substitution mid-token → ILIKE fails, trigram should still hit.
+    fuzzy = phrase[:10] + "X" + phrase[11:]
+    assert fuzzy != phrase
     _add_index_item(
         db_session,
         person_id=seeded["person"].id,
         object_type="PROJECT",
         object_id=seeded["project_a"].id,
-        search_text=f"project uses {phrase} extensively",
+        # Keep search_text close to the query so pg_trgm similarity clears threshold
+        # (channel compares full search_text, not best substring).
+        search_text=phrase,
     )
+    # Sanity: similarity should clear the shared threshold for this pair.
+    from app.modules.search.ranking import KEYWORD_TRIGRAM_THRESHOLD
+
+    sim = db_session.execute(
+        text("SELECT similarity(:a, :b)"),
+        {"a": phrase, "b": fuzzy},
+    ).scalar()
+    assert float(sim) >= KEYWORD_TRIGRAM_THRESHOLD
+    # Exact ILIKE must fail so we are exercising trigram (or FTS), not substring.
+    assert fuzzy.lower() not in phrase.lower()
     try:
         _login(client, user.login_id)
-        # Drop one character mid-token to force trigram rather than exact ILIKE
-        fuzzy = phrase[:-1] + "X"
-        # Also try a close variant if needed
-        resp = _search(client, {"keyword_query": phrase[: max(4, len(phrase) - 2)]})
+        resp = _search(client, {"keyword_query": fuzzy})
         assert resp.status_code == 200, resp.text
-        # Prefix ILIKE or trigram should hit
         assert str(seeded["person"].id) in _person_ids(resp.json())
-        _ = fuzzy
     finally:
         _cleanup_person(db_session, seeded["person"].id)
         _cleanup_user(db_session, user.id)
