@@ -37,6 +37,7 @@ from app.modules.search.ranking import (
     relevance_to_score,
 )
 from app.modules.search.project_ranking import (
+    JobConditionGroup,
     ProjectRankingRepository,
     build_project_query_signals,
 )
@@ -114,10 +115,12 @@ class SearchQueryService:
             expanded_preferred_jobs=expanded["preferred_jobs"],
         )
 
+        required_job_groups = self._job_condition_groups(request.required.jobs)
+        preferred_job_groups = self._job_condition_groups(request.preferred.jobs)
         project_signals = build_project_query_signals(
             request,
-            expanded_required_jobs=expanded["required_jobs"],
-            expanded_preferred_jobs=expanded["preferred_jobs"],
+            required_job_groups=required_job_groups,
+            preferred_job_groups=preferred_job_groups,
         )
         project_summaries = self.project_ranker.summarize_persons(
             person_ids,
@@ -149,10 +152,11 @@ class SearchQueryService:
                 if not project_signals.active
                 else (summary.project_relevance if summary else 0.0)
             )
+            # No related projects → recency inactive (None), not undated bonus 0.60.
             recency_score = (
                 None
                 if not project_signals.active
-                else (summary.recency_score if summary else 0.60)
+                else (summary.recency_score if summary else None)
             )
             if no_query:
                 relevance = 0.0
@@ -190,7 +194,8 @@ class SearchQueryService:
             project_summaries=project_summaries,
             keyword_hits=keyword_hits,
             semantic_hits=semantic_hits,
-            expanded=expanded,
+            required_job_groups=required_job_groups,
+            preferred_job_groups=preferred_job_groups,
         )
 
         return SearchPeopleResponse(
@@ -313,6 +318,14 @@ class SearchQueryService:
 
         return sorted(candidates, key=key_relevance)
 
+    def _job_condition_groups(self, roots: list[str]) -> list[JobConditionGroup]:
+        groups: list[JobConditionGroup] = []
+        for root in roots:
+            expanded = self.repo._expand_job_codes([root])
+            codes = frozenset(expanded) if expanded else frozenset({root})
+            groups.append(JobConditionGroup(root_code=root, codes=codes))
+        return groups
+
     def _build_results(
         self,
         page_slice: list[MergedCandidate],
@@ -322,7 +335,8 @@ class SearchQueryService:
         project_summaries: dict,
         keyword_hits: list[ChannelHit],
         semantic_hits: list[ChannelHit],
-        expanded: dict[str, Any],
+        required_job_groups: list[JobConditionGroup],
+        preferred_job_groups: list[JobConditionGroup],
     ) -> list[SearchPersonResult]:
         person_ids = [c.person_id for c in page_slice]
         if not person_ids:
@@ -337,8 +351,10 @@ class SearchQueryService:
         )
 
         preferred_job_root_hits: dict[str, set[UUID]] = {}
+        pref_by_root = {g.root_code: g for g in preferred_job_groups}
         for root in request.preferred.jobs:
-            expanded_root = self.repo._expand_job_codes([root])
+            group = pref_by_root.get(root)
+            expanded_root = list(group.codes) if group else self.repo._expand_job_codes([root])
             preferred_job_root_hits[root] = self.repo._person_ids_matching_job(
                 person_ids, expanded_root
             )
@@ -401,8 +417,8 @@ class SearchQueryService:
             scaffold_matches=scaffold_matches,
             project_summaries=project_summaries,
             channel_hits=channel_hits,
-            expanded_required_jobs=expanded.get("required_jobs", []),
-            expanded_preferred_jobs=expanded.get("preferred_jobs", []),
+            required_job_groups=required_job_groups,
+            preferred_job_groups=preferred_job_groups,
         )
 
         results: list[SearchPersonResult] = []

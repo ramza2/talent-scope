@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from uuid import UUID
 
@@ -123,6 +123,59 @@ class SearchEvidenceRepository:
                 Evidence.id.asc(),
             )
         )
+        return self._rows_from_stmt(stmt)
+
+    def list_supporting_project_evidence(
+        self,
+        project_ids: Sequence[UUID],
+        *,
+        person_ids: Sequence[UUID],
+    ) -> list[EvidenceRow]:
+        """All SUPPORTS EvidenceLinks for projects, any field_name (wildcard).
+
+        Unlike ``EvidenceTargetKey(..., field_name=None)`` which means exact
+        NULL, this intentionally ignores field_name so top_projects can collect
+        project_name / summary / relation field evidence together.
+        """
+        if not project_ids or not person_ids:
+            return []
+        person_id_set = set(person_ids)
+        stmt = (
+            select(
+                Evidence.id,
+                EvidenceLink.target_type,
+                EvidenceLink.target_id,
+                EvidenceLink.field_name,
+                EvidenceLink.relation_type,
+                Evidence.document_id,
+                DocumentGroup.title,
+                Document.original_filename,
+                Document.version_no,
+                Evidence.page_no,
+                Evidence.quote_text,
+                DocumentGroup.person_id,
+            )
+            .join(Evidence, Evidence.id == EvidenceLink.evidence_id)
+            .join(Document, Document.id == Evidence.document_id)
+            .join(DocumentGroup, DocumentGroup.id == Document.document_group_id)
+            .where(
+                EvidenceLink.relation_type == RELATION_TYPE_SUPPORTS,
+                EvidenceLink.target_type == "PROJECT",
+                EvidenceLink.target_id.in_(list(project_ids)),
+                Document.deleted_at.is_(None),
+                DocumentGroup.deleted_at.is_(None),
+                Document.processing_status == "READY",
+                DocumentGroup.person_id.in_(list(person_id_set)),
+            )
+            .order_by(
+                Evidence.page_no.asc().nulls_last(),
+                Evidence.created_at.asc(),
+                Evidence.id.asc(),
+            )
+        )
+        return self._rows_from_stmt(stmt)
+
+    def _rows_from_stmt(self, stmt: Select) -> list[EvidenceRow]:
         rows = self.db.execute(stmt).all()
         out: list[EvidenceRow] = []
         for row in rows:

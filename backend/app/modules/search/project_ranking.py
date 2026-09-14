@@ -23,11 +23,7 @@ from app.modules.search.embedding_policy import (
     current_embedding_model,
     effective_embedding_version,
 )
-from app.modules.search.query_schemas import (
-    PreferredConditionBlock,
-    SearchConditionBlock,
-    SearchPeopleRequest,
-)
+from app.modules.search.query_schemas import SearchPeopleRequest
 from app.modules.search.ranking import (
     EXPERTISE_EXPLICIT_FACTOR,
     EXPERTISE_INFERRED_FACTOR,
@@ -45,14 +41,35 @@ from app.modules.search.ranking import (
     normalize_weighted_parts,
 )
 
+REQUIRED_CONDITION_WEIGHT = 1.0
+PREFERRED_CONDITION_WEIGHT = 0.5
+
+
+@dataclass(frozen=True)
+class JobConditionGroup:
+    """One requested JOB root and its expanded descendant code set."""
+
+    root_code: str
+    codes: frozenset[str]
+
+    def matches(self, project_job_codes: set[str]) -> bool:
+        return bool(project_job_codes.intersection(self.codes))
+
 
 @dataclass(frozen=True)
 class ProjectQuerySignals:
-    job_codes: tuple[str, ...] = ()
-    skill_codes: tuple[str, ...] = ()
-    expertise_codes: tuple[str, ...] = ()
-    business_domain_codes: tuple[str, ...] = ()
-    customer_type_codes: tuple[str, ...] = ()
+    """Project ranking signals with required / preferred kept separate."""
+
+    required_job_groups: tuple[JobConditionGroup, ...] = ()
+    preferred_job_groups: tuple[JobConditionGroup, ...] = ()
+    required_skills: tuple[str, ...] = ()
+    preferred_skills: tuple[str, ...] = ()
+    required_expertise: tuple[str, ...] = ()
+    preferred_expertise: tuple[str, ...] = ()
+    required_business_domains: tuple[str, ...] = ()
+    preferred_business_domains: tuple[str, ...] = ()
+    required_customer_types: tuple[str, ...] = ()
+    preferred_customer_types: tuple[str, ...] = ()
     project_keywords: tuple[str, ...] = ()
     keyword_query: str | None = None
     semantic_query: str | None = None
@@ -60,11 +77,16 @@ class ProjectQuerySignals:
     @property
     def has_structured(self) -> bool:
         return bool(
-            self.job_codes
-            or self.skill_codes
-            or self.expertise_codes
-            or self.business_domain_codes
-            or self.customer_type_codes
+            self.required_job_groups
+            or self.preferred_job_groups
+            or self.required_skills
+            or self.preferred_skills
+            or self.required_expertise
+            or self.preferred_expertise
+            or self.required_business_domains
+            or self.preferred_business_domains
+            or self.required_customer_types
+            or self.preferred_customer_types
             or self.project_keywords
         )
 
@@ -98,25 +120,53 @@ class PersonProjectSummary:
     project_scores: dict[UUID, float] = field(default_factory=dict)
 
 
+def _job_groups_from_roots(
+    roots: Sequence[str],
+    *,
+    expand_root,
+) -> tuple[JobConditionGroup, ...]:
+    groups: list[JobConditionGroup] = []
+    for root in roots:
+        expanded = list(expand_root(root))
+        codes = frozenset(expanded) if expanded else frozenset({root})
+        groups.append(JobConditionGroup(root_code=root, codes=codes))
+    return tuple(groups)
+
+
 def build_project_query_signals(
     request: SearchPeopleRequest,
     *,
-    expanded_required_jobs: Sequence[str],
-    expanded_preferred_jobs: Sequence[str],
+    required_job_groups: Sequence[JobConditionGroup] | None = None,
+    preferred_job_groups: Sequence[JobConditionGroup] | None = None,
+    expand_job_root=None,
 ) -> ProjectQuerySignals:
+    """Build separated required/preferred project signals.
+
+    Prefer prebuilt ``*_job_groups``. When omitted, ``expand_job_root(root)``
+    must return the descendant code list for that root (including the root).
+    """
     req = request.required
     pref = request.preferred
-    jobs = tuple(dict.fromkeys([*expanded_required_jobs, *expanded_preferred_jobs]))
-    skills = tuple(dict.fromkeys([*req.skills, *pref.skills]))
-    expertise = tuple(dict.fromkeys([*req.expertise, *pref.expertise]))
-    biz = tuple(dict.fromkeys([*req.business_domains, *pref.business_domains]))
-    cust = tuple(dict.fromkeys([*req.customer_types, *pref.customer_types]))
+    if required_job_groups is None:
+        if expand_job_root is None:
+            raise ValueError("required_job_groups or expand_job_root is required")
+        required_job_groups = _job_groups_from_roots(req.jobs, expand_root=expand_job_root)
+    if preferred_job_groups is None:
+        if expand_job_root is None:
+            raise ValueError("preferred_job_groups or expand_job_root is required")
+        preferred_job_groups = _job_groups_from_roots(pref.jobs, expand_root=expand_job_root)
+
     return ProjectQuerySignals(
-        job_codes=jobs,
-        skill_codes=skills,
-        expertise_codes=expertise,
-        business_domain_codes=biz,
-        customer_type_codes=cust,
+        required_job_groups=tuple(required_job_groups),
+        preferred_job_groups=tuple(preferred_job_groups),
+        required_skills=tuple(dict.fromkeys(req.skills)),
+        preferred_skills=tuple(dict.fromkeys(pref.skills)),
+        required_expertise=tuple(dict.fromkeys(req.expertise)),
+        preferred_expertise=tuple(dict.fromkeys(pref.expertise)),
+        required_business_domains=tuple(dict.fromkeys(req.business_domains)),
+        preferred_business_domains=tuple(dict.fromkeys(pref.business_domains)),
+        required_customer_types=tuple(dict.fromkeys(req.customer_types)),
+        preferred_customer_types=tuple(dict.fromkeys(pref.customer_types)),
         project_keywords=tuple(req.project_keywords),
         keyword_query=request.keyword_query,
         semantic_query=request.semantic_query,
@@ -127,6 +177,59 @@ def _expertise_factor(evidence_type: str | None) -> float:
     if (evidence_type or "EXPLICIT").upper() == "INFERRED":
         return EXPERTISE_INFERRED_FACTOR
     return EXPERTISE_EXPLICIT_FACTOR
+
+
+def _code_set_ratio(have: set[str], requested: Sequence[str]) -> float:
+    if not requested:
+        return 0.0
+    matched = len(have.intersection(requested))
+    return matched / len(requested)
+
+
+def _job_group_ratio(groups: Sequence[JobConditionGroup], job_codes: set[str]) -> float:
+    if not groups:
+        return 0.0
+    hits = sum(1 for group in groups if group.matches(job_codes))
+    return hits / len(groups)
+
+
+def _expertise_ratio(
+    requested: Sequence[str],
+    expertise_rows: list[tuple[str, str]],
+) -> float:
+    if not requested:
+        return 0.0
+    wanted = set(requested)
+    best_by_code: dict[str, float] = {}
+    for code, evidence_type in expertise_rows:
+        if code not in wanted:
+            continue
+        best_by_code[code] = max(
+            best_by_code.get(code, 0.0), _expertise_factor(evidence_type)
+        )
+    return sum(best_by_code.get(code, 0.0) for code in requested) / len(requested)
+
+
+def _keyword_blob_ratio(
+    keywords: Sequence[str],
+    *,
+    project_name: str,
+    customer_name: str | None,
+    responsibilities: str | None,
+    project_summary: str | None,
+) -> float:
+    if not keywords:
+        return 0.0
+    blob = " ".join(
+        [
+            project_name or "",
+            customer_name or "",
+            responsibilities or "",
+            project_summary or "",
+        ]
+    ).casefold()
+    hits = sum(1 for kw in keywords if kw.casefold() in blob)
+    return hits / len(keywords)
 
 
 def compute_project_structured_score(
@@ -141,63 +244,110 @@ def compute_project_structured_score(
     customer_name: str | None,
     responsibilities: str | None,
     project_summary: str | None,
-    required: SearchConditionBlock,
-    preferred: PreferredConditionBlock,
 ) -> float | None:
-    del preferred
     if not signals.has_structured:
         return None
 
     parts: list[tuple[float, float]] = []
 
-    if signals.job_codes:
-        matched = len(job_codes.intersection(signals.job_codes))
-        ratio = matched / len(signals.job_codes)
-        weight = 1.0 if required.jobs else 0.5
-        parts.append((weight, clamp01(ratio)))
-
-    if signals.skill_codes:
-        matched = len(skill_codes.intersection(signals.skill_codes))
-        ratio = matched / len(signals.skill_codes)
-        weight = 1.0 if required.skills else 0.5
-        parts.append((weight, clamp01(ratio)))
-
-    if signals.expertise_codes:
-        best_by_code: dict[str, float] = {}
-        for code, evidence_type in expertise_rows:
-            if code not in signals.expertise_codes:
-                continue
-            best_by_code[code] = max(
-                best_by_code.get(code, 0.0), _expertise_factor(evidence_type)
+    if signals.required_job_groups:
+        parts.append(
+            (
+                REQUIRED_CONDITION_WEIGHT,
+                clamp01(_job_group_ratio(signals.required_job_groups, job_codes)),
             )
-        ratio = sum(best_by_code.values()) / len(signals.expertise_codes)
-        weight = 1.0 if required.expertise else 0.5
-        parts.append((weight, clamp01(ratio)))
+        )
+    if signals.preferred_job_groups:
+        parts.append(
+            (
+                PREFERRED_CONDITION_WEIGHT,
+                clamp01(_job_group_ratio(signals.preferred_job_groups, job_codes)),
+            )
+        )
 
-    if signals.business_domain_codes:
-        matched = len(biz_codes.intersection(signals.business_domain_codes))
-        ratio = matched / len(signals.business_domain_codes)
-        weight = 1.0 if required.business_domains else 0.5
-        parts.append((weight, clamp01(ratio)))
+    if signals.required_skills:
+        parts.append(
+            (
+                REQUIRED_CONDITION_WEIGHT,
+                clamp01(_code_set_ratio(skill_codes, signals.required_skills)),
+            )
+        )
+    if signals.preferred_skills:
+        parts.append(
+            (
+                PREFERRED_CONDITION_WEIGHT,
+                clamp01(_code_set_ratio(skill_codes, signals.preferred_skills)),
+            )
+        )
 
-    if signals.customer_type_codes:
-        matched = len(customer_codes.intersection(signals.customer_type_codes))
-        ratio = matched / len(signals.customer_type_codes)
-        weight = 1.0 if required.customer_types else 0.5
-        parts.append((weight, clamp01(ratio)))
+    if signals.required_expertise:
+        parts.append(
+            (
+                REQUIRED_CONDITION_WEIGHT,
+                clamp01(_expertise_ratio(signals.required_expertise, expertise_rows)),
+            )
+        )
+    if signals.preferred_expertise:
+        parts.append(
+            (
+                PREFERRED_CONDITION_WEIGHT,
+                clamp01(_expertise_ratio(signals.preferred_expertise, expertise_rows)),
+            )
+        )
+
+    if signals.required_business_domains:
+        parts.append(
+            (
+                REQUIRED_CONDITION_WEIGHT,
+                clamp01(
+                    _code_set_ratio(biz_codes, signals.required_business_domains)
+                ),
+            )
+        )
+    if signals.preferred_business_domains:
+        parts.append(
+            (
+                PREFERRED_CONDITION_WEIGHT,
+                clamp01(
+                    _code_set_ratio(biz_codes, signals.preferred_business_domains)
+                ),
+            )
+        )
+
+    if signals.required_customer_types:
+        parts.append(
+            (
+                REQUIRED_CONDITION_WEIGHT,
+                clamp01(
+                    _code_set_ratio(customer_codes, signals.required_customer_types)
+                ),
+            )
+        )
+    if signals.preferred_customer_types:
+        parts.append(
+            (
+                PREFERRED_CONDITION_WEIGHT,
+                clamp01(
+                    _code_set_ratio(customer_codes, signals.preferred_customer_types)
+                ),
+            )
+        )
 
     if signals.project_keywords:
-        blob = " ".join(
-            [
-                project_name or "",
-                customer_name or "",
-                responsibilities or "",
-                project_summary or "",
-            ]
-        ).casefold()
-        hits = sum(1 for kw in signals.project_keywords if kw.casefold() in blob)
-        ratio = hits / len(signals.project_keywords)
-        parts.append((1.0, clamp01(ratio)))
+        parts.append(
+            (
+                REQUIRED_CONDITION_WEIGHT,
+                clamp01(
+                    _keyword_blob_ratio(
+                        signals.project_keywords,
+                        project_name=project_name,
+                        customer_name=customer_name,
+                        responsibilities=responsibilities,
+                        project_summary=project_summary,
+                    )
+                ),
+            )
+        )
 
     if not parts:
         return None
@@ -244,6 +394,11 @@ def compute_person_project_relevance(
 
 
 def compute_recency_score(latest_related_date: date | None, *, as_of: date) -> float:
+    """Score for a person who has at least one related project.
+
+    ``latest_related_date is None`` means related projects exist but dates are
+    unknown → 0.60. Callers must not invoke this when related_count == 0.
+    """
     if latest_related_date is None:
         return 0.60
     if latest_related_date > as_of:
@@ -307,6 +462,7 @@ class ProjectRankingRepository:
         query_vector: list[float] | None,
         as_of: date | None = None,
     ) -> dict[UUID, PersonProjectSummary]:
+        del request  # signals already carry required/preferred separation
         as_of_date = as_of or date.today()
         if not person_ids:
             return {}
@@ -325,7 +481,7 @@ class ProjectRankingRepository:
             pid: PersonProjectSummary(
                 person_id=pid,
                 project_relevance=0.0,
-                recency_score=0.60,
+                recency_score=None,
             )
             for pid in person_ids
         }
@@ -366,14 +522,13 @@ class ProjectRankingRepository:
                 customer_name=project.customer_name,
                 responsibilities=project.responsibilities,
                 project_summary=project.project_summary,
-                required=request.required,
-                preferred=request.preferred,
             )
+            # Query channel present → component active for every project (miss = 0.0).
             keyword_component = (
-                keyword_scores.get(project.id) if signals.keyword_query else None
+                keyword_scores.get(project.id, 0.0) if signals.keyword_query else None
             )
             semantic_component = (
-                semantic_scores.get(project.id) if signals.semantic_query else None
+                semantic_scores.get(project.id, 0.0) if signals.semantic_query else None
             )
             if (
                 structured is None
@@ -429,10 +584,11 @@ class ProjectRankingRepository:
                 project_relevance = compute_person_project_relevance(
                     related_scores, duration_sum
                 )
+                # Undated related → 0.60; no related → None (inactive).
                 recency = compute_recency_score(latest, as_of=as_of_date)
             else:
                 project_relevance = 0.0
-                recency = 0.60
+                recency = None
 
             pool = related if related else details
             ranked = sorted(
