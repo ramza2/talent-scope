@@ -889,6 +889,19 @@ POST /search/people
 
 자연어를 사용하지 않을 때는 1단계를 생략하고 직접 `/search/people`을 호출한다.
 
+**구현 상태 (현재):**
+
+| Endpoint | 상태 |
+|---|---|
+| `POST /search/people` | 구현됨 — Structured Hard Filter + Keyword(FTS/`pg_trgm`) + pgvector Semantic, Person 병합, 결정적 RRF Ranking |
+| `POST /search/interpret` | TODO — 자연어 조건해석 |
+| Evidence / `top_projects` 상세 연결 | TODO — 응답 scaffold만 (`evidence=[]`, `top_projects=[]`) |
+| `relaxations` 조건완화 | TODO — 항상 `[]` |
+| `POST /search/explain` | TODO |
+
+`POST /search/people`는 인증된 USER/ADMIN이 호출하며, 읽기 전용 검색이므로 CSRF를 요구하지 않는다.
+`semantic_query`가 있을 때 `EMBEDDING_ENABLED=false`이거나 Embedding Provider 실패 시 `503 SEARCH_EMBEDDING_UNAVAILABLE`을 반환하며 silent degrade하지 않는다.
+
 ### `POST /search/interpret`
 
 Request:

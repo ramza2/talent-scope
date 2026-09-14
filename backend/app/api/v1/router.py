@@ -21,6 +21,7 @@ from app.modules.documents import (
 from app.modules.evidence import router as evidence_router
 from app.modules.people import router as people_router
 from app.modules.projects import person_projects_router, projects_router
+from app.modules.search import router as search_router
 from app.modules.users import router as users_router
 
 api_router = APIRouter()
@@ -41,3 +42,4 @@ api_router.include_router(documents_router)
 api_router.include_router(document_groups_router)
 api_router.include_router(analyses_router)
 api_router.include_router(evidence_router)
+api_router.include_router(search_router)

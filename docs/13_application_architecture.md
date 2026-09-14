@@ -549,7 +549,7 @@ Embedding 대상:
 
 - Confirmed Person Profile (`search_index_item` PROFILE) — 현재 구현
 - Confirmed Project (`search_index_item` PROJECT) — 현재 구현
-- Document Chunk — 아직 미구현
+- Document Chunk (`search_index_item` DOCUMENT_CHUNK) — 현재 구현
 
 Embedding과 FTS 데이터는 `search_index_item`에 저장한다.
 validity는 embedding_model + embedding_version(pipeline+input-cap) + content_hash + search_document_version으로 판단한다.

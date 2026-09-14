@@ -340,3 +340,20 @@ class AIResponseInvalidError(TalentScopeError):
 
     def __init__(self, detail: str | None = None) -> None:
         super().__init__(detail or "AI 응답을 검증할 수 없습니다.")
+
+
+class SearchInvalidCodeError(ValidationAppError):
+    code = "SEARCH_INVALID_CODE"
+    title = "Search invalid code"
+
+    def __init__(self, detail: str | None = None) -> None:
+        super().__init__(detail or "검색 조건에 유효하지 않은 코드가 포함되어 있습니다.")
+
+
+class SearchEmbeddingUnavailableError(TalentScopeError):
+    code = "SEARCH_EMBEDDING_UNAVAILABLE"
+    title = "Search embedding unavailable"
+    status_code = 503
+
+    def __init__(self, detail: str | None = None) -> None:
+        super().__init__(detail or "검색 임베딩 서비스를 사용할 수 없습니다.")
