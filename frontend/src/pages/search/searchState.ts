@@ -117,6 +117,18 @@ export function normalizeDraftQuery(query: SearchDraftQuery): SearchDraftQuery {
   }
 }
 
+/** UI/route hydrate: shape blocks without trimming in-progress text fields. */
+export function hydrateDraftQuery(query: SearchDraftQuery): SearchDraftQuery {
+  return {
+    required: normalizeConditionBlock(query.required),
+    preferred: normalizePreferredBlock(query.preferred),
+    skill_match_mode: (query.skill_match_mode ?? 'ANY') as SkillMatchMode,
+    semantic_query: query.semantic_query ?? null,
+    keyword_query: query.keyword_query ?? null,
+    sort: (query.sort ?? 'RELEVANCE') as SearchSort,
+  }
+}
+
 export function draftToPeopleRequest(
   draft: SearchDraftQuery,
   opts: { page: number; page_size: number },
@@ -201,8 +213,18 @@ export function validateDraftQuery(draft: SearchDraftQuery): string | null {
   if (career) {
     const min = career.min_months
     const max = career.max_months
-    if (min != null && min < 0) return '최소 경력(개월)은 0 이상이어야 합니다.'
-    if (max != null && max < 0) return '최대 경력(개월)은 0 이상이어야 합니다.'
+    if (min != null && (!Number.isFinite(min) || min < 0)) {
+      return '최소 경력(개월)은 0 이상이어야 합니다.'
+    }
+    if (max != null && (!Number.isFinite(max) || max < 0)) {
+      return '최대 경력(개월)은 0 이상이어야 합니다.'
+    }
+    if (
+      (min != null && !Number.isInteger(min)) ||
+      (max != null && !Number.isInteger(max))
+    ) {
+      return '경력(개월)은 정수로 입력해주세요.'
+    }
     if (min != null && max != null && min > max) {
       return '최소 경력은 최대 경력보다 클 수 없습니다.'
     }
@@ -259,7 +281,7 @@ export function parseTalentSearchState(raw: unknown): TalentSearchRouteState | n
   if (!state.draftQuery || typeof state.draftQuery !== 'object') return null
   return {
     version: SEARCH_ROUTE_STATE_VERSION,
-    draftQuery: normalizeDraftQuery(state.draftQuery as SearchDraftQuery),
+    draftQuery: hydrateDraftQuery(state.draftQuery as SearchDraftQuery),
     submittedRequest: (state.submittedRequest as SearchPeopleRequest | null) ?? null,
     naturalText: typeof state.naturalText === 'string' ? state.naturalText : '',
     assumptions: Array.isArray(state.assumptions)

@@ -224,16 +224,44 @@ export function SearchConditionPanel({
               <Space wrap>
                 <InputNumber
                   min={0}
+                  step={1}
+                  precision={0}
+                  controls
+                  inputMode="numeric"
                   placeholder="최소"
                   value={careerMin ?? undefined}
-                  onChange={(v) => setCareer(typeof v === 'number' ? v : null, careerMax)}
+                  onKeyDown={(e) => {
+                    if (['.', ',', 'e', 'E', '+', '-'].includes(e.key)) {
+                      e.preventDefault()
+                    }
+                  }}
+                  onChange={(v) =>
+                    setCareer(
+                      typeof v === 'number' && Number.isInteger(v) ? v : null,
+                      careerMax,
+                    )
+                  }
                 />
                 <Typography.Text>~</Typography.Text>
                 <InputNumber
                   min={0}
+                  step={1}
+                  precision={0}
+                  controls
+                  inputMode="numeric"
                   placeholder="최대"
                   value={careerMax ?? undefined}
-                  onChange={(v) => setCareer(careerMin, typeof v === 'number' ? v : null)}
+                  onKeyDown={(e) => {
+                    if (['.', ',', 'e', 'E', '+', '-'].includes(e.key)) {
+                      e.preventDefault()
+                    }
+                  }}
+                  onChange={(v) =>
+                    setCareer(
+                      careerMin,
+                      typeof v === 'number' && Number.isInteger(v) ? v : null,
+                    )
+                  }
                 />
               </Space>
             </Form.Item>

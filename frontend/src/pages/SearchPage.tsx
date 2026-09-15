@@ -34,7 +34,6 @@ import {
   hasActiveSearchConditions,
   interpretDataToDraft,
   isSearchDirty,
-  normalizeDraftQuery,
   parseTalentSearchState,
   type SearchDraftQuery,
   type TalentSearchRouteState,
@@ -131,6 +130,8 @@ export function SearchPage() {
       boot?.followUpEnabled ??
       hasActiveSearchConditions(boot?.draftQuery ?? createEmptyDraftQuery()),
   )
+  // Once the user explicitly toggles follow-up, do not auto-enable on draft edits.
+  const [followUpTouched, setFollowUpTouched] = useState(() => boot != null)
   const [interpretError, setInterpretError] = useState<string | null>(null)
   const [dismissedSearchError, setDismissedSearchError] = useState(false)
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null)
@@ -141,7 +142,8 @@ export function SearchPage() {
   const buildRouteState = useCallback((): TalentSearchRouteState => {
     return {
       version: 1,
-      draftQuery: normalizeDraftQuery(draftQuery),
+      // Keep raw draft text (no live-trim) so dirty in-progress edits restore.
+      draftQuery,
       submittedRequest,
       naturalText,
       assumptions,
@@ -149,8 +151,8 @@ export function SearchPage() {
     }
   }, [assumptions, draftQuery, followUpEnabled, naturalText, submittedRequest])
 
-  const persistSearchState = useCallback(() => {
-    navigate('/search', {
+  const persistSearchState = useCallback(async () => {
+    await navigate('/search', {
       replace: true,
       state: { talentSearch: buildRouteState() },
     })
@@ -202,10 +204,20 @@ export function SearchPage() {
   }, [queryClient, searchQuery.error, searchQuery.isError])
 
   const handleDraftChange = (next: SearchDraftQuery) => {
-    setDraftQuery(normalizeDraftQuery(next))
-    if (!followUpEnabled && hasActiveSearchConditions(next)) {
+    // Preserve in-progress spaces; canonicalize only at API/dirty boundaries.
+    setDraftQuery(next)
+    if (
+      !followUpTouched &&
+      !followUpEnabled &&
+      hasActiveSearchConditions(next)
+    ) {
       setFollowUpEnabled(true)
     }
+  }
+
+  const handleFollowUpChange = (value: boolean) => {
+    setFollowUpTouched(true)
+    setFollowUpEnabled(value)
   }
 
   const handleInterpret = () => {
@@ -242,7 +254,7 @@ export function SearchPage() {
       state: {
         talentSearch: {
           ...buildRouteState(),
-          draftQuery: normalizeDraftQuery(draftQuery),
+          draftQuery,
           submittedRequest: next,
         },
       },
@@ -255,6 +267,7 @@ export function SearchPage() {
     setNaturalText('')
     setAssumptions([])
     setFollowUpEnabled(false)
+    setFollowUpTouched(false)
     setInterpretError(null)
     setDismissedSearchError(false)
     setSelectedProjectId(null)
@@ -307,8 +320,8 @@ export function SearchPage() {
     })
   }
 
-  const handleOpenProfile = (personId: string) => {
-    persistSearchState()
+  const handleOpenProfile = async (personId: string) => {
+    await persistSearchState()
     navigate(`/people/${personId}`, { state: { fromSearch: true } })
   }
 
@@ -332,7 +345,7 @@ export function SearchPage() {
           naturalText={naturalText}
           onNaturalTextChange={setNaturalText}
           followUpEnabled={followUpEnabled}
-          onFollowUpChange={setFollowUpEnabled}
+          onFollowUpChange={handleFollowUpChange}
           assumptions={assumptions}
           interpretPending={interpretMutation.isPending}
           searchPending={searchQuery.isFetching}
