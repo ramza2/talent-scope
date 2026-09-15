@@ -896,6 +896,7 @@ POST /search/people
 | `POST /search/people` | 구현됨 — Structured Hard Filter + Keyword(FTS/`pg_trgm`) + pgvector Semantic, Person 병합, 결정적 RRF Ranking |
 | `POST /search/interpret` | 구현됨 — NL→Query JSON (Qwen3), Code/Alias 정규화, SearchPeopleRequest 호환 검증 |
 | Evidence / `top_projects` 상세 연결 | 구현됨 — Match `evidence_count`, Top Projects(≤3), persistent Evidence + DOCUMENT_CHUNK derived evidence, Drill-down ID |
+| Frontend Integrated Search UI | 구현됨 — `/search`: Interpret → editable Structured Query → `/search/people` → 기존 Project/Evidence/Document Drill-down |
 | `relaxations` 조건완화 | TODO — 항상 `[]` |
 | `POST /search/explain` | TODO |
 
