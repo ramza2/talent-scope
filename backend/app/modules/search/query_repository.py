@@ -1066,16 +1066,12 @@ class SearchQueryRepository:
         rows = self.db.execute(stmt).all()
         person_truncated = len(rows) > limit
         rows = rows[:limit]
-
-        # Bounded typed ANN pools can omit eligible far-neighbors. If any typed
-        # pool saturated at pool_size, surface candidate_limit_reached so the UI
-        # does not silently claim full evaluation.
-        pool_sat_rows = self.db.execute(
-            select(pool.c.object_type, func.count())
-            .group_by(pool.c.object_type)
-        ).all()
-        pool_saturated = any(int(cnt) >= pool_size for _, cnt in pool_sat_rows)
-        truncated = person_truncated or pool_saturated
+        # Policy A: typed ANN pools are bounded (SEMANTIC_ANN_MAX_POOL_PER_TYPE).
+        # Always surface candidate_limit_reached on the ANN path so the UI cannot
+        # silently claim full evaluation. Avoid a second COUNT over the pool
+        # subquery (it can re-execute HNSW scans). Required hard filters use
+        # force_exact instead, so typical filtered search does not warn via ANN.
+        truncated = True
         return self._rows_to_semantic_hits(rows), truncated
 
     def _rows_to_semantic_hits(self, rows: Sequence[Any]) -> list[ChannelHit]:

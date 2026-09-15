@@ -8,6 +8,7 @@ This document records **measured** Hybrid Search performance work for TalentScop
 - Seed: `0x612d` (deterministic)
 - Scale: people=2000, projects=6000, search_index_items≈28,590 (active current embeddings≈28,490)
 - Crowd-out fixture: person0 with 500 near `DOCUMENT_CHUNK` vectors
+- Ineligible-near flood: JOB-PL persons (~1/3) sit near the query axis (filtered ANN stress)
 - Embedding in benchmark: synthetic 1024-d vectors (no live BGE-M3 HTTP)
 - PostgreSQL 16.15, pgvector 0.6.0, pg_trgm 1.6
 
@@ -17,6 +18,8 @@ Requires `PERF_DATABASE_URL`. Refuses `--seed/--reset` when equal to `DATABASE_U
 Artifacts:
 - `/opt/cursor/artifacts/search-perf-before/`
 - `/opt/cursor/artifacts/search-perf-after/`
+- `/opt/cursor/artifacts/search-perf-recall-after.json`
+- `/opt/cursor/artifacts/search-perf-channel-timing-after.json`
 
 ## Ranking / correctness invariants (unchanged)
 
@@ -30,72 +33,93 @@ Artifacts:
 - Current `embedding_model` + `embedding_version` only
 - `source_weight` semantics retained (DOCUMENT_CHUNK 0.7)
 
-## Chosen optimizations
+## Semantic path policy (correctness)
 
-1. **Semantic typed-pool ANN (HNSW-friendly)**  
+1. **Typed-pool ANN (HNSW-friendly)** when no required hard filter and `eligible_count > 1000`  
    Per `PROFILE` / `PROJECT` / `DOCUMENT_CHUNK`: `ORDER BY embedding <=> q LIMIT pool`, union, score with `similarity * source_weight`, person-best, LIMIT.  
-   Eligible hard-filter applied **after** HNSW pool (keeps KNN shape), then intersect eligible person ids.
+   Eligible hard-filter applied **after** HNSW pool (keeps KNN shape).
 
-2. **Exact fallback when eligible_count ≤ 1000**  
-   Filtered searches (typical) use exact person-best window (often faster than ANN on small eligible sets).
+2. **Exact person-best when `eligible_count ≤ 1000`**  
+   Small eligible sets stay on exact window (often cheaper than ANN).
 
-3. **Set-based `recent_project_date`**  
-   `GROUP BY person_id` derived table + `LEFT JOIN` instead of correlated scalar subquery.
+3. **Required hard filter → `force_exact=True`**  
+   If any required structured filter is present, semantic retrieval always uses the exact path.  
+   Rationale (measured): filtered ANN can miss eligible near-neighbors that sit outside the global typed pools (ineligible-near flood). Exact also wins on latency for filtered sets in this fixture (see below).
 
-4. **Eligible metadata late-load**  
-   When keyword/semantic channels exist: channel SQL uses eligible subquery first; profile/recent metadata loaded only for merged candidate ids.
+4. **`candidate_limit_reached` on ANN (policy A)**  
+   Typed ANN pools are bounded. On the ANN path the repository always returns `candidate_limit_reached=True` so the UI cannot silently claim full evaluation.  
+   Required/filtered searches use exact and therefore do not inherit this ANN warning.
 
-5. **Preferred match batching**  
-   Page preferred code maps loaded with `IN (codes)` batch queries per category (not N queries per code).
+5. **Runtime embedding labels for PERF seed**  
+   `_insert_index` resolves `MODEL`/`VERSION` at call time (not def-time defaults) so seed rows track active embedding settings.
 
-6. **Stage timing log** (no PII / no query text / no vectors): eligible/keyword/embedding/semantic/preferred/project/enrichment/total ms.
+## Recall@K definition (corrected)
+
+```
+Recall@K = |ExactTopK ∩ AnnTopK| / |ExactTopK|
+```
+
+Both sides are truncated to **K** (not “ExactTopK vs full AnnTopLimit”).
+
+Top-K overlap is also recorded as `|ExactTopK ∩ AnnTopK| / |ExactTopK ∪ AnnTopK|`.
+
+## Measured recall (seed `0x612d`, people=2000)
+
+| Scenario | eligible | Recall@10 | Recall@50 | Recall@100 | deep underfill |
+|---|---:|---:|---:|---:|---|
+| Unfiltered forced ANN (limit=100) | 2000 | 1.0 | 1.0 | 1.0 | no |
+| Filtered `JOB-AI-DEV` forced ANN | 1334 | 1.0 | 1.0 | 1.0 | no |
+| Depth person_limit=500 / 2000 / 5000 | 2000 | 1.0 | 1.0 | 1.0 | no (ANN count matched exact within dataset) |
+
+Production still uses **force_exact** for required filters even when forced-ANN recall is 1.0 here — latency + flood safety.
+
+## Channel latency (repository probe, limit=`channel_candidate_limit(page=1)=500`)
+
+| Path | Median | p95 | `candidate_limit_reached` |
+|---|---:|---:|---|
+| Unfiltered router (ANN) | 158.5ms | 162.3ms | true (ANN policy A) |
+| Unfiltered forced ANN | 142.3ms | 144.7ms | true |
+| Unfiltered exact | 129.3ms | 130.7ms | true (limit+1) |
+| Filtered `JOB-AI-DEV` force_exact (policy) | **76.4ms** | 80.3ms | true (limit+1) |
+| Filtered forced ANN (not production) | 132.2ms | 140.0ms | true |
+
+Notes:
+- Earlier ~45ms ANN figures were on a warmer/smaller-shape probe before the ineligible-near flood fixture; re-measure after distribution changes.
+- Filtered exact remains faster than filtered ANN on this set — consistent with the force_exact policy.
+
+## End-to-end scenarios (after policy, iterations=5, fake embed provider)
+
+| Scenario | Median ms | SQL count (median) | `candidate_limit_reached` |
+|---|---:|---:|---|
+| S1 no query | 35 | 17 | false |
+| S2 structured | 101 | 30 | false |
+| S3 keyword | 283 | 26 | true |
+| S4 semantic | 439 | 27 | true (ANN) |
+| S5 keyword+semantic | 671 | 30 | true |
+| S6 required+semantic | **201** | 27 | false (exact) |
+| S7 hybrid full | 295 | 34 | false |
+| S8 preferred+project | 819 | 44 | true |
+| S9 deep page=10 | 1292 | 30 | true |
+| S10 near max depth | 1217 | 29 | true |
+
+SQL count stays bounded as page_size grows (no page_size-linear N+1).
+
+## Chosen supporting optimizations (unchanged)
+
+- Set-based `recent_project_date`
+- Eligible metadata late-load after merge
+- Preferred match batching
+- Stage timing log (no PII / no query text / no vectors)
 
 ## Rejected alternatives (measured)
 
 | Alternative | Result |
 |---|---|
-| Global single ANN item pool | Faster raw KNN possible, but DOCUMENT_CHUNK crowd-out risk; rejected vs typed pools |
-| Keyword 2-stage FTS∪ILIKE∪`%` UNION then score | On ~28k rows, median keyword channel **regressed** (~29ms → ~117ms); reverted to original OR + person-best |
-| Always-ANN even for tiny eligible sets | Filtered eligible=334: exact ~28ms vs ANN ~124ms; hence exact threshold=1000 |
-| New partial HNSW per object_type | Not needed after typed-pool query shape used existing `idx_search_index_embedding_hnsw` |
-| Speculative new B-tree/GIN indexes | Not added; existing GIN/HNSW sufficient when query shape allows |
-
-## EXPLAIN summary (people=2000)
-
-| Query | Before plan | After plan | Notes |
-|---|---|---|---|
-| Semantic legacy window | Seq Scan + WindowAgg + Sort (~216ms exec) | still available as exact path | Full vector eval; **no HNSW** |
-| Semantic typed ANN pools | — | **HNSW Index Scan** + Append + person WindowAgg (~45ms exec) | Uses `idx_search_index_embedding_hnsw` |
-| Keyword OR FTS/ILIKE/trgm | Seq Scan + WindowAgg (~100–114ms exec on EXPLAIN) | unchanged shape | GIN not chosen at this scale; 2-stage UNION slower in app timings |
-| Structured eligible | Nested Loop / index touches on person_job, grade, skills | set-based recent_project join | Existing relation indexes used |
-| Project semantic (bounded ids) | WindowAgg over candidate projects | unchanged | Bounded brute-force acceptable |
-
-## Channel latency (repository hybrid probe, same fixture)
-
-| Stage | Before median | After median | Δ |
-|---|---:|---:|---:|
-| Eligible list | 7.98ms | 7.85ms | ~0 |
-| Keyword | 28.94ms | 28.81ms | ~0 |
-| Semantic | 93.87ms (p95 513.6ms) | **45.32ms (p95 60.0ms)** | **p95 ≫ improved** |
-
-Exact-vs-ANN recall (person-level, limit=100): **Recall@10/50/100 = 1.0** on this synthetic set.
-
-## End-to-end scenarios (after, iterations=5, fake embed provider)
-
-| Scenario | Median ms | SQL count (median) |
-|---|---:|---:|
-| S1 no query | 33 | 17 |
-| S2 structured | 97 | 30 |
-| S3 keyword | 255 | 26 |
-| S4 semantic | 283 | 27 |
-| S5 keyword+semantic | 549 | 29 |
-| S6 required+semantic | 190 | 27 |
-| S7 hybrid full | 289 | 34 |
-| S8 preferred+project | 615 | 44 |
-| S9 deep page=10 | 978 | 29 |
-| S10 near max depth | 912 | 28 |
-
-SQL count stays bounded as page_size grows (no page_size-linear N+1).
+| Global single ANN item pool | DOCUMENT_CHUNK crowd-out risk; rejected vs typed pools |
+| Keyword 2-stage FTS∪ILIKE∪`%` UNION then score | Keyword channel regressed (~29ms → ~117ms); reverted |
+| Always-ANN for tiny eligible sets | Filtered exact faster; threshold=1000 retained |
+| Filtered ANN without force_exact | Flood risk + slower than exact here; production uses force_exact |
+| New partial HNSW / speculative B-tree/GIN | Not added; existing indexes reused |
 
 ## Indexes
 
@@ -108,10 +132,9 @@ SQL count stays bounded as page_size grows (no page_size-linear N+1).
 ## Known limits
 
 - Synthetic distribution ≠ production résumé text/vector skew
-- HNSW is approximate; monitor recall on real data
-- Cold vs warm cache differs (see semantic p95 before)
+- HNSW is approximate; monitor recall on real data (especially selective hard filters)
+- ANN path always advertises `candidate_limit_reached` (policy A)
 - Embedding HTTP latency is out of band (benchmark uses synthetic vectors)
-- Keyword GIN may appear at larger scales even though Seq Scan wins at 28k
 - Re-measure after production data growth
 
 ## How to re-run
@@ -120,7 +143,10 @@ SQL count stays bounded as page_size grows (no page_size-linear N+1).
 export PERF_DATABASE_URL=postgresql+psycopg://talentscope:talentscope@127.0.0.1:5432/talentscope_perf
 export DATABASE_URL=postgresql+psycopg://talentscope:talentscope@127.0.0.1:5432/talentscope
 cd backend
-python scripts/search_perf_benchmark.py --seed --people 2000
+python scripts/search_perf_benchmark.py --reset
+# reset mutates DATABASE_URL via session factory — re-export before seed
+export DATABASE_URL=postgresql+psycopg://talentscope:talentscope@127.0.0.1:5432/talentscope
+python scripts/search_perf_benchmark.py --seed --people 2000 --seed-value 0x612d
 python scripts/search_perf_benchmark.py --explain --out /opt/cursor/artifacts/search-perf-after
 python scripts/search_perf_benchmark.py --benchmark --out /opt/cursor/artifacts/search-perf-after --iterations 5
 python scripts/search_perf_benchmark.py --recall

@@ -115,6 +115,9 @@ def _resolve_embedding_constants() -> tuple[str, str, int]:
 
 
 def _session_factory(database_url: str):
+    # Point settings at the target DB without permanently clobbering a distinct
+    # caller DATABASE_URL (reset+seed in one process must keep them distinct).
+    previous = os.environ.get("DATABASE_URL")
     os.environ["DATABASE_URL"] = database_url
     from app.core.config import get_settings
 
@@ -124,6 +127,9 @@ def _session_factory(database_url: str):
 
     engine = create_engine(database_url, pool_pre_ping=True)
     _resolve_embedding_constants()
+    if previous is not None:
+        os.environ["DATABASE_URL"] = previous
+        get_settings.cache_clear()
     return sessionmaker(bind=engine, autoflush=False, autocommit=False), engine
 
 
