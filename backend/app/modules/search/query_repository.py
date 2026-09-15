@@ -38,6 +38,7 @@ from app.modules.search.query_schemas import (
     SearchConditionBlock,
     SearchPeopleRequest,
 )
+from app.modules.search import ranking as search_ranking
 from app.modules.search.ranking import (
     KEYWORD_TRIGRAM_THRESHOLD,
     SEMANTIC_EXACT_ELIGIBLE_THRESHOLD,
@@ -873,6 +874,7 @@ class SearchQueryRepository:
         query_vector: list[float],
         eligible_subq: Any,
         limit: int,
+        force_exact: bool = False,
     ) -> tuple[list[ChannelHit], bool]:
         """Person-level semantic hits with HNSW-friendly ANN pools when beneficial.
 
@@ -882,6 +884,13 @@ class SearchQueryRepository:
         - score = cosine_similarity * source_weight
         - person-best before channel LIMIT (no DOCUMENT_CHUNK crowd-out)
         - deterministic id ASC tie-break
+
+        Path selection:
+        - force_exact=True (required hard filters present): always exact
+        - eligible_count <= SEMANTIC_EXACT_ELIGIBLE_THRESHOLD: exact
+        - else: typed-pool ANN
+        Threshold is read from search_ranking at call time so tests can
+        monkeypatch ranking.SEMANTIC_EXACT_ELIGIBLE_THRESHOLD reliably.
         """
         if limit <= 0:
             return [], False
@@ -892,7 +901,8 @@ class SearchQueryRepository:
             ).scalar_one()
             or 0
         )
-        if eligible_count <= SEMANTIC_EXACT_ELIGIBLE_THRESHOLD:
+        threshold = search_ranking.SEMANTIC_EXACT_ELIGIBLE_THRESHOLD
+        if force_exact or eligible_count <= threshold:
             return self._semantic_channel_hits_exact(
                 query_vector=query_vector,
                 eligible_subq=eligible_subq,
@@ -1054,10 +1064,18 @@ class SearchQueryRepository:
             .limit(limit + 1)
         )
         rows = self.db.execute(stmt).all()
-        # Person-level truncation only (limit+1 fetch). ANN pool saturation is a
-        # recall concern measured separately; do not conflate with this flag.
-        truncated = len(rows) > limit
+        person_truncated = len(rows) > limit
         rows = rows[:limit]
+
+        # Bounded typed ANN pools can omit eligible far-neighbors. If any typed
+        # pool saturated at pool_size, surface candidate_limit_reached so the UI
+        # does not silently claim full evaluation.
+        pool_sat_rows = self.db.execute(
+            select(pool.c.object_type, func.count())
+            .group_by(pool.c.object_type)
+        ).all()
+        pool_saturated = any(int(cnt) >= pool_size for _, cnt in pool_sat_rows)
+        truncated = person_truncated or pool_saturated
         return self._rows_to_semantic_hits(rows), truncated
 
     def _rows_to_semantic_hits(self, rows: Sequence[Any]) -> list[ChannelHit]:

@@ -1332,17 +1332,48 @@ def test_required_jobs_or_matches_aggregated(
 
 
 
+
+def _force_ann_path(monkeypatch) -> None:
+    """Force semantic ANN regardless of eligible count (runtime + imported binding)."""
+    monkeypatch.setattr(
+        "app.modules.search.ranking.SEMANTIC_EXACT_ELIGIBLE_THRESHOLD",
+        0,
+    )
+    monkeypatch.setattr(
+        "app.modules.search.query_repository.SEMANTIC_EXACT_ELIGIBLE_THRESHOLD",
+        0,
+    )
+
+
+def _spy_forced_ann(monkeypatch) -> dict[str, int]:
+    """Assert ANN runs and exact path is never entered."""
+    from app.modules.search.query_repository import SearchQueryRepository
+
+    calls = {"ann": 0, "exact": 0}
+    orig_ann = SearchQueryRepository._semantic_channel_hits_ann
+    orig_exact = SearchQueryRepository._semantic_channel_hits_exact
+
+    def wrap_ann(self, *args, **kwargs):
+        calls["ann"] += 1
+        return orig_ann(self, *args, **kwargs)
+
+    def wrap_exact(self, *args, **kwargs):
+        calls["exact"] += 1
+        raise AssertionError("exact semantic path must not run when ANN is forced")
+
+    monkeypatch.setattr(SearchQueryRepository, "_semantic_channel_hits_ann", wrap_ann)
+    monkeypatch.setattr(SearchQueryRepository, "_semantic_channel_hits_exact", wrap_exact)
+    return calls
+
 def test_semantic_ann_respects_required_hard_filter(db_session, monkeypatch) -> None:
-    """Nearest vector person failing required grade must be excluded."""
+    """Nearest vector person failing required grade must be excluded (forced ANN)."""
     import uuid
 
     from app.db.models.person import PersonProfile
 
     _enable_embedding(monkeypatch)
-    monkeypatch.setattr(
-        "app.modules.search.ranking.SEMANTIC_EXACT_ELIGIBLE_THRESHOLD",
-        0,
-    )
+    _force_ann_path(monkeypatch)
+    calls = _spy_forced_ann(monkeypatch)
     suffix = uuid.uuid4().hex[:8]
     near = _unit_vector(index=0, value=1.0)
     mid = _unit_vector(index=0, value=0.85)
@@ -1385,12 +1416,16 @@ def test_semantic_ann_respects_required_hard_filter(db_session, monkeypatch) -> 
             page_size=20,
         )
         eligible_subq, repo = _eligible_subq(db_session, request=req)
+        # force_exact=False: exercise ANN + eligible intersection (service uses force_exact)
         hits, _ = repo.semantic_channel_hits(
             query_vector=near,
             eligible_subq=eligible_subq,
             limit=10,
+            force_exact=False,
         )
         ids = {h.person_id for h in hits}
+        assert calls["ann"] >= 1
+        assert calls["exact"] == 0
         assert a["person"].id not in ids
         assert b["person"].id in ids
     finally:
@@ -1399,26 +1434,35 @@ def test_semantic_ann_respects_required_hard_filter(db_session, monkeypatch) -> 
 
 
 def test_semantic_ignores_stale_embedding_version(db_session, monkeypatch) -> None:
-    """Stale embedding_model/version rows must not beat current version."""
+    """Stale embedding_model/version rows must not beat current version (forced ANN)."""
     import uuid
 
     _enable_embedding(monkeypatch)
+    _force_ann_path(monkeypatch)
+    calls = _spy_forced_ann(monkeypatch)
     suffix = uuid.uuid4().hex[:8]
-    near = _unit_vector(index=0, value=1.0)
-    mid = _unit_vector(index=0, value=0.8)
+    # Unique axis reduces collision with leftover fixtures; angled vectors
+    # differentiate cosine similarity (same-axis sparse vectors are all sim=1).
+    axis = (int(suffix, 16) % 200) + 3
+    near = _unit_vector(index=axis, value=1.0)
+    mid = _mix_vector(primary=axis, secondary=axis + 1, primary_w=0.90, secondary_w=0.20)
+    far_current = _mix_vector(primary=axis, secondary=axis + 1, primary_w=0.55, secondary_w=0.70)
     seeded = _seed_person(db_session, suffix=f"ver{suffix}")
+    other = _seed_person(db_session, suffix=f"ver2{suffix}")
     try:
-        _add_index_item(
-            db_session,
-            person_id=seeded["person"].id,
-            object_type="PROFILE",
-            object_id=uuid.uuid4(),
-            search_text="stale",
-            source_weight="1.000",
-            embedding=near,
-            embedding_model="old-model",
-            embedding_version="old-v0",
-        )
+        # Flood ANN pool with near but stale-version vectors
+        for i in range(40):
+            _add_index_item(
+                db_session,
+                person_id=seeded["person"].id,
+                object_type="DOCUMENT_CHUNK",
+                object_id=uuid.uuid4(),
+                search_text=f"stale-near-{i}",
+                source_weight="1.000",
+                embedding=near,
+                embedding_model="old-model",
+                embedding_version="old-v0",
+            )
         current_item = _add_index_item(
             db_session,
             person_id=seeded["person"].id,
@@ -1428,30 +1472,47 @@ def test_semantic_ignores_stale_embedding_version(db_session, monkeypatch) -> No
             source_weight="1.000",
             embedding=mid,
         )
+        # Another current-version person farther away — must remain eligible
+        _add_index_item(
+            db_session,
+            person_id=other["person"].id,
+            object_type="PROFILE",
+            object_id=other["person"].id,
+            search_text="other-current",
+            source_weight="1.000",
+            embedding=far_current,
+        )
         eligible_subq, repo = _eligible_subq(db_session)
         hits, _ = repo.semantic_channel_hits(
             query_vector=near,
             eligible_subq=eligible_subq,
             limit=10,
+            force_exact=False,
         )
+        assert calls["ann"] >= 1
+        assert calls["exact"] == 0
         assert hits
         assert hits[0].person_id == seeded["person"].id
         assert hits[0].item_id == current_item.id
+        # Stale near flood must not erase other current-version persons from the channel
+        hit_ids = {h.person_id for h in hits}
+        assert other["person"].id in hit_ids
+        # And must not under-fill relative to the two current-version fixtures
+        assert len(hit_ids) >= 2
     finally:
         _cleanup_person(db_session, seeded["person"].id)
+        _cleanup_person(db_session, other["person"].id)
 
 
 def test_semantic_chunk_crowd_out_does_not_drop_profile_or_project(
     db_session, monkeypatch
 ) -> None:
-    """Many near DOCUMENT_CHUNK rows for one person must not crowd out others."""
+    """Many near DOCUMENT_CHUNK rows for one person must not crowd out others (forced ANN)."""
     import uuid
 
     _enable_embedding(monkeypatch)
-    monkeypatch.setattr(
-        "app.modules.search.ranking.SEMANTIC_EXACT_ELIGIBLE_THRESHOLD",
-        0,
-    )
+    _force_ann_path(monkeypatch)
+    calls = _spy_forced_ann(monkeypatch)
     suffix = uuid.uuid4().hex[:8]
     near = _unit_vector(index=0, value=1.0)
     profile_vec = _unit_vector(index=0, value=0.92)
@@ -1493,8 +1554,11 @@ def test_semantic_chunk_crowd_out_does_not_drop_profile_or_project(
             query_vector=near,
             eligible_subq=eligible_subq,
             limit=2,
+            force_exact=False,
         )
         ids = {h.person_id for h in hits}
+        assert calls["ann"] >= 1
+        assert calls["exact"] == 0
         # DOCUMENT_CHUNK source_weight 0.7 loses to PROFILE/PROJECT person-best.
         # Crowd-out regression: B and C must occupy the limit=2 slots (A cannot monopolize).
         assert b["person"].id in ids
@@ -1504,3 +1568,66 @@ def test_semantic_chunk_crowd_out_does_not_drop_profile_or_project(
         _cleanup_person(db_session, a["person"].id)
         _cleanup_person(db_session, b["person"].id)
         _cleanup_person(db_session, c["person"].id)
+
+
+def test_semantic_required_force_exact_skips_ann(db_session, monkeypatch) -> None:
+    """Service policy: required hard filters force exact path even if threshold=0."""
+    import uuid
+
+    _enable_embedding(monkeypatch)
+    _force_ann_path(monkeypatch)
+    from app.modules.search.query_repository import SearchQueryRepository
+
+    calls = {"ann": 0, "exact": 0}
+    orig_ann = SearchQueryRepository._semantic_channel_hits_ann
+    orig_exact = SearchQueryRepository._semantic_channel_hits_exact
+
+    def wrap_ann(self, *args, **kwargs):
+        calls["ann"] += 1
+        return orig_ann(self, *args, **kwargs)
+
+    def wrap_exact(self, *args, **kwargs):
+        calls["exact"] += 1
+        return orig_exact(self, *args, **kwargs)
+
+    monkeypatch.setattr(SearchQueryRepository, "_semantic_channel_hits_ann", wrap_ann)
+    monkeypatch.setattr(SearchQueryRepository, "_semantic_channel_hits_exact", wrap_exact)
+
+    suffix = uuid.uuid4().hex[:8]
+    seeded = _seed_person(db_session, suffix=f"fx{suffix}")
+    try:
+        _add_index_item(
+            db_session,
+            person_id=seeded["person"].id,
+            object_type="PROFILE",
+            object_id=seeded["person"].id,
+            search_text="current",
+            source_weight="1.000",
+            embedding=_unit_vector(index=0, value=1.0),
+        )
+        eligible_subq, repo = _eligible_subq(db_session)
+        hits, _ = repo.semantic_channel_hits(
+            query_vector=_unit_vector(index=0, value=1.0),
+            eligible_subq=eligible_subq,
+            limit=10,
+            force_exact=True,
+        )
+        assert hits
+        assert calls["exact"] >= 1
+        assert calls["ann"] == 0
+    finally:
+        _cleanup_person(db_session, seeded["person"].id)
+
+
+def test_perf_insert_index_uses_runtime_model_version(monkeypatch) -> None:
+    """_insert_index defaults must follow runtime MODEL/VERSION, not def-time capture."""
+    import scripts.search_perf_benchmark as bench
+
+    monkeypatch.setattr(bench, "MODEL", "runtime-model-x")
+    monkeypatch.setattr(bench, "VERSION", "runtime-ver-y")
+    model, version = bench._resolved_index_labels()
+    assert model == "runtime-model-x"
+    assert version == "runtime-ver-y"
+    model2, version2 = bench._resolved_index_labels("explicit-m", "explicit-v")
+    assert model2 == "explicit-m"
+    assert version2 == "explicit-v"

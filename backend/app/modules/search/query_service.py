@@ -114,6 +114,7 @@ class SearchQueryService:
                 query_vector=query_vector,
                 eligible_subq=eligible_subq,
                 limit=limit,
+                force_exact=required_present,
             )
             semantic_ms = (time.perf_counter() - t0) * 1000.0
             candidate_limit_reached = candidate_limit_reached or sem_trunc

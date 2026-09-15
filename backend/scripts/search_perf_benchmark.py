@@ -204,6 +204,17 @@ def _seed_codes(conn) -> None:
             )
 
 
+def _resolved_index_labels(
+    model: str | None = None,
+    version: str | None = None,
+) -> tuple[str, str]:
+    """Resolve embedding labels at call time (avoids def-time default capture)."""
+    return (
+        MODEL if model is None else model,
+        VERSION if version is None else version,
+    )
+
+
 def _insert_index(
     conn,
     *,
@@ -213,11 +224,12 @@ def _insert_index(
     search_text: str,
     source_weight: float,
     embedding: list[float],
-    model: str = MODEL,
-    version: str = VERSION,
+    model: str | None = None,
+    version: str | None = None,
 ) -> None:
     from sqlalchemy import text
 
+    effective_model, effective_version = _resolved_index_labels(model, version)
     conn.execute(
         text(
             """
@@ -239,8 +251,8 @@ def _insert_index(
             "stext": search_text,
             "emb": _vector_literal(embedding),
             "sw": source_weight,
-            "model": model,
-            "ver": version,
+            "model": effective_model,
+            "ver": effective_version,
         },
     )
 
@@ -433,10 +445,17 @@ def _seed_person_batch(
                 {"prid": str(prid), "cust": cust},
             )
 
-        # PROFILE embedding: person 1 sits near query axis
+        # PROFILE embedding:
+        # - person 1 near query axis (unfiltered top hit)
+        # - JOB-PL persons (i%3==2) near axis → ineligible flood for JOB-AI-DEV filter
+        # - remaining AI-job persons farther (_person_vector)
         if i == 1:
             pvec = _unit_vector(0, 0.97)
             profile_text = "Near query profile RAG specialist DEMIS"
+        elif i % 3 == 2:
+            # Ineligible-near flood for filtered ANN (JOB-PL not under JOB-AI-DEV tree)
+            pvec = _unit_vector(0, 0.98 - (i % 100) * 0.0001)
+            profile_text = f"Near-axis ineligible profile {i} DEMIS"
         else:
             pvec = _person_vector(rng, i)
             profile_text = f"Profile {i} Python RAG LLM expert DEMIS"
@@ -566,6 +585,30 @@ def seed_dataset(
             "embedding_version": VERSION,
             "embedding_dim": EMBED_DIM,
         }
+        if int(stats["active_current_embeddings"]) <= 0:
+            raise SystemExit(
+                "Seed integrity failure: active_current_embeddings must be > 0 "
+                f"(model={MODEL!r} version={VERSION!r})"
+            )
+        sample = conn.execute(
+            text(
+                """
+                SELECT embedding_model, embedding_version
+                FROM search_index_item
+                WHERE is_active AND embedding IS NOT NULL
+                  AND object_type = 'PROFILE'
+                LIMIT 5
+                """
+            )
+        ).all()
+        if not sample:
+            raise SystemExit("Seed integrity failure: no active PROFILE embeddings")
+        for model, version in sample:
+            if model != MODEL or version != VERSION:
+                raise SystemExit(
+                    "Seed integrity failure: PROFILE row labels "
+                    f"({model!r}, {version!r}) != runtime ({MODEL!r}, {VERSION!r})"
+                )
     engine.dispose()
     return stats
 
@@ -1212,69 +1255,184 @@ def _exact_semantic_person_ids(
 
 
 def run_recall(*, limit: int = 100) -> None:
+    """Compare exact vs ANN person lists with true top-K Recall@K.
+
+    Recall@K = |ExactTopK ∩ AnnTopK| / |ExactTopK|
+    (ANN side is also truncated to K — not the full ANN limit window.)
+    """
+    from sqlalchemy import func, select
+
     perf_url = _require_perf_url(allow_write=False)
     SessionLocal, engine = _session_factory(perf_url)
     db = SessionLocal()
     try:
         from app.modules.search.query_repository import SearchQueryRepository
-        from app.modules.search.query_schemas import SearchConditionBlock, SearchPeopleRequest
-        from app.modules.search.ranking import ChannelHit
+        from app.modules.search.query_schemas import (
+            SearchConditionBlock,
+            SearchPeopleRequest,
+        )
+        from app.modules.search.ranking import (
+            SEMANTIC_EXACT_ELIGIBLE_THRESHOLD,
+            ChannelHit,
+            semantic_ann_pool_size,
+        )
 
         repo = SearchQueryRepository(db)
-        req = SearchPeopleRequest(required=SearchConditionBlock(), page=1, page_size=20)
-        expanded = repo.validate_and_expand_codes(req)
-        eligible_subq = repo.eligible_person_ids_subquery(
-            required=req.required,
-            expanded=expanded,
-            skill_match_mode=req.skill_match_mode,
-        )
         qvec = _unit_vector(0, 1.0)
 
-        exact_method = getattr(repo, "semantic_channel_hits_exact", None)
-        if callable(exact_method):
-            exact_hits, _ = exact_method(
-                query_vector=qvec, eligible_subq=eligible_subq, limit=limit
-            )
-            exact_ids = [h.person_id for h in exact_hits]
-            exact_source = "semantic_channel_hits_exact"
-        else:
-            exact_ids = _exact_semantic_person_ids(db, query_vector=qvec, limit=limit)
-            exact_source = "raw_sql_exact_window"
+        def _ids(hits: list) -> list:
+            if hits and isinstance(hits[0], ChannelHit):
+                return [h.person_id for h in hits]
+            return list(hits)
 
-        ann_hits, _ = repo.semantic_channel_hits(
-            query_vector=qvec, eligible_subq=eligible_subq, limit=limit
-        )
-        # Before ANN optimization, repository path == exact window; still compare.
-        if isinstance(ann_hits[0], ChannelHit) if ann_hits else True:
-            ann_set = {h.person_id for h in ann_hits}
-        else:
-            ann_set = set(ann_hits)
-
-        def recall_at(k: int) -> float:
+        def _recall_at(exact_ids: list, ann_ids: list, k: int) -> float:
             if not exact_ids:
                 return 1.0
-            top = exact_ids[:k]
-            hit = sum(1 for p in top if p in ann_set)
-            return hit / len(top)
+            top_exact = exact_ids[:k]
+            if not top_exact:
+                return 1.0
+            ann_top = set(ann_ids[:k])
+            return sum(1 for pid in top_exact if pid in ann_top) / len(top_exact)
+
+        def _overlap_at(exact_ids: list, ann_ids: list, k: int) -> float:
+            a = set(exact_ids[:k])
+            b = set(ann_ids[:k])
+            if not a and not b:
+                return 1.0
+            return len(a & b) / max(len(a | b), 1)
+
+        def _run_pair(*, req: SearchPeopleRequest, person_limit: int, force_ann: bool):
+            expanded = repo.validate_and_expand_codes(req)
+            eligible_subq = repo.eligible_person_ids_subquery(
+                required=req.required,
+                expanded=expanded,
+                skill_match_mode=req.skill_match_mode,
+            )
+            eligible_count = int(
+                db.execute(
+                    select(func.count()).select_from(eligible_subq)
+                ).scalar_one()
+                or 0
+            )
+            exact_hits, exact_trunc = repo.semantic_channel_hits_exact(
+                query_vector=qvec, eligible_subq=eligible_subq, limit=person_limit
+            )
+            if force_ann:
+                ann_hits, ann_trunc = repo._semantic_channel_hits_ann(
+                    query_vector=qvec, eligible_subq=eligible_subq, limit=person_limit
+                )
+                path = "forced_ann"
+            else:
+                # Mirror router without service-level force_exact.
+                ann_hits, ann_trunc = repo.semantic_channel_hits(
+                    query_vector=qvec,
+                    eligible_subq=eligible_subq,
+                    limit=person_limit,
+                    force_exact=False,
+                )
+                path = (
+                    "exact_threshold"
+                    if eligible_count <= SEMANTIC_EXACT_ELIGIBLE_THRESHOLD
+                    else "ann"
+                )
+            exact_ids = _ids(exact_hits)
+            ann_ids = _ids(ann_hits)
+            pool = semantic_ann_pool_size(person_limit=person_limit)
+            underfill = len(exact_ids) >= min(person_limit, eligible_count) and len(
+                ann_ids
+            ) < min(person_limit, len(exact_ids))
+            return {
+                "path": path,
+                "eligible_count": eligible_count,
+                "person_limit": person_limit,
+                "pool_size_per_type": pool,
+                "exact_count": len(exact_ids),
+                "ann_count": len(ann_ids),
+                "exact_truncated": bool(exact_trunc),
+                "ann_candidate_limit_reached": bool(ann_trunc),
+                "deep_page_underfill": bool(underfill),
+                "recall_at_10": _recall_at(exact_ids, ann_ids, 10),
+                "recall_at_50": _recall_at(exact_ids, ann_ids, 50),
+                "recall_at_100": _recall_at(exact_ids, ann_ids, 100),
+                "recall_at_limit": _recall_at(exact_ids, ann_ids, person_limit),
+                "overlap_at_10": _overlap_at(exact_ids, ann_ids, 10),
+                "overlap_at_50": _overlap_at(exact_ids, ann_ids, 50),
+                "overlap_at_100": _overlap_at(exact_ids, ann_ids, 100),
+            }
+
+        unfiltered = _run_pair(
+            req=SearchPeopleRequest(
+                required=SearchConditionBlock(), page=1, page_size=20
+            ),
+            person_limit=limit,
+            force_ann=True,
+        )
+
+        filtered_req = SearchPeopleRequest(
+            required=SearchConditionBlock(jobs=["JOB-AI-DEV"]),
+            page=1,
+            page_size=20,
+        )
+        filtered_forced_ann = _run_pair(
+            req=filtered_req, person_limit=limit, force_ann=True
+        )
+        filtered_router = _run_pair(
+            req=filtered_req, person_limit=limit, force_ann=False
+        )
+
+        expanded = repo.validate_and_expand_codes(filtered_req)
+        eligible_subq = repo.eligible_person_ids_subquery(
+            required=filtered_req.required,
+            expanded=expanded,
+            skill_match_mode=filtered_req.skill_match_mode,
+        )
+        policy_hits, policy_trunc = repo.semantic_channel_hits(
+            query_vector=qvec,
+            eligible_subq=eligible_subq,
+            limit=limit,
+            force_exact=True,
+        )
+
+        depth_report = [
+            _run_pair(
+                req=SearchPeopleRequest(
+                    required=SearchConditionBlock(), page=1, page_size=20
+                ),
+                person_limit=person_limit,
+                force_ann=True,
+            )
+            for person_limit in (500, 2000, 5000)
+        ]
 
         report = {
             "limit": limit,
-            "exact_source": exact_source,
-            "exact_count": len(exact_ids),
-            "ann_count": len(ann_hits),
-            "recall_at_10": recall_at(10),
-            "recall_at_50": recall_at(50),
-            "recall_at_100": recall_at(100),
-            "recall_at_limit": recall_at(limit),
-            "note": (
-                "Before ANN optimization, repository semantic_channel_hits is the exact "
-                "window path; recall vs itself should be ~1.0."
+            "recall_definition": (
+                "Recall@K = |ExactTopK ∩ AnnTopK| / |ExactTopK| "
+                "(both sides truncated to K)"
             ),
+            "unfiltered_forced_ann": unfiltered,
+            "filtered_job_ai_dev_forced_ann": filtered_forced_ann,
+            "filtered_job_ai_dev_router_no_service_force": filtered_router,
+            "filtered_required_force_exact_policy": {
+                "count": len(policy_hits),
+                "candidate_limit_reached": bool(policy_trunc),
+                "note": (
+                    "Production SearchQueryService passes force_exact=True when any "
+                    "required hard filter is present; ANN is unused on that path."
+                ),
+            },
+            "depth_pool_caps": depth_report,
+            "policy": {
+                "required_hard_filter": "force_exact",
+                "ann_pool_saturation_sets_candidate_limit_reached": True,
+                "exact_eligible_threshold": SEMANTIC_EXACT_ELIGIBLE_THRESHOLD,
+            },
         }
         print(json.dumps(report, indent=2, default=str))
     finally:
         db.close()
         engine.dispose()
+
 
 
 def _parse_int(value: str) -> int:
