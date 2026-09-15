@@ -18,6 +18,22 @@ MAX_CHANNEL_CANDIDATE_ITEMS = 5000
 # Keep low enough for short Korean/tech tokens; central constant for tests.
 KEYWORD_TRIGRAM_THRESHOLD = 0.25
 
+
+# Semantic ANN retrieval (HNSW-friendly). Does not change rank-v2 weights.
+SEMANTIC_OBJECT_TYPES: tuple[str, ...] = ("PROFILE", "PROJECT", "DOCUMENT_CHUNK")
+SEMANTIC_ANN_OVERSAMPLE_FACTOR = 12
+SEMANTIC_ANN_MIN_POOL_PER_TYPE = 200
+SEMANTIC_ANN_MAX_POOL_PER_TYPE = 2000
+# Below this eligible size, exact person-best window is cheap enough.
+SEMANTIC_EXACT_ELIGIBLE_THRESHOLD = 1000
+
+
+def semantic_ann_pool_size(*, person_limit: int) -> int:
+    """Per-object-type ANN item pool size before person-best collapse."""
+    raw = max(SEMANTIC_ANN_MIN_POOL_PER_TYPE, int(person_limit) * SEMANTIC_ANN_OVERSAMPLE_FACTOR)
+    return min(SEMANTIC_ANN_MAX_POOL_PER_TYPE, raw)
+
+
 SKILL_DISPLAY_CAP = 10
 EXPERTISE_DISPLAY_CAP = 10
 

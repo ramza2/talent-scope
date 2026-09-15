@@ -560,6 +560,8 @@ EMBEDDING_ENABLED=false로 worker가 실행되면 COMPLETED가 아니라 CANCELL
 
 ## 13. Search Architecture
 
+Semantic channel uses typed-pool HNSW ANN (`ORDER BY embedding <=> q LIMIT pool` per PROFILE/PROJECT/DOCUMENT_CHUNK) then person-best collapse; small eligible sets use exact person-best window. Hard filters remain SQL SoT; person-best prevents DOCUMENT_CHUNK crowd-out. See `docs/16_search_performance.md`.
+
 MVP 검색엔진은 PostgreSQL 안에서 구성한다.
 
 ```text
@@ -607,7 +609,8 @@ Qwen3 Query Parser
 
 Search Result Evidence / Top Projects / Drill-down ID / rank-v2 Project relevance는 구현됨.
 Frontend Integrated Search UI(`/search`): Natural Language Interpret → editable Structured Query → `/search/people` → 기존 Project/Evidence/Document Drill-down APIs.
-남은 TODO: 조건완화(relaxations), Search Explanation, Reranker, Hybrid/Project Ranking 성능 튜닝.
+Hybrid Search candidate retrieval은 typed-pool ANN(HNSW) + person-best collapse, eligible 규모에 따른 exact fallback, set-based recent_project_date, preferred code batch lookup으로 튜닝됨(벤치마크 people=2000). 상세 `docs/16_search_performance.md`.
+남은 TODO: 조건완화(relaxations), Search Explanation, Reranker.
 
 별도 Elasticsearch/OpenSearch/Vector DB는 검색 규모가 PostgreSQL 단독 운영한계를 넘을 때 검토한다.
 
