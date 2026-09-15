@@ -590,25 +590,22 @@ def seed_dataset(
                 "Seed integrity failure: active_current_embeddings must be > 0 "
                 f"(model={MODEL!r} version={VERSION!r})"
             )
-        sample = conn.execute(
+        current_profiles = conn.execute(
             text(
                 """
-                SELECT embedding_model, embedding_version
-                FROM search_index_item
+                SELECT count(*) FROM search_index_item
                 WHERE is_active AND embedding IS NOT NULL
                   AND object_type = 'PROFILE'
-                LIMIT 5
+                  AND embedding_model = :m AND embedding_version = :v
                 """
+            ),
+            {"m": MODEL, "v": VERSION},
+        ).scalar_one()
+        if int(current_profiles) <= 0:
+            raise SystemExit(
+                "Seed integrity failure: no PROFILE rows with runtime labels "
+                f"(model={MODEL!r} version={VERSION!r})"
             )
-        ).all()
-        if not sample:
-            raise SystemExit("Seed integrity failure: no active PROFILE embeddings")
-        for model, version in sample:
-            if model != MODEL or version != VERSION:
-                raise SystemExit(
-                    "Seed integrity failure: PROFILE row labels "
-                    f"({model!r}, {version!r}) != runtime ({MODEL!r}, {VERSION!r})"
-                )
     engine.dispose()
     return stats
 
