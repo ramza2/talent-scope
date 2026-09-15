@@ -1329,3 +1329,178 @@ def test_required_jobs_or_matches_aggregated(
     finally:
         _cleanup_person(db_session, seeded["person"].id)
         _cleanup_user(db_session, user.id)
+
+
+
+def test_semantic_ann_respects_required_hard_filter(db_session, monkeypatch) -> None:
+    """Nearest vector person failing required grade must be excluded."""
+    import uuid
+
+    from app.db.models.person import PersonProfile
+
+    _enable_embedding(monkeypatch)
+    monkeypatch.setattr(
+        "app.modules.search.ranking.SEMANTIC_EXACT_ELIGIBLE_THRESHOLD",
+        0,
+    )
+    suffix = uuid.uuid4().hex[:8]
+    near = _unit_vector(index=0, value=1.0)
+    mid = _unit_vector(index=0, value=0.85)
+
+    a = _seed_person(db_session, suffix=f"anna{suffix}")
+    b = _seed_person(db_session, suffix=f"annb{suffix}")
+    # Force hard-filter differentiation via technical_grade
+    db_session.get(PersonProfile, a["person"].id).technical_grade = "BEGINNER"
+    db_session.get(PersonProfile, b["person"].id).technical_grade = "EXPERT"
+    db_session.commit()
+    try:
+        _add_index_item(
+            db_session,
+            person_id=a["person"].id,
+            object_type="PROFILE",
+            object_id=a["person"].id,
+            search_text="near query",
+            source_weight="1.000",
+            embedding=near,
+        )
+        _add_index_item(
+            db_session,
+            person_id=b["person"].id,
+            object_type="PROFILE",
+            object_id=b["person"].id,
+            search_text="mid query",
+            source_weight="1.000",
+            embedding=mid,
+        )
+
+        from app.modules.search.query_schemas import (
+            GradeFilter,
+            SearchConditionBlock,
+            SearchPeopleRequest,
+        )
+
+        req = SearchPeopleRequest(
+            required=SearchConditionBlock(grade=GradeFilter(values=["EXPERT"])),
+            page=1,
+            page_size=20,
+        )
+        eligible_subq, repo = _eligible_subq(db_session, request=req)
+        hits, _ = repo.semantic_channel_hits(
+            query_vector=near,
+            eligible_subq=eligible_subq,
+            limit=10,
+        )
+        ids = {h.person_id for h in hits}
+        assert a["person"].id not in ids
+        assert b["person"].id in ids
+    finally:
+        _cleanup_person(db_session, a["person"].id)
+        _cleanup_person(db_session, b["person"].id)
+
+
+def test_semantic_ignores_stale_embedding_version(db_session, monkeypatch) -> None:
+    """Stale embedding_model/version rows must not beat current version."""
+    import uuid
+
+    _enable_embedding(monkeypatch)
+    suffix = uuid.uuid4().hex[:8]
+    near = _unit_vector(index=0, value=1.0)
+    mid = _unit_vector(index=0, value=0.8)
+    seeded = _seed_person(db_session, suffix=f"ver{suffix}")
+    try:
+        _add_index_item(
+            db_session,
+            person_id=seeded["person"].id,
+            object_type="PROFILE",
+            object_id=uuid.uuid4(),
+            search_text="stale",
+            source_weight="1.000",
+            embedding=near,
+            embedding_model="old-model",
+            embedding_version="old-v0",
+        )
+        current_item = _add_index_item(
+            db_session,
+            person_id=seeded["person"].id,
+            object_type="PROFILE",
+            object_id=seeded["person"].id,
+            search_text="current",
+            source_weight="1.000",
+            embedding=mid,
+        )
+        eligible_subq, repo = _eligible_subq(db_session)
+        hits, _ = repo.semantic_channel_hits(
+            query_vector=near,
+            eligible_subq=eligible_subq,
+            limit=10,
+        )
+        assert hits
+        assert hits[0].person_id == seeded["person"].id
+        assert hits[0].item_id == current_item.id
+    finally:
+        _cleanup_person(db_session, seeded["person"].id)
+
+
+def test_semantic_chunk_crowd_out_does_not_drop_profile_or_project(
+    db_session, monkeypatch
+) -> None:
+    """Many near DOCUMENT_CHUNK rows for one person must not crowd out others."""
+    import uuid
+
+    _enable_embedding(monkeypatch)
+    monkeypatch.setattr(
+        "app.modules.search.ranking.SEMANTIC_EXACT_ELIGIBLE_THRESHOLD",
+        0,
+    )
+    suffix = uuid.uuid4().hex[:8]
+    near = _unit_vector(index=0, value=1.0)
+    profile_vec = _unit_vector(index=0, value=0.92)
+    project_vec = _unit_vector(index=0, value=0.90)
+    a = _seed_person(db_session, suffix=f"cda{suffix}")
+    b = _seed_person(db_session, suffix=f"cdb{suffix}")
+    c = _seed_person(db_session, suffix=f"cdc{suffix}")
+    try:
+        for i in range(120):
+            _add_index_item(
+                db_session,
+                person_id=a["person"].id,
+                object_type="DOCUMENT_CHUNK",
+                object_id=uuid.uuid4(),
+                search_text=f"chunk-{i}",
+                source_weight="0.700",
+                embedding=near,
+            )
+        _add_index_item(
+            db_session,
+            person_id=b["person"].id,
+            object_type="PROFILE",
+            object_id=b["person"].id,
+            search_text="profile near",
+            source_weight="1.000",
+            embedding=profile_vec,
+        )
+        _add_index_item(
+            db_session,
+            person_id=c["person"].id,
+            object_type="PROJECT",
+            object_id=c["project_a"].id,
+            search_text="project near",
+            source_weight="1.000",
+            embedding=project_vec,
+        )
+        eligible_subq, repo = _eligible_subq(db_session)
+        hits, _ = repo.semantic_channel_hits(
+            query_vector=near,
+            eligible_subq=eligible_subq,
+            limit=2,
+        )
+        ids = {h.person_id for h in hits}
+        # DOCUMENT_CHUNK source_weight 0.7 loses to PROFILE/PROJECT person-best.
+        # Crowd-out regression: B and C must occupy the limit=2 slots (A cannot monopolize).
+        assert b["person"].id in ids
+        assert c["person"].id in ids
+        assert a["person"].id not in ids
+    finally:
+        _cleanup_person(db_session, a["person"].id)
+        _cleanup_person(db_session, b["person"].id)
+        _cleanup_person(db_session, c["person"].id)

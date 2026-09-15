@@ -7,7 +7,7 @@ from datetime import date
 from typing import Any, Sequence
 from uuid import UUID
 
-from sqlalchemy import Float, Select, and_, case, cast, exists, func, literal, or_, select, text, true
+from sqlalchemy import Float, Select, and_, case, cast, exists, func, literal, or_, select, text, true, union_all
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import SearchInvalidCodeError
@@ -40,7 +40,10 @@ from app.modules.search.query_schemas import (
 )
 from app.modules.search.ranking import (
     KEYWORD_TRIGRAM_THRESHOLD,
+    SEMANTIC_EXACT_ELIGIBLE_THRESHOLD,
+    SEMANTIC_OBJECT_TYPES,
     ChannelHit,
+    semantic_ann_pool_size,
 )
 
 CODE_TYPE_JOB = "JOB"
@@ -391,12 +394,16 @@ class SearchQueryRepository:
         skill_match_mode: str,
     ) -> list[EligiblePersonRow]:
         career = self.effective_career_months_expr()
-        recent_project = (
-            select(func.max(func.coalesce(Project.end_date, Project.start_date)))
-            .where(Project.person_id == Person.id, self._project_alive())
-            .correlate(Person)
-            .scalar_subquery()
-        )
+        recent_sq = (
+            select(
+                Project.person_id.label("person_id"),
+                func.max(func.coalesce(Project.end_date, Project.start_date)).label(
+                    "recent_project_date"
+                ),
+            )
+            .where(self._project_alive())
+            .group_by(Project.person_id)
+        ).subquery("eligible_recent_project")
         stmt = (
             select(
                 Person.id,
@@ -404,9 +411,10 @@ class SearchQueryRepository:
                 PersonProfile.technical_grade,
                 career,
                 PersonProfile.profile_updated_at,
-                recent_project,
+                recent_sq.c.recent_project_date,
             )
             .join(PersonProfile, PersonProfile.person_id == Person.id)
+            .outerjoin(recent_sq, recent_sq.c.person_id == Person.id)
             .where(self._active_person_filter())
         )
         stmt = self.apply_required_filters(
@@ -427,6 +435,72 @@ class SearchQueryRepository:
             )
             for row in rows
         ]
+
+    def list_eligible_person_ids(
+        self,
+        *,
+        required: SearchConditionBlock,
+        expanded: dict[str, Any],
+        skill_match_mode: str,
+    ) -> list[UUID]:
+        """Lightweight eligible IDs (no profile/project metadata)."""
+        stmt = select(Person.id).where(self._active_person_filter())
+        stmt = self.apply_required_filters(
+            stmt,
+            required=required,
+            expanded=expanded,
+            skill_match_mode=skill_match_mode,
+        )
+        return list(self.db.execute(stmt).scalars().all())
+
+    def load_eligible_persons_by_ids(
+        self, person_ids: Sequence[UUID]
+    ) -> dict[UUID, EligiblePersonRow]:
+        """Batch-load eligible metadata for a candidate ID set only."""
+        if not person_ids:
+            return {}
+        career = self.effective_career_months_expr()
+        recent_sq = (
+            select(
+                Project.person_id.label("person_id"),
+                func.max(func.coalesce(Project.end_date, Project.start_date)).label(
+                    "recent_project_date"
+                ),
+            )
+            .where(
+                self._project_alive(),
+                Project.person_id.in_(list(person_ids)),
+            )
+            .group_by(Project.person_id)
+        ).subquery("candidate_recent_project")
+        stmt = (
+            select(
+                Person.id,
+                PersonProfile.name,
+                PersonProfile.technical_grade,
+                career,
+                PersonProfile.profile_updated_at,
+                recent_sq.c.recent_project_date,
+            )
+            .join(PersonProfile, PersonProfile.person_id == Person.id)
+            .outerjoin(recent_sq, recent_sq.c.person_id == Person.id)
+            .where(
+                self._active_person_filter(),
+                Person.id.in_(list(person_ids)),
+            )
+        )
+        rows = self.db.execute(stmt).all()
+        return {
+            row[0]: EligiblePersonRow(
+                person_id=row[0],
+                name=row[1],
+                technical_grade=row[2],
+                career_months=row[3],
+                profile_updated_at=row[4],
+                recent_project_date=row[5],
+            )
+            for row in rows
+        }
 
     # ------------------------------------------------ preferred ratios
     def preferred_match_ratio(
@@ -595,6 +669,99 @@ class SearchQueryRepository:
 
     # ----------------------------------------------------- keyword channel
 
+
+    def preferred_skill_hits_by_code(
+        self, person_ids: Sequence[UUID], tech_codes: Sequence[str]
+    ) -> dict[str, set[UUID]]:
+        out: dict[str, set[UUID]] = {c: set() for c in tech_codes}
+        if not person_ids or not tech_codes:
+            return out
+        person_rows = self.db.execute(
+            select(PersonSkill.person_id, PersonSkill.tech_code).where(
+                PersonSkill.person_id.in_(list(person_ids)),
+                PersonSkill.tech_code.in_(list(tech_codes)),
+            )
+        ).all()
+        for pid, code in person_rows:
+            out.setdefault(code, set()).add(pid)
+        project_rows = self.db.execute(
+            select(Project.person_id, ProjectSkill.tech_code)
+            .join(ProjectSkill, ProjectSkill.project_id == Project.id)
+            .where(
+                Project.person_id.in_(list(person_ids)),
+                Project.deleted_at.is_(None),
+                ProjectSkill.tech_code.in_(list(tech_codes)),
+            )
+        ).all()
+        for pid, code in project_rows:
+            out.setdefault(code, set()).add(pid)
+        return out
+
+    def preferred_expertise_hits_by_code(
+        self, person_ids: Sequence[UUID], exp_codes: Sequence[str]
+    ) -> dict[str, set[UUID]]:
+        out: dict[str, set[UUID]] = {c: set() for c in exp_codes}
+        if not person_ids or not exp_codes:
+            return out
+        person_rows = self.db.execute(
+            select(PersonExpertise.person_id, PersonExpertise.exp_code).where(
+                PersonExpertise.person_id.in_(list(person_ids)),
+                PersonExpertise.exp_code.in_(list(exp_codes)),
+            )
+        ).all()
+        for pid, code in person_rows:
+            out.setdefault(code, set()).add(pid)
+        project_rows = self.db.execute(
+            select(Project.person_id, ProjectExpertise.exp_code)
+            .join(ProjectExpertise, ProjectExpertise.project_id == Project.id)
+            .where(
+                Project.person_id.in_(list(person_ids)),
+                Project.deleted_at.is_(None),
+                ProjectExpertise.exp_code.in_(list(exp_codes)),
+            )
+        ).all()
+        for pid, code in project_rows:
+            out.setdefault(code, set()).add(pid)
+        return out
+
+    def preferred_biz_hits_by_code(
+        self, person_ids: Sequence[UUID], biz_codes: Sequence[str]
+    ) -> dict[str, set[UUID]]:
+        out: dict[str, set[UUID]] = {c: set() for c in biz_codes}
+        if not person_ids or not biz_codes:
+            return out
+        rows = self.db.execute(
+            select(Project.person_id, ProjectBusinessDomain.biz_code)
+            .join(ProjectBusinessDomain, ProjectBusinessDomain.project_id == Project.id)
+            .where(
+                Project.person_id.in_(list(person_ids)),
+                Project.deleted_at.is_(None),
+                ProjectBusinessDomain.biz_code.in_(list(biz_codes)),
+            )
+        ).all()
+        for pid, code in rows:
+            out.setdefault(code, set()).add(pid)
+        return out
+
+    def preferred_customer_hits_by_code(
+        self, person_ids: Sequence[UUID], customer_codes: Sequence[str]
+    ) -> dict[str, set[UUID]]:
+        out: dict[str, set[UUID]] = {c: set() for c in customer_codes}
+        if not person_ids or not customer_codes:
+            return out
+        rows = self.db.execute(
+            select(Project.person_id, ProjectCustomerType.customer_type_code)
+            .join(ProjectCustomerType, ProjectCustomerType.project_id == Project.id)
+            .where(
+                Project.person_id.in_(list(person_ids)),
+                Project.deleted_at.is_(None),
+                ProjectCustomerType.customer_type_code.in_(list(customer_codes)),
+            )
+        ).all()
+        for pid, code in rows:
+            out.setdefault(code, set()).add(pid)
+        return out
+
     def keyword_channel_hits(
         self,
         *,
@@ -610,6 +777,11 @@ class SearchQueryRepository:
         3) trigram similarity
         4) source_weight
         5) item id
+
+        Note: on mid-size corpora (~30k index rows) a single OR predicate with
+        person-best window outperformed a 2-stage UNION prefilter in EXPLAIN/
+        benchmark timings, so we keep the simpler shape. GIN usage is
+        dataset/plan dependent; do not assert Index Scan in unit tests.
         """
         if limit <= 0:
             return [], False
@@ -654,7 +826,6 @@ class SearchQueryRepository:
             )
         ).subquery("keyword_ranked_items")
 
-        # Fetch limit+1 person-best rows to detect person-level truncation.
         stmt = (
             select(
                 ranked.c.id,
@@ -703,18 +874,60 @@ class SearchQueryRepository:
         eligible_subq: Any,
         limit: int,
     ) -> tuple[list[ChannelHit], bool]:
-        """Person-level semantic hits: best item per person in SQL, then LIMIT.
+        """Person-level semantic hits with HNSW-friendly ANN pools when beneficial.
 
-        Best item score = cosine_similarity * source_weight
-        (computed in PostgreSQL via pgvector cosine_distance; no Python vector math).
+        Correctness invariants preserved:
+        - hard-filter eligible persons only
+        - current embedding_model / embedding_version only
+        - score = cosine_similarity * source_weight
+        - person-best before channel LIMIT (no DOCUMENT_CHUNK crowd-out)
+        - deterministic id ASC tie-break
         """
         if limit <= 0:
             return [], False
 
+        eligible_count = int(
+            self.db.execute(
+                select(func.count()).select_from(eligible_subq)
+            ).scalar_one()
+            or 0
+        )
+        if eligible_count <= SEMANTIC_EXACT_ELIGIBLE_THRESHOLD:
+            return self._semantic_channel_hits_exact(
+                query_vector=query_vector,
+                eligible_subq=eligible_subq,
+                limit=limit,
+            )
+        return self._semantic_channel_hits_ann(
+            query_vector=query_vector,
+            eligible_subq=eligible_subq,
+            limit=limit,
+        )
+
+    def semantic_channel_hits_exact(
+        self,
+        *,
+        query_vector: list[float],
+        eligible_subq: Any,
+        limit: int,
+    ) -> tuple[list[ChannelHit], bool]:
+        """Public exact person-best semantic channel (benchmark recall reference)."""
+        return self._semantic_channel_hits_exact(
+            query_vector=query_vector,
+            eligible_subq=eligible_subq,
+            limit=limit,
+        )
+
+    def _semantic_channel_hits_exact(
+        self,
+        *,
+        query_vector: list[float],
+        eligible_subq: Any,
+        limit: int,
+    ) -> tuple[list[ChannelHit], bool]:
         model = current_embedding_model()
         version = effective_embedding_version()
         distance = SearchIndexItem.embedding.cosine_distance(query_vector)
-        # similarity in [0,1] approx via 1 - distance; clamp at 0 for safety.
         similarity = func.greatest(literal(0.0), literal(1.0) - distance)
         effective_score = similarity * cast(SearchIndexItem.source_weight, Float)
 
@@ -758,7 +971,96 @@ class SearchQueryRepository:
         rows = self.db.execute(stmt).all()
         truncated = len(rows) > limit
         rows = rows[:limit]
+        return self._rows_to_semantic_hits(rows), truncated
 
+    def _semantic_channel_hits_ann(
+        self,
+        *,
+        query_vector: list[float],
+        eligible_subq: Any,
+        limit: int,
+    ) -> tuple[list[ChannelHit], bool]:
+        model = current_embedding_model()
+        version = effective_embedding_version()
+        distance = SearchIndexItem.embedding.cosine_distance(query_vector)
+        pool_size = semantic_ann_pool_size(person_limit=limit)
+
+        # HNSW-friendly: keep ORDER BY distance LIMIT free of eligible IN-list.
+        # Apply hard-filter eligibility after the typed ANN pools (correctness SoT).
+        pool_stmts = []
+        for object_type in SEMANTIC_OBJECT_TYPES:
+            pool_stmts.append(
+                select(
+                    SearchIndexItem.id.label("id"),
+                    SearchIndexItem.person_id.label("person_id"),
+                    SearchIndexItem.object_type.label("object_type"),
+                    SearchIndexItem.object_id.label("object_id"),
+                    SearchIndexItem.source_weight.label("source_weight"),
+                    distance.label("distance"),
+                )
+                .where(
+                    SearchIndexItem.is_active.is_(True),
+                    SearchIndexItem.embedding.is_not(None),
+                    SearchIndexItem.embedding_model == model,
+                    SearchIndexItem.embedding_version == version,
+                    SearchIndexItem.object_type == object_type,
+                )
+                .order_by(distance.asc(), SearchIndexItem.id.asc())
+                .limit(pool_size)
+            )
+
+        pool = union_all(*pool_stmts).subquery("semantic_ann_pool")
+        eligible_pool = (
+            select(
+                pool.c.id,
+                pool.c.person_id,
+                pool.c.object_type,
+                pool.c.object_id,
+                pool.c.source_weight,
+                pool.c.distance,
+            )
+            .where(pool.c.person_id.in_(select(eligible_subq.c.person_id)))
+        ).subquery("semantic_ann_eligible_pool")
+        similarity = func.greatest(literal(0.0), literal(1.0) - eligible_pool.c.distance)
+        effective_score = similarity * cast(eligible_pool.c.source_weight, Float)
+        item_order = (effective_score.desc(), eligible_pool.c.id.asc())
+        ranked = (
+            select(
+                eligible_pool.c.id,
+                eligible_pool.c.person_id,
+                eligible_pool.c.object_type,
+                eligible_pool.c.object_id,
+                eligible_pool.c.distance,
+                effective_score.label("effective_score"),
+                eligible_pool.c.source_weight,
+                func.row_number()
+                .over(partition_by=eligible_pool.c.person_id, order_by=item_order)
+                .label("rn"),
+            )
+        ).subquery("semantic_ann_person_best")
+
+        stmt = (
+            select(
+                ranked.c.id,
+                ranked.c.person_id,
+                ranked.c.object_type,
+                ranked.c.object_id,
+                ranked.c.distance,
+                ranked.c.effective_score,
+                ranked.c.source_weight,
+            )
+            .where(ranked.c.rn == 1)
+            .order_by(ranked.c.effective_score.desc(), ranked.c.id.asc())
+            .limit(limit + 1)
+        )
+        rows = self.db.execute(stmt).all()
+        # Person-level truncation only (limit+1 fetch). ANN pool saturation is a
+        # recall concern measured separately; do not conflate with this flag.
+        truncated = len(rows) > limit
+        rows = rows[:limit]
+        return self._rows_to_semantic_hits(rows), truncated
+
+    def _rows_to_semantic_hits(self, rows: Sequence[Any]) -> list[ChannelHit]:
         hits: list[ChannelHit] = []
         for rank, row in enumerate(rows, start=1):
             hits.append(
@@ -772,7 +1074,7 @@ class SearchQueryRepository:
                     source_weight=float(row.source_weight or 1.0),
                 )
             )
-        return hits, truncated
+        return hits
 
     def load_profiles(self, person_ids: Sequence[UUID]) -> dict[UUID, PersonProfile]:
         if not person_ids:

@@ -295,7 +295,8 @@ Document READY
   - Project / Evidence / Document Drill-down (기존 API 재사용)
   - Search → Person Detail → Back 시 React Router state로 조건 복원
   - 적합도는 `적합도 N점`(probability/% 아님)
-- 남은 TODO: 조건완화(relaxations), Search explanation(`POST /search/explain`), Reranker, 대규모 Hybrid Search 성능 튜닝 / EXPLAIN ANALYZE.
+- Hybrid Search 성능 튜닝 / EXPLAIN ANALYZE: 완료(벤치마크 규모 people=2000 / search_index_items≈28.6k, seed=0x612d). 상세는 `docs/16_search_performance.md`.
+- 남은 TODO: 조건완화(relaxations), Search explanation(`POST /search/explain`), Reranker.
 
 
 최근성은 보정값으로 사용하며 오래된 경험을 과도하게 감점하지 않는다.
