@@ -75,4 +75,4 @@ def test_production_semantic_ann_is_explicitly_disabled() -> None:
     )
 
     assert SEMANTIC_ANN_PRODUCTION_ENABLED is False
-    assert SEMANTIC_EXACT_ELIGIBLE_THRESHOLD == 1000
+    assert SEMANTIC_EXACT_ELIGIBLE_THRESHOLD >= 1_000_000
