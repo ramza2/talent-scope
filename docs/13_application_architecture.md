@@ -560,7 +560,7 @@ EMBEDDING_ENABLED=false로 worker가 실행되면 COMPLETED가 아니라 CANCELL
 
 ## 13. Search Architecture
 
-Semantic channel uses typed-pool HNSW ANN (`ORDER BY embedding <=> q LIMIT pool` per PROFILE/PROJECT/DOCUMENT_CHUNK) then person-best collapse; small eligible sets use exact person-best window. Hard filters remain SQL SoT; person-best prevents DOCUMENT_CHUNK crowd-out. See `docs/16_search_performance.md`.
+Semantic channel은 현재 production에서 exact person-best를 기본으로 사용한다. typed-pool HNSW ANN 구현은 유지하지만 2,000명 synthetic PERF fixture에서 exact보다 빠른 crossover가 확인되지 않아 production selector에서는 비활성화한다. ANN은 PERF/test에서만 강제 실행하여 실제 repository SQL의 HNSW plan·recall·pool underfill을 검증하고, 향후 대규모/실데이터에서 유의미한 성능 이득이 확인될 때 활성화한다. Hard filter는 계속 SQL SoT이며 person-best semantics도 유지한다. 상세는 `docs/16_search_performance.md`를 따른다.
 
 MVP 검색엔진은 PostgreSQL 안에서 구성한다.
 
@@ -609,7 +609,7 @@ Qwen3 Query Parser
 
 Search Result Evidence / Top Projects / Drill-down ID / rank-v2 Project relevance는 구현됨.
 Frontend Integrated Search UI(`/search`): Natural Language Interpret → editable Structured Query → `/search/people` → 기존 Project/Evidence/Document Drill-down APIs.
-Hybrid Search candidate retrieval은 typed-pool ANN(HNSW) + person-best collapse, eligible 규모에 따른 exact fallback, set-based recent_project_date, preferred code batch lookup으로 튜닝됨(벤치마크 people=2000). 상세 `docs/16_search_performance.md`.
+Hybrid Search candidate retrieval은 exact person-best production 경로 + benchmark용 typed-pool ANN(HNSW), set-based recent_project_date, late eligible metadata load, preferred code batch lookup으로 튜닝됨. 현재 ANN production activation은 보류하며 실제 repository SQL EXPLAIN과 대규모 crossover를 `docs/16_search_performance.md` 기준으로 재검증한다.
 남은 TODO: 조건완화(relaxations), Search Explanation, Reranker.
 
 별도 Elasticsearch/OpenSearch/Vector DB는 검색 규모가 PostgreSQL 단독 운영한계를 넘을 때 검토한다.
