@@ -41,7 +41,6 @@ from app.modules.search.query_schemas import (
 from app.modules.search import ranking as search_ranking
 from app.modules.search.ranking import (
     KEYWORD_TRIGRAM_THRESHOLD,
-    SEMANTIC_EXACT_ELIGIBLE_THRESHOLD,
     SEMANTIC_OBJECT_TYPES,
     ChannelHit,
     semantic_ann_pool_size,
@@ -670,7 +669,6 @@ class SearchQueryRepository:
 
     # ----------------------------------------------------- keyword channel
 
-
     def preferred_skill_hits_by_code(
         self, person_ids: Sequence[UUID], tech_codes: Sequence[str]
     ) -> dict[str, set[UUID]]:
@@ -867,7 +865,6 @@ class SearchQueryRepository:
             )
         return hits, truncated
 
-
     def semantic_channel_hits(
         self,
         *,
@@ -876,7 +873,7 @@ class SearchQueryRepository:
         limit: int,
         force_exact: bool = False,
     ) -> tuple[list[ChannelHit], bool]:
-        """Person-level semantic hits with HNSW-friendly ANN pools when beneficial.
+        """Person-level semantic hits with an exact-first production policy.
 
         Correctness invariants preserved:
         - hard-filter eligible persons only
@@ -886,14 +883,23 @@ class SearchQueryRepository:
         - deterministic id ASC tie-break
 
         Path selection:
-        - force_exact=True (required hard filters present): always exact
+        - force_exact=True: return exact immediately (no eligible COUNT)
         - eligible_count <= SEMANTIC_EXACT_ELIGIBLE_THRESHOLD: exact
         - else: typed-pool ANN
-        Threshold is read from search_ranking at call time so tests can
-        monkeypatch ranking.SEMANTIC_EXACT_ELIGIBLE_THRESHOLD reliably.
+
+        The production threshold is intentionally set high until a measured
+        large-scale crossover proves ANN is faster with acceptable recall.
+        Tests/PERF can still force ANN by monkeypatching the threshold to 0.
         """
         if limit <= 0:
             return [], False
+
+        if force_exact:
+            return self._semantic_channel_hits_exact(
+                query_vector=query_vector,
+                eligible_subq=eligible_subq,
+                limit=limit,
+            )
 
         eligible_count = int(
             self.db.execute(
@@ -902,7 +908,7 @@ class SearchQueryRepository:
             or 0
         )
         threshold = search_ranking.SEMANTIC_EXACT_ELIGIBLE_THRESHOLD
-        if force_exact or eligible_count <= threshold:
+        if eligible_count <= threshold:
             return self._semantic_channel_hits_exact(
                 query_vector=query_vector,
                 eligible_subq=eligible_subq,
@@ -995,8 +1001,8 @@ class SearchQueryRepository:
         distance = SearchIndexItem.embedding.cosine_distance(query_vector)
         pool_size = semantic_ann_pool_size(person_limit=limit)
 
-        # HNSW-friendly: keep ORDER BY distance LIMIT free of eligible IN-list.
-        # Apply hard-filter eligibility after the typed ANN pools (correctness SoT).
+        # HNSW-friendly candidate pools. Eligibility remains a hard-filter SoT
+        # and is applied before person-best ranking, after the bounded KNN pool.
         pool_stmts = []
         for object_type in SEMANTIC_OBJECT_TYPES:
             pool_stmts.append(
@@ -1064,13 +1070,10 @@ class SearchQueryRepository:
             .limit(limit + 1)
         )
         rows = self.db.execute(stmt).all()
-        person_truncated = len(rows) > limit
         rows = rows[:limit]
-        # Policy A: typed ANN pools are bounded (SEMANTIC_ANN_MAX_POOL_PER_TYPE).
-        # Always surface candidate_limit_reached on the ANN path so the UI cannot
-        # silently claim full evaluation. Avoid a second COUNT over the pool
-        # subquery (it can re-execute HNSW scans). Required hard filters use
-        # force_exact instead, so typical filtered search does not warn via ANN.
+        # Typed ANN pools are bounded, so ANN is always conservative about
+        # candidate completeness. This path is benchmark/experimental until a
+        # production crossover is measured.
         truncated = True
         return self._rows_to_semantic_hits(rows), truncated
 
