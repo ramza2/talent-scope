@@ -46,6 +46,11 @@ from app.modules.search.ranking import (
     semantic_ann_pool_size,
 )
 
+# Compatibility hook for existing ANN regression tests. Runtime path selection
+# deliberately reads search_ranking.SEMANTIC_EXACT_ELIGIBLE_THRESHOLD at call
+# time; this alias only keeps older monkeypatch targets valid.
+SEMANTIC_EXACT_ELIGIBLE_THRESHOLD = search_ranking.SEMANTIC_EXACT_ELIGIBLE_THRESHOLD
+
 CODE_TYPE_JOB = "JOB"
 CODE_TYPE_TECH = "TECH"
 CODE_TYPE_EXP = "EXP"
