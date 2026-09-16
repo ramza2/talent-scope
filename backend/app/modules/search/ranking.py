@@ -24,8 +24,10 @@ SEMANTIC_OBJECT_TYPES: tuple[str, ...] = ("PROFILE", "PROJECT", "DOCUMENT_CHUNK"
 SEMANTIC_ANN_OVERSAMPLE_FACTOR = 12
 SEMANTIC_ANN_MIN_POOL_PER_TYPE = 200
 SEMANTIC_ANN_MAX_POOL_PER_TYPE = 2000
-# Below this eligible size, exact person-best window is cheap enough.
-SEMANTIC_EXACT_ELIGIBLE_THRESHOLD = 1000
+# Production keeps the exact person-best path until a real-data/large-scale
+# crossover shows ANN is faster without unacceptable recall loss. Tests and
+# PERF benchmarks can still force ANN by monkeypatching this threshold to 0.
+SEMANTIC_EXACT_ELIGIBLE_THRESHOLD = 1_000_000_000
 
 
 def semantic_ann_pool_size(*, person_limit: int) -> int:
