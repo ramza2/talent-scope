@@ -55,13 +55,18 @@ The measured 2k fixture did **not** establish an ANN performance crossover. On t
 | Filtered `JOB-AI-DEV` exact | **76.4ms** | 80.3ms | true (limit+1) |
 | Filtered forced ANN | 132.2ms | 140.0ms | true |
 
-Therefore production keeps the exact person-best path until a larger-scale / real-distribution benchmark shows ANN is faster with acceptable recall. `SEMANTIC_EXACT_ELIGIBLE_THRESHOLD` is intentionally set far above the current expected scale. PERF/tests can set it to `0` to exercise ANN.
+Therefore production now keeps the exact person-best path until a larger-scale / real-distribution benchmark shows ANN is faster with acceptable recall.
 
-This avoids claiming a performance win that the measured fixture does not show.
+Two conservative gates make this explicit:
 
-### Required hard filters
+- `SEMANTIC_ANN_PRODUCTION_ENABLED = False`
+- `SEMANTIC_EXACT_ELIGIBLE_THRESHOLD` remains a very high safety threshold until a measured crossover is approved
 
-`force_exact=True` short-circuits **before** the eligible-person `COUNT(*)`. Required+semantic searches therefore do not pay a count query only to choose the already-known exact path.
+PERF/tests set the threshold to `0` to force the ANN implementation without changing the production default.
+
+Because ANN is production-disabled, normal semantic requests return the exact path **before** running an eligible-person `COUNT(*)`. Required searches also pass `force_exact=True` and take the same no-count short-circuit.
+
+This avoids claiming a performance win that the measured fixture does not show, while preserving the ANN implementation for controlled benchmarking.
 
 ### Experimental ANN path
 
@@ -121,7 +126,7 @@ python scripts/search_perf_runtime_explain.py \
   --out /opt/cursor/artifacts/search-perf-after/runtime-ann-explain.json
 ```
 
-Repeat after seeding 2k / 5k / 10k (or the largest feasible scale) before lowering the production exact threshold.
+Repeat after seeding 2k / 5k / 10k (or the largest feasible scale) before enabling production ANN and lowering the exact threshold.
 
 ## pgvector 0.6.0 note
 
@@ -189,7 +194,7 @@ Existing search indexes remain:
 
 ## Acceptance before enabling ANN in production
 
-Before lowering `SEMANTIC_EXACT_ELIGIBLE_THRESHOLD`, record at minimum:
+Before setting `SEMANTIC_ANN_PRODUCTION_ENABLED=True` and lowering `SEMANTIC_EXACT_ELIGIBLE_THRESHOLD`, record at minimum:
 
 - dataset size and SearchIndexItem count,
 - exact median/p95,
