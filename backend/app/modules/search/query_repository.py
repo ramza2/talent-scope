@@ -662,8 +662,7 @@ class SearchQueryRepository:
                 select(Project.person_id)
                 .join(
                     ProjectCustomerType,
-                    ProjectCustomerType.project_id == Project.id,
-                )
+                    ProjectCustomerType.project_id == Project.id)
                 .where(
                     Project.person_id.in_(list(person_ids)),
                     Project.deleted_at.is_(None),
@@ -887,20 +886,27 @@ class SearchQueryRepository:
         - person-best before channel LIMIT (no DOCUMENT_CHUNK crowd-out)
         - deterministic id ASC tie-break
 
-        Path selection:
-        - force_exact=True: return exact immediately (no eligible COUNT)
-        - eligible_count <= SEMANTIC_EXACT_ELIGIBLE_THRESHOLD: exact
-        - else: typed-pool ANN
-
-        The production threshold is intentionally set high until a measured
-        large-scale crossover proves ANN is faster with acceptable recall.
-        Tests/PERF can still force ANN by monkeypatching the threshold to 0.
+        Production keeps ANN disabled until a measured crossover is approved.
+        PERF/tests may force ANN by monkeypatching the exact threshold to 0.
         """
         if limit <= 0:
             return [], False
 
-        if force_exact:
+        threshold = search_ranking.SEMANTIC_EXACT_ELIGIBLE_THRESHOLD
+        ann_forced_for_measurement = threshold <= 0
+
+        if force_exact or (
+            not search_ranking.SEMANTIC_ANN_PRODUCTION_ENABLED
+            and not ann_forced_for_measurement
+        ):
             return self._semantic_channel_hits_exact(
+                query_vector=query_vector,
+                eligible_subq=eligible_subq,
+                limit=limit,
+            )
+
+        if ann_forced_for_measurement:
+            return self._semantic_channel_hits_ann(
                 query_vector=query_vector,
                 eligible_subq=eligible_subq,
                 limit=limit,
@@ -912,7 +918,6 @@ class SearchQueryRepository:
             ).scalar_one()
             or 0
         )
-        threshold = search_ranking.SEMANTIC_EXACT_ELIGIBLE_THRESHOLD
         if eligible_count <= threshold:
             return self._semantic_channel_hits_exact(
                 query_vector=query_vector,
