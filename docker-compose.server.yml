@@ -50,25 +50,29 @@ services:
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
     volumes:
       - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
     networks:
       - internal
 
   minio-init:
-    image: minio/mc:latest
+    # Docker Hub minio/mc may be unavailable. MinIO's own build publishes the
+    # client image to Quay as well, and that image is scratch-based (no /bin/sh),
+    # so use MC_HOST_* credentials and invoke mc directly without a shell.
+    image: quay.io/minio/mc:latest
     restart: "no"
     depends_on:
-      - minio
+      minio:
+        condition: service_healthy
     environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
-      S3_BUCKET: ${S3_BUCKET}
-    entrypoint: ["/bin/sh", "-ec"]
-    command:
-      - |
-        until mc alias set local http://minio:9000 "$${MINIO_ROOT_USER}" "$${MINIO_ROOT_PASSWORD}"; do
-          sleep 2
-        done
-        mc mb --ignore-existing "local/$${S3_BUCKET}"
+      MC_HOST_local: http://${MINIO_ROOT_USER}:${MINIO_ROOT_PASSWORD}@minio:9000
+      MC_NO_COLOR: "1"
+    entrypoint: ["/usr/bin/mc"]
+    command: ["mb", "--ignore-existing", "local/${S3_BUCKET}"]
     networks:
       - internal
 
