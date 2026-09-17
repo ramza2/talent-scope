@@ -1,4 +1,4 @@
-"""Document processing orchestration: convert → extract → DocumentPage."""
+"""Document processing orchestration: convert -> extract -> DocumentPage."""
 
 from __future__ import annotations
 
@@ -17,11 +17,17 @@ from app.db.models.document import Document
 from app.modules.document_processing.converters.base import ConverterError, PdfConverter
 from app.modules.document_processing.converters.libreoffice import LibreOfficeConverter
 from app.modules.document_processing.parsers.image import extract_image_page
+from app.modules.document_processing.parsers.korean import (
+    KoreanDocumentExtractionError,
+    extract_korean_document_text,
+)
 from app.modules.document_processing.parsers.pdf import extract_pdf_pages
 from app.modules.document_processing.repository import DocumentProcessingRepository
 from app.modules.document_processing.types import (
     CONVERT_TO_PDF_EXTENSIONS,
     IMAGE_EXTENSIONS,
+    KOREAN_DOCUMENT_EXTENSIONS,
+    ExtractedPage,
     ExtractionResult,
 )
 from app.storage.base import ObjectStorage
@@ -62,7 +68,6 @@ class DocumentProcessingService:
         Returns final ``processing_status``. Concurrent callers lose the atomic
         claim and return the current status without running conversion.
         """
-        # Atomic claim closes the race between SKIP LOCKED select and status commit.
         if not self.repo.try_claim_processing(document_id):
             existing = self.db.execute(
                 select(Document).where(Document.id == document_id)
@@ -78,7 +83,6 @@ class DocumentProcessingService:
 
         self.db.commit()
 
-        # Re-lock after claim commit for the remainder of the unit of work.
         document = self.repo.get_document_for_update(document_id)
         if document is None:
             raise NotFoundError("문서를 찾을 수 없습니다.")
@@ -105,8 +109,6 @@ class DocumentProcessingService:
             )
 
             if result.preview_pdf_bytes is not None:
-                # Always use a fresh unique key so a failed reprocess never
-                # overwrites / compensates-away a previously good preview.
                 new_preview_key = self.preview_key(
                     group.person_id, group.id, document.id
                 )
@@ -117,7 +119,6 @@ class DocumentProcessingService:
                 )
                 uploaded_new_preview = True
 
-            # Prefer new preview key; native PDF/image keep previous None.
             final_preview_key = (
                 new_preview_key
                 if uploaded_new_preview
@@ -134,13 +135,11 @@ class DocumentProcessingService:
                 preview_storage_key=final_preview_key,
                 preview_page_count=result.page_count,
             )
-            # SearchIndexJob SoT only — no chunk materialization / embedding in this TX.
             from app.modules.search.document_chunk_sync import DocumentChunkSyncService
 
             DocumentChunkSyncService(self.db).ensure_sync_job(group.id)
             self.db.commit()
 
-            # After READY is committed, remove obsolete previous preview if replaced.
             if (
                 uploaded_new_preview
                 and previous_preview_key
@@ -158,8 +157,6 @@ class DocumentProcessingService:
         except Exception as exc:
             logger.exception("document processing failed document_id=%s", document_id)
             self.db.rollback()
-            # Compensate only the newly uploaded unique preview; never touch
-            # previous_preview_key / object (may still be the live READY preview).
             if uploaded_new_preview and new_preview_key:
                 try:
                     self.storage.delete(new_preview_key)
@@ -169,7 +166,6 @@ class DocumentProcessingService:
                         new_preview_key,
                         exc_info=True,
                     )
-            # Preserve original object and existing preview_storage_key; mark FAILED.
             document = self.repo.get_document_for_update(document_id)
             if document is not None:
                 self.repo.mark_failed(document, self._safe_error(exc))
@@ -181,9 +177,6 @@ class DocumentProcessingService:
                 shutil.rmtree(work_dir, ignore_errors=True)
 
     def _download_original(self, document: Document) -> bytes:
-        # TODO(perf): stream ObjectStorage directly to work_dir source file to
-        # avoid holding up to ~50MB twice in Python memory (chunks list + join).
-        # Prefer path-based PyMuPDF open / LibreOffice source path after that.
         obj = self.storage.get(document.storage_key)
         try:
             chunks = list(obj.iter_chunks())
@@ -211,6 +204,14 @@ class DocumentProcessingService:
         if extension in IMAGE_EXTENSIONS:
             return extract_image_page()
 
+        if extension in KOREAN_DOCUMENT_EXTENSIONS:
+            return self._extract_korean_document(
+                extension=extension,
+                original_bytes=original_bytes,
+                original_filename=document.original_filename,
+                work_dir=work_dir,
+            )
+
         if extension in CONVERT_TO_PDF_EXTENSIONS:
             return self._convert_and_extract(
                 extension=extension,
@@ -221,6 +222,57 @@ class DocumentProcessingService:
 
         raise ConverterError(f"지원하지 않는 처리 확장자입니다: .{extension or '?'}")
 
+    def _extract_korean_document(
+        self,
+        *,
+        extension: str,
+        original_bytes: bytes,
+        original_filename: str,
+        work_dir: Path,
+    ) -> ExtractionResult:
+        """Prefer a real PDF preview; fall back to native text when LO cannot render."""
+        try:
+            return self._convert_and_extract(
+                extension=extension,
+                original_bytes=original_bytes,
+                original_filename=original_filename,
+                work_dir=work_dir,
+            )
+        except ConverterError as convert_exc:
+            logger.info(
+                "korean document PDF conversion failed; trying native text "
+                "extension=%s err=%s",
+                extension,
+                type(convert_exc).__name__,
+            )
+
+        source_path = work_dir / f"source.{extension}"
+        if not source_path.exists():
+            source_path.write_bytes(original_bytes)
+        try:
+            text = extract_korean_document_text(source_path, extension=extension)
+        except KoreanDocumentExtractionError as native_exc:
+            raise ConverterError(
+                f"{extension.upper()} PDF 변환과 native text 추출이 모두 실패했습니다."
+            ) from native_exc
+
+        return ExtractionResult(
+            pages=[
+                ExtractedPage(
+                    page_no=1,
+                    extracted_text=text,
+                    extraction_method=f"{extension.upper()}_TEXT_PARSER",
+                    layout_json={
+                        "source_format": extension.upper(),
+                        "page_mapping": "UNAVAILABLE",
+                    },
+                )
+            ],
+            page_count=1,
+            preview_pdf_bytes=None,
+            uses_original_as_preview=False,
+        )
+
     def _convert_and_extract(
         self,
         *,
@@ -229,7 +281,6 @@ class DocumentProcessingService:
         original_filename: str,
         work_dir: Path,
     ) -> ExtractionResult:
-        # Keep a safe local name; never pass user path to a shell.
         safe_name = f"source.{extension}"
         source_path = work_dir / safe_name
         source_path.write_bytes(original_bytes)
@@ -252,5 +303,4 @@ class DocumentProcessingService:
     @staticmethod
     def _safe_error(exc: BaseException) -> str:
         msg = str(exc).strip() or exc.__class__.__name__
-        # Never dump full stack traces into the DB column for UI leakage risk.
         return msg[:2000]
