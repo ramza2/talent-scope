@@ -250,6 +250,7 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
+      target: test
     env_file:
       - .env.server
     environment:
