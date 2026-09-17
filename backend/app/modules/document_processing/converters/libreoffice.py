@@ -13,6 +13,13 @@ from app.modules.document_processing.converters.base import ConverterError
 logger = logging.getLogger(__name__)
 
 
+def _decode_tail(value: bytes | None, *, limit: int = 800) -> str:
+    text = (value or b"").decode("utf-8", errors="replace").strip()
+    if len(text) <= limit:
+        return text
+    return text[-limit:]
+
+
 class LibreOfficeConverter:
     """Convert Office/HWP documents to PDF via LibreOffice argv subprocess.
 
@@ -36,7 +43,6 @@ class LibreOfficeConverter:
         out_dir.mkdir(parents=True, exist_ok=True)
         profile_dir.mkdir(parents=True, exist_ok=True)
 
-        # file:// URI for UserInstallation (LibreOffice requirement).
         profile_uri = profile_dir.resolve().as_uri()
         cmd = [
             binary,
@@ -66,13 +72,18 @@ class LibreOfficeConverter:
                 f"LibreOffice 변환 시간 초과({timeout}s)"
             ) from exc
 
+        stdout = _decode_tail(completed.stdout)
+        stderr = _decode_tail(completed.stderr)
         if completed.returncode != 0:
-            stderr = (completed.stderr or b"").decode("utf-8", errors="replace")[:800]
             raise ConverterError(
-                f"LibreOffice 변환 실패(code={completed.returncode}): {stderr}"
+                "LibreOffice 변환 실패"
+                f"(code={completed.returncode}, stdout={stdout!r}, stderr={stderr!r})"
             )
 
         pdfs = sorted(out_dir.glob("*.pdf"))
         if not pdfs:
-            raise ConverterError("LibreOffice 변환 결과 PDF가 없습니다.")
+            raise ConverterError(
+                "LibreOffice 변환 결과 PDF가 없습니다. "
+                f"stdout={stdout!r}, stderr={stderr!r}"
+            )
         return pdfs[0]
