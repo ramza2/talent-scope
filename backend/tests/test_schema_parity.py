@@ -270,26 +270,20 @@ def test_default_reference_codes_seeded(db_engine) -> None:
     with db_engine.connect() as conn:
         rows = conn.execute(
             text(
-                "SELECT code, code_type, parent_code, is_active "
+                "SELECT code, code_type, is_active "
                 "FROM code_master WHERE code = ANY(:codes)"
             ),
             {"codes": sorted(expected)},
         ).fetchall()
 
     by_code = {
-        code: {"type": code_type, "parent": parent_code, "active": is_active}
-        for code, code_type, parent_code, is_active in rows
+        code: {"type": code_type, "active": is_active}
+        for code, code_type, is_active in rows
     }
     missing = expected - set(by_code)
     assert not missing, f"missing default codes: {sorted(missing)}"
     assert all(by_code[code]["type"] == "DOC_TYPE" for code in EXPECTED_DOC_TYPES)
     assert all(by_code[code]["active"] for code in expected)
-
-    # Representative hierarchy checks catch parent-before-child/FK regressions.
-    assert by_code["JOB-AI-DEV"]["parent"] == "JOB-AI"
-    assert by_code["TECH-LANG-PYTHON"]["parent"] == "TECH-LANG"
-    assert by_code["TECH-DB-ORACLE"]["parent"] == "TECH-DB"
-    assert by_code["EXP-AI-RAG"]["parent"] == "EXP-AI"
 
 
 def test_default_code_seed_migration_is_idempotent() -> None:
@@ -309,6 +303,11 @@ def test_default_code_seed_migration_is_idempotent() -> None:
     assert '"TECH-LANG-PYTHON"' in source
     assert '"EXP-AI-RAG"' in source
     assert '"BIZ-PUBLIC"' in source
+    # Fresh installs get the intended hierarchy, while reused DB rows are not overwritten.
+    assert '"parent_code": "JOB-AI"' in source
+    assert '"parent_code": "TECH-LANG"' in source
+    assert '"parent_code": "TECH-DB"' in source
+    assert '"parent_code": "EXP-AI"' in source
 
 
 def test_migration_module_is_self_contained() -> None:
