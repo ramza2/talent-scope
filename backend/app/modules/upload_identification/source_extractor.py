@@ -15,10 +15,15 @@ from app.ai.providers.vlm import VLMProvider
 from app.core.config import Settings, get_settings
 from app.modules.document_processing.converters.base import ConverterError, PdfConverter
 from app.modules.document_processing.converters.libreoffice import LibreOfficeConverter
+from app.modules.document_processing.parsers.korean import (
+    KoreanDocumentExtractionError,
+    extract_korean_document_text,
+)
 from app.modules.document_processing.parsers.pdf import extract_pdf_pages
 from app.modules.document_processing.types import (
     CONVERT_TO_PDF_EXTENSIONS,
     IMAGE_EXTENSIONS,
+    KOREAN_DOCUMENT_EXTENSIONS,
     MIN_TEXT_CHARS_FOR_READY_PAGE,
 )
 from app.storage.base import ObjectStorage
@@ -107,7 +112,7 @@ class ExtractionBundle:
 
 
 class IdentitySourceExtractor:
-    """Ephemeral temp-file → text extraction for identify (no DocumentPage)."""
+    """Ephemeral temp-file -> text extraction for identify (no DocumentPage)."""
 
     def __init__(
         self,
@@ -170,6 +175,46 @@ class IdentitySourceExtractor:
                     page_count=pages,
                     vlm_pages_used=vlm_used,
                 )
+            if ext in KOREAN_DOCUMENT_EXTENSIONS:
+                source_path = work_dir / f"source.{ext}"
+                source_path.write_bytes(data)
+                try:
+                    text = extract_korean_document_text(source_path, extension=ext)
+                    return ExtractedFileSource(
+                        temp_file_id=file_id,
+                        filename=filename,
+                        document_type=doc_type,
+                        text=text,
+                        page_count=1,
+                        vlm_pages_used=0,
+                    )
+                except KoreanDocumentExtractionError:
+                    logger.info(
+                        "identify native korean extraction failed; trying PDF fallback "
+                        "temp_file_id=%s extension=%s",
+                        file_id,
+                        ext,
+                    )
+                    try:
+                        pdf_path = self.converter.convert_to_pdf(source_path, work_dir)
+                    except ConverterError as exc:
+                        raise ConverterError(
+                            f"{ext.upper()} native extraction and PDF conversion failed"
+                        ) from exc
+                    pdf_bytes = pdf_path.read_bytes()
+                    text, pages, vlm_used = self._from_pdf_bytes(
+                        pdf_bytes,
+                        vlm_budget=vlm_budget,
+                        log_context={**(log_context or {}), "temp_file_id": file_id},
+                    )
+                    return ExtractedFileSource(
+                        temp_file_id=file_id,
+                        filename=filename,
+                        document_type=doc_type,
+                        text=text,
+                        page_count=pages,
+                        vlm_pages_used=vlm_used,
+                    )
             if ext in CONVERT_TO_PDF_EXTENSIONS:
                 source_path = work_dir / f"source.{ext}"
                 source_path.write_bytes(data)
