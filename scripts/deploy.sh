@@ -17,7 +17,7 @@ Options:
   --configure       Recreate .env.server interactively even if it exists
   --test            Run isolated server-side pytest after deployment
   --perf            Prepare PERF DB and run 2k benchmark/recall/runtime EXPLAIN
-  --no-build        Skip docker compose build
+  --no-build        Skip production application image build (--test still refreshes test image)
   -h, --help        Show this help
 
 Default behavior:
@@ -282,6 +282,10 @@ log "Container status"
 compose ps
 
 if [[ "$RUN_TESTS" -eq 1 ]]; then
+  # The test service is disposable and must reflect the current checkout even
+  # when --no-build skips production application image rebuilds.
+  log "Building isolated test image"
+  compose --profile tools build test
   log "Running isolated pytest"
   compose --profile tools run --rm tools-db-init
   compose --profile tools run --rm test
