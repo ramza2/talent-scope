@@ -127,7 +127,7 @@ EXPECTED_REFERENCE_CODES = {
     "JOB-OPS-SYS",
     "JOB-OPS-APP",
     "JOB-QA-ENG",
-    # TECH / EXP roots plus canonical leaves already fixed by docs/tests
+    # TECH / EXP roots plus canonical leaves already fixed by docs/API/tests
     "TECH-LANG",
     "TECH-LANG-PYTHON",
     "TECH-BE",
@@ -141,6 +141,7 @@ EXPECTED_REFERENCE_CODES = {
     "EXP-AI-RAG",
     "EXP-SW",
     "EXP-DATA",
+    "EXP-DATA-DB-TUNING",
     "EXP-INFRA",
     "EXP-MGT",
     # BIZ roots
@@ -302,12 +303,14 @@ def test_default_code_seed_migration_is_idempotent() -> None:
     assert '"JOB-AI-DEV"' in source
     assert '"TECH-LANG-PYTHON"' in source
     assert '"EXP-AI-RAG"' in source
+    assert '"EXP-DATA-DB-TUNING"' in source
     assert '"BIZ-PUBLIC"' in source
     # Fresh installs get the intended hierarchy, while reused DB rows are not overwritten.
     assert '"parent_code": "JOB-AI"' in source
     assert '"parent_code": "TECH-LANG"' in source
     assert '"parent_code": "TECH-DB"' in source
     assert '"parent_code": "EXP-AI"' in source
+    assert '"parent_code": "EXP-DATA"' in source
 
 
 def test_migration_module_is_self_contained() -> None:
