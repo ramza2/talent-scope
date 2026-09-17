@@ -5,10 +5,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-# Formats that need LibreOffice → PDF before text extraction.
+# Office formats that require LibreOffice → PDF before text extraction.
 CONVERT_TO_PDF_EXTENSIONS: frozenset[str] = frozenset(
-    {"doc", "docx", "ppt", "pptx", "xls", "xlsx", "hwp", "hwpx"}
+    {"doc", "docx", "ppt", "pptx", "xls", "xlsx"}
 )
+
+# HWP/HWPX have native text extraction paths and use LibreOffice only as a
+# preview / compatibility fallback.
+KOREAN_DOCUMENT_EXTENSIONS: frozenset[str] = frozenset({"hwp", "hwpx"})
 
 IMAGE_EXTENSIONS: frozenset[str] = frozenset({"jpg", "jpeg", "png"})
 
