@@ -1,7 +1,7 @@
 """Schema parity smoke tests against a migrated PostgreSQL database.
 
-These tests verify Alembic-applied DDL (not just SQLAlchemy Metadata counts).
-They skip when DATABASE_URL is unreachable.
+These tests verify Alembic-applied DDL and required reference data (not just
+SQLAlchemy Metadata counts). They skip when DATABASE_URL is unreachable.
 """
 
 from __future__ import annotations
@@ -80,6 +80,87 @@ CRITICAL_INDEX_SNIPPETS = {
     ],
 }
 
+EXPECTED_DOC_TYPES = {
+    "DOC-RESUME",
+    "DOC-PROFILE",
+    "DOC-CAREER",
+    "DOC-KOSA",
+    "DOC-CERT",
+    "DOC-PORTFOLIO",
+    "DOC-EDU",
+    "DOC-OTHER",
+}
+
+EXPECTED_REFERENCE_CODES = {
+    # JOB roots / leaves
+    "JOB-MGT",
+    "JOB-MGT-PM",
+    "JOB-MGT-PL",
+    "JOB-MGT-PMO",
+    "JOB-ARC",
+    "JOB-ARC-SA",
+    "JOB-ARC-AA",
+    "JOB-ARC-TA",
+    "JOB-DATA",
+    "JOB-DATA-DA",
+    "JOB-DATA-DBA",
+    "JOB-DEV",
+    "JOB-DEV-GEN",
+    "JOB-DEV-BE",
+    "JOB-DEV-FE",
+    "JOB-DEV-FS",
+    "JOB-DEV-MOB",
+    "JOB-DEV-INT",
+    "JOB-AI",
+    "JOB-AI-DEV",
+    "JOB-AI-ML",
+    "JOB-AI-LLM",
+    "JOB-AI-VISION",
+    "JOB-AI-PLATFORM",
+    "JOB-SYS",
+    "JOB-SYS-SE",
+    "JOB-SYS-OS",
+    "JOB-SYS-CLOUD",
+    "JOB-SYS-MW",
+    "JOB-NET-ENG",
+    "JOB-SEC-ENG",
+    "JOB-OPS-SYS",
+    "JOB-OPS-APP",
+    "JOB-QA-ENG",
+    # TECH / EXP roots plus canonical leaves already fixed by docs/API/tests
+    "TECH-LANG",
+    "TECH-LANG-PYTHON",
+    "TECH-BE",
+    "TECH-FE",
+    "TECH-DB",
+    "TECH-DB-ORACLE",
+    "TECH-AI",
+    "TECH-INFRA",
+    "TECH-DATA",
+    "EXP-AI",
+    "EXP-AI-RAG",
+    "EXP-SW",
+    "EXP-DATA",
+    "EXP-DATA-DB-TUNING",
+    "EXP-INFRA",
+    "EXP-MGT",
+    # BIZ roots
+    "BIZ-PUBLIC",
+    "BIZ-DEFENSE",
+    "BIZ-HEALTHCARE",
+    "BIZ-FINANCE",
+    "BIZ-MANUFACTURING",
+    "BIZ-ENERGY",
+    "BIZ-TELECOM",
+    "BIZ-RETAIL",
+    "BIZ-LOGISTICS",
+    "BIZ-EDUCATION",
+    "BIZ-TRANSPORT",
+    "BIZ-CONSTRUCTION",
+    "BIZ-MEDIA",
+    "BIZ-ENTERPRISE",
+}
+
 
 @pytest.fixture(scope="module")
 def db_engine():
@@ -147,16 +228,7 @@ def test_key_check_constraints_present(db_engine) -> None:
             )
         ).fetchall()
     defs = " | ".join(f"{name}:{defn}" for name, defn in rows).upper()
-    required_fragments = [
-        "ROLE IN",
-        "CODE_TYPE IN",
-        "TECHNICAL_GRADE",
-        "PROCESSING_STATUS",
-        "CHANGE_TYPE IN",
-        "REVIEW_STATUS",
-        "VECTOR",  # may not appear in check; skip if not
-    ]
-    # Focus on checks we know exist in schema.sql
+    # Focus on checks we know exist in schema.sql.
     for fragment in [
         "USER",
         "ADMIN",
@@ -192,6 +264,53 @@ def test_extensions_present(db_engine) -> None:
         rows = conn.execute(text("SELECT extname FROM pg_extension")).fetchall()
     names = {r[0] for r in rows}
     assert {"pgcrypto", "vector", "pg_trgm"}.issubset(names)
+
+
+def test_default_reference_codes_seeded(db_engine) -> None:
+    expected = EXPECTED_DOC_TYPES | EXPECTED_REFERENCE_CODES
+    with db_engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                "SELECT code, code_type, is_active "
+                "FROM code_master WHERE code = ANY(:codes)"
+            ),
+            {"codes": sorted(expected)},
+        ).fetchall()
+
+    by_code = {
+        code: {"type": code_type, "active": is_active}
+        for code, code_type, is_active in rows
+    }
+    missing = expected - set(by_code)
+    assert not missing, f"missing default codes: {sorted(missing)}"
+    assert all(by_code[code]["type"] == "DOC_TYPE" for code in EXPECTED_DOC_TYPES)
+    assert all(by_code[code]["active"] for code in expected)
+
+
+def test_default_code_seed_migration_is_idempotent() -> None:
+    from pathlib import Path
+
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "alembic"
+        / "versions"
+        / "0002_seed_default_codes.py"
+    )
+    source = path.read_text(encoding="utf-8")
+    assert 'down_revision = "0001_initial_schema"' in source
+    assert "ON CONFLICT (code) DO NOTHING" in source
+    assert '"DOC-RESUME"' in source
+    assert '"JOB-AI-DEV"' in source
+    assert '"TECH-LANG-PYTHON"' in source
+    assert '"EXP-AI-RAG"' in source
+    assert '"EXP-DATA-DB-TUNING"' in source
+    assert '"BIZ-PUBLIC"' in source
+    # Fresh installs get the intended hierarchy, while reused DB rows are not overwritten.
+    assert '"parent_code": "JOB-AI"' in source
+    assert '"parent_code": "TECH-LANG"' in source
+    assert '"parent_code": "TECH-DB"' in source
+    assert '"parent_code": "EXP-AI"' in source
+    assert '"parent_code": "EXP-DATA"' in source
 
 
 def test_migration_module_is_self_contained() -> None:
