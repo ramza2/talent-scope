@@ -271,20 +271,18 @@ def test_default_reference_codes_seeded(db_engine) -> None:
     with db_engine.connect() as conn:
         rows = conn.execute(
             text(
-                "SELECT code, code_type, is_active "
+                "SELECT code, code_type "
                 "FROM code_master WHERE code = ANY(:codes)"
             ),
             {"codes": sorted(expected)},
         ).fetchall()
 
-    by_code = {
-        code: {"type": code_type, "active": is_active}
-        for code, code_type, is_active in rows
-    }
+    by_code = {code: code_type for code, code_type in rows}
     missing = expected - set(by_code)
     assert not missing, f"missing default codes: {sorted(missing)}"
-    assert all(by_code[code]["type"] == "DOC_TYPE" for code in EXPECTED_DOC_TYPES)
-    assert all(by_code[code]["active"] for code in expected)
+    assert all(by_code[code] == "DOC_TYPE" for code in EXPECTED_DOC_TYPES)
+    # Reused databases may contain operator-deactivated seeded rows. Migration 0002
+    # deliberately uses ON CONFLICT DO NOTHING so deploys never undo those edits.
 
 
 def test_default_code_seed_migration_is_idempotent() -> None:
@@ -305,7 +303,9 @@ def test_default_code_seed_migration_is_idempotent() -> None:
     assert '"EXP-AI-RAG"' in source
     assert '"EXP-DATA-DB-TUNING"' in source
     assert '"BIZ-PUBLIC"' in source
-    # Fresh installs get the intended hierarchy, while reused DB rows are not overwritten.
+    # Fresh installs get active defaults and the intended hierarchy, while reused
+    # DB rows are not overwritten.
+    assert ":sort_order,\n        TRUE" in source
     assert '"parent_code": "JOB-AI"' in source
     assert '"parent_code": "TECH-LANG"' in source
     assert '"parent_code": "TECH-DB"' in source
