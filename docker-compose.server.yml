@@ -242,8 +242,9 @@ services:
     networks:
       - internal
 
-  # One-shot server-side test runner. It uses a separate *_test database and
-  # installs dev dependencies only in the ephemeral runner container.
+  # One-shot server-side test runner. It uses a separate *_test database.
+  # The repository bind mount stays read-only; dev extras are installed from
+  # /app, which is the writable source tree baked into the disposable image.
   test:
     profiles: ["tools"]
     build:
@@ -273,7 +274,7 @@ services:
       [
         "sh",
         "-lc",
-        "python -m pip install '.[dev]' && alembic upgrade head && pytest -p no:cacheprovider",
+        "python -m pip install '/app[dev]' && alembic upgrade head && pytest -p no:cacheprovider",
       ]
     networks:
       - internal
