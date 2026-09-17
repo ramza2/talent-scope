@@ -5,11 +5,11 @@ Revises: 0001_initial_schema
 Create Date: 2026-09-17
 
 The MVP UI and analysis pipeline require a minimal canonical code catalog on a
-fresh database.  This revision seeds only codes that are explicitly defined in
-TalentScope design documents or already used as canonical references by the
+fresh database. This revision seeds only codes that are explicitly defined in
+TalentScope design/API documents or already used as canonical references by the
 server test suite.
 
-Existing rows are never overwritten.  Operators may edit seeded rows later via
+Existing rows are never overwritten. Operators may edit seeded rows later via
 the code-management UI without a future deploy resetting those changes.
 """
 
@@ -108,10 +108,11 @@ CHILD_CODES = (
     {"code": "JOB-SYS-CLOUD", "code_type": "JOB", "name": "Cloud Engineer", "parent_code": "JOB-SYS", "sort_order": 630},
     {"code": "JOB-SYS-MW", "code_type": "JOB", "name": "Middleware Engineer", "parent_code": "JOB-SYS", "sort_order": 640},
 
-    # Canonical leaf examples already fixed by docs/tests.
+    # Canonical leaf examples already fixed by docs/API/tests.
     {"code": "TECH-LANG-PYTHON", "code_type": "TECH", "name": "Python", "parent_code": "TECH-LANG", "sort_order": 110},
     {"code": "TECH-DB-ORACLE", "code_type": "TECH", "name": "Oracle", "parent_code": "TECH-DB", "sort_order": 410},
     {"code": "EXP-AI-RAG", "code_type": "EXP", "name": "RAG", "parent_code": "EXP-AI", "sort_order": 110},
+    {"code": "EXP-DATA-DB-TUNING", "code_type": "EXP", "name": "DB 튜닝", "parent_code": "EXP-DATA", "sort_order": 310},
 )
 
 
@@ -144,7 +145,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    # Reference data is intentionally retained on downgrade.  Removing a seeded
+    # Reference data is intentionally retained on downgrade. Removing a seeded
     # code can be destructive once it is referenced by profiles/documents, and
     # re-upgrade is safe because upgrade() uses ON CONFLICT DO NOTHING.
     pass
