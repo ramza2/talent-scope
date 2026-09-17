@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.12-slim AS base
 
 WORKDIR /app
 
@@ -28,7 +28,17 @@ COPY alembic.ini ./
 RUN pip install --upgrade pip \
     && pip install .
 
-# Same image runs API or Celery worker via command override.
+# Server-side pytest executes a small frontend TypeScript contract through
+# `npx tsx`. Keep Node/npm out of the production API/worker image by installing
+# them only in the dedicated test target selected by docker-compose.server.yml.
+FROM base AS test
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends nodejs npm \
+    && rm -rf /var/lib/apt/lists/*
+
+FROM base AS runtime
+
+# Same runtime image runs API or Celery worker via command override.
 EXPOSE 8000
 
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

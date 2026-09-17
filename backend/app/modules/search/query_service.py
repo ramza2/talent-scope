@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import logging
+import time
+
 import math
 from typing import Any
 from uuid import UUID
@@ -44,6 +47,9 @@ from app.modules.search.project_ranking import (
 from app.modules.search.result_enrichment import SearchResultEnricher
 
 
+logger = logging.getLogger(__name__)
+
+
 class SearchQueryService:
     def __init__(self, db: Session) -> None:
         self.db = db
@@ -53,21 +59,31 @@ class SearchQueryService:
         self.enricher = SearchResultEnricher(db)
 
     def search_people(self, request: SearchPeopleRequest) -> SearchPeopleResponse:
+        t_total = time.perf_counter()
         expanded = self.repo.validate_and_expand_codes(request)
         preferred_present = self._preferred_present(request.preferred)
         required_present = self._required_present(request)
+        has_retrieval = bool(request.keyword_query or request.semantic_query)
 
+        t0 = time.perf_counter()
         eligible_subq = self.repo.eligible_person_ids_subquery(
             required=request.required,
             expanded=expanded,
             skill_match_mode=request.skill_match_mode,
         )
-        eligible_rows = self.repo.list_eligible_persons(
-            required=request.required,
-            expanded=expanded,
-            skill_match_mode=request.skill_match_mode,
-        )
-        eligible_by_id = {row.person_id: row for row in eligible_rows}
+        eligible_by_id: dict[UUID, EligiblePersonRow]
+        if has_retrieval:
+            # Hard filters still apply via eligible_subq inside channel SQL.
+            # Defer profile/project metadata until after candidate merge.
+            eligible_by_id = {}
+        else:
+            eligible_rows = self.repo.list_eligible_persons(
+                required=request.required,
+                expanded=expanded,
+                skill_match_mode=request.skill_match_mode,
+            )
+            eligible_by_id = {row.person_id: row for row in eligible_rows}
+        eligible_ms = (time.perf_counter() - t0) * 1000.0
 
         limit = channel_candidate_limit(page=request.page, page_size=request.page_size)
         candidate_limit_reached = False
@@ -75,29 +91,42 @@ class SearchQueryService:
         keyword_hits: list[ChannelHit] = []
         semantic_hits: list[ChannelHit] = []
         query_vector: list[float] | None = None
+        keyword_ms = 0.0
+        embedding_ms = 0.0
+        semantic_ms = 0.0
 
         if request.keyword_query:
+            t0 = time.perf_counter()
             keyword_hits, kw_trunc = self.repo.keyword_channel_hits(
                 keyword=request.keyword_query,
                 eligible_subq=eligible_subq,
                 limit=limit,
             )
+            keyword_ms = (time.perf_counter() - t0) * 1000.0
             candidate_limit_reached = candidate_limit_reached or kw_trunc
 
         if request.semantic_query:
+            t0 = time.perf_counter()
             query_vector = self._embed_semantic_query(request.semantic_query)
+            embedding_ms = (time.perf_counter() - t0) * 1000.0
+            t0 = time.perf_counter()
             semantic_hits, sem_trunc = self.repo.semantic_channel_hits(
                 query_vector=query_vector,
                 eligible_subq=eligible_subq,
                 limit=limit,
+                force_exact=required_present,
             )
+            semantic_ms = (time.perf_counter() - t0) * 1000.0
             candidate_limit_reached = candidate_limit_reached or sem_trunc
 
-        if request.keyword_query or request.semantic_query:
+        if has_retrieval:
             merged = merge_channel_hits(
                 keyword_hits=keyword_hits,
                 semantic_hits=semantic_hits,
             )
+            t0 = time.perf_counter()
+            eligible_by_id = self.repo.load_eligible_persons_by_ids(list(merged.keys()))
+            eligible_ms += (time.perf_counter() - t0) * 1000.0
             merged = {
                 pid: cand
                 for pid, cand in merged.items()
@@ -109,11 +138,13 @@ class SearchQueryService:
             }
 
         person_ids = list(merged.keys())
+        t0 = time.perf_counter()
         preferred_ratios = self.repo.preferred_match_ratio(
             person_ids,
             preferred=request.preferred,
             expanded_preferred_jobs=expanded["preferred_jobs"],
         )
+        preferred_ms = (time.perf_counter() - t0) * 1000.0
 
         required_job_groups = self._job_condition_groups(request.required.jobs)
         preferred_job_groups = self._job_condition_groups(request.preferred.jobs)
@@ -122,12 +153,14 @@ class SearchQueryService:
             required_job_groups=required_job_groups,
             preferred_job_groups=preferred_job_groups,
         )
+        t0 = time.perf_counter()
         project_summaries = self.project_ranker.summarize_persons(
             person_ids,
             request=request,
             signals=project_signals,
             query_vector=query_vector,
         )
+        project_ms = (time.perf_counter() - t0) * 1000.0
 
         no_query = (
             not required_present
@@ -187,6 +220,7 @@ class SearchQueryService:
         start = (request.page - 1) * request.page_size
         page_slice = ordered[start : start + request.page_size]
 
+        t0 = time.perf_counter()
         results = self._build_results(
             page_slice,
             eligible_by_id=eligible_by_id,
@@ -196,6 +230,31 @@ class SearchQueryService:
             semantic_hits=semantic_hits,
             required_job_groups=required_job_groups,
             preferred_job_groups=preferred_job_groups,
+        )
+        enrichment_ms = (time.perf_counter() - t0) * 1000.0
+        total_ms = (time.perf_counter() - t_total) * 1000.0
+
+        # Aggregate timing only — never log query text, vectors, names, or snippets.
+        logger.info(
+            "search_people completed",
+            extra={
+                "ranking_policy": SEARCH_RANKING_POLICY_VERSION,
+                "page": request.page,
+                "page_size": request.page_size,
+                "eligible_count": len(eligible_by_id) if not has_retrieval else None,
+                "merged_candidate_count": len(merged),
+                "keyword_enabled": bool(request.keyword_query),
+                "semantic_enabled": bool(request.semantic_query),
+                "candidate_limit_reached": candidate_limit_reached,
+                "eligible_ms": round(eligible_ms, 2),
+                "keyword_ms": round(keyword_ms, 2),
+                "embedding_ms": round(embedding_ms, 2),
+                "semantic_ms": round(semantic_ms, 2),
+                "preferred_ms": round(preferred_ms, 2),
+                "project_ms": round(project_ms, 2),
+                "enrichment_ms": round(enrichment_ms, 2),
+                "total_ms": round(total_ms, 2),
+            },
         )
 
         return SearchPeopleResponse(
@@ -359,22 +418,18 @@ class SearchQueryService:
                 person_ids, expanded_root
             )
 
-        preferred_skill_by_code: dict[str, set[UUID]] = {
-            code: self.repo._person_ids_matching_skill_any(person_ids, [code])
-            for code in request.preferred.skills
-        }
-        preferred_exp_by_code: dict[str, set[UUID]] = {
-            code: self.repo._person_ids_matching_expertise(person_ids, [code])
-            for code in request.preferred.expertise
-        }
-        preferred_biz_by_code: dict[str, set[UUID]] = {
-            code: self.repo._person_ids_matching_biz(person_ids, [code])
-            for code in request.preferred.business_domains
-        }
-        preferred_cust_by_code: dict[str, set[UUID]] = {
-            code: self.repo._person_ids_matching_customer(person_ids, [code])
-            for code in request.preferred.customer_types
-        }
+        preferred_skill_by_code = self.repo.preferred_skill_hits_by_code(
+            person_ids, request.preferred.skills
+        )
+        preferred_exp_by_code = self.repo.preferred_expertise_hits_by_code(
+            person_ids, request.preferred.expertise
+        )
+        preferred_biz_by_code = self.repo.preferred_biz_hits_by_code(
+            person_ids, request.preferred.business_domains
+        )
+        preferred_cust_by_code = self.repo.preferred_customer_hits_by_code(
+            person_ids, request.preferred.customer_types
+        )
 
         code_names = self.repo.load_code_names(
             list(

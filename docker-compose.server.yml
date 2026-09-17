@@ -1,0 +1,321 @@
+# TalentScope server stack for the existing shared Traefik instance.
+#
+# Required invocation pattern:
+#   docker compose --env-file .env.server -f docker-compose.server.yml ...
+#
+# Only frontend/api join the external Traefik network. PostgreSQL, Redis,
+# MinIO, worker, beat and one-shot tool containers stay on the private network.
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_TEST_DB: ${POSTGRES_TEST_DB}
+      POSTGRES_PERF_DB: ${POSTGRES_PERF_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    networks:
+      - internal
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks:
+      - internal
+
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+    networks:
+      - internal
+
+  minio-init:
+    # Docker Hub minio/mc may be unavailable. MinIO's own build publishes the
+    # client image to Quay as well, and that image is scratch-based (no /bin/sh),
+    # so use MC_HOST_* credentials and invoke mc directly without a shell.
+    image: quay.io/minio/mc:latest
+    restart: "no"
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MC_HOST_local: http://${MINIO_ROOT_USER}:${MINIO_ROOT_PASSWORD}@minio:9000
+      MC_NO_COLOR: "1"
+    entrypoint: ["/usr/bin/mc"]
+    command: ["mb", "--ignore-existing", "local/${S3_BUCKET}"]
+    networks:
+      - internal
+
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env.server
+    environment:
+      APP_ENV: production
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379/0
+      S3_ENDPOINT: http://minio:9000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health/live', timeout=3)\"",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=${TRAEFIK_NETWORK:-traefik_proxy}
+      - traefik.http.routers.talentscope-api.rule=Host(`${TALENTSCOPE_HOST}`) && PathPrefix(`/api`)
+      - traefik.http.routers.talentscope-api.entrypoints=${TRAEFIK_ENTRYPOINT:-websecure}
+      - traefik.http.routers.talentscope-api.priority=100
+      - traefik.http.routers.talentscope-api.tls=true
+      - traefik.http.routers.talentscope-api.tls.certresolver=${TRAEFIK_CERTRESOLVER:-letsencrypt}
+      - traefik.http.routers.talentscope-api.service=talentscope-api
+      - traefik.http.services.talentscope-api.loadbalancer.server.port=8000
+    networks:
+      - internal
+      - proxy
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env.server
+    environment:
+      APP_ENV: production
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379/0
+      S3_ENDPOINT: http://minio:9000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    command:
+      [
+        "celery",
+        "-A",
+        "app.tasks.celery_app.celery_app",
+        "worker",
+        "-Q",
+        "document,analysis,index",
+        "-l",
+        "info",
+      ]
+    networks:
+      - internal
+
+  beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env.server
+    environment:
+      APP_ENV: production
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379/0
+      S3_ENDPOINT: http://minio:9000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: ["celery", "-A", "app.tasks.celery_app.celery_app", "beat", "-l", "info"]
+    networks:
+      - internal
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=${TRAEFIK_NETWORK:-traefik_proxy}
+      - traefik.http.routers.talentscope-web.rule=Host(`${TALENTSCOPE_HOST}`)
+      - traefik.http.routers.talentscope-web.entrypoints=${TRAEFIK_ENTRYPOINT:-websecure}
+      - traefik.http.routers.talentscope-web.priority=10
+      - traefik.http.routers.talentscope-web.tls=true
+      - traefik.http.routers.talentscope-web.tls.certresolver=${TRAEFIK_CERTRESOLVER:-letsencrypt}
+      - traefik.http.routers.talentscope-web.service=talentscope-web
+      - traefik.http.services.talentscope-web.loadbalancer.server.port=80
+    networks:
+      - proxy
+
+  # One-shot production migration runner. It is internal-only so Traefik never
+  # routes requests to a container whose only job is `alembic upgrade head`.
+  migrate:
+    profiles: ["tools"]
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    env_file:
+      - .env.server
+    environment:
+      APP_ENV: production
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379/0
+      S3_ENDPOINT: http://minio:9000
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["alembic", "upgrade", "head"]
+    networks:
+      - internal
+
+  # Idempotently create isolated test/PERF databases. PostgreSQL creates only
+  # POSTGRES_DB on first boot, so the tool databases must be provisioned before
+  # pytest/PERF. No product tables are touched here.
+  tools-db-init:
+    profiles: ["tools"]
+    image: pgvector/pgvector:pg16
+    environment:
+      PGHOST: postgres
+      PGPORT: 5432
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_TEST_DB: ${POSTGRES_TEST_DB}
+      POSTGRES_PERF_DB: ${POSTGRES_PERF_DB}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        for db in "$${POSTGRES_TEST_DB}" "$${POSTGRES_PERF_DB}"; do
+          if ! psql -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='$${db}'" | grep -q 1; then
+            createdb "$${db}"
+          fi
+        done
+    networks:
+      - internal
+
+  # One-shot server-side test runner. It uses a separate *_test database.
+  # The repository bind mount stays read-only; dev extras are installed from
+  # /app, which is the writable source tree baked into the disposable image.
+  test:
+    profiles: ["tools"]
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: test
+    env_file:
+      - .env.server
+    environment:
+      APP_ENV: test
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_TEST_DB}
+      REDIS_URL: redis://redis:6379/0
+      REDIS_KEY_PREFIX: talentscope:test
+      S3_ENDPOINT: http://minio:9000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_started
+      tools-db-init:
+        condition: service_completed_successfully
+    working_dir: /workspace/backend
+    volumes:
+      - ./:/workspace:ro
+    command:
+      [
+        "sh",
+        "-lc",
+        "python -m pip install '/app[dev]' && alembic upgrade head && pytest -p no:cacheprovider",
+      ]
+    networks:
+      - internal
+
+  # One-shot PERF runner. Product DATABASE_URL and PERF_DATABASE_URL are kept
+  # different so the benchmark script's destructive-write safety check remains active.
+  perf:
+    profiles: ["tools"]
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    env_file:
+      - .env.server
+    environment:
+      APP_ENV: test
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      PERF_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_PERF_DB}
+      REDIS_URL: redis://redis:6379/0
+      S3_ENDPOINT: http://minio:9000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      tools-db-init:
+        condition: service_completed_successfully
+    working_dir: /workspace/backend
+    volumes:
+      - ./:/workspace:ro
+      - ./artifacts:/artifacts
+    command: ["python", "scripts/search_perf_benchmark.py", "--help"]
+    networks:
+      - internal
+
+networks:
+  internal:
+    driver: bridge
+  proxy:
+    external: true
+    name: ${TRAEFIK_NETWORK:-traefik_proxy}
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:

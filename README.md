@@ -85,6 +85,8 @@ TalentScope는 사내에서 보유한 이력서, 경력기술서, 인력 프로�
 - [13. Application Architecture & Backend Stack](docs/13_application_architecture.md)
 - [14. PostgreSQL DDL Baseline](docs/14_database_ddl.md)
 - [15. Backend REST API Specification](docs/15_backend_api.md)
+- [16. Search Performance / EXPLAIN ANALYZE](docs/16_search_performance.md)
+- [17. Server Deployment / Migration / Pytest / PERF Runbook](docs/17_server_deployment.md)
 
 실행 가능한 1차 MVP 기준 PostgreSQL Schema 초안은 [`db/schema.sql`](db/schema.sql)에 정리합니다. 구현 착수 이후 Schema 변경은 SQLAlchemy + Alembic Migration으로 관리합니다.
 
@@ -95,10 +97,12 @@ TalentScope는 사내에서 보유한 이력서, 경력기술서, 인력 프로�
 - `backend/` — FastAPI + SQLAlchemy + Alembic + Celery
 - `frontend/` — React + Vite + Ant Design + TanStack Query + React Router
 - `docker-compose.dev.yml` — 로컬용 Postgres(pgvector)/Redis/MinIO/api/frontend
+- `docker-compose.server.yml` — 서버용 Traefik label 배포 + 내부 DB/Redis/MinIO + migration/test/PERF tool profile
+- `.env.server.example` — `talentscope.openlink.kr` 서버 환경 템플릿(실제 secret은 `.env.server`에만 저장)
 - `AGENTS.md` — Cursor/AI Agent 작업 규칙
 
 Cloud Agent 환경은 `scripts/cloud-install.sh` / `scripts/cloud-start.sh`로 Host PostgreSQL(+Redis)을 기동합니다. Docker Compose는 이와 별개의 로컬 개발용 스택입니다(Postgres host port `5433`).
 
-`15_backend_api.md`에서는 인증·사용자·코드·인력·업로드·문서·AI 분석·프로젝트·근거·통합검색·운영상태 API의 Endpoint, 권한, Request/Response, 비동기 처리와 상태코드를 FIX합니다.
+서버 배포는 기존 공용 Traefik의 `traefik_proxy` external network, `websecure` entrypoint, `letsencrypt` resolver를 전제로 하며 상세 명령은 [`docs/17_server_deployment.md`](docs/17_server_deployment.md)를 따른다.
 
-향후 배포 설계는 **Docker Compose + Traefik Label 기반 라우팅**을 전제로 하며, Frontend/Backend/Worker/PostgreSQL(pgvector)/Redis/MinIO의 서비스·네트워크·Persistent Volume 구성을 별도 문서에서 구체화할 예정입니다.
+`15_backend_api.md`에서는 인증·사용자·코드·인력·업로드·문서·AI 분석·프로젝트·근거·통합검색·운영상태 API의 Endpoint, 권한, Request/Response, 비동기 처리와 상태코드를 FIX합니다.
