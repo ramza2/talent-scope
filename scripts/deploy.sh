@@ -15,6 +15,7 @@ Usage:
 
 Options:
   --configure       Recreate .env.server interactively even if it exists
+  --create-admin    Interactively create an ADMIN account after application startup
   --test            Run isolated server-side pytest after deployment
   --perf            Prepare PERF DB and run 2k benchmark/recall/runtime EXPLAIN
   --no-build        Skip production application image build (--test still refreshes test image)
@@ -26,17 +27,22 @@ Default behavior:
   - APP_SECRET_KEY / PostgreSQL password / MinIO password are generated
     automatically when left blank.
   - Existing .env.server is reused unless --configure is specified.
+  - On a newly configured server, offer to create the first ADMIN when no
+    ACTIVE ADMIN account exists. ADMIN passwords are never written to .env.server.
 EOF
 }
 
 FORCE_CONFIGURE=0
+RUN_CREATE_ADMIN=0
 RUN_TESTS=0
 RUN_PERF=0
 DO_BUILD=1
+INITIAL_ENV_CREATED=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --configure) FORCE_CONFIGURE=1 ;;
+    --create-admin) RUN_CREATE_ADMIN=1 ;;
     --test) RUN_TESTS=1 ;;
     --perf) RUN_PERF=1 ;;
     --no-build) DO_BUILD=0 ;;
@@ -82,6 +88,31 @@ prompt_secret_or_generate() {
   read -r -s -p "${label} (Enter = auto-generate): " input || true
   printf '\n'
   printf -v "$__var" '%s' "${input:-$generated}"
+}
+
+prompt_yes_no() {
+  local label="$1" default="${2:-y}" input
+  local suffix="[Y/n]"
+  [[ "$default" == "n" ]] && suffix="[y/N]"
+  read -r -p "${label} ${suffix}: " input || true
+  input="${input:-$default}"
+  case "${input,,}" in
+    y|yes) return 0 ;;
+    n|no) return 1 ;;
+    *) echo "Please answer y or n."; prompt_yes_no "$label" "$default" ;;
+  esac
+}
+
+prompt_required() {
+  local __var="$1" label="$2" input
+  while true; do
+    read -r -p "${label}: " input || true
+    if [[ -n "${input//[[:space:]]/}" ]]; then
+      printf -v "$__var" '%s' "$input"
+      return 0
+    fi
+    echo "${label} must not be empty."
+  done
 }
 
 write_env() {
@@ -212,14 +243,43 @@ compose() {
 env_value() {
   local key="$1" value
   value="$(sed -n "s/^${key}=//p" "$ENV_FILE" | tail -n 1)"
-  # deploy.sh writes plain values. Also tolerate simple matching single/double quotes
-  # for operators who later edit .env.server manually.
+  # deploy.sh writes plain values. Compose parses the file itself; tolerate
+  # simple matching quotes for operators who later edit .env.server manually.
   if [[ "$value" == \"*\" && "$value" == *\" ]]; then
     value="${value:1:${#value}-2}"
   elif [[ "$value" == \'*\' && "$value" == *\' ]]; then
     value="${value:1:${#value}-2}"
   fi
   printf '%s' "$value"
+}
+
+active_admin_exists() {
+  compose exec -T api python -m app.cli has-admin --quiet >/dev/null 2>&1
+}
+
+create_admin_interactive() {
+  local login_id name email department
+  local -a args
+
+  [[ -t 0 && -t 1 ]] || die "ADMIN creation requires an interactive terminal"
+
+  log "Create ADMIN account"
+  prompt_default login_id "Login ID" "admin"
+  prompt_required name "Name"
+  prompt_optional email "Email"
+  prompt_optional department "Department"
+
+  args=(
+    exec api python -m app.cli create-admin
+    --login-id "$login_id"
+    --name "$name"
+  )
+  [[ -n "$email" ]] && args+=(--email "$email")
+  [[ -n "$department" ]] && args+=(--department "$department")
+
+  # Password/confirmation are read with Python getpass inside the API container,
+  # so they are never stored in .env.server or shell history.
+  compose "${args[@]}"
 }
 
 require_cmd docker
@@ -229,7 +289,9 @@ require_cmd docker
 docker compose version >/dev/null 2>&1 || die "Docker Compose v2 is required"
 
 if [[ ! -f "$ENV_FILE" || "$FORCE_CONFIGURE" -eq 1 ]]; then
-  if [[ -f "$ENV_FILE" && "$FORCE_CONFIGURE" -eq 1 ]]; then
+  if [[ ! -f "$ENV_FILE" ]]; then
+    INITIAL_ENV_CREATED=1
+  elif [[ "$FORCE_CONFIGURE" -eq 1 ]]; then
     backup="${ENV_FILE}.bak.$(date +%Y%m%d%H%M%S)"
     cp -p "$ENV_FILE" "$backup"
     echo "Existing environment backed up to $backup"
@@ -280,6 +342,19 @@ compose up -d api worker beat frontend
 
 log "Container status"
 compose ps
+
+if [[ "$RUN_CREATE_ADMIN" -eq 1 ]]; then
+  create_admin_interactive
+elif [[ "$INITIAL_ENV_CREATED" -eq 1 ]]; then
+  if active_admin_exists; then
+    echo "ACTIVE ADMIN account already exists; skipping initial ADMIN creation."
+  elif prompt_yes_no "No ACTIVE ADMIN account exists. Create the initial ADMIN now?" "y"; then
+    create_admin_interactive
+  else
+    echo "Initial ADMIN creation skipped."
+    echo "Run ./scripts/deploy.sh --create-admin when you are ready to create one."
+  fi
+fi
 
 if [[ "$RUN_TESTS" -eq 1 ]]; then
   # The test service is disposable and must reflect the current checkout even
