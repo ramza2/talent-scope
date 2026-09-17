@@ -14,6 +14,20 @@ from app.ai.providers.errors import AIProviderError
 logger = logging.getLogger(__name__)
 
 
+def _json_headers(api_key: str) -> dict[str, str]:
+    """Build JSON headers with optional Bearer authentication.
+
+    Internal OpenAI-compatible runtimes may not require authentication.  Never
+    emit an empty ``Authorization: Bearer `` value because httpx rejects it as
+    an invalid header before the request reaches the provider.
+    """
+    headers = {"Content-Type": "application/json"}
+    key = (api_key or "").strip()
+    if key and key != "change-me":
+        headers["Authorization"] = f"Bearer {key}"
+    return headers
+
+
 def normalize_chat_completions_url(base_url: str) -> str:
     """Normalize provider base URL to ``.../v1/chat/completions``."""
     raw = (base_url or "").strip().rstrip("/")
@@ -41,10 +55,7 @@ def post_chat_completions(
 ) -> dict[str, Any]:
     """POST chat completions. Never logs API keys or full prompt/response bodies."""
     url = normalize_chat_completions_url(base_url)
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
+    headers = _json_headers(api_key)
     ctx = dict(log_context or {})
     started = time.perf_counter()
     try:
@@ -141,10 +152,7 @@ def post_embeddings(
 ) -> dict[str, Any]:
     """POST OpenAI-compatible embeddings. Never logs API keys, input text, or vectors."""
     url = normalize_embeddings_url(base_url)
-    headers = {"Content-Type": "application/json"}
-    key = (api_key or "").strip()
-    if key and key not in {"change-me", ""}:
-        headers["Authorization"] = f"Bearer {key}"
+    headers = _json_headers(api_key)
 
     inputs = payload.get("input")
     if isinstance(inputs, list):
@@ -210,4 +218,3 @@ def post_embeddings(
     if not isinstance(data, dict):
         raise AIProviderError("embedding response invalid")
     return data
-
