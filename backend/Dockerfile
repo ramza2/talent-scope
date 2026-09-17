@@ -7,8 +7,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1
 
 # LibreOffice (headless convert) + CJK fonts for Korean document rendering.
-# Image size impact: LibreOffice packages are large; kept to writer/calc/impress
-# rather than the full desktop metapackage where possible.
+# Node/npm are also installed because the backend pytest suite executes a small
+# frontend TypeScript contract via `npx tsx` during server-side verification.
+# Image size impact is acceptable for the MVP server image, which already ships
+# LibreOffice for document conversion.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         build-essential \
@@ -18,6 +20,8 @@ RUN apt-get update \
         libreoffice-impress \
         fonts-noto-cjk \
         fonts-nanum \
+        nodejs \
+        npm \
     && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml README.md ./
