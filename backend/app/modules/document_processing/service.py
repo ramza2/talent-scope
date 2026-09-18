@@ -16,12 +16,23 @@ from app.core.exceptions import NotFoundError, StorageError
 from app.db.models.document import Document
 from app.modules.document_processing.converters.base import ConverterError, PdfConverter
 from app.modules.document_processing.converters.libreoffice import LibreOfficeConverter
+from app.modules.document_processing.parsers.hancom import (
+    HancomExtractionError,
+    extract_hancom_text,
+)
 from app.modules.document_processing.parsers.image import extract_image_page
 from app.modules.document_processing.parsers.pdf import extract_pdf_pages
+from app.modules.document_processing.parsers.pptx import (
+    PptxExtractionError,
+    extract_pptx_text,
+)
 from app.modules.document_processing.repository import DocumentProcessingRepository
 from app.modules.document_processing.types import (
     CONVERT_TO_PDF_EXTENSIONS,
+    HANCOM_NATIVE_EXTENSIONS,
     IMAGE_EXTENSIONS,
+    PPTX_NATIVE_EXTENSIONS,
+    ExtractedPage,
     ExtractionResult,
 )
 from app.storage.base import ObjectStorage
@@ -211,6 +222,22 @@ class DocumentProcessingService:
         if extension in IMAGE_EXTENSIONS:
             return extract_image_page()
 
+        if extension in HANCOM_NATIVE_EXTENSIONS:
+            return self._convert_or_extract_hancom(
+                extension=extension,
+                original_bytes=original_bytes,
+                original_filename=document.original_filename,
+                work_dir=work_dir,
+            )
+
+        if extension in PPTX_NATIVE_EXTENSIONS:
+            return self._convert_or_extract_pptx(
+                extension=extension,
+                original_bytes=original_bytes,
+                original_filename=document.original_filename,
+                work_dir=work_dir,
+            )
+
         if extension in CONVERT_TO_PDF_EXTENSIONS:
             return self._convert_and_extract(
                 extension=extension,
@@ -220,6 +247,112 @@ class DocumentProcessingService:
             )
 
         raise ConverterError(f"지원하지 않는 처리 확장자입니다: .{extension or '?'}")
+
+    def _convert_or_extract_hancom(
+        self,
+        *,
+        extension: str,
+        original_bytes: bytes,
+        original_filename: str,
+        work_dir: Path,
+    ) -> ExtractionResult:
+        """Prefer PDF conversion for preview, then fall back to native text."""
+        try:
+            return self._convert_and_extract(
+                extension=extension,
+                original_bytes=original_bytes,
+                original_filename=original_filename,
+                work_dir=work_dir,
+            )
+        except ConverterError as convert_exc:
+            logger.info(
+                "hancom pdf conversion failed extension=%s fallback=native err=%s",
+                extension,
+                type(convert_exc).__name__,
+            )
+
+        source_path = work_dir / f"source.{extension}"
+        if not source_path.exists():
+            source_path.write_bytes(original_bytes)
+        try:
+            native = extract_hancom_text(source_path)
+        except HancomExtractionError as native_exc:
+            raise ConverterError(
+                "한글 문서 PDF 변환과 native 텍스트 추출이 모두 실패했습니다."
+            ) from native_exc
+
+        return ExtractionResult(
+            pages=[
+                ExtractedPage(
+                    page_no=1,
+                    extracted_text=native.text,
+                    extraction_method="TEXT_PARSER",
+                    layout_json={
+                        "source_format": native.detected_format,
+                        "native_parser": native.parser_name,
+                        "page_mapping": "UNAVAILABLE",
+                        "logical_page": True,
+                        "needs_vlm": False,
+                    },
+                )
+            ],
+            # One logical page only; do not fabricate a physical HWP/HWPX page count.
+            page_count=1,
+            preview_pdf_bytes=None,
+            uses_original_as_preview=False,
+        )
+
+    def _convert_or_extract_pptx(
+        self,
+        *,
+        extension: str,
+        original_bytes: bytes,
+        original_filename: str,
+        work_dir: Path,
+    ) -> ExtractionResult:
+        """Prefer LibreOffice PDF preview, then fall back to native slide text."""
+        try:
+            return self._convert_and_extract(
+                extension=extension,
+                original_bytes=original_bytes,
+                original_filename=original_filename,
+                work_dir=work_dir,
+            )
+        except ConverterError as convert_exc:
+            logger.info(
+                "pptx pdf conversion failed fallback=native err=%s",
+                type(convert_exc).__name__,
+            )
+
+        source_path = work_dir / f"source.{extension}"
+        if not source_path.exists():
+            source_path.write_bytes(original_bytes)
+        try:
+            native = extract_pptx_text(source_path)
+        except PptxExtractionError as native_exc:
+            raise ConverterError(
+                "PPTX PDF 변환과 native 텍스트 추출이 모두 실패했습니다."
+            ) from native_exc
+
+        return ExtractionResult(
+            pages=[
+                ExtractedPage(
+                    page_no=slide.slide_no,
+                    extracted_text=slide.text,
+                    extraction_method="TEXT_PARSER",
+                    layout_json={
+                        "source_format": "pptx",
+                        "native_parser": native.parser_name,
+                        "page_mapping": "SLIDE",
+                        "needs_vlm": False,
+                    },
+                )
+                for slide in native.slides
+            ],
+            page_count=len(native.slides),
+            preview_pdf_bytes=None,
+            uses_original_as_preview=False,
+        )
 
     def _convert_and_extract(
         self,

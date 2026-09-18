@@ -51,6 +51,9 @@ class Settings(BaseSettings):
     identify_pdf_render_dpi: int = 120
 
     # Detailed profile analysis limits
+    # Structured profile extraction can generate much larger responses than
+    # upload identity extraction, so it needs an independent request budget.
+    analysis_ai_request_timeout_seconds: float = 180.0
     analysis_max_pages_per_document: int = 10
     analysis_max_vlm_pages: int = 5
     analysis_max_total_text_chars: int = 40000

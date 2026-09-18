@@ -30,6 +30,8 @@ import {
   confidenceLabel,
   confirmAnalysis,
   countPendingActionableDiffs,
+  countReviewedDiffs,
+  diffRequiresCodeMapping,
   getAnalysis,
   initialMergeDecidedValueText,
   isActiveAnalysisStatus,
@@ -50,6 +52,7 @@ type DiffFilterTab =
   | 'UPDATE'
   | 'CONFLICT'
   | 'REVIEW'
+  | 'pending'
   | 'reviewed'
 
 function formatDate(value?: string | null) {
@@ -158,6 +161,14 @@ export function AnalysisDetailPage() {
           data: all.data.filter((d) => d.review_status !== 'PENDING'),
         }
       }
+      if (filterTab === 'pending') {
+        const all = await listAnalysisDiffs(analysisId)
+        return {
+          data: all.data.filter(
+            (d) => d.review_status === 'PENDING' && d.change_type !== 'SAME',
+          ),
+        }
+      }
       if (filterTab === 'all') {
         return listAnalysisDiffs(analysisId)
       }
@@ -171,7 +182,9 @@ export function AnalysisDetailPage() {
     queryFn: () => listAnalysisDiffs(analysisId),
     enabled: Boolean(analysisId) && showDiffs,
   })
-  const pendingActionable = countPendingActionableDiffs(allDiffsQuery.data?.data ?? [])
+  const allDiffs = allDiffsQuery.data?.data ?? []
+  const pendingActionable = countPendingActionableDiffs(allDiffs)
+  const reviewedCount = countReviewedDiffs(allDiffs)
   const canConfirm = canConfirmAnalysis({
     status: analysis?.status,
     diffsQuerySuccess: allDiffsQuery.isSuccess,
@@ -416,11 +429,14 @@ export function AnalysisDetailPage() {
       width: 220,
       fixed: 'right',
       render: (_, row) => {
-        if (!canReview || row.review_status !== 'PENDING') {
+        if (!canReview) {
           return <Typography.Text type="secondary">—</Typography.Text>
         }
-        return (
-          <Space size="small" wrap>
+        if (row.review_status !== 'PENDING') {
+          if (row.review_status === 'MERGED') {
+            return <Typography.Text type="secondary">—</Typography.Text>
+          }
+          return (
             <Button
               type="link"
               size="small"
@@ -428,12 +444,35 @@ export function AnalysisDetailPage() {
               onClick={() =>
                 decisionMutation.mutate({
                   diffId: row.id,
-                  body: { review_status: 'ACCEPTED' },
+                  body: { review_status: 'PENDING' },
                 })
               }
             >
-              승인
+              결정 취소
             </Button>
+          )
+        }
+
+        const needsCodeMapping = diffRequiresCodeMapping(row)
+        return (
+          <Space size="small" wrap>
+            {!needsCodeMapping ? (
+              <Button
+                type="link"
+                size="small"
+                loading={decisionMutation.isPending}
+                onClick={() =>
+                  decisionMutation.mutate({
+                    diffId: row.id,
+                    body: { review_status: 'ACCEPTED' },
+                  })
+                }
+              >
+                승인
+              </Button>
+            ) : (
+              <Typography.Text type="warning">코드 지정 필요</Typography.Text>
+            )}
             <Button
               type="link"
               size="small"
@@ -449,7 +488,7 @@ export function AnalysisDetailPage() {
               반려
             </Button>
             <Button type="link" size="small" onClick={() => openModify(row)}>
-              수정
+              {needsCodeMapping ? '코드 지정/수정' : '수정'}
             </Button>
             {isProjectRootReview(row) ? (
               <Button type="link" size="small" onClick={() => openMerge(row)}>
@@ -565,7 +604,8 @@ export function AnalysisDetailPage() {
               { key: 'UPDATE', label: `변경 (${counts.update})` },
               { key: 'CONFLICT', label: `충돌 (${counts.conflict})` },
               { key: 'REVIEW', label: `확인필요 (${counts.review})` },
-              { key: 'reviewed', label: '검토완료' },
+              { key: 'pending', label: `미검토 (${pendingActionable})` },
+              { key: 'reviewed', label: `검토완료 (${reviewedCount})` },
             ]}
             style={{ marginBottom: 8 }}
           />

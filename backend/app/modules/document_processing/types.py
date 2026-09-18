@@ -7,8 +7,15 @@ from typing import Any
 
 # Formats that need LibreOffice → PDF before text extraction.
 CONVERT_TO_PDF_EXTENSIONS: frozenset[str] = frozenset(
-    {"doc", "docx", "ppt", "pptx", "xls", "xlsx", "hwp", "hwpx"}
+    {"doc", "docx", "ppt", "pptx", "xls", "xlsx"}
 )
+
+# Hancom formats have a native text-extraction path.  LibreOffice may still be
+# attempted by document processing when a PDF preview can be produced.
+HANCOM_NATIVE_EXTENSIONS: frozenset[str] = frozenset({"hwp", "hwpx"})
+
+# PPTX has a safe OOXML text fallback when LibreOffice cannot render it.
+PPTX_NATIVE_EXTENSIONS: frozenset[str] = frozenset({"pptx"})
 
 IMAGE_EXTENSIONS: frozenset[str] = frozenset({"jpg", "jpeg", "png"})
 

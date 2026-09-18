@@ -10,12 +10,17 @@ from typing import Any, Literal
 BoundKind = Literal["start", "end"]
 
 _DATE_RE = re.compile(
-    r"^(?P<y>\d{4})(?:-(?P<m>\d{2})(?:-(?P<d>\d{2}))?)?$"
+    r"^(?P<y>\d{4})(?:-(?P<m>\d{1,2})(?:-(?P<d>\d{1,2}))?)?$"
+)
+_KOREAN_DATE_RE = re.compile(
+    r"^(?P<y>\d{4})\s*년"
+    r"(?:\s*(?P<m>\d{1,2})\s*월"
+    r"(?:\s*(?P<d>\d{1,2})\s*일)?)?\s*\.?$"
 )
 
 
 def parse_partial_date(value: Any) -> tuple[int, int | None, int | None] | None:
-    """Parse YYYY / YYYY-MM / YYYY-MM-DD. Returns None for empty; raises ValueError if illegal."""
+    """Parse YYYY / YYYY-MM / YYYY-MM-DD with common separators. Returns None for empty."""
     if value is None:
         return None
     if isinstance(value, date):
@@ -25,8 +30,16 @@ def parse_partial_date(value: Any) -> tuple[int, int | None, int | None] | None:
         return None
     if "T" in text:
         text = text.split("T", 1)[0]
-    text = text.replace("/", "-")
-    match = _DATE_RE.fullmatch(text)
+
+    # Korean resumes commonly mix "2014년 8월" with 2010.12 / 2024.09.
+    # Accept those source-friendly forms at the confirm boundary and normalize
+    # them to the same partial-date tuple used by ISO-like values.
+    korean_match = _KOREAN_DATE_RE.fullmatch(text)
+    if korean_match:
+        match = korean_match
+    else:
+        text = text.replace("/", "-").replace(".", "-").rstrip("-")
+        match = _DATE_RE.fullmatch(text)
     if not match:
         raise ValueError(f"invalid date: {value!r}")
     year = int(match.group("y"))

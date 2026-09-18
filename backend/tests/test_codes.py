@@ -150,6 +150,8 @@ def test_list_codes_requires_auth(client: TestClient) -> None:
 def test_list_codes_user_and_admin(client: TestClient, db_session) -> None:
     suffix = uuid.uuid4().hex[:8]
     codes = [f"TECH-T-{suffix}", f"TECH-C-{suffix}"]
+    unique_name = f"Python-{suffix}"
+    unique_alias = f"파이썬-{suffix}"
     user = _create_user(db_session, login_id=f"u_{suffix}", password="Secret123!", role="USER")
     admin = _create_user(db_session, login_id=f"a_{suffix}", password="Secret123!", role="ADMIN")
     try:
@@ -160,8 +162,8 @@ def test_list_codes_user_and_admin(client: TestClient, db_session) -> None:
             json={
                 "code": codes[0],
                 "type": "TECH",
-                "name": "Python",
-                "aliases": ["파이썬"],
+                "name": unique_name,
+                "aliases": [unique_alias],
                 "sort_order": 10,
             },
         )
@@ -169,13 +171,20 @@ def test_list_codes_user_and_admin(client: TestClient, db_session) -> None:
 
         client.post("/api/v1/auth/logout", headers={"X-CSRF-Token": csrf})
         _login(client, user.login_id)
-        listed = client.get("/api/v1/codes", params={"type": "TECH", "q": "python"})
+        listed = client.get(
+            "/api/v1/codes",
+            params={"type": "TECH", "q": unique_name.lower()},
+        )
         assert listed.status_code == 200
         data = listed.json()["data"]
         assert any(item["code"] == codes[0] for item in data)
-        assert any("파이썬" in item["aliases"] for item in data if item["code"] == codes[0])
+        assert any(
+            unique_alias in item["aliases"]
+            for item in data
+            if item["code"] == codes[0]
+        )
 
-        by_alias = client.get("/api/v1/codes", params={"q": "파이썬"})
+        by_alias = client.get("/api/v1/codes", params={"q": unique_alias})
         assert by_alias.status_code == 200
         assert any(item["code"] == codes[0] for item in by_alias.json()["data"])
     finally:

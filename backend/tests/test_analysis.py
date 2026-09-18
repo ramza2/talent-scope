@@ -1371,7 +1371,7 @@ def test_bulk_conflict_reject_and_foreign_diff(client: TestClient, db_session):
         entity_type="JOB",
         candidate_path="jobs[0]",
         change_type="NEW",
-        new_value={"code": "X"},
+        new_value={"code": "JOB-DEV-GEN"},
         review_status="PENDING",
     )
     d_conflict = AnalysisDiffItem(
@@ -1389,7 +1389,7 @@ def test_bulk_conflict_reject_and_foreign_diff(client: TestClient, db_session):
         entity_type="JOB",
         candidate_path="jobs[0]",
         change_type="NEW",
-        new_value={"code": "Y"},
+        new_value={"code": "JOB-MGT-PM"},
         review_status="PENDING",
     )
     db_session.add_all([d_new, d_conflict, d_foreign])
@@ -2518,6 +2518,14 @@ def test_confirm_dates_and_version_base_lock(client: TestClient, db_session):
     assert normalize_confirmed_date("2020", bound="end") == date(2020, 12, 31)
     assert normalize_confirmed_date("2020-03", bound="start") == date(2020, 3, 1)
     assert normalize_confirmed_date("2020-03", bound="end") == date(2020, 3, 31)
+    assert normalize_confirmed_date("2010.12", bound="start") == date(2010, 12, 1)
+    assert normalize_confirmed_date("2010.12.", bound="end") == date(2010, 12, 31)
+    assert normalize_confirmed_date("2024.9", bound="start") == date(2024, 9, 1)
+    assert normalize_confirmed_date("2024/9/7", bound="end") == date(2024, 9, 7)
+    assert normalize_confirmed_date("2014년 8월", bound="start") == date(2014, 8, 1)
+    assert normalize_confirmed_date("2014년 8월", bound="end") == date(2014, 8, 31)
+    assert normalize_confirmed_date("2014년", bound="end") == date(2014, 12, 31)
+    assert normalize_confirmed_date("2014년 8월 15일", bound="start") == date(2014, 8, 15)
 
     admin = _create_user(
         db_session, login_id=f"cd_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
