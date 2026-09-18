@@ -1371,7 +1371,7 @@ def test_bulk_conflict_reject_and_foreign_diff(client: TestClient, db_session):
         entity_type="JOB",
         candidate_path="jobs[0]",
         change_type="NEW",
-        new_value={"code": "X"},
+        new_value={"code": "JOB-DEV-GEN"},
         review_status="PENDING",
     )
     d_conflict = AnalysisDiffItem(
@@ -1389,7 +1389,7 @@ def test_bulk_conflict_reject_and_foreign_diff(client: TestClient, db_session):
         entity_type="JOB",
         candidate_path="jobs[0]",
         change_type="NEW",
-        new_value={"code": "Y"},
+        new_value={"code": "JOB-MGT-PM"},
         review_status="PENDING",
     )
     db_session.add_all([d_new, d_conflict, d_foreign])
