@@ -577,23 +577,25 @@ export function PeopleNewPage() {
           <Paragraph type="secondary">
             자동 후보에 없으면 이름·회사·이메일·전화번호로 기존 인력을 직접 찾아 연결할 수 있습니다.
           </Paragraph>
-          <Input.Search
-            style={{ maxWidth: 520, marginBottom: 12 }}
-            value={manualSearchText}
-            placeholder="이름·회사·이메일·전화번호"
-            enterButton="검색"
-            loading={manualPeopleQuery.isFetching}
-            onChange={(e) => setManualSearchText(e.target.value)}
-            onSearch={(value) => {
-              const query = value.trim()
-              if (!query) {
-                message.warning('기존 인력 검색어를 입력하세요.')
-                return
-              }
-              setManualSearchText(query)
-              setManualSearchQuery(query)
-            }}
-          />
+          <div style={{ maxWidth: 520, marginBottom: 12 }}>
+            <Input.Search
+              style={{ width: '100%' }}
+              value={manualSearchText}
+              placeholder="이름·회사·이메일·전화번호"
+              enterButton="검색"
+              loading={manualPeopleQuery.isFetching}
+              onChange={(e) => setManualSearchText(e.target.value)}
+              onSearch={(value) => {
+                const query = value.trim()
+                if (!query) {
+                  message.warning('기존 인력 검색어를 입력하세요.')
+                  return
+                }
+                setManualSearchText(query)
+                setManualSearchQuery(query)
+              }}
+            />
+          </div>
           {manualSearchQuery && (
             <Table
               rowKey="id"
@@ -615,17 +617,18 @@ export function PeopleNewPage() {
             />
           )}
 
-          <Radio.Group
-            style={{ marginTop: 16 }}
-            value={decision}
-            onChange={(e) => {
-              setDecision(e.target.value)
-              if (e.target.value === 'CREATE_NEW') setSelectedPersonId(null)
-            }}
-          >
-            <Radio value="CREATE_NEW">신규 인력으로 등록</Radio>
-            <Radio value="LINK_EXISTING">기존 인력에 연결</Radio>
-          </Radio.Group>
+          <div style={{ marginTop: 24 }}>
+            <Radio.Group
+              value={decision}
+              onChange={(e) => {
+                setDecision(e.target.value)
+                if (e.target.value === 'CREATE_NEW') setSelectedPersonId(null)
+              }}
+            >
+              <Radio value="CREATE_NEW">신규 인력으로 등록</Radio>
+              <Radio value="LINK_EXISTING">기존 인력에 연결</Radio>
+            </Radio.Group>
+          </div>
 
           <Space style={{ marginTop: 16 }}>
             <Button type="primary" onClick={onConfirmDecision}>
