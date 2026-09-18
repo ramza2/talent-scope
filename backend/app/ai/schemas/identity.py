@@ -24,7 +24,7 @@ def _normalize_korean_person_name(value: str | None) -> str | None:
     value = _blank_to_none(value)
     if value is None:
         return None
-    compact = re.sub(r"\\s+", "", value)
+    compact = re.sub(r"\s+", "", value)
     if 2 <= len(compact) <= 6 and re.fullmatch(r"[가-힣]+", compact):
         return compact
     return value
