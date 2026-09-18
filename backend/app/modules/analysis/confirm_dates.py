@@ -15,7 +15,7 @@ _DATE_RE = re.compile(
 
 
 def parse_partial_date(value: Any) -> tuple[int, int | None, int | None] | None:
-    """Parse YYYY / YYYY-MM / YYYY-MM-DD. Returns None for empty; raises ValueError if illegal."""
+    """Parse YYYY / YYYY-MM / YYYY-MM-DD with common separators. Returns None for empty."""
     if value is None:
         return None
     if isinstance(value, date):
@@ -25,7 +25,9 @@ def parse_partial_date(value: Any) -> tuple[int, int | None, int | None] | None:
         return None
     if "T" in text:
         text = text.split("T", 1)[0]
-    text = text.replace("/", "-")
+    # Resume/profile documents commonly use YYYY.MM or YYYY.MM. in Korea.
+    # Normalize separators here instead of forcing the LLM to rewrite source dates.
+    text = text.replace("/", "-").replace(".", "-").rstrip("-")
     match = _DATE_RE.fullmatch(text)
     if not match:
         raise ValueError(f"invalid date: {value!r}")
