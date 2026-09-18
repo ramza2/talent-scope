@@ -276,7 +276,7 @@ class DocumentProcessingService:
                     extraction_method="TEXT_PARSER",
                     layout_json={
                         "source_format": native.detected_format,
-                        "native_parser": "syhwp",
+                        "native_parser": native.parser_name,
                         "page_mapping": "UNAVAILABLE",
                         "logical_page": True,
                         "needs_vlm": False,
