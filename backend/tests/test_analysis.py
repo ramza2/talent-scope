@@ -2518,6 +2518,8 @@ def test_confirm_dates_and_version_base_lock(client: TestClient, db_session):
     assert normalize_confirmed_date("2020", bound="end") == date(2020, 12, 31)
     assert normalize_confirmed_date("2020-03", bound="start") == date(2020, 3, 1)
     assert normalize_confirmed_date("2020-03", bound="end") == date(2020, 3, 31)
+    assert normalize_confirmed_date("2010.12", bound="start") == date(2010, 12, 1)
+    assert normalize_confirmed_date("2010.12.", bound="end") == date(2010, 12, 31)
 
     admin = _create_user(
         db_session, login_id=f"cd_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
