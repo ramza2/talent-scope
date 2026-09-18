@@ -57,6 +57,49 @@ from app.storage.s3 import get_object_storage
 
 logger = logging.getLogger(__name__)
 
+_CODE_ENTITY_EXPECTED_TYPE: dict[str, str] = {
+    "JOB": "JOB",
+    "TECH": "TECH",
+    "EXP": "EXP",
+}
+_PROJECT_CODE_FIELD_EXPECTED_TYPE: dict[str, str] = {
+    "jobs": "JOB",
+    "skills": "TECH",
+    "expertise": "EXP",
+    "business_domains": "BIZ",
+    "customer_types": "CUSTOMER_TYPE",
+}
+
+
+def _extract_candidate_code(value: Any) -> str | None:
+    if isinstance(value, str):
+        text = value.strip()
+        return text or None
+    if not isinstance(value, dict):
+        return None
+    for key in (
+        "code",
+        "job_code",
+        "tech_code",
+        "exp_code",
+        "biz_code",
+        "customer_type_code",
+    ):
+        raw = value.get(key)
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip()
+    return None
+
+
+def _code_mapping_expected_type(diff: AnalysisDiffItem) -> str | None:
+    expected = _CODE_ENTITY_EXPECTED_TYPE.get(diff.entity_type)
+    if expected is not None:
+        return expected
+    if diff.entity_type == "PROJECT" and diff.field_name:
+        return _PROJECT_CODE_FIELD_EXPECTED_TYPE.get(diff.field_name)
+    return None
+
+
 
 @dataclass(frozen=True)
 class _RunContext:
@@ -515,10 +558,6 @@ class AnalysisService:
         diff = self.repo.get_diff(diff_id, for_update=True)
         if diff is None or diff.analysis_run_id != analysis_id:
             raise NotFoundError("Diff를 찾을 수 없습니다.")
-        if diff.review_status != "PENDING":
-            raise AnalysisStateConflictError(
-                "이미 결정된 Diff는 재결정할 수 없습니다."
-            )
 
         self._apply_decision(run, diff, payload, actor_user_id)
         self.repo.add_audit(
@@ -607,11 +646,40 @@ class AnalysisService:
 
         status = payload.review_status
         if status == "PENDING":
-            raise ValidationAppError("review_status를 PENDING으로 설정할 수 없습니다.")
+            if diff.review_status == "PENDING":
+                return
+            if diff.review_status == "MERGED":
+                raise ValidationAppError("병합 결정은 취소할 수 없습니다.")
+            diff.review_status = "PENDING"
+            diff.decided_value = None
+            diff.decided_by = None
+            diff.decided_at = None
+            self.db.add(diff)
+            self.db.flush()
+            return
+
         if diff.review_status != "PENDING":
             raise AnalysisStateConflictError(
-                "이미 결정된 Diff는 재결정할 수 없습니다."
+                "이미 결정된 Diff는 먼저 결정 취소 후 다시 검토해 주세요."
             )
+
+        expected_code_type = _code_mapping_expected_type(diff)
+        decision_value = payload.decided_value if status == "MODIFIED" else diff.new_value
+        if status in {"ACCEPTED", "MODIFIED"} and expected_code_type is not None:
+            code = _extract_candidate_code(decision_value)
+            if not code:
+                raise ValidationAppError(
+                    f"{expected_code_type} 코드가 매핑되지 않은 항목은 승인할 수 없습니다. "
+                    "코드를 지정하거나 반려해 주세요."
+                )
+            active_codes = {
+                row.code
+                for row in self.repo.list_active_codes([expected_code_type])
+            }
+            if code not in active_codes:
+                raise ValidationAppError(
+                    f"유효한 {expected_code_type} 코드를 지정해 주세요: {code}"
+                )
 
         if status == "MODIFIED":
             if payload.decided_value is None:
