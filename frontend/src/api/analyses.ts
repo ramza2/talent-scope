@@ -273,6 +273,58 @@ export function countPendingActionableDiffs(diffs: DiffItem[]): number {
   ).length
 }
 
+
+const CODE_ENTITY_TYPES: Record<string, string> = {
+  JOB: 'JOB',
+  TECH: 'TECH',
+  EXP: 'EXP',
+}
+
+const PROJECT_CODE_FIELDS: Record<string, string> = {
+  jobs: 'JOB',
+  skills: 'TECH',
+  expertise: 'EXP',
+  business_domains: 'BIZ',
+  customer_types: 'CUSTOMER_TYPE',
+}
+
+function candidateCode(value: unknown): string | null {
+  if (typeof value === 'string') {
+    const text = value.trim()
+    return text || null
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const row = value as Record<string, unknown>
+  for (const key of [
+    'code',
+    'job_code',
+    'tech_code',
+    'exp_code',
+    'biz_code',
+    'customer_type_code',
+  ]) {
+    const raw = row[key]
+    if (typeof raw === 'string' && raw.trim()) return raw.trim()
+  }
+  return null
+}
+
+/** Coded REVIEW items cannot be accepted until a canonical code is selected. */
+export function diffRequiresCodeMapping(diff: DiffItem): boolean {
+  if (diff.change_type !== 'REVIEW') return false
+  const expected =
+    CODE_ENTITY_TYPES[diff.entity_type] ||
+    (diff.entity_type === 'PROJECT' && diff.field_name
+      ? PROJECT_CODE_FIELDS[diff.field_name]
+      : undefined)
+  if (!expected) return false
+  return candidateCode(diff.new_value) == null
+}
+
+export function countReviewedDiffs(diffs: DiffItem[]): number {
+  return diffs.filter((d) => d.review_status !== 'PENDING').length
+}
+
 /** Confirm CTA gate — require diffs query success so loading ≠ pending 0. */
 export function canConfirmAnalysis(input: {
   status?: AnalysisStatus | string | null
