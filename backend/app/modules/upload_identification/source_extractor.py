@@ -20,11 +20,16 @@ from app.modules.document_processing.parsers.hancom import (
     extract_hancom_text,
 )
 from app.modules.document_processing.parsers.pdf import extract_pdf_pages
+from app.modules.document_processing.parsers.pptx import (
+    PptxExtractionError,
+    extract_pptx_text,
+)
 from app.modules.document_processing.types import (
     CONVERT_TO_PDF_EXTENSIONS,
     HANCOM_NATIVE_EXTENSIONS,
     IMAGE_EXTENSIONS,
     MIN_TEXT_CHARS_FOR_READY_PAGE,
+    PPTX_NATIVE_EXTENSIONS,
 )
 from app.storage.base import ObjectStorage
 
@@ -212,9 +217,31 @@ class IdentitySourceExtractor:
                         page_count=pages,
                         vlm_pages_used=vlm_used,
                     )
-            if ext in CONVERT_TO_PDF_EXTENSIONS:
+            if ext in PPTX_NATIVE_EXTENSIONS:
                 source_path = work_dir / f"source.{ext}"
                 source_path.write_bytes(data)
+                try:
+                    native = extract_pptx_text(source_path)
+                    return ExtractedFileSource(
+                        temp_file_id=file_id,
+                        filename=filename,
+                        document_type=doc_type,
+                        text=native.text,
+                        page_count=len(native.slides),
+                        vlm_pages_used=0,
+                    )
+                except PptxExtractionError as exc:
+                    logger.info(
+                        "identify native pptx extraction failed temp_file_id=%s "
+                        "fallback=libreoffice err=%s",
+                        file_id,
+                        type(exc).__name__,
+                    )
+
+            if ext in CONVERT_TO_PDF_EXTENSIONS:
+                source_path = work_dir / f"source.{ext}"
+                if not source_path.exists():
+                    source_path.write_bytes(data)
                 pdf_path = self.converter.convert_to_pdf(source_path, work_dir)
                 pdf_bytes = pdf_path.read_bytes()
                 text, pages, vlm_used = self._from_pdf_bytes(
@@ -255,7 +282,12 @@ class IdentitySourceExtractor:
                 document_type=doc_type,
                 error=f"unsupported extension .{ext or '?'}",
             )
-        except (ConverterError, HancomExtractionError, AIProviderError) as exc:
+        except (
+            ConverterError,
+            HancomExtractionError,
+            PptxExtractionError,
+            AIProviderError,
+        ) as exc:
             logger.info(
                 "identify extraction file failure temp_file_id=%s err=%s",
                 file_id,
