@@ -215,9 +215,9 @@ services:
     networks:
       - internal
 
-  # Idempotently create isolated test/PERF databases. PostgreSQL creates only
-  # POSTGRES_DB on first boot, so the tool databases must be provisioned before
-  # pytest/PERF. No product tables are touched here.
+  # Prepare isolated test/PERF databases. The test DB is recreated on every
+  # tools run so interrupted/previous pytest sessions cannot leak rows into the
+  # next regression. PERF is preserved unless it does not exist.
   tools-db-init:
     profiles: ["tools"]
     image: pgvector/pgvector:pg16
@@ -234,11 +234,17 @@ services:
     entrypoint: ["/bin/sh", "-ec"]
     command:
       - |
-        for db in "$${POSTGRES_TEST_DB}" "$${POSTGRES_PERF_DB}"; do
-          if ! psql -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='$${db}'" | grep -q 1; then
-            createdb "$${db}"
-          fi
-        done
+        case "${POSTGRES_TEST_DB}" in
+          *_test*) ;;
+          *) echo "Refusing to reset non-test DB: ${POSTGRES_TEST_DB}" >&2; exit 1 ;;
+        esac
+        psql -d postgres -v ON_ERROR_STOP=1 -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${POSTGRES_TEST_DB}' AND pid <> pg_backend_pid();"
+        dropdb --if-exists "${POSTGRES_TEST_DB}"
+        createdb "${POSTGRES_TEST_DB}"
+
+        if ! psql -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='${POSTGRES_PERF_DB}'" | grep -q 1; then
+          createdb "${POSTGRES_PERF_DB}"
+        fi
     networks:
       - internal
 
