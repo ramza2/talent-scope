@@ -45,7 +45,12 @@ class OpenAICompatibleLLMProvider:
         user_prompt: str,
         log_context: dict | None = None,
     ) -> IdentityExtraction:
-        content = self._chat(system_prompt, user_prompt, log_context)
+        content = self._chat(
+            system_prompt,
+            user_prompt,
+            log_context,
+            timeout_seconds=float(self.settings.ai_request_timeout_seconds),
+        )
         return _parse_identity_content(content, allow_repair=True)
 
     def complete_json(
@@ -55,13 +60,22 @@ class OpenAICompatibleLLMProvider:
         user_prompt: str,
         log_context: dict | None = None,
     ) -> dict:
-        content = self._chat(system_prompt, user_prompt, log_context)
+        content = self._chat(
+            system_prompt,
+            user_prompt,
+            log_context,
+            timeout_seconds=float(self.settings.analysis_ai_request_timeout_seconds),
+        )
         return _parse_json_dict(content, allow_repair=True)
 
     def _chat(
-        self, system_prompt: str, user_prompt: str, log_context: dict | None
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        log_context: dict | None,
+        *,
+        timeout_seconds: float,
     ) -> str:
-        timeout = float(self.settings.ai_request_timeout_seconds)
         payload = {
             "model": self.settings.llm_model,
             "temperature": 0,
@@ -79,7 +93,7 @@ class OpenAICompatibleLLMProvider:
             base_url=self.settings.llm_base_url,
             api_key=self.settings.llm_api_key,
             payload=payload,
-            timeout_seconds=timeout,
+            timeout_seconds=timeout_seconds,
             log_context=ctx,
         )
         return extract_message_content(data)
