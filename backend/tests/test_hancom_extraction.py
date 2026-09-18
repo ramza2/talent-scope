@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import subprocess
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -68,6 +69,43 @@ def test_hancom_adapter_normalizes_plain_text(tmp_path, monkeypatch):
     assert result.detected_format == "hwp5"
     assert result.text == "홍길동\nPython\n\nFastAPI"
 
+
+
+def test_hwpx_owpml_extraction_preserves_table_rows(tmp_path, monkeypatch):
+    from app.modules.document_processing.parsers import hancom
+
+    source = tmp_path / "resume.hwpx"
+    section_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<hp:sec xmlns:hp="http://www.hancom.co.kr/hwpml/2011/section">
+  <hp:p><hp:run><hp:t>이 력 서</hp:t></hp:run></hp:p>
+  <hp:p><hp:run><hp:tbl>
+    <hp:tr>
+      <hp:tc><hp:subList><hp:p><hp:run><hp:t>성 명</hp:t></hp:run></hp:p></hp:subList></hp:tc>
+      <hp:tc><hp:subList><hp:p><hp:run><hp:t>곽   영   훈</hp:t></hp:run></hp:p></hp:subList></hp:tc>
+    </hp:tr>
+    <hp:tr>
+      <hp:tc><hp:subList><hp:p><hp:run><hp:t>19.01~현재</hp:t></hp:run></hp:p></hp:subList></hp:tc>
+      <hp:tc><hp:subList><hp:p><hp:run><hp:t>클라우드통신망 운영 및 유지보수</hp:t></hp:run></hp:p></hp:subList></hp:tc>
+    </hp:tr>
+  </hp:tbl></hp:run></hp:p>
+</hp:sec>
+"""
+    with zipfile.ZipFile(source, "w") as archive:
+        archive.writestr("mimetype", "application/hwp+zip")
+        archive.writestr("Contents/section0.xml", section_xml)
+
+    def should_not_use_syhwp(_path):
+        raise AssertionError("valid HWPX must use the OWPML XML parser")
+
+    monkeypatch.setattr(hancom.syhwp, "extract_text", should_not_use_syhwp)
+
+    result = extract_hancom_text(source)
+
+    assert result.detected_format == "hwpx"
+    assert result.parser_name == "owpml-xml"
+    assert "이 력 서" in result.text
+    assert "성 명 | 곽 영 훈" in result.text
+    assert "19.01~현재 | 클라우드통신망 운영 및 유지보수" in result.text
 
 def test_hancom_adapter_rejects_empty_text(tmp_path, monkeypatch):
     from app.modules.document_processing.parsers import hancom
@@ -161,6 +199,7 @@ def test_document_processing_hancom_falls_back_without_fake_page_count(
         lambda _path: HancomTextExtraction(
             text="한글 원문 전체 텍스트",
             detected_format="hwpx",
+            parser_name="owpml-xml",
         ),
     )
     svc = object.__new__(DocumentProcessingService)
@@ -181,7 +220,7 @@ def test_document_processing_hancom_falls_back_without_fake_page_count(
     assert page.extracted_text == "한글 원문 전체 텍스트"
     assert page.layout_json == {
         "source_format": "hwpx",
-        "native_parser": "syhwp",
+        "native_parser": "owpml-xml",
         "page_mapping": "UNAVAILABLE",
         "logical_page": True,
         "needs_vlm": False,
