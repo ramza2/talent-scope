@@ -266,6 +266,12 @@ services:
       REDIS_URL: redis://redis:6379/0
       REDIS_KEY_PREFIX: talentscope:test
       S3_ENDPOINT: http://minio:9000
+      # Keep regression tests deterministic even when production embedding is
+      # enabled in .env.server. Individual embedding tests opt in explicitly.
+      EMBEDDING_ENABLED: "false"
+      EMBEDDING_MODEL: bge-m3
+      EMBEDDING_DIMENSIONS: 1024
+      EMBEDDING_MAX_INPUT_CHARS: 8000
     depends_on:
       postgres:
         condition: service_healthy
