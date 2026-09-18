@@ -23,6 +23,7 @@ import type { UploadFile } from 'antd/es/upload/interface'
 
 import { apiErrorMessage } from '@/api/errors'
 import { listCodes } from '@/api/codes'
+import { listPeople, type PeopleListItem } from '@/api/people'
 import {
   cancelUploadSession,
   createUploadSession,
@@ -70,6 +71,8 @@ export function PeopleNewPage() {
   const [identity, setIdentity] = useState<IdentityForm>({ name: '' })
   const [decision, setDecision] = useState<Decision>('CREATE_NEW')
   const [selectedPersonId, setSelectedPersonId] = useState<string | null>(null)
+  const [manualSearchText, setManualSearchText] = useState('')
+  const [manualSearchQuery, setManualSearchQuery] = useState('')
   const [resolutions, setResolutions] = useState<Record<string, DocumentResolutionItem>>(
     {},
   )
@@ -96,6 +99,18 @@ export function PeopleNewPage() {
     queryKey: ['people', selectedPersonId, 'documents', 'wizard'],
     queryFn: () => listPersonDocuments(selectedPersonId!),
     enabled: decision === 'LINK_EXISTING' && !!selectedPersonId,
+  })
+
+  const manualPeopleQuery = useQuery({
+    queryKey: ['people', 'wizard-manual-search', manualSearchQuery],
+    queryFn: () =>
+      listPeople({
+        q: manualSearchQuery,
+        sort: 'name_asc',
+        page: 1,
+        page_size: 10,
+      }),
+    enabled: step === 3 && !!manualSearchQuery,
   })
 
   const groupOptionsByType = useMemo(() => {
@@ -148,12 +163,15 @@ export function PeopleNewPage() {
         if (data.status === 'IDENTIFIED') {
           stopPolling()
           setIdentifyError(null)
+          const identifiedName = data.identity?.name ?? ''
           setIdentity({
-            name: data.identity?.name ?? '',
+            name: identifiedName,
             company: data.identity?.company ?? undefined,
             phone: data.identity?.phone ?? undefined,
             email: data.identity?.email ?? undefined,
           })
+          setManualSearchText(identifiedName)
+          setManualSearchQuery('')
           setStep(3)
           setBusy(false)
         } else if (
@@ -270,6 +288,20 @@ export function PeopleNewPage() {
       dataIndex: 'score',
       width: 120,
       render: (score: number) => `${Math.round(score * 100)}%`,
+    },
+  ]
+
+  const manualPersonColumns: ColumnsType<PeopleListItem> = [
+    { title: '이름', dataIndex: 'name' },
+    {
+      title: '회사',
+      dataIndex: 'affiliation_company',
+      render: (value?: string | null) => value || '-',
+    },
+    {
+      title: '주요 직무',
+      dataIndex: 'primary_job',
+      render: (value?: PeopleListItem['primary_job']) => value?.name || '-',
     },
   ]
 
@@ -489,7 +521,12 @@ export function PeopleNewPage() {
             <Form.Item label="이름" required>
               <Input
                 value={identity.name}
-                onChange={(e) => setIdentity((s) => ({ ...s, name: e.target.value }))}
+                onChange={(e) => {
+                  const name = e.target.value
+                  setIdentity((s) => ({ ...s, name }))
+                  setManualSearchText(name)
+                  setManualSearchQuery('')
+                }}
               />
             </Form.Item>
             <Form.Item label="소속회사">
@@ -533,6 +570,50 @@ export function PeopleNewPage() {
               },
             }}
           />
+
+          <Title level={5} style={{ marginTop: 24 }}>
+            기존 인력 직접 검색
+          </Title>
+          <Paragraph type="secondary">
+            자동 후보에 없으면 이름·회사·이메일·전화번호로 기존 인력을 직접 찾아 연결할 수 있습니다.
+          </Paragraph>
+          <Input.Search
+            style={{ maxWidth: 520, marginBottom: 12 }}
+            value={manualSearchText}
+            placeholder="이름·회사·이메일·전화번호"
+            enterButton="검색"
+            loading={manualPeopleQuery.isFetching}
+            onChange={(e) => setManualSearchText(e.target.value)}
+            onSearch={(value) => {
+              const query = value.trim()
+              if (!query) {
+                message.warning('기존 인력 검색어를 입력하세요.')
+                return
+              }
+              setManualSearchText(query)
+              setManualSearchQuery(query)
+            }}
+          />
+          {manualSearchQuery && (
+            <Table
+              rowKey="id"
+              size="small"
+              pagination={false}
+              columns={manualPersonColumns}
+              dataSource={manualPeopleQuery.data?.data ?? []}
+              loading={manualPeopleQuery.isFetching}
+              locale={{ emptyText: '검색된 기존 인력이 없습니다.' }}
+              rowSelection={{
+                type: 'radio',
+                selectedRowKeys: selectedPersonId ? [selectedPersonId] : [],
+                onChange: (keys) => {
+                  const id = String(keys[0] ?? '')
+                  setSelectedPersonId(id || null)
+                  if (id) setDecision('LINK_EXISTING')
+                },
+              }}
+            />
+          )}
 
           <Radio.Group
             style={{ marginTop: 16 }}
