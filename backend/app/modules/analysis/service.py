@@ -20,7 +20,10 @@ from app.ai.prompts.profile_extract import (
 from app.ai.providers.errors import AIProviderError, AIResponseValidationError
 from app.ai.providers.llm import LLMProvider, OpenAICompatibleLLMProvider
 from app.ai.providers.vlm import OpenAICompatibleVLMProvider, VLMProvider
-from app.ai.schemas.profile_candidate import ProfileCandidateDocument
+from app.ai.schemas.profile_candidate import (
+    PROFILE_SCALAR_FIELDS,
+    ProfileCandidateDocument,
+)
 from app.core.config import Settings, get_settings
 from app.core.exceptions import (
     AIQueueUnavailableError,
@@ -69,6 +72,96 @@ _PROJECT_CODE_FIELD_EXPECTED_TYPE: dict[str, str] = {
     "business_domains": "BIZ",
     "customer_types": "CUSTOMER_TYPE",
 }
+
+# Candidate quality guard (empty / sparse LLM output).
+# Sparse applies only to rich profile-like document types with enough source text,
+# so CERT / short docs that legitimately yield 0–1 items are not retried as sparse.
+_SPARSE_MIN_SOURCE_CHARS = 500
+_SPARSE_MAX_QUALITY_SCORE = 1
+_RICH_DOC_TYPE_TOKENS_ASCII = frozenset({"PROFILE", "RESUME", "CAREER", "KOSA"})
+_RICH_DOC_TYPE_TOKENS_KO = frozenset({"이력서", "경력", "프로파일", "프로필", "코사"})
+
+
+class InsufficientCandidateError(Exception):
+    """LLM returned empty/sparse candidate after the allowed retry."""
+
+    USER_MESSAGE = (
+        "AI 분석 결과에서 유효한 프로필 정보를 충분히 추출하지 못했습니다. "
+        "다시 분석해 주세요."
+    )
+
+
+def _profile_scalar_filled(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    return True
+
+
+def candidate_quality_score(candidate: ProfileCandidateDocument) -> int:
+    """Count substantive profile items (scalars + list entities).
+
+    ``summary`` / ``analysis`` metadata alone do not contribute.
+    """
+    score = 0
+    for field in PROFILE_SCALAR_FIELDS:
+        if _profile_scalar_filled(getattr(candidate.profile, field, None)):
+            score += 1
+    score += len(candidate.jobs)
+    score += len(candidate.skills)
+    score += len(candidate.expertise)
+    score += len(candidate.employment_history)
+    score += len(candidate.education)
+    score += len(candidate.certifications)
+    score += len(candidate.projects)
+    return score
+
+
+def candidate_is_empty(candidate: ProfileCandidateDocument) -> bool:
+    return candidate_quality_score(candidate) == 0
+
+
+def _documents_are_rich_profile_type(documents: tuple[DocumentSnapshot, ...] | list[DocumentSnapshot]) -> bool:
+    for doc in documents:
+        code = (doc.document_type_code or "").strip()
+        name = (doc.document_type_name or "").strip()
+        ascii_blob = f"{code} {name}".upper()
+        for token in _RICH_DOC_TYPE_TOKENS_ASCII:
+            if token in ascii_blob:
+                return True
+        ko_blob = f"{code} {name}"
+        for token in _RICH_DOC_TYPE_TOKENS_KO:
+            if token in ko_blob:
+                return True
+    return False
+
+
+def candidate_is_sparse(
+    candidate: ProfileCandidateDocument,
+    *,
+    documents: tuple[DocumentSnapshot, ...] | list[DocumentSnapshot],
+    source_char_count: int,
+) -> bool:
+    """True when a rich PROFILE/RESUME/CAREER/KOSA source yields almost no items."""
+    if source_char_count < _SPARSE_MIN_SOURCE_CHARS:
+        return False
+    if not _documents_are_rich_profile_type(documents):
+        return False
+    return candidate_quality_score(candidate) <= _SPARSE_MAX_QUALITY_SCORE
+
+
+def candidate_needs_llm_retry(
+    candidate: ProfileCandidateDocument,
+    *,
+    documents: tuple[DocumentSnapshot, ...] | list[DocumentSnapshot],
+    source_char_count: int,
+) -> bool:
+    if candidate_is_empty(candidate):
+        return True
+    return candidate_is_sparse(
+        candidate, documents=documents, source_char_count=source_char_count
+    )
 
 
 def _extract_candidate_code(value: Any) -> str | None:
@@ -251,34 +344,78 @@ class AnalysisService:
             if not blocks.strip():
                 raise AIProviderError("no usable text for profile analysis")
 
-            raw = self.llm.complete_json(
-                system_prompt=prompt.system_prompt,
-                user_prompt=prompt.build_user_prompt(
-                    code_catalog=claimed.code_catalog_text,
-                    document_blocks=blocks,
-                ),
-                log_context={
-                    "analysis_run_id": str(run_id),
-                    "document_count": len(claimed.documents),
-                    "vlm_pages": bundle.total_vlm_pages,
-                    "prompt_version": prompt.prompt_version,
-                },
+            user_prompt = prompt.build_user_prompt(
+                code_catalog=claimed.code_catalog_text,
+                document_blocks=blocks,
             )
-            if not isinstance(raw, dict):
-                raise AIResponseValidationError("profile JSON root is not an object")
-
             catalog_map = {
                 code: (code_type, active)
                 for code, code_type, active in claimed.catalog
             }
-            # source_ref validation uses only pages actually present in the LLM prompt.
-            candidate = normalize_candidate(
-                raw,
-                catalog=catalog_map,
-                allowed_documents=prompt_source.allowed_documents,
-                settings=self.settings,
-                page_texts=prompt_source.page_texts,
-            )
+            source_char_count = len(blocks.strip())
+            base_log = {
+                "analysis_run_id": str(run_id),
+                "document_count": len(claimed.documents),
+                "vlm_pages": bundle.total_vlm_pages,
+                "prompt_version": prompt.prompt_version,
+                "source_char_count": source_char_count,
+            }
+
+            def _llm_normalize(*, attempt: int) -> ProfileCandidateDocument:
+                raw = self.llm.complete_json(
+                    system_prompt=prompt.system_prompt,
+                    user_prompt=user_prompt,
+                    log_context={**base_log, "attempt": attempt},
+                )
+                if not isinstance(raw, dict):
+                    raise AIResponseValidationError(
+                        "profile JSON root is not an object"
+                    )
+                # source_ref validation uses only pages actually present in the LLM prompt.
+                return normalize_candidate(
+                    raw,
+                    catalog=catalog_map,
+                    allowed_documents=prompt_source.allowed_documents,
+                    settings=self.settings,
+                    page_texts=prompt_source.page_texts,
+                )
+
+            def _log_quality(*, attempt: int, candidate: ProfileCandidateDocument) -> None:
+                empty = candidate_is_empty(candidate)
+                sparse = candidate_is_sparse(
+                    candidate,
+                    documents=claimed.documents,
+                    source_char_count=source_char_count,
+                )
+                logger.info(
+                    "analysis candidate quality run_id=%s attempt=%s "
+                    "document_count=%s vlm_pages=%s empty=%s sparse=%s "
+                    "quality_score=%s",
+                    run_id,
+                    attempt,
+                    len(claimed.documents),
+                    bundle.total_vlm_pages,
+                    empty,
+                    sparse,
+                    candidate_quality_score(candidate),
+                )
+
+            candidate = _llm_normalize(attempt=1)
+            _log_quality(attempt=1, candidate=candidate)
+            if candidate_needs_llm_retry(
+                candidate,
+                documents=claimed.documents,
+                source_char_count=source_char_count,
+            ):
+                # Reuse the same prompt source; do not rebuild VLM/source.
+                candidate = _llm_normalize(attempt=2)
+                _log_quality(attempt=2, candidate=candidate)
+                if candidate_needs_llm_retry(
+                    candidate,
+                    documents=claimed.documents,
+                    source_char_count=source_char_count,
+                ):
+                    raise InsufficientCandidateError()
 
             if claimed.base_profile_version is None:
                 raise AIProviderError("missing base_profile_version")
@@ -447,7 +584,9 @@ class AnalysisService:
             status = run.status
             self.db.rollback()
             return status
-        if isinstance(exc, AIResponseValidationError):
+        if isinstance(exc, InsufficientCandidateError):
+            message = InsufficientCandidateError.USER_MESSAGE
+        elif isinstance(exc, AIResponseValidationError):
             message = "AI response validation failed"
         elif isinstance(exc, AIProviderError):
             message = "AI provider error"

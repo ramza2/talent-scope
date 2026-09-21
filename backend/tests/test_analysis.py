@@ -4161,3 +4161,437 @@ def test_confirm_vs_manual_employment_lock_order_no_deadlock(db_session):
     )
 
     _cleanup_person(db_session, person_id, admin.id)
+
+
+# ---------------------------------------------------------------------------
+# Empty / sparse Candidate guard (LLM 1-retry)
+# ---------------------------------------------------------------------------
+
+
+_RICH_PAGE_TEXT = (
+    "홍길동 이력서 / KOSA 경력기술서\n"
+    "소속 ABC테크 / 부서 AI개발팀 / 직위 책임\n"
+    "기술등급 특급 / Python FastAPI PostgreSQL RAG LLM\n"
+    "학력 서울대학교 컴퓨터공학 학사\n"
+    "자격증 정보처리기사\n"
+    "프로젝트 공공기관 RAG 구축 2023-01 ~ 2024-06 PL\n"
+    "프로젝트 금융권 AI 상담 2022-03 ~ 2022-12 TA\n"
+) * 8  # >500 chars for sparse guard
+
+
+def _ensure_named_doc_type(db_session, *, code: str, name: str) -> str:
+    from app.db.models.code import CodeMaster
+
+    row = db_session.get(CodeMaster, code)
+    if row is None:
+        db_session.add(
+            CodeMaster(
+                code=code,
+                code_type="DOC_TYPE",
+                name=name,
+                sort_order=1,
+                is_active=True,
+            )
+        )
+        db_session.commit()
+    return code
+
+
+def _seed_person_doc(
+    db_session,
+    user_id,
+    *,
+    doc_type_code: str,
+    doc_type_name: str,
+    page_text: str,
+):
+    from app.db.models.document import Document, DocumentGroup, DocumentPage
+    from app.db.models.person import Person, PersonProfile
+    from app.db.models.revision import ProfileRevision
+    from app.modules.people.snapshot import build_confirmed_profile_snapshot
+
+    _ensure_named_doc_type(db_session, code=doc_type_code, name=doc_type_name)
+    person = Person(status="ACTIVE", created_by=user_id)
+    db_session.add(person)
+    db_session.flush()
+    profile = PersonProfile(
+        person_id=person.id,
+        name="분석대상",
+        technical_grade="ADVANCED",
+        profile_version=1,
+    )
+    db_session.add(profile)
+    db_session.flush()
+    snap = build_confirmed_profile_snapshot(db_session, person.id)
+    db_session.add(
+        ProfileRevision(
+            person_id=person.id,
+            revision_no=1,
+            snapshot_json=snap,
+            source_type="USER",
+            created_by=user_id,
+        )
+    )
+    group = DocumentGroup(
+        person_id=person.id,
+        document_type_code=doc_type_code,
+        title=doc_type_name,
+    )
+    db_session.add(group)
+    db_session.flush()
+    document = Document(
+        document_group_id=group.id,
+        version_no=1,
+        is_latest=True,
+        original_filename=f"{doc_type_code.lower()}.pdf",
+        extension="pdf",
+        mime_type="application/pdf",
+        file_size=100,
+        storage_key=f"test/{uuid.uuid4()}.pdf",
+        sha256="b" * 64,
+        processing_status="READY",
+        uploaded_by=user_id,
+    )
+    db_session.add(document)
+    db_session.flush()
+    db_session.add(
+        DocumentPage(
+            document_id=document.id,
+            page_no=1,
+            extracted_text=page_text,
+            layout_json={"needs_vlm": False},
+            extraction_method="TEXT_PARSER",
+        )
+    )
+    db_session.commit()
+    return person, document
+
+
+def _empty_candidate_json() -> dict:
+    return {
+        "schema_version": "profile-candidate-v1",
+        "profile": {},
+        "jobs": [],
+        "skills": [],
+        "expertise": [],
+        "employment_history": [],
+        "education": [],
+        "certifications": [],
+        "projects": [],
+        "summary": {"text": "요약만 있고 구조화 항목 없음"},
+        "analysis": {"overall_confidence": 0.9, "notes": "meta only"},
+    }
+
+
+def _sparse_candidate_json() -> dict:
+    return {
+        "schema_version": "profile-candidate-v1",
+        "profile": {},
+        "jobs": [{"raw_value": "TA", "job_type": "PRIMARY"}],
+        "skills": [],
+        "expertise": [],
+        "employment_history": [],
+        "education": [],
+        "certifications": [],
+        "projects": [],
+        "summary": {},
+        "analysis": {"overall_confidence": 0.5},
+    }
+
+
+def _valid_candidate_json() -> dict:
+    return {
+        "schema_version": "profile-candidate-v1",
+        "profile": {
+            "name": "홍길동",
+            "technical_grade": "EXPERT",
+            "affiliation_company": "ABC테크",
+        },
+        "jobs": [
+            {"raw_value": "AI개발자", "code": "JOB-AI-DEV", "job_type": "PRIMARY"},
+            {"raw_value": "PL", "job_type": "SECONDARY"},
+        ],
+        "skills": [{"raw_value": "Python", "code": "TECH-LANG-PYTHON"}],
+        "expertise": [{"raw_value": "RAG", "code": "EXP-AI-RAG"}],
+        "employment_history": [
+            {"company_name": "ABC테크", "title": "책임", "start_date": "2020-01"}
+        ],
+        "education": [{"school_name": "서울대", "major": "컴공"}],
+        "certifications": [{"certification_name": "정보처리기사"}],
+        "projects": [
+            {"project_name": "공공 RAG", "start_date": "2023-01", "end_date": "2024-06"}
+        ],
+        "summary": {},
+        "analysis": {"overall_confidence": 0.85},
+    }
+
+
+def _cert_only_candidate_json() -> dict:
+    return {
+        "schema_version": "profile-candidate-v1",
+        "profile": {},
+        "jobs": [],
+        "skills": [],
+        "expertise": [],
+        "employment_history": [],
+        "education": [],
+        "certifications": [{"certification_name": "정보처리기사", "issuer": "한국산업인력공단"}],
+        "projects": [],
+        "summary": {},
+        "analysis": {"overall_confidence": 0.7},
+    }
+
+
+class _SequenceLLM:
+    """Return successive profile JSON payloads; counts complete_json calls."""
+
+    def __init__(self, payloads: list[dict]) -> None:
+        self.payloads = list(payloads)
+        self.calls = 0
+        self.last_user_prompt: str | None = None
+
+    def complete_json(self, **kwargs):
+        self.calls += 1
+        self.last_user_prompt = kwargs.get("user_prompt")
+        idx = min(self.calls - 1, len(self.payloads) - 1)
+        return dict(self.payloads[idx])
+
+
+def _queue_run(db_session, person_id, document_id):
+    from app.modules.analysis.repository import AnalysisRepository
+
+    repo = AnalysisRepository(db_session)
+    run = repo.create_run(
+        person_id=person_id,
+        base_profile_version=1,
+        llm_model="fake",
+        vlm_model="fake",
+        prompt_version="profile-extract-v1",
+        schema_version="profile-candidate-v1",
+    )
+    repo.add_run_documents(run.id, [document_id])
+    db_session.commit()
+    return run
+
+
+def test_candidate_quality_helpers_ignore_summary_metadata():
+    from app.ai.schemas.profile_candidate import ProfileCandidateDocument
+    from app.modules.analysis.service import (
+        candidate_is_empty,
+        candidate_is_sparse,
+        candidate_quality_score,
+    )
+    from app.modules.analysis.source_builder import DocumentSnapshot
+    from uuid import uuid4
+
+    empty = ProfileCandidateDocument.model_validate(_empty_candidate_json())
+    assert candidate_quality_score(empty) == 0
+    assert candidate_is_empty(empty)
+
+    sparse = ProfileCandidateDocument.model_validate(_sparse_candidate_json())
+    assert candidate_quality_score(sparse) == 1
+    assert not candidate_is_empty(sparse)
+
+    docs = (
+        DocumentSnapshot(
+            id=uuid4(),
+            original_filename="kosa.pdf",
+            extension="pdf",
+            mime_type="application/pdf",
+            storage_key="x",
+            preview_storage_key=None,
+            document_type_code="DOC-KOSA",
+            document_type_name="KOSA 경력",
+            version_no=1,
+            person_id=uuid4(),
+        ),
+    )
+    assert candidate_is_sparse(sparse, documents=docs, source_char_count=600)
+    assert not candidate_is_sparse(sparse, documents=docs, source_char_count=100)
+
+    cert_docs = (
+        DocumentSnapshot(
+            id=uuid4(),
+            original_filename="cert.pdf",
+            extension="pdf",
+            mime_type="application/pdf",
+            storage_key="x",
+            preview_storage_key=None,
+            document_type_code="DOC-CERT",
+            document_type_name="자격증",
+            version_no=1,
+            person_id=uuid4(),
+        ),
+    )
+    cert = ProfileCandidateDocument.model_validate(_cert_only_candidate_json())
+    assert candidate_quality_score(cert) == 1
+    assert not candidate_is_sparse(cert, documents=cert_docs, source_char_count=6000)
+
+
+def test_empty_candidate_retries_then_reviewing(db_session):
+    from app.db.models.analysis import AnalysisDiffItem
+    from app.modules.analysis.service import AnalysisService
+    from app.storage.s3 import get_object_storage
+    from sqlalchemy import select
+
+    admin = _create_user(
+        db_session, login_id=f"a_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    person, document = _seed_person_doc(
+        db_session,
+        admin.id,
+        doc_type_code="DOC-KOSA",
+        doc_type_name="KOSA",
+        page_text=_RICH_PAGE_TEXT,
+    )
+    run = _queue_run(db_session, person.id, document.id)
+    llm = _SequenceLLM([_empty_candidate_json(), _valid_candidate_json()])
+    service = AnalysisService(db_session, storage=get_object_storage(), llm=llm)
+    assert service.run_analysis(run.id) == "REVIEWING"
+    assert llm.calls == 2
+    db_session.refresh(run)
+    assert run.status == "REVIEWING"
+    diffs = list(
+        db_session.execute(
+            select(AnalysisDiffItem).where(AnalysisDiffItem.analysis_run_id == run.id)
+        ).scalars()
+    )
+    assert len(diffs) >= 1
+    _cleanup_person(db_session, person.id, admin.id)
+
+
+def test_empty_candidate_retries_then_failed(db_session):
+    from app.db.models.analysis import AnalysisDiffItem
+    from app.modules.analysis.service import (
+        AnalysisService,
+        InsufficientCandidateError,
+    )
+    from app.storage.s3 import get_object_storage
+    from sqlalchemy import select
+
+    admin = _create_user(
+        db_session, login_id=f"a_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    person, document = _seed_person_doc(
+        db_session,
+        admin.id,
+        doc_type_code="DOC-RESUME",
+        doc_type_name="이력서",
+        page_text=_RICH_PAGE_TEXT,
+    )
+    run = _queue_run(db_session, person.id, document.id)
+    llm = _SequenceLLM([_empty_candidate_json(), _empty_candidate_json()])
+    service = AnalysisService(db_session, storage=get_object_storage(), llm=llm)
+    assert service.run_analysis(run.id) == "FAILED"
+    assert llm.calls == 2
+    db_session.refresh(run)
+    assert run.status == "FAILED"
+    assert run.error_message == InsufficientCandidateError.USER_MESSAGE
+    diffs = list(
+        db_session.execute(
+            select(AnalysisDiffItem).where(AnalysisDiffItem.analysis_run_id == run.id)
+        ).scalars()
+    )
+    assert diffs == []
+    _cleanup_person(db_session, person.id, admin.id)
+
+
+def test_sparse_profile_retries_then_reviewing(db_session):
+    from app.modules.analysis.service import AnalysisService
+    from app.storage.s3 import get_object_storage
+
+    admin = _create_user(
+        db_session, login_id=f"a_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    person, document = _seed_person_doc(
+        db_session,
+        admin.id,
+        doc_type_code="DOC-PROFILE",
+        doc_type_name="프로필",
+        page_text=_RICH_PAGE_TEXT,
+    )
+    run = _queue_run(db_session, person.id, document.id)
+    llm = _SequenceLLM([_sparse_candidate_json(), _valid_candidate_json()])
+    service = AnalysisService(db_session, storage=get_object_storage(), llm=llm)
+    assert service.run_analysis(run.id) == "REVIEWING"
+    assert llm.calls == 2
+    db_session.refresh(run)
+    assert run.status == "REVIEWING"
+    _cleanup_person(db_session, person.id, admin.id)
+
+
+def test_sparse_kosa_retries_then_failed(db_session):
+    from app.modules.analysis.service import (
+        AnalysisService,
+        InsufficientCandidateError,
+    )
+    from app.storage.s3 import get_object_storage
+
+    admin = _create_user(
+        db_session, login_id=f"a_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    person, document = _seed_person_doc(
+        db_session,
+        admin.id,
+        doc_type_code="DOC-KOSA",
+        doc_type_name="KOSA 경력기술서",
+        page_text=_RICH_PAGE_TEXT,
+    )
+    run = _queue_run(db_session, person.id, document.id)
+    llm = _SequenceLLM([_sparse_candidate_json(), _sparse_candidate_json()])
+    service = AnalysisService(db_session, storage=get_object_storage(), llm=llm)
+    assert service.run_analysis(run.id) == "FAILED"
+    assert llm.calls == 2
+    db_session.refresh(run)
+    assert run.status == "FAILED"
+    assert run.error_message == InsufficientCandidateError.USER_MESSAGE
+    _cleanup_person(db_session, person.id, admin.id)
+
+
+def test_valid_candidate_single_llm_call(db_session):
+    from app.modules.analysis.service import AnalysisService
+    from app.storage.s3 import get_object_storage
+
+    admin = _create_user(
+        db_session, login_id=f"a_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    person, document = _seed_person_doc(
+        db_session,
+        admin.id,
+        doc_type_code="DOC-RESUME",
+        doc_type_name="이력서",
+        page_text=_RICH_PAGE_TEXT,
+    )
+    run = _queue_run(db_session, person.id, document.id)
+    llm = _SequenceLLM([_valid_candidate_json()])
+    service = AnalysisService(db_session, storage=get_object_storage(), llm=llm)
+    assert service.run_analysis(run.id) == "REVIEWING"
+    assert llm.calls == 1
+    db_session.refresh(run)
+    assert run.status == "REVIEWING"
+    _cleanup_person(db_session, person.id, admin.id)
+
+
+def test_cert_single_item_does_not_sparse_retry(db_session):
+    from app.modules.analysis.service import AnalysisService
+    from app.storage.s3 import get_object_storage
+
+    admin = _create_user(
+        db_session, login_id=f"a_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    # Long source text + CERT type: 1 certification is legitimate, not sparse.
+    person, document = _seed_person_doc(
+        db_session,
+        admin.id,
+        doc_type_code="DOC-CERT",
+        doc_type_name="자격증",
+        page_text=_RICH_PAGE_TEXT,
+    )
+    run = _queue_run(db_session, person.id, document.id)
+    llm = _SequenceLLM([_cert_only_candidate_json()])
+    service = AnalysisService(db_session, storage=get_object_storage(), llm=llm)
+    assert service.run_analysis(run.id) == "REVIEWING"
+    assert llm.calls == 1
+    db_session.refresh(run)
+    assert run.status == "REVIEWING"
+    _cleanup_person(db_session, person.id, admin.id)
