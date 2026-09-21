@@ -158,6 +158,7 @@ def resolve_upload_session(
             document_ids=data["document_ids"],
             profile_version=data["profile_version"],
             upload_session_id=data["upload_session_id"],
+            reused_document_ids=data.get("reused_document_ids") or [],
         )
     )
 

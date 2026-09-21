@@ -104,11 +104,61 @@ class DocumentRepository:
         ).scalar_one_or_none()
 
     def find_document_by_sha256(self, sha256: str) -> Document | None:
+        """Active-person duplicate lookup for upload validation (DUPLICATE warning).
+
+        Excludes soft-deleted Document/Group and DELETED/soft-deleted Person so
+        removed people do not block or warn on re-upload.
+        """
         return self.db.execute(
             select(Document)
-            .where(Document.sha256 == sha256, Document.deleted_at.is_(None))
-            .order_by(Document.uploaded_at.desc())
+            .join(DocumentGroup, DocumentGroup.id == Document.document_group_id)
+            .join(Person, Person.id == DocumentGroup.person_id)
+            .where(
+                Document.sha256 == sha256,
+                Document.deleted_at.is_(None),
+                DocumentGroup.deleted_at.is_(None),
+                Person.deleted_at.is_(None),
+                Person.status != "DELETED",
+            )
+            .order_by(Document.uploaded_at.desc(), Document.id.desc())
             .limit(1)
+        ).scalar_one_or_none()
+
+    def find_reusable_document(
+        self,
+        person_id: UUID,
+        sha256: str,
+        *,
+        document_type_code: str | None = None,
+        document_group_id: UUID | None = None,
+    ) -> Document | None:
+        """Same-person READY document eligible for resolve-time reuse.
+
+        NEW_GROUP: match ``document_type_code`` on the active group.
+        NEW_VERSION: match within ``document_group_id`` only.
+        """
+        stmt = (
+            select(Document)
+            .join(DocumentGroup, DocumentGroup.id == Document.document_group_id)
+            .join(Person, Person.id == DocumentGroup.person_id)
+            .where(
+                Document.sha256 == sha256,
+                Document.deleted_at.is_(None),
+                Document.processing_status == "READY",
+                DocumentGroup.person_id == person_id,
+                DocumentGroup.deleted_at.is_(None),
+                Person.deleted_at.is_(None),
+                Person.status != "DELETED",
+            )
+        )
+        if document_group_id is not None:
+            stmt = stmt.where(Document.document_group_id == document_group_id)
+        elif document_type_code is not None:
+            stmt = stmt.where(DocumentGroup.document_type_code == document_type_code)
+        else:
+            return None
+        return self.db.execute(
+            stmt.order_by(Document.uploaded_at.desc(), Document.id.desc()).limit(1)
         ).scalar_one_or_none()
 
     # --- Document group / document ---

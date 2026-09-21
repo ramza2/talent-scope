@@ -89,6 +89,7 @@ class ResolveResponseData(BaseModel):
     document_ids: list[UUID]
     profile_version: int
     upload_session_id: UUID
+    reused_document_ids: list[UUID] = Field(default_factory=list)
 
 
 class ResolveResponse(BaseModel):

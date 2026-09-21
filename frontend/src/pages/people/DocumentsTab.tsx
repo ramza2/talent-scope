@@ -112,8 +112,23 @@ export function DocumentsTab({ personId, isAdmin, onChanged }: Props) {
         mode: 'NEW_GROUP',
       })
     },
-    onSuccess: async () => {
-      message.success('문서를 업로드했습니다. 문서 처리 완료 후 AI 상세 분석이 자동으로 시작됩니다.')
+    onSuccess: async (result) => {
+      const reused = result.data.reused_document_ids ?? []
+      const all = result.data.document_ids ?? []
+      const newCount = all.length - reused.length
+      if (reused.length > 0 && newCount <= 0) {
+        message.success(
+          `동일한 기존 문서 ${reused.length}건을 재사용했습니다. 중복 저장 및 문서 처리는 수행하지 않습니다.`,
+        )
+      } else if (reused.length > 0) {
+        message.success(
+          `문서를 등록했습니다. 동일 파일 ${reused.length}건은 기존 문서를 재사용했습니다.`,
+        )
+      } else {
+        message.success(
+          '문서를 업로드했습니다. 문서 처리 완료 후 AI 상세 분석이 자동으로 시작됩니다.',
+        )
+      }
       setUploadOpen(false)
       setFileList([])
       setDocType(undefined)
