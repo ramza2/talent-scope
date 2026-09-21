@@ -276,6 +276,77 @@ def test_normalize_and_diff_unit():
     assert any(s.entity_type == "TECH" and s.change_type == "REVIEW" for s in specs)
 
 
+def test_normalize_career_document_value_length_guard():
+    from app.modules.analysis.normalize import normalize_candidate
+
+    doc_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    allowed = {doc_id: {1}}
+
+    def _raw(career_value, *, name="홍길동", career_refs=None, name_refs=None):
+        source_refs = {}
+        if name_refs is not None:
+            source_refs["name"] = name_refs
+        if career_refs is not None:
+            source_refs["career_document_value"] = career_refs
+        return {
+            "schema_version": "profile-candidate-v1",
+            "profile": {
+                "name": name,
+                "career_document_value": career_value,
+                "source_refs": source_refs,
+            },
+            "jobs": [],
+            "skills": [],
+            "expertise": [],
+            "employment_history": [],
+            "education": [],
+            "certifications": [],
+            "projects": [],
+            "summary": {},
+            "analysis": {},
+        }
+
+    sample_ref = [{"document_id": doc_id, "page_no": 1, "quote_text": "13년 8개월"}]
+    name_ref = [{"document_id": doc_id, "page_no": 1, "quote_text": "홍길동"}]
+
+    kept = normalize_candidate(
+        _raw("13년 8개월", career_refs=sample_ref, name_refs=name_ref),
+        catalog={},
+        allowed_documents=allowed,
+    )
+    assert kept.profile.career_document_value == "13년 8개월"
+    assert "career_document_value" in kept.profile.source_refs
+    assert "name" in kept.profile.source_refs
+
+    trimmed = normalize_candidate(
+        _raw("  기술경력 16년  ", career_refs=sample_ref, name_refs=name_ref),
+        catalog={},
+        allowed_documents=allowed,
+    )
+    assert trimmed.profile.career_document_value == "기술경력 16년"
+    assert trimmed.profile.name == "홍길동"
+
+    exact_100 = "가" * 100
+    at_limit = normalize_candidate(
+        _raw(exact_100, career_refs=sample_ref, name_refs=name_ref),
+        catalog={},
+        allowed_documents=allowed,
+    )
+    assert at_limit.profile.career_document_value == exact_100
+    assert "career_document_value" in at_limit.profile.source_refs
+
+    over_101 = "나" * 101
+    dropped = normalize_candidate(
+        _raw(over_101, career_refs=sample_ref, name_refs=name_ref),
+        catalog={},
+        allowed_documents=allowed,
+    )
+    assert dropped.profile.career_document_value is None
+    assert "career_document_value" not in dropped.profile.source_refs
+    assert dropped.profile.name == "홍길동"
+    assert "name" in dropped.profile.source_refs
+
+
 def test_create_run_list_review_retry_confirm(
     client: TestClient, db_session, monkeypatch: pytest.MonkeyPatch
 ):

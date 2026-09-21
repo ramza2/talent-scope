@@ -5,10 +5,10 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from app.ai.prompts import profile_extract_v1, profile_extract_v2
+from app.ai.prompts import profile_extract_v1, profile_extract_v2, profile_extract_v3
 from app.ai.providers.errors import AIProviderError
 
-CURRENT_PROFILE_PROMPT_VERSION = "profile-extract-v2"
+CURRENT_PROFILE_PROMPT_VERSION = "profile-extract-v3"
 
 
 class UnknownProfilePromptVersionError(AIProviderError):
@@ -35,6 +35,7 @@ def _spec_from_module(module) -> ProfilePromptSpec:
 _REGISTRY: dict[str, ProfilePromptSpec] = {
     profile_extract_v1.PROMPT_VERSION: _spec_from_module(profile_extract_v1),
     profile_extract_v2.PROMPT_VERSION: _spec_from_module(profile_extract_v2),
+    profile_extract_v3.PROMPT_VERSION: _spec_from_module(profile_extract_v3),
 }
 
 

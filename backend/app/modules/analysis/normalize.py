@@ -40,6 +40,33 @@ SENSITIVE_KEYS = frozenset(
     }
 )
 
+# Matches person_profile.career_document_value VARCHAR(100) / confirm limits.
+_CAREER_DOCUMENT_VALUE_MAX_LEN = 100
+
+
+def _sanitize_career_document_value(cleaned: dict[str, Any]) -> None:
+    """Drop overlong career_document_value before model validation.
+
+    Truncation is intentionally avoided — a clipped string is not a valid
+    career expression. Matching profile.source_refs entry is cleared too.
+    """
+    profile = cleaned.get("profile")
+    if not isinstance(profile, dict):
+        return
+    value = profile.get("career_document_value")
+    if value is None:
+        return
+    if not isinstance(value, str):
+        return
+    stripped = value.strip()
+    if len(stripped) > _CAREER_DOCUMENT_VALUE_MAX_LEN:
+        profile["career_document_value"] = None
+        source_refs = profile.get("source_refs")
+        if isinstance(source_refs, dict):
+            source_refs.pop("career_document_value", None)
+    else:
+        profile["career_document_value"] = stripped or None
+
 
 def _strip_sensitive(obj: Any) -> Any:
     if isinstance(obj, dict):
@@ -165,6 +192,7 @@ def normalize_candidate(
     cleaned = _strip_sensitive(raw if isinstance(raw, dict) else {})
     if not isinstance(cleaned, dict):
         cleaned = {}
+    _sanitize_career_document_value(cleaned)
 
     doc = ProfileCandidateDocument.model_validate(cleaned)
     doc.schema_version = SCHEMA_VERSION
