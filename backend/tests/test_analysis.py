@@ -4427,6 +4427,44 @@ def test_candidate_quality_helpers_ignore_summary_metadata():
     assert candidate_quality_score(cert) == 1
     assert not candidate_is_sparse(cert, documents=cert_docs, source_char_count=6000)
 
+    # Name / Korean label alone must not trigger sparse; only canonical DOC_TYPE codes.
+    name_only_docs = (
+        DocumentSnapshot(
+            id=uuid4(),
+            original_filename="misc.pdf",
+            extension="pdf",
+            mime_type="application/pdf",
+            storage_key="x",
+            preview_storage_key=None,
+            document_type_code="DOC-OTHER",
+            document_type_name="이력서 PROFILE RESUME",
+            version_no=1,
+            person_id=uuid4(),
+        ),
+    )
+    assert not candidate_is_sparse(
+        sparse, documents=name_only_docs, source_char_count=600
+    )
+
+    # Exact match is case-insensitive after strip/upper.
+    lower_code_docs = (
+        DocumentSnapshot(
+            id=uuid4(),
+            original_filename="resume.pdf",
+            extension="pdf",
+            mime_type="application/pdf",
+            storage_key="x",
+            preview_storage_key=None,
+            document_type_code="  doc-resume  ",
+            document_type_name="anything",
+            version_no=1,
+            person_id=uuid4(),
+        ),
+    )
+    assert candidate_is_sparse(
+        sparse, documents=lower_code_docs, source_char_count=600
+    )
+
 
 def test_empty_candidate_retries_then_reviewing(db_session):
     from app.db.models.analysis import AnalysisDiffItem

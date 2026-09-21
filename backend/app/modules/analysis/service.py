@@ -78,8 +78,12 @@ _PROJECT_CODE_FIELD_EXPECTED_TYPE: dict[str, str] = {
 # so CERT / short docs that legitimately yield 0–1 items are not retried as sparse.
 _SPARSE_MIN_SOURCE_CHARS = 500
 _SPARSE_MAX_QUALITY_SCORE = 1
-_RICH_DOC_TYPE_TOKENS_ASCII = frozenset({"PROFILE", "RESUME", "CAREER", "KOSA"})
-_RICH_DOC_TYPE_TOKENS_KO = frozenset({"이력서", "경력", "프로파일", "프로필", "코사"})
+_RICH_PROFILE_DOC_TYPES = frozenset({
+    "DOC-PROFILE",
+    "DOC-RESUME",
+    "DOC-CAREER",
+    "DOC-KOSA",
+})
 
 
 class InsufficientCandidateError(Exception):
@@ -123,18 +127,10 @@ def candidate_is_empty(candidate: ProfileCandidateDocument) -> bool:
 
 
 def _documents_are_rich_profile_type(documents: tuple[DocumentSnapshot, ...] | list[DocumentSnapshot]) -> bool:
-    for doc in documents:
-        code = (doc.document_type_code or "").strip()
-        name = (doc.document_type_name or "").strip()
-        ascii_blob = f"{code} {name}".upper()
-        for token in _RICH_DOC_TYPE_TOKENS_ASCII:
-            if token in ascii_blob:
-                return True
-        ko_blob = f"{code} {name}"
-        for token in _RICH_DOC_TYPE_TOKENS_KO:
-            if token in ko_blob:
-                return True
-    return False
+    return any(
+        (doc.document_type_code or "").strip().upper() in _RICH_PROFILE_DOC_TYPES
+        for doc in documents
+    )
 
 
 def candidate_is_sparse(
