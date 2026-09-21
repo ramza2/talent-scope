@@ -225,7 +225,7 @@ class AnalysisService:
     # ------------------------------------------------------------------ create
 
     def create_analysis(
-        self, payload: CreateAnalysisRequest, actor_user_id: UUID
+        self, payload: CreateAnalysisRequest, actor_user_id: UUID | None
     ) -> CreateAnalysisResponseData:
         if payload.analysis_type != "PROFILE":
             raise ValidationAppError("analysis_type은 PROFILE만 지원합니다.")
@@ -296,6 +296,60 @@ class AnalysisService:
             )
 
         return CreateAnalysisResponseData(analysis_id=run.id, status="QUEUED")
+
+    def create_analysis_for_ready_document(
+        self, document_id: UUID
+    ) -> CreateAnalysisResponseData | None:
+        """Auto-start PROFILE analysis for a newly READY document.
+
+        Idempotent: skips when any AnalysisRun already references the document.
+        Returns None when skipped; raises only on unexpected create/enqueue errors
+        (caller should not mark the Document FAILED).
+        """
+        docs = self.repo.list_documents_by_ids([document_id])
+        if not docs:
+            logger.info(
+                "auto analysis skipped document_id=%s reason=document_unavailable",
+                document_id,
+            )
+            return None
+
+        document, group, _name = docs[0]
+        if document.processing_status != "READY":
+            logger.info(
+                "auto analysis skipped document_id=%s reason=not_ready status=%s",
+                document_id,
+                document.processing_status,
+            )
+            return None
+
+        person = self.repo.get_person(group.person_id, for_update=True)
+        if person is None or person.deleted_at is not None or person.status == "DELETED":
+            logger.info(
+                "auto analysis skipped document_id=%s reason=person_unavailable",
+                document_id,
+            )
+            return None
+
+        if self.repo.has_any_run_for_document(document_id):
+            logger.info(
+                "auto analysis skipped document_id=%s reason=analysis_run_exists",
+                document_id,
+            )
+            return None
+
+        payload = CreateAnalysisRequest(
+            person_id=group.person_id,
+            document_ids=[document_id],
+            analysis_type="PROFILE",
+        )
+        result = self.create_analysis(payload, document.uploaded_by)
+        logger.info(
+            "auto analysis started document_id=%s analysis_run_id=%s",
+            document_id,
+            result.analysis_id,
+        )
+        return result
 
     # -------------------------------------------------------------------- run
 

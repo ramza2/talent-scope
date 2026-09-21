@@ -113,7 +113,7 @@ export function DocumentsTab({ personId, isAdmin, onChanged }: Props) {
       })
     },
     onSuccess: async () => {
-      message.success('문서를 업로드했습니다. 처리 상태를 갱신합니다.')
+      message.success('문서를 업로드했습니다. 문서 처리 완료 후 AI 상세 분석이 자동으로 시작됩니다.')
       setUploadOpen(false)
       setFileList([])
       setDocType(undefined)

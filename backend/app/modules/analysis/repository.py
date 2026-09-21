@@ -97,6 +97,15 @@ class AnalysisRepository:
         ).scalars().all()
         return list(rows)
 
+    def has_any_run_for_document(self, document_id: UUID) -> bool:
+        """True when any AnalysisRun is already linked to this document."""
+        row = self.db.execute(
+            select(AnalysisRunDocument.analysis_run_id)
+            .where(AnalysisRunDocument.document_id == document_id)
+            .limit(1)
+        ).scalar_one_or_none()
+        return row is not None
+
     def list_runs(
         self,
         *,
