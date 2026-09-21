@@ -4704,3 +4704,241 @@ def test_cert_single_item_does_not_sparse_retry(db_session):
     db_session.refresh(run)
     assert run.status == "REVIEWING"
     _cleanup_person(db_session, person.id, admin.id)
+
+
+# --------------------------------------------------------------------------- auto PROFILE analysis on READY
+
+
+def test_auto_analysis_for_ready_document_creates_run_once(
+    db_session, monkeypatch: pytest.MonkeyPatch
+):
+    from app.db.models.analysis import AnalysisRun, AnalysisRunDocument
+    from app.db.models.document import Document
+    from app.db.models.person import PersonProfile
+    from app.modules.analysis.service import AnalysisService
+    from app.storage.s3 import get_object_storage
+
+    enqueue_calls: list[tuple] = []
+
+    def _capture_enqueue(run_id, actor_user_id=None):
+        enqueue_calls.append((run_id, actor_user_id))
+
+    monkeypatch.setattr(
+        "app.tasks.analysis_tasks.enqueue_profile_analysis", _capture_enqueue
+    )
+
+    admin = _create_user(
+        db_session, login_id=f"aa_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    person, document = _seed_person_with_ready_doc(db_session, admin.id)
+    profile = db_session.execute(
+        select(PersonProfile).where(PersonProfile.person_id == person.id)
+    ).scalar_one()
+
+    service = AnalysisService(db_session, storage=get_object_storage())
+    first = service.create_analysis_for_ready_document(document.id)
+    assert first is not None
+    assert first.status == "QUEUED"
+    assert len(enqueue_calls) == 1
+    assert enqueue_calls[0][0] == first.analysis_id
+    assert enqueue_calls[0][1] == admin.id
+
+    run = db_session.get(AnalysisRun, first.analysis_id)
+    assert run is not None
+    assert run.person_id == person.id
+    assert run.base_profile_version == profile.profile_version
+    linked = list(
+        db_session.execute(
+            select(AnalysisRunDocument.document_id).where(
+                AnalysisRunDocument.analysis_run_id == run.id
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert linked == [document.id]
+
+    second = service.create_analysis_for_ready_document(document.id)
+    assert second is None
+    assert len(enqueue_calls) == 1
+
+    runs = list(
+        db_session.execute(
+            select(AnalysisRun).where(AnalysisRun.person_id == person.id)
+        )
+        .scalars()
+        .all()
+    )
+    assert len(runs) == 1
+
+    # Already-READY re-hook (e.g. atomic claim no-op) must stay idempotent.
+    from app.tasks.document_tasks import _maybe_start_auto_profile_analysis
+
+    _maybe_start_auto_profile_analysis(db_session, document.id)
+    runs_after = list(
+        db_session.execute(
+            select(AnalysisRun).where(AnalysisRun.person_id == person.id)
+        )
+        .scalars()
+        .all()
+    )
+    assert len(runs_after) == 1
+    assert len(enqueue_calls) == 1
+
+    _cleanup_person(db_session, person.id, admin.id)
+
+
+def test_auto_analysis_skips_failed_deleted_and_keeps_document_ready_on_enqueue_error(
+    db_session, monkeypatch: pytest.MonkeyPatch
+):
+    from datetime import UTC, datetime
+
+    from app.core.exceptions import AIQueueUnavailableError
+    from app.db.models.analysis import AnalysisRun
+    from app.db.models.document import Document, DocumentGroup
+    from app.db.models.person import Person
+    from app.modules.analysis.service import AnalysisService
+    from app.storage.s3 import get_object_storage
+
+    admin = _create_user(
+        db_session, login_id=f"as_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    person, document = _seed_person_with_ready_doc(db_session, admin.id)
+    service = AnalysisService(db_session, storage=get_object_storage())
+
+    document.processing_status = "FAILED"
+    db_session.commit()
+    assert service.create_analysis_for_ready_document(document.id) is None
+
+    document.processing_status = "READY"
+    db_session.commit()
+
+    document.deleted_at = datetime.now(UTC)
+    db_session.commit()
+    assert service.create_analysis_for_ready_document(document.id) is None
+    document.deleted_at = None
+    db_session.commit()
+
+    group = db_session.get(DocumentGroup, document.document_group_id)
+    assert group is not None
+    group.deleted_at = datetime.now(UTC)
+    db_session.commit()
+    assert service.create_analysis_for_ready_document(document.id) is None
+    group.deleted_at = None
+    db_session.commit()
+
+    person_row = db_session.get(Person, person.id)
+    assert person_row is not None
+    person_row.status = "DELETED"
+    db_session.commit()
+    assert service.create_analysis_for_ready_document(document.id) is None
+    person_row.status = "ACTIVE"
+    db_session.commit()
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("broker down")
+
+    monkeypatch.setattr("app.tasks.analysis_tasks.enqueue_profile_analysis", _boom)
+    with pytest.raises(AIQueueUnavailableError):
+        service.create_analysis_for_ready_document(document.id)
+
+    db_session.refresh(document)
+    assert document.processing_status == "READY"
+    runs = list(
+        db_session.execute(
+            select(AnalysisRun).where(AnalysisRun.person_id == person.id)
+        )
+        .scalars()
+        .all()
+    )
+    assert len(runs) == 1
+    assert runs[0].status == "FAILED"
+
+    # Existing run (FAILED) still blocks auto re-create.
+    monkeypatch.setattr(
+        "app.tasks.analysis_tasks.enqueue_profile_analysis",
+        lambda *_a, **_k: None,
+    )
+    assert service.create_analysis_for_ready_document(document.id) is None
+    assert (
+        len(
+            list(
+                db_session.execute(
+                    select(AnalysisRun).where(AnalysisRun.person_id == person.id)
+                )
+                .scalars()
+                .all()
+            )
+        )
+        == 1
+    )
+
+    _cleanup_person(db_session, person.id, admin.id)
+
+
+def test_process_document_task_auto_analysis_only_on_ready(
+    db_session, monkeypatch: pytest.MonkeyPatch
+):
+    from app.tasks import document_tasks
+
+    ready_calls: list = []
+    failed_calls: list = []
+
+    monkeypatch.setattr(
+        "app.modules.document_processing.service.DocumentProcessingService.process_document",
+        lambda self, document_id: "READY",
+    )
+
+    def _auto_ready(db, document_id):
+        ready_calls.append(document_id)
+
+    monkeypatch.setattr(
+        document_tasks, "_maybe_start_auto_profile_analysis", _auto_ready
+    )
+    result = document_tasks.process_document.run(str(uuid.uuid4()))
+    assert result["status"] == "READY"
+    assert len(ready_calls) == 1
+
+    monkeypatch.setattr(
+        "app.modules.document_processing.service.DocumentProcessingService.process_document",
+        lambda self, document_id: "FAILED",
+    )
+
+    def _auto_failed(db, document_id):
+        failed_calls.append(document_id)
+
+    monkeypatch.setattr(
+        document_tasks, "_maybe_start_auto_profile_analysis", _auto_failed
+    )
+    result2 = document_tasks.process_document.run(str(uuid.uuid4()))
+    assert result2["status"] == "FAILED"
+    assert failed_calls == []
+
+
+def test_process_document_task_keeps_ready_when_auto_analysis_raises(
+    db_session, monkeypatch: pytest.MonkeyPatch
+):
+    from app.tasks import document_tasks
+
+    admin = _create_user(
+        db_session, login_id=f"ar_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    person, document = _seed_person_with_ready_doc(db_session, admin.id)
+
+    monkeypatch.setattr(
+        "app.modules.document_processing.service.DocumentProcessingService.process_document",
+        lambda self, document_id: "READY",
+    )
+
+    def _raise(self, document_id):
+        raise RuntimeError("auto analysis boom")
+
+    monkeypatch.setattr(
+        "app.modules.analysis.service.AnalysisService.create_analysis_for_ready_document",
+        _raise,
+    )
+    result = document_tasks.process_document.run(str(document.id))
+    assert result["status"] == "READY"
+    db_session.refresh(document)
+    assert document.processing_status == "READY"
+    _cleanup_person(db_session, person.id, admin.id)
