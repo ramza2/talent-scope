@@ -545,3 +545,95 @@ def test_recent_people_order_and_limit(client: TestClient, db_session):
         if csrf:
             client.post("/api/v1/auth/logout", headers={"X-CSRF-Token": csrf})
         _cleanup_user(db_session, admin.id)
+
+
+def test_admin_dashboard_excludes_deleted_person_analyses(client: TestClient, db_session):
+    """DELETED / soft-deleted Person AnalysisRun must not affect ops KPIs or recent list."""
+    suffix = uuid.uuid4().hex[:8]
+    admin = _create_user(db_session, login_id=f"dd_{suffix}", role="ADMIN")
+    now = datetime.now(UTC)
+    people = []
+    try:
+        visible = _add_person(
+            db_session,
+            name=f"Visible_{suffix}",
+            created_at=now - timedelta(hours=1),
+        )
+        people.append(visible)
+        visible_run = _add_analysis(
+            db_session,
+            visible.id,
+            status="REVIEWING",
+            created_at=now + timedelta(days=500),
+        )
+        db_session.commit()
+
+        _login(client, admin.login_id)
+        before = client.get("/api/v1/dashboard").json()["data"]
+        before_analysis = before["analysis"]
+        assert before_analysis is not None
+
+        status_deleted = _add_person(
+            db_session,
+            status="DELETED",
+            name=f"StatusDel_{suffix}",
+            created_at=now,
+            deleted_at=now,
+        )
+        soft_deleted = _add_person(
+            db_session,
+            status="ACTIVE",
+            name=f"SoftDel_{suffix}",
+            created_at=now,
+            deleted_at=now,
+        )
+        people.extend([status_deleted, soft_deleted])
+
+        hidden_runs = [
+            _add_analysis(
+                db_session,
+                status_deleted.id,
+                status="REVIEWING",
+                created_at=now + timedelta(days=501),
+            ),
+            _add_analysis(
+                db_session,
+                status_deleted.id,
+                status="FAILED",
+                created_at=now + timedelta(days=502),
+            ),
+            _add_analysis(
+                db_session,
+                soft_deleted.id,
+                status="REVIEWING",
+                created_at=now + timedelta(days=503),
+            ),
+            _add_analysis(
+                db_session,
+                soft_deleted.id,
+                status="FAILED",
+                created_at=now + timedelta(days=504),
+            ),
+        ]
+        db_session.commit()
+
+        after = client.get("/api/v1/dashboard").json()["data"]
+        after_analysis = after["analysis"]
+        assert after_analysis is not None
+        assert after_analysis["queued"] == before_analysis["queued"]
+        assert after_analysis["processing"] == before_analysis["processing"]
+        assert after_analysis["reviewing"] == before_analysis["reviewing"]
+        assert after_analysis["failed"] == before_analysis["failed"]
+        assert after_analysis["review_pending_runs"] == before_analysis["review_pending_runs"]
+
+        recent_ids = {r["analysis_id"] for r in (after["recent_analyses"] or [])}
+        for run in hidden_runs:
+            assert str(run.id) not in recent_ids
+        assert str(visible_run.id) in recent_ids
+    finally:
+        for p in people:
+            _cleanup_person(db_session, p.id)
+        csrf = client.cookies.get("ts_csrf")
+        if csrf:
+            client.post("/api/v1/auth/logout", headers={"X-CSRF-Token": csrf})
+        _cleanup_user(db_session, admin.id)

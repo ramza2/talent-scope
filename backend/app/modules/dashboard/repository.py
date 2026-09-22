@@ -80,7 +80,12 @@ class DashboardRepository:
     def analysis_status_summary(self) -> dict[str, int]:
         rows = self.db.execute(
             select(AnalysisRun.status, func.count())
-            .where(AnalysisRun.status.in_(_OPS_ANALYSIS_STATUSES))
+            .join(Person, Person.id == AnalysisRun.person_id)
+            .where(
+                AnalysisRun.status.in_(_OPS_ANALYSIS_STATUSES),
+                Person.deleted_at.is_(None),
+                Person.status.in_(_VISIBLE_STATUSES),
+            )
             .group_by(AnalysisRun.status)
         ).all()
         counts = {status: 0 for status in _OPS_ANALYSIS_STATUSES}
@@ -111,8 +116,13 @@ class DashboardRepository:
                 PersonProfile.name,
                 func.coalesce(pending_subq.c.pending_count, 0).label("pending_count"),
             )
+            .join(Person, Person.id == AnalysisRun.person_id)
             .outerjoin(PersonProfile, PersonProfile.person_id == AnalysisRun.person_id)
             .outerjoin(pending_subq, pending_subq.c.run_id == AnalysisRun.id)
+            .where(
+                Person.deleted_at.is_(None),
+                Person.status.in_(_VISIBLE_STATUSES),
+            )
             .order_by(AnalysisRun.created_at.desc(), AnalysisRun.id.desc())
             .limit(limit)
         ).all()
