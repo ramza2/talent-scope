@@ -26,6 +26,7 @@ import {
   buildDefaultModifiedDecision,
   buildMergeDecisionRequestBody,
   canConfirmAnalysis,
+  cancelAnalysis,
   confidenceColor,
   confidenceLabel,
   confirmAnalysis,
@@ -81,11 +82,13 @@ function statusTag(status: AnalysisStatus) {
       ? 'error'
       : status === 'CONFIRMED'
         ? 'success'
-        : status === 'REVIEWING'
-          ? 'processing'
-          : status === 'PROCESSING' || status === 'QUEUED'
-            ? 'blue'
-            : 'default'
+        : status === 'CANCELLED'
+          ? 'warning'
+          : status === 'REVIEWING'
+            ? 'processing'
+            : status === 'PROCESSING' || status === 'QUEUED'
+              ? 'blue'
+              : 'default'
   return <Tag color={color}>{status}</Tag>
 }
 
@@ -150,6 +153,8 @@ export function AnalysisDetailPage() {
 
   const analysis = detailQuery.data?.data
   const canReview = analysis?.status === 'REVIEWING'
+  const canCancel =
+    analysis?.status === 'REVIEWING' || analysis?.status === 'FAILED'
   const showDiffs = Boolean(analysis) && !isActiveAnalysisStatus(analysis!.status)
 
   const diffsQuery = useQuery({
@@ -255,6 +260,28 @@ export function AnalysisDetailPage() {
       message.error(apiErrorMessage(error, '최종 확정에 실패했습니다.'))
     },
   })
+
+  const cancelMutation = useMutation({
+    mutationFn: () => cancelAnalysis(analysisId),
+    onSuccess: async () => {
+      message.success('분석을 폐기했습니다.')
+      await invalidateDetail()
+    },
+    onError: (error) => {
+      message.error(apiErrorMessage(error, '분석 폐기에 실패했습니다.'))
+    },
+  })
+
+  const requestCancel = () => {
+    Modal.confirm({
+      title: '이 분석을 폐기할까요?',
+      content: '분석 결과와 검토 이력은 삭제하지 않고 CANCELLED 상태로 보존됩니다.',
+      okText: '폐기',
+      okButtonProps: { danger: true },
+      cancelText: '취소',
+      onOk: () => cancelMutation.mutateAsync(),
+    })
+  }
 
   const openModify = (diff: DiffItem) => {
     setEditingDiff(diff)
@@ -540,7 +567,7 @@ export function AnalysisDetailPage() {
             LLM: {analysis.llm_model || '—'} · VLM: {analysis.vlm_model || '—'}
             {analysis.prompt_version ? ` · prompt ${analysis.prompt_version}` : ''}
           </Typography.Text>
-          {analysis.error_message ? (
+          {analysis.status === 'FAILED' && analysis.error_message ? (
             <Alert
               style={{ marginTop: 12 }}
               type="error"
@@ -549,20 +576,43 @@ export function AnalysisDetailPage() {
               description={analysis.error_message}
             />
           ) : null}
+          {analysis.status === 'CANCELLED' ? (
+            <Alert
+              style={{ marginTop: 12 }}
+              type="warning"
+              showIcon
+              message="폐기된 분석입니다."
+              description={
+                analysis.error_message ||
+                '이 분석은 CANCELLED 상태로 보존됩니다. 검토·확정은 할 수 없습니다.'
+              }
+            />
+          ) : null}
         </div>
         <Space direction="vertical" align="end">
           <Typography.Text type="secondary">
             생성 {formatDate(analysis.created_at)} · 완료 {formatDate(analysis.completed_at)}
           </Typography.Text>
-          {analysis.status === 'CONFIRMED' ? (
-            <Button type="primary" onClick={() => navigate(`/people/${analysis.person.id}`)}>
-              인력 상세 보기
-            </Button>
-          ) : analysis.status === 'REVIEWING' ? (
-            <Button type="primary" disabled={!canConfirm} onClick={() => setConfirmOpen(true)}>
-              최종 확정
-            </Button>
-          ) : null}
+          <Space>
+            {canCancel ? (
+              <Button
+                danger
+                loading={cancelMutation.isPending}
+                onClick={requestCancel}
+              >
+                분석 폐기
+              </Button>
+            ) : null}
+            {analysis.status === 'CONFIRMED' ? (
+              <Button type="primary" onClick={() => navigate(`/people/${analysis.person.id}`)}>
+                인력 상세 보기
+              </Button>
+            ) : analysis.status === 'REVIEWING' ? (
+              <Button type="primary" disabled={!canConfirm} onClick={() => setConfirmOpen(true)}>
+                최종 확정
+              </Button>
+            ) : null}
+          </Space>
         </Space>
       </Space>
 

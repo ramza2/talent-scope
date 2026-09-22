@@ -176,6 +176,10 @@ class RetryAnalysisResponse(BaseModel):
     data: CreateAnalysisResponseData
 
 
+class CancelAnalysisResponse(BaseModel):
+    data: CreateAnalysisResponseData
+
+
 class ConfirmAnalysisRequest(BaseModel):
     expected_profile_version: int = Field(ge=1)
 
