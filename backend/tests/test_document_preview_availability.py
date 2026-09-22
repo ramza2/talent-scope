@@ -213,9 +213,9 @@ def _seed_document(
 
     storage = build_object_storage()
     if put_storage:
-        storage.put(storage_key, body, content_type="application/octet-stream")
+        storage.put_bytes(storage_key, body, content_type="application/octet-stream")
     if put_preview and preview_key:
-        storage.put(preview_key, b"%PDF-1.4 preview", content_type="application/pdf")
+        storage.put_bytes(preview_key, b"%PDF-1.4 preview", content_type="application/pdf")
     return doc
 
 
