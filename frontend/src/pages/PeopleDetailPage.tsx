@@ -27,6 +27,7 @@ import { ApiError } from '@/api/client'
 import { listCodes } from '@/api/codes'
 import {
   GRADE_LABELS,
+  JOB_TYPE_LABELS,
   formatCareerMonths,
   getPerson,
   listPersonRevisions,
@@ -35,6 +36,7 @@ import {
   replacePersonSkills,
   updatePersonProfile,
   updatePersonStatus,
+  type JobType,
   type PersonDetail,
   type PersonStatus,
   type RevisionItem,
@@ -46,6 +48,34 @@ import { EducationCertTab } from '@/pages/people/EducationCertTab'
 import { ProjectCareerTab } from '@/pages/people/ProjectCareerTab'
 
 type CodeOption = { value: string; label: string }
+
+const JOB_TYPE_ORDER: Record<JobType, number> = {
+  PRIMARY: 0,
+  SECONDARY: 1,
+  EXPERIENCE: 2,
+}
+
+const JOB_TYPE_TAG_COLOR: Record<JobType, string> = {
+  PRIMARY: 'success',
+  SECONDARY: 'processing',
+  EXPERIENCE: 'default',
+}
+
+function sortJobsForDisplay(jobs: PersonDetail['jobs']): PersonDetail['jobs'] {
+  return [...jobs].sort((a, b) => {
+    const typeDiff =
+      (JOB_TYPE_ORDER[a.job_type] ?? 99) - (JOB_TYPE_ORDER[b.job_type] ?? 99)
+    if (typeDiff !== 0) return typeDiff
+    if (a.sort_order !== b.sort_order) return a.sort_order - b.sort_order
+    return (a.name || a.code).localeCompare(b.name || b.code, 'ko')
+  })
+}
+
+function jobTypeTag(jobType: JobType) {
+  return (
+    <Tag color={JOB_TYPE_TAG_COLOR[jobType]}>{JOB_TYPE_LABELS[jobType]}</Tag>
+  )
+}
 
 function mergeCodeOptions(
   activeOptions: CodeOption[],
@@ -244,9 +274,14 @@ export function PeopleDetailPage() {
     onError: (error) => message.error(apiErrorMessage(error, '상태 변경에 실패했습니다.')),
   })
 
-  const primaryJob = useMemo(
-    () => person?.jobs.find((j) => j.job_type === 'PRIMARY'),
+  const primaryJobs = useMemo(
+    () => (person?.jobs ?? []).filter((j) => j.job_type === 'PRIMARY'),
     [person],
+  )
+  const primaryJob = primaryJobs[0]
+  const displayJobs = useMemo(
+    () => sortJobsForDisplay(person?.jobs ?? []),
+    [person?.jobs],
   )
 
   if (isLoading || !person) {
@@ -346,6 +381,18 @@ export function PeopleDetailPage() {
               .filter(Boolean)
               .join(' · ') || '소속 미정'}
           </Typography.Text>
+          {primaryJobs.length > 1 ? (
+            <Alert
+              style={{ marginTop: 12, maxWidth: 560 }}
+              type="warning"
+              showIcon
+              message={
+                isAdmin
+                  ? '주직무가 여러 개 지정되어 있습니다. 직무 수정에서 주직무를 1개만 남겨주세요.'
+                  : '주직무 정보 확인이 필요합니다.'
+              }
+            />
+          ) : null}
           {person.pending_analysis &&
           ['QUEUED', 'PROCESSING', 'REVIEWING'].includes(person.pending_analysis.status) ? (
             <Alert
@@ -492,13 +539,12 @@ export function PeopleDetailPage() {
                     ) : null
                   }
                 >
-                  {person.jobs.length === 0 ? (
+                  {displayJobs.length === 0 ? (
                     <Typography.Text type="secondary">등록된 직무 없음</Typography.Text>
                   ) : (
-                    person.jobs.map((j) => (
-                      <div key={`${j.code}-${j.job_type}`}>
-                        <Tag>{j.job_type}</Tag> {j.name}{' '}
-                        <Typography.Text code>{j.code}</Typography.Text>
+                    displayJobs.map((j) => (
+                      <div key={`${j.code}-${j.job_type}`} style={{ marginBottom: 4 }}>
+                        {jobTypeTag(j.job_type)} {j.name}
                       </div>
                     ))
                   )}
@@ -689,7 +735,19 @@ export function PeopleDetailPage() {
         <Form
           form={jobsForm}
           layout="vertical"
-          onFinish={(values) => jobsMutation.mutate(values.jobs ?? [])}
+          onFinish={(values) => {
+            const jobs = (values.jobs ?? []) as Array<{
+              job_code: string
+              job_type: JobType
+              sort_order?: number
+            }>
+            const primaryCount = jobs.filter((j) => j.job_type === 'PRIMARY').length
+            if (primaryCount > 1) {
+              message.error('주직무는 1개만 지정할 수 있습니다.')
+              return
+            }
+            jobsMutation.mutate(jobs)
+          }}
         >
           <Form.List name="jobs">
             {(fields, { add, remove }) => (
@@ -708,11 +766,10 @@ export function PeopleDetailPage() {
                     <Form.Item {...field} name={[field.name, 'job_type']} rules={[{ required: true }]}>
                       <Select
                         style={{ width: 140 }}
-                        options={[
-                          { value: 'PRIMARY', label: 'PRIMARY' },
-                          { value: 'SECONDARY', label: 'SECONDARY' },
-                          { value: 'EXPERIENCE', label: 'EXPERIENCE' },
-                        ]}
+                        options={(Object.keys(JOB_TYPE_LABELS) as JobType[]).map((value) => ({
+                          value,
+                          label: JOB_TYPE_LABELS[value],
+                        }))}
                       />
                     </Form.Item>
                     <Form.Item {...field} name={[field.name, 'sort_order']}>

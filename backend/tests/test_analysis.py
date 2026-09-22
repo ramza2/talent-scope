@@ -5878,3 +5878,127 @@ def test_llm_fail_keeps_vlm_text_for_retry(db_session):
     finally:
         _cleanup_person_with_search(db_session, person.id, admin.id)
         reset_object_storage_cache()
+
+
+def test_confirm_rejects_second_primary_job(client: TestClient, db_session):
+    from app.db.models.analysis import AnalysisDiffItem
+    from app.db.models.code import CodeMaster
+    from app.db.models.person import PersonJob, PersonProfile
+
+    def _ensure_job(code: str, name: str) -> None:
+        if db_session.get(CodeMaster, code) is None:
+            db_session.add(
+                CodeMaster(
+                    code=code,
+                    code_type="JOB",
+                    name=name,
+                    sort_order=0,
+                    is_active=True,
+                )
+            )
+            db_session.commit()
+
+    suffix = uuid.uuid4().hex[:8]
+    job_a = f"JOB-PA-{suffix}"
+    job_b = f"JOB-PB-{suffix}"
+    _ensure_job(job_a, "주직무A")
+    _ensure_job(job_b, "주직무B")
+
+    admin = _create_user(
+        db_session, login_id=f"cp_{suffix}", password="Passw0rd!"
+    )
+    csrf = _login(client, admin.login_id, "Passw0rd!")
+    person, document = _seed_person_with_ready_doc(db_session, admin.id)
+    db_session.add(
+        PersonJob(
+            person_id=person.id,
+            job_code=job_a,
+            job_type="PRIMARY",
+            sort_order=0,
+            source_type="USER",
+            is_active=True,
+        )
+    )
+    db_session.commit()
+
+    analysis_id, run = _start_reviewing_analysis(
+        client, db_session, csrf, person, document
+    )
+    db_session.add(
+        AnalysisDiffItem(
+            analysis_run_id=run.id,
+            entity_type="JOB",
+            candidate_path="jobs[0]",
+            change_type="NEW",
+            new_value={"code": job_b, "job_type": "PRIMARY"},
+            review_status="ACCEPTED",
+        )
+    )
+    db_session.commit()
+
+    resp = client.post(
+        f"/api/v1/analyses/{analysis_id}/confirm",
+        headers={"X-CSRF-Token": csrf},
+        json={"expected_profile_version": 1},
+    )
+    assert resp.status_code == 400
+    assert resp.json()["code"] == "CONFIRM_VALIDATION_ERROR"
+    assert "주직무" in resp.json()["detail"]
+
+    db_session.refresh(run)
+    assert run.status == "REVIEWING"
+    profile = db_session.execute(
+        select(PersonProfile).where(PersonProfile.person_id == person.id)
+    ).scalar_one()
+    assert profile.profile_version == 1
+    jobs = list(
+        db_session.execute(
+            select(PersonJob).where(PersonJob.person_id == person.id)
+        ).scalars()
+    )
+    assert len(jobs) == 1
+    assert jobs[0].job_code == job_a
+    assert jobs[0].job_type == "PRIMARY"
+
+    # Same PRIMARY code should reuse existing row without failing.
+    for d in db_session.execute(
+        select(AnalysisDiffItem).where(AnalysisDiffItem.analysis_run_id == run.id)
+    ).scalars():
+        db_session.delete(d)
+    db_session.add(
+        AnalysisDiffItem(
+            analysis_run_id=run.id,
+            entity_type="JOB",
+            candidate_path="jobs[0]",
+            change_type="NEW",
+            new_value={"code": job_a, "job_type": "PRIMARY"},
+            review_status="ACCEPTED",
+        )
+    )
+    # Also need a non-job mutation so confirm is meaningful? zero-diff guard is
+    # about empty diffs table; one ACCEPTED NEW is enough.
+    db_session.commit()
+    ok = client.post(
+        f"/api/v1/analyses/{analysis_id}/confirm",
+        headers={"X-CSRF-Token": csrf},
+        json={"expected_profile_version": 1},
+    )
+    assert ok.status_code == 200, ok.text
+    db_session.refresh(run)
+    assert run.status == "CONFIRMED"
+    jobs_after = list(
+        db_session.execute(
+            select(PersonJob).where(PersonJob.person_id == person.id)
+        ).scalars()
+    )
+    assert len(jobs_after) == 1
+    assert jobs_after[0].job_code == job_a
+
+    from app.db.models.person import PersonJob as PJ
+
+    db_session.execute(delete(PJ).where(PJ.person_id == person.id))
+    db_session.commit()
+    _cleanup_person(db_session, person.id, admin.id)
+    for code in (job_a, job_b):
+        db_session.execute(delete(CodeMaster).where(CodeMaster.code == code))
+    db_session.commit()
