@@ -363,6 +363,40 @@ class AnalysisRepository:
         self.db.add(run)
         self.db.flush()
 
+    def mark_cancelled(self, run: AnalysisRun, reason: str) -> None:
+        """Lifecycle end without deleting candidate/diffs/document links."""
+        now = datetime.now(UTC)
+        run.status = "CANCELLED"
+        run.error_message = (reason or "")[:4000] or None
+        run.updated_at = now
+        self.db.add(run)
+        self.db.flush()
+
+    def list_stale_reviewing_runs_for_update(
+        self,
+        *,
+        person_id: UUID,
+        current_profile_version: int,
+        exclude_run_id: UUID,
+    ) -> list[AnalysisRun]:
+        """REVIEWING runs whose base_profile_version is behind current profile."""
+        return list(
+            self.db.execute(
+                select(AnalysisRun)
+                .where(
+                    AnalysisRun.person_id == person_id,
+                    AnalysisRun.status == "REVIEWING",
+                    AnalysisRun.id != exclude_run_id,
+                    AnalysisRun.base_profile_version.is_not(None),
+                    AnalysisRun.base_profile_version < current_profile_version,
+                )
+                .order_by(AnalysisRun.created_at.asc(), AnalysisRun.id.asc())
+                .with_for_update()
+            )
+            .scalars()
+            .all()
+        )
+
     def mark_reviewing(
         self,
         run: AnalysisRun,

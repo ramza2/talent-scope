@@ -13,6 +13,7 @@ from app.modules.analysis.schemas import (
     AnalysisListResponse,
     BulkDiffRequest,
     BulkDiffResponse,
+    CancelAnalysisResponse,
     ConfirmAnalysisRequest,
     ConfirmAnalysisResponse,
     CreateAnalysisRequest,
@@ -163,3 +164,16 @@ def retry_analysis(
     service: AnalysisService = Depends(get_analysis_service),
 ) -> RetryAnalysisResponse:
     return RetryAnalysisResponse(data=service.retry_analysis(analysis_id, ctx.user.id))
+
+
+@router.post(
+    "/{analysis_id}/cancel",
+    response_model=CancelAnalysisResponse,
+)
+def cancel_analysis(
+    analysis_id: UUID,
+    _admin: AuthenticatedContext = Depends(require_admin),
+    ctx: AuthenticatedContext = Depends(require_csrf),
+    service: AnalysisService = Depends(get_analysis_service),
+) -> CancelAnalysisResponse:
+    return CancelAnalysisResponse(data=service.cancel_analysis(analysis_id, ctx.user.id))

@@ -4942,3 +4942,465 @@ def test_process_document_task_keeps_ready_when_auto_analysis_raises(
     db_session.refresh(document)
     assert document.processing_status == "READY"
     _cleanup_person(db_session, person.id, admin.id)
+
+
+# --------------------------------------------------------------------------- analysis cancel + stale CANCELLED
+
+
+def _set_run_reviewing(db_session, run, *, candidate=None, with_accepted_diff=False):
+    from app.db.models.analysis import AnalysisDiffItem
+
+    run.status = "REVIEWING"
+    run.candidate_json = candidate or {"schema_version": "profile-candidate-v1", "profile": {"name": "분석대상"}}
+    run.error_message = None
+    db_session.add(run)
+    if with_accepted_diff:
+        db_session.add(
+            AnalysisDiffItem(
+                analysis_run_id=run.id,
+                entity_type="PROFILE",
+                field_name="name",
+                candidate_path="profile.name",
+                change_type="SAME",
+                review_status="PENDING",
+                new_value="분석대상",
+            )
+        )
+    db_session.commit()
+    db_session.refresh(run)
+    return run
+
+
+def test_cancel_reviewing_and_failed_preserves_history(client: TestClient, db_session):
+    from app.db.models.analysis import AnalysisDiffItem, AnalysisRun, AnalysisRunDocument
+    from app.db.models.revision import AuditLog
+
+    admin = _create_user(
+        db_session, login_id=f"cx_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    csrf = _login(client, admin.login_id, "Passw0rd!")
+    person, document = _seed_person_with_ready_doc(db_session, admin.id)
+
+    created = client.post(
+        "/api/v1/analyses",
+        headers={"X-CSRF-Token": csrf},
+        json={
+            "person_id": str(person.id),
+            "document_ids": [str(document.id)],
+            "analysis_type": "PROFILE",
+        },
+    )
+    assert created.status_code == 202, created.text
+    analysis_id = uuid.UUID(created.json()["data"]["analysis_id"])
+    run = db_session.get(AnalysisRun, analysis_id)
+    assert run is not None
+    candidate = {"schema_version": "profile-candidate-v1", "profile": {"name": "보존"}}
+    run.candidate_json = candidate
+    run.status = "REVIEWING"
+    db_session.add(
+        AnalysisDiffItem(
+            analysis_run_id=run.id,
+            entity_type="PROFILE",
+            field_name="name",
+            change_type="UPDATE",
+            review_status="PENDING",
+            new_value="보존",
+        )
+    )
+    db_session.commit()
+
+    cancelled = client.post(
+        f"/api/v1/analyses/{analysis_id}/cancel",
+        headers={"X-CSRF-Token": csrf},
+        json={},
+    )
+    assert cancelled.status_code == 200, cancelled.text
+    assert cancelled.json()["data"]["status"] == "CANCELLED"
+
+    db_session.refresh(run)
+    assert run.status == "CANCELLED"
+    assert run.candidate_json == candidate
+    assert run.error_message and "폐기" in run.error_message
+    diffs = list(
+        db_session.execute(
+            select(AnalysisDiffItem).where(AnalysisDiffItem.analysis_run_id == run.id)
+        )
+        .scalars()
+        .all()
+    )
+    assert len(diffs) == 1
+    links = list(
+        db_session.execute(
+            select(AnalysisRunDocument).where(
+                AnalysisRunDocument.analysis_run_id == run.id
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(links) == 1
+    audits = list(
+        db_session.execute(
+            select(AuditLog).where(
+                AuditLog.action_type == "ANALYSIS_CANCEL",
+                AuditLog.target_id == run.id,
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(audits) == 1
+    assert audits[0].metadata_json.get("reason") == "MANUAL"
+
+    # Idempotent CANCELLED re-call
+    again = client.post(
+        f"/api/v1/analyses/{analysis_id}/cancel",
+        headers={"X-CSRF-Token": csrf},
+        json={},
+    )
+    assert again.status_code == 200
+    assert again.json()["data"]["status"] == "CANCELLED"
+    assert (
+        len(
+            list(
+                db_session.execute(
+                    select(AuditLog).where(
+                        AuditLog.action_type == "ANALYSIS_CANCEL",
+                        AuditLog.target_id == run.id,
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        )
+        == 1
+    )
+
+    # FAILED → CANCELLED
+    run2 = _queue_run(db_session, person.id, document.id)
+    run2.status = "FAILED"
+    run2.error_message = "llm failed"
+    db_session.commit()
+    fail_cancel = client.post(
+        f"/api/v1/analyses/{run2.id}/cancel",
+        headers={"X-CSRF-Token": csrf},
+        json={},
+    )
+    assert fail_cancel.status_code == 200, fail_cancel.text
+    db_session.refresh(run2)
+    assert run2.status == "CANCELLED"
+
+    _cleanup_person(db_session, person.id, admin.id)
+
+
+def test_cancel_rejects_queued_processing_confirmed(client: TestClient, db_session):
+    from app.db.models.analysis import AnalysisRun
+
+    admin = _create_user(
+        db_session, login_id=f"cr_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    csrf = _login(client, admin.login_id, "Passw0rd!")
+    person, document = _seed_person_with_ready_doc(db_session, admin.id)
+
+    queued = client.post(
+        "/api/v1/analyses",
+        headers={"X-CSRF-Token": csrf},
+        json={
+            "person_id": str(person.id),
+            "document_ids": [str(document.id)],
+            "analysis_type": "PROFILE",
+        },
+    ).json()["data"]["analysis_id"]
+    q_resp = client.post(
+        f"/api/v1/analyses/{queued}/cancel",
+        headers={"X-CSRF-Token": csrf},
+        json={},
+    )
+    assert q_resp.status_code == 409
+    run_q = db_session.get(AnalysisRun, uuid.UUID(queued))
+    assert run_q is not None and run_q.status == "QUEUED"
+
+    run_p = db_session.get(AnalysisRun, uuid.UUID(queued))
+    assert run_p is not None
+    run_p.status = "PROCESSING"
+    db_session.commit()
+    p_resp = client.post(
+        f"/api/v1/analyses/{queued}/cancel",
+        headers={"X-CSRF-Token": csrf},
+        json={},
+    )
+    assert p_resp.status_code == 409
+    db_session.refresh(run_p)
+    assert run_p.status == "PROCESSING"
+
+    run_p.status = "CONFIRMED"
+    db_session.commit()
+    c_resp = client.post(
+        f"/api/v1/analyses/{queued}/cancel",
+        headers={"X-CSRF-Token": csrf},
+        json={},
+    )
+    assert c_resp.status_code == 409
+    db_session.refresh(run_p)
+    assert run_p.status == "CONFIRMED"
+
+    _cleanup_person(db_session, person.id, admin.id)
+
+
+def test_confirm_auto_cancels_stale_reviewing_runs(client: TestClient, db_session):
+    from app.db.models.analysis import AnalysisDiffItem, AnalysisRun, AnalysisRunDocument
+    from app.db.models.revision import AuditLog
+    from app.modules.analysis.repository import AnalysisRepository
+
+    admin = _create_user(
+        db_session, login_id=f"cs_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    csrf = _login(client, admin.login_id, "Passw0rd!")
+    person, document = _seed_person_with_ready_doc(db_session, admin.id)
+    other, other_doc = _seed_person_with_ready_doc(db_session, admin.id)
+
+    repo = AnalysisRepository(db_session)
+
+    def _make_reviewing(person_id, document_id, *, name_value: str):
+        run = repo.create_run(
+            person_id=person_id,
+            base_profile_version=1,
+            llm_model="fake",
+            vlm_model="fake",
+            prompt_version="profile-extract-v1",
+            schema_version="profile-candidate-v1",
+        )
+        repo.add_run_documents(run.id, [document_id])
+        run.status = "REVIEWING"
+        run.candidate_json = {
+            "schema_version": "profile-candidate-v1",
+            "profile": {"name": name_value},
+        }
+        db_session.add(
+            AnalysisDiffItem(
+                analysis_run_id=run.id,
+                entity_type="PROFILE",
+                field_name="phone",
+                candidate_path="profile.phone",
+                change_type="NEW",
+                new_value="010-1111-2222",
+                review_status="ACCEPTED",
+            )
+        )
+        db_session.flush()
+        return run
+
+    run_a = _make_reviewing(person.id, document.id, name_value="A")
+    run_b = _make_reviewing(person.id, document.id, name_value="B")
+    run_failed = repo.create_run(
+        person_id=person.id,
+        base_profile_version=1,
+        llm_model="fake",
+        vlm_model="fake",
+        prompt_version="profile-extract-v1",
+        schema_version="profile-candidate-v1",
+    )
+    run_failed.status = "FAILED"
+    run_failed.error_message = "keep failed"
+    other_reviewing = _make_reviewing(other.id, other_doc.id, name_value="Other")
+    db_session.commit()
+
+    b_candidate = dict(run_b.candidate_json)
+    b_diff_count = len(
+        list(
+            db_session.execute(
+                select(AnalysisDiffItem).where(
+                    AnalysisDiffItem.analysis_run_id == run_b.id
+                )
+            )
+            .scalars()
+            .all()
+        )
+    )
+
+    confirm = client.post(
+        f"/api/v1/analyses/{run_a.id}/confirm",
+        headers={"X-CSRF-Token": csrf},
+        json={"expected_profile_version": 1},
+    )
+    assert confirm.status_code == 200, confirm.text
+    assert confirm.json()["data"]["status"] == "CONFIRMED"
+    assert confirm.json()["data"]["profile_version"] == 2
+
+    db_session.refresh(run_a)
+    db_session.refresh(run_b)
+    db_session.refresh(run_failed)
+    db_session.refresh(other_reviewing)
+    assert run_a.status == "CONFIRMED"
+    assert run_b.status == "CANCELLED"
+    assert run_b.candidate_json == b_candidate
+    assert (
+        len(
+            list(
+                db_session.execute(
+                    select(AnalysisDiffItem).where(
+                        AnalysisDiffItem.analysis_run_id == run_b.id
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        )
+        == b_diff_count
+    )
+    assert run_failed.status == "FAILED"
+    assert other_reviewing.status == "REVIEWING"
+    assert run_b.error_message and "자동 폐기" in run_b.error_message
+
+    stale_audits = list(
+        db_session.execute(
+            select(AuditLog).where(
+                AuditLog.action_type == "ANALYSIS_CANCEL",
+                AuditLog.target_id == run_b.id,
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(stale_audits) == 1
+    meta = stale_audits[0].metadata_json
+    assert meta.get("reason") == "STALE_PROFILE_VERSION"
+    assert meta.get("source_analysis_run_id") == str(run_a.id)
+    assert meta.get("current_profile_version") == 2
+    assert meta.get("base_profile_version") == 1
+
+    # CANCELLED cannot review/confirm
+    review = client.patch(
+        f"/api/v1/analyses/{run_b.id}/diffs/{list(db_session.execute(select(AnalysisDiffItem.id).where(AnalysisDiffItem.analysis_run_id == run_b.id)).scalars().all())[0]}",
+        headers={"X-CSRF-Token": csrf},
+        json={"review_status": "ACCEPTED"},
+    )
+    assert review.status_code == 409
+    reconfirm = client.post(
+        f"/api/v1/analyses/{run_b.id}/confirm",
+        headers={"X-CSRF-Token": csrf},
+        json={"expected_profile_version": 2},
+    )
+    assert reconfirm.status_code == 409
+
+    _cleanup_person(db_session, person.id, admin.id)
+    # Second person without deleting shared admin again
+    from app.db.models.analysis import AnalysisDiffItem, AnalysisRun, AnalysisRunDocument
+    from app.db.models.document import Document, DocumentGroup, DocumentPage
+    from app.db.models.person import Person, PersonProfile
+    from app.db.models.revision import ProfileRevision
+
+    other_id = other.id
+    run_ids = list(
+        db_session.execute(
+            select(AnalysisRun.id).where(AnalysisRun.person_id == other_id)
+        )
+        .scalars()
+        .all()
+    )
+    if run_ids:
+        db_session.execute(
+            delete(AnalysisDiffItem).where(AnalysisDiffItem.analysis_run_id.in_(run_ids))
+        )
+        db_session.execute(
+            delete(AnalysisRunDocument).where(
+                AnalysisRunDocument.analysis_run_id.in_(run_ids)
+            )
+        )
+        db_session.execute(delete(AnalysisRun).where(AnalysisRun.id.in_(run_ids)))
+    group_ids = list(
+        db_session.execute(
+            select(DocumentGroup.id).where(DocumentGroup.person_id == other_id)
+        )
+        .scalars()
+        .all()
+    )
+    if group_ids:
+        doc_ids = list(
+            db_session.execute(
+                select(Document.id).where(Document.document_group_id.in_(group_ids))
+            )
+            .scalars()
+            .all()
+        )
+        if doc_ids:
+            db_session.execute(
+                delete(DocumentPage).where(DocumentPage.document_id.in_(doc_ids))
+            )
+            db_session.execute(delete(Document).where(Document.id.in_(doc_ids)))
+        db_session.execute(
+            delete(DocumentGroup).where(DocumentGroup.id.in_(group_ids))
+        )
+    db_session.execute(
+        delete(ProfileRevision).where(ProfileRevision.person_id == other_id)
+    )
+    db_session.execute(delete(PersonProfile).where(PersonProfile.person_id == other_id))
+    db_session.execute(delete(Person).where(Person.id == other_id))
+    db_session.commit()
+
+
+def test_confirm_succeeds_when_stale_cleanup_raises(
+    client: TestClient, db_session, monkeypatch: pytest.MonkeyPatch
+):
+    from app.db.models.analysis import AnalysisDiffItem, AnalysisRun
+    from app.db.models.person import PersonProfile
+    from app.modules.analysis.service import AnalysisService
+
+    admin = _create_user(
+        db_session, login_id=f"cf_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    csrf = _login(client, admin.login_id, "Passw0rd!")
+    person, document = _seed_person_with_ready_doc(db_session, admin.id)
+
+    created = client.post(
+        "/api/v1/analyses",
+        headers={"X-CSRF-Token": csrf},
+        json={
+            "person_id": str(person.id),
+            "document_ids": [str(document.id)],
+            "analysis_type": "PROFILE",
+        },
+    ).json()["data"]["analysis_id"]
+    run = db_session.get(AnalysisRun, uuid.UUID(created))
+    assert run is not None
+    run.status = "REVIEWING"
+    run.candidate_json = {"schema_version": "profile-candidate-v1", "profile": {}}
+    db_session.add(
+        AnalysisDiffItem(
+            analysis_run_id=run.id,
+            entity_type="PROFILE",
+            field_name="phone",
+            candidate_path="profile.phone",
+            change_type="NEW",
+            new_value="010-0000-0000",
+            review_status="ACCEPTED",
+        )
+    )
+    db_session.commit()
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("stale cleanup boom")
+
+    monkeypatch.setattr(
+        AnalysisService,
+        "_cancel_stale_reviewing_runs_after_confirm",
+        _boom,
+    )
+
+    confirm = client.post(
+        f"/api/v1/analyses/{run.id}/confirm",
+        headers={"X-CSRF-Token": csrf},
+        json={"expected_profile_version": 1},
+    )
+    assert confirm.status_code == 200, confirm.text
+    assert confirm.json()["data"]["status"] == "CONFIRMED"
+    assert confirm.json()["data"]["profile_version"] == 2
+
+    db_session.refresh(run)
+    assert run.status == "CONFIRMED"
+    profile = db_session.execute(
+        select(PersonProfile).where(PersonProfile.person_id == person.id)
+    ).scalar_one()
+    assert profile.profile_version == 2
+
+    _cleanup_person(db_session, person.id, admin.id)

@@ -236,6 +236,16 @@ export function retryAnalysis(analysisId: string) {
   )
 }
 
+export function cancelAnalysis(analysisId: string) {
+  return apiFetch<{ data: { analysis_id: string; status: AnalysisStatus } }>(
+    `/analyses/${analysisId}/cancel`,
+    {
+      method: 'POST',
+      body: JSON.stringify({}),
+    },
+  )
+}
+
 export type ConfirmAnalysisResult = {
   analysis_id: string
   person_id: string

@@ -947,6 +947,44 @@ class AnalysisService:
 
         return CreateAnalysisResponseData(analysis_id=run.id, status="QUEUED")
 
+    def cancel_analysis(
+        self, analysis_id: UUID, actor_user_id: UUID
+    ) -> CreateAnalysisResponseData:
+        run = self.repo.get_run(analysis_id, for_update=True)
+        if run is None:
+            raise NotFoundError("분석을 찾을 수 없습니다.")
+
+        if run.status == "CANCELLED":
+            return CreateAnalysisResponseData(
+                analysis_id=run.id, status="CANCELLED"
+            )
+        if run.status in {"QUEUED", "PROCESSING"}:
+            raise AnalysisStateConflictError(
+                "QUEUED/PROCESSING 상태의 분석은 현재 폐기할 수 없습니다."
+            )
+        if run.status == "CONFIRMED":
+            raise AnalysisStateConflictError("확정된 분석은 폐기할 수 없습니다.")
+        if run.status not in {"REVIEWING", "FAILED"}:
+            raise AnalysisStateConflictError(
+                f"상태가 {run.status}인 분석은 폐기할 수 없습니다."
+            )
+
+        before = {"status": run.status}
+        self.repo.mark_cancelled(run, "사용자에 의해 폐기된 분석입니다.")
+        self.repo.add_audit(
+            action_type="ANALYSIS_CANCEL",
+            actor_user_id=actor_user_id,
+            target_id=run.id,
+            before=before,
+            after={"status": "CANCELLED"},
+            metadata={
+                "reason": "MANUAL",
+                "person_id": str(run.person_id),
+            },
+        )
+        self.db.commit()
+        return CreateAnalysisResponseData(analysis_id=run.id, status="CANCELLED")
+
     def confirm_analysis(
         self,
         analysis_id: UUID,
@@ -967,7 +1005,6 @@ class AnalysisService:
                 actor_user_id=actor_user_id,
             )
             self.db.commit()
-            return result
         except IntegrityError as exc:
             self.db.rollback()
             raise ConfirmValidationError(
@@ -976,6 +1013,61 @@ class AnalysisService:
         except Exception:
             self.db.rollback()
             raise
+
+        # Separate transaction after confirm commit — never rolls back Confirm.
+        try:
+            self._cancel_stale_reviewing_runs_after_confirm(
+                person_id=result.person_id,
+                current_profile_version=result.profile_version,
+                confirmed_run_id=result.analysis_id,
+                actor_user_id=actor_user_id,
+            )
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            logger.exception(
+                "stale analysis cancel after confirm failed "
+                "confirmed_run_id=%s person_id=%s",
+                result.analysis_id,
+                result.person_id,
+            )
+
+        return result
+
+    def _cancel_stale_reviewing_runs_after_confirm(
+        self,
+        *,
+        person_id: UUID,
+        current_profile_version: int,
+        confirmed_run_id: UUID,
+        actor_user_id: UUID,
+    ) -> None:
+        stale_runs = self.repo.list_stale_reviewing_runs_for_update(
+            person_id=person_id,
+            current_profile_version=current_profile_version,
+            exclude_run_id=confirmed_run_id,
+        )
+        for run in stale_runs:
+            before = {"status": run.status}
+            base_version = run.base_profile_version
+            self.repo.mark_cancelled(
+                run,
+                "프로필이 변경되어 최신 상태와 맞지 않아 자동 폐기되었습니다.",
+            )
+            self.repo.add_audit(
+                action_type="ANALYSIS_CANCEL",
+                actor_user_id=actor_user_id,
+                target_id=run.id,
+                before=before,
+                after={"status": "CANCELLED"},
+                metadata={
+                    "reason": "STALE_PROFILE_VERSION",
+                    "person_id": str(person_id),
+                    "base_profile_version": base_version,
+                    "current_profile_version": current_profile_version,
+                    "source_analysis_run_id": str(confirmed_run_id),
+                },
+            )
 
     # ----------------------------------------------------------------- mappers
 
