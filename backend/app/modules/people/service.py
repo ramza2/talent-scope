@@ -452,9 +452,12 @@ class PeopleService:
         person, profile = self._lock_profile(person_id, payload.expected_profile_version)
         seen: set[tuple[str, str]] = set()
         items = []
+        primary_count = 0
         for job in payload.jobs:
             if job.job_type not in ALLOWED_JOB_TYPES:
                 raise ValidationAppError("job_type이 올바르지 않습니다.")
+            if job.job_type == "PRIMARY":
+                primary_count += 1
             key = (job.job_code, job.job_type)
             if key in seen:
                 raise ValidationAppError("동일한 직무 코드/유형이 중복되었습니다.")
@@ -466,6 +469,8 @@ class PeopleService:
                     "sort_order": job.sort_order,
                 }
             )
+        if primary_count > 1:
+            raise ValidationAppError("주직무는 1개만 지정할 수 있습니다.")
         self._validate_codes([i["job_code"] for i in items], "JOB")
         before = build_confirmed_profile_snapshot(self.db, person_id)
         from sqlalchemy import select

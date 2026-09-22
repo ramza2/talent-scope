@@ -666,3 +666,72 @@ def test_deleted_person_detail_rbac_and_restore(client: TestClient, db_session) 
             _cleanup_person(db_session, person_id)
         _cleanup_user(db_session, admin.id)
         _cleanup_user(db_session, user.id)
+
+
+def test_replace_jobs_rejects_multiple_primary(client: TestClient, db_session) -> None:
+    suffix = uuid.uuid4().hex[:8]
+    job_a = f"JOB-A-{suffix}"
+    job_b = f"JOB-B-{suffix}"
+    job_c = f"JOB-C-{suffix}"
+    _ensure_code(db_session, job_a, "JOB", "직무A")
+    _ensure_code(db_session, job_b, "JOB", "직무B")
+    _ensure_code(db_session, job_c, "JOB", "직무C")
+
+    admin = _create_user(db_session, login_id=f"pj_{suffix}", password="Secret123!", role="ADMIN")
+    person_id = None
+    try:
+        csrf = _login(client, admin.login_id)
+        created = client.post(
+            "/api/v1/people",
+            headers={"X-CSRF-Token": csrf},
+            json={"name": f"JobGuard_{suffix}"},
+        )
+        assert created.status_code == 201, created.text
+        person_id = uuid.UUID(created.json()["data"]["id"])
+
+        ok = client.put(
+            f"/api/v1/people/{person_id}/jobs",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "expected_profile_version": 1,
+                "jobs": [
+                    {"job_code": job_a, "job_type": "PRIMARY", "sort_order": 0},
+                    {"job_code": job_b, "job_type": "SECONDARY", "sort_order": 1},
+                    {"job_code": job_c, "job_type": "SECONDARY", "sort_order": 2},
+                ],
+            },
+        )
+        assert ok.status_code == 200, ok.text
+        assert ok.json()["data"]["profile_version"] == 2
+        types = [j["job_type"] for j in ok.json()["data"]["jobs"]]
+        assert types.count("PRIMARY") == 1
+
+        bad = client.put(
+            f"/api/v1/people/{person_id}/jobs",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "expected_profile_version": 2,
+                "jobs": [
+                    {"job_code": job_a, "job_type": "PRIMARY", "sort_order": 0},
+                    {"job_code": job_b, "job_type": "PRIMARY", "sort_order": 1},
+                ],
+            },
+        )
+        assert bad.status_code == 400
+        assert bad.json()["code"] == "VALIDATION_ERROR"
+        assert "주직무" in bad.json()["detail"]
+
+        detail = client.get(f"/api/v1/people/{person_id}").json()["data"]
+        assert detail["profile_version"] == 2
+        assert [j["job_type"] for j in detail["jobs"]].count("PRIMARY") == 1
+        assert {j["code"] for j in detail["jobs"]} == {job_a, job_b, job_c}
+    finally:
+        if person_id:
+            _cleanup_person(db_session, person_id)
+        for code in (job_a, job_b, job_c):
+            from app.db.models.code import CodeAlias, CodeMaster
+
+            db_session.execute(delete(CodeAlias).where(CodeAlias.code == code))
+            db_session.execute(delete(CodeMaster).where(CodeMaster.code == code))
+        db_session.commit()
+        _cleanup_user(db_session, admin.id)

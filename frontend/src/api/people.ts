@@ -8,6 +8,14 @@ export type TechnicalGrade =
   | 'EXPERT'
   | 'UNKNOWN'
 
+export type JobType = 'PRIMARY' | 'SECONDARY' | 'EXPERIENCE'
+
+export const JOB_TYPE_LABELS: Record<JobType, string> = {
+  PRIMARY: '주직무',
+  SECONDARY: '부직무',
+  EXPERIENCE: '경험직무',
+}
+
 export type CodeRef = { code: string; name: string }
 
 export type PeopleListItem = {
@@ -72,7 +80,7 @@ export type PersonDetail = {
   jobs: Array<{
     code: string
     name: string
-    job_type: 'PRIMARY' | 'SECONDARY' | 'EXPERIENCE'
+    job_type: JobType
     sort_order: number
     source_type?: string | null
   }>
