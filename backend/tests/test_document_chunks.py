@@ -1776,3 +1776,164 @@ def test_version_fallback_requeues_stale_completed_embedding_job(
         assert fake.calls and fake.calls[0] == "version one embed text"
     finally:
         _cleanup_person(db_session, seeded["person"].id)
+
+
+def test_scanned_pdf_vlm_persist_creates_document_chunks(db_session, monkeypatch):
+    """VLM page persistence → ensure_sync_job → DOCUMENT_CHUNK + embedding job."""
+    import pymupdf
+
+    from app.ai.providers.llm import FakeLLMProvider
+    from app.ai.providers.vlm import FakeVLMProvider
+    from app.db.models.analysis import AnalysisDiffItem, AnalysisRun, AnalysisRunDocument
+    from app.db.models.document import DocumentChunk, DocumentPage
+    from app.db.models.revision import ProfileRevision
+    from app.db.models.search import SearchIndexItem, SearchIndexJob
+    from app.modules.analysis.repository import AnalysisRepository
+    from app.modules.analysis.service import AnalysisService
+    from app.modules.people.snapshot import build_confirmed_profile_snapshot
+    from app.modules.search.document_chunk_sync import DocumentChunkSyncService
+    from app.modules.search.service import SearchIndexService
+    from app.storage.s3 import build_object_storage, reset_object_storage_cache
+
+    _enable_embedding(monkeypatch)
+    reset_object_storage_cache()
+    storage = build_object_storage()
+    user = _create_user(db_session)
+
+    blank = pymupdf.open()
+    blank.new_page()
+    pdf_bytes = blank.tobytes()
+    blank.close()
+    key = f"test/chunk-vlm/{uuid.uuid4()}.pdf"
+    storage.put_bytes(key, pdf_bytes, content_type="application/pdf")
+
+    seeded = _seed_person_group(
+        db_session,
+        pages=[(1, None, "TEXT_PARSER")],
+    )
+    document = seeded["document"]
+    document.storage_key = key
+    db_session.add(document)
+    page = db_session.execute(
+        select(DocumentPage).where(DocumentPage.document_id == document.id)
+    ).scalar_one()
+    page.layout_json = {"needs_vlm": True, "text_chars": 0}
+    db_session.add(page)
+
+    snap = build_confirmed_profile_snapshot(db_session, seeded["person"].id)
+    db_session.add(
+        ProfileRevision(
+            person_id=seeded["person"].id,
+            revision_no=1,
+            snapshot_json=snap,
+            source_type="USER",
+            created_by=user.id,
+        )
+    )
+    db_session.commit()
+
+    # Empty page → zero chunks before VLM.
+    pre_job, _ = DocumentChunkSyncService(db_session).ensure_sync_job(seeded["group"].id)
+    db_session.commit()
+    SearchIndexService(db_session).process_job(pre_job.id)
+    pre_chunks = list(
+        db_session.scalars(
+            select(DocumentChunk).where(DocumentChunk.document_id == document.id)
+        ).all()
+    )
+    assert len(pre_chunks) == 0
+
+    vlm_text = "홍길동 Python FastAPI PostgreSQL chunk search"
+    repo = AnalysisRepository(db_session)
+    run = repo.create_run(
+        person_id=seeded["person"].id,
+        base_profile_version=1,
+        llm_model="fake",
+        vlm_model="fake",
+        prompt_version="profile-extract-v1",
+        schema_version="profile-candidate-v1",
+    )
+    repo.add_run_documents(run.id, [document.id])
+    db_session.commit()
+
+    profile_json = {
+        "schema_version": "profile-candidate-v1",
+        "profile": {"name": "홍길동", "technical_grade": "EXPERT"},
+        "jobs": [],
+        "skills": [],
+        "expertise": [],
+        "employment_history": [],
+        "education": [],
+        "certifications": [],
+        "projects": [],
+        "summary": {},
+        "analysis": {},
+    }
+    vlm = FakeVLMProvider(vlm_text)
+    llm = FakeLLMProvider(profile_json=profile_json)
+    try:
+        service = AnalysisService(db_session, storage=storage, llm=llm, vlm=vlm)
+        assert service.run_analysis(run.id) == "REVIEWING"
+        assert vlm.calls == 1
+
+        db_session.expire_all()
+        page = db_session.execute(
+            select(DocumentPage).where(DocumentPage.document_id == document.id)
+        ).scalar_one()
+        assert vlm_text in (page.extracted_text or "")
+        assert page.extraction_method == "VLM"
+
+        pending = list(
+            db_session.scalars(
+                select(SearchIndexJob).where(
+                    SearchIndexJob.person_id == seeded["person"].id,
+                    SearchIndexJob.status == "PENDING",
+                )
+            ).all()
+        )
+        assert pending, "VLM persist should ensure a PENDING DocumentChunk sync job"
+        result = SearchIndexService(db_session).process_job(pending[-1].id)
+        assert result.status == "COMPLETED"
+
+        chunks = list(
+            db_session.scalars(
+                select(DocumentChunk).where(DocumentChunk.document_id == document.id)
+            ).all()
+        )
+        assert len(chunks) > 0
+        assert any(vlm_text in (c.chunk_text or "") for c in chunks)
+
+        items = list(
+            db_session.scalars(
+                select(SearchIndexItem).where(
+                    SearchIndexItem.person_id == seeded["person"].id,
+                    SearchIndexItem.object_type == "DOCUMENT_CHUNK",
+                    SearchIndexItem.is_active.is_(True),
+                )
+            ).all()
+        )
+        assert items
+        assert any(vlm_text in (i.search_text or "") for i in items)
+
+        embed_jobs = list(
+            db_session.scalars(
+                select(SearchIndexJob).where(
+                    SearchIndexJob.person_id == seeded["person"].id,
+                    SearchIndexJob.status == "PENDING",
+                )
+            ).all()
+        )
+        assert embed_jobs, "chunk sync should queue embedding jobs when enabled"
+    finally:
+        db_session.execute(
+            delete(AnalysisDiffItem).where(AnalysisDiffItem.analysis_run_id == run.id)
+        )
+        db_session.execute(
+            delete(AnalysisRunDocument).where(
+                AnalysisRunDocument.analysis_run_id == run.id
+            )
+        )
+        db_session.execute(delete(AnalysisRun).where(AnalysisRun.id == run.id))
+        db_session.commit()
+        _cleanup_person(db_session, seeded["person"].id, user.id)
+        reset_object_storage_cache()

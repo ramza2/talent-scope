@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 from dataclasses import dataclass, field
 from typing import Any
@@ -19,6 +20,8 @@ from app.modules.document_processing.types import (
 from app.storage.base import ObjectStorage
 
 logger = logging.getLogger(__name__)
+
+_VLM_DONE_METHODS = frozenset({"VLM", "HYBRID"})
 
 
 @dataclass
@@ -44,6 +47,20 @@ class DocumentSnapshot:
     version_no: int
     person_id: UUID
     pages: list[PageSnapshot] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class VLMPageTranscription:
+    """Successful page-level VLM result to persist (same text used in the prompt)."""
+
+    document_id: UUID
+    page_no: int
+    expected_extracted_text: str | None
+    expected_extraction_method: str | None
+    expected_layout_json: dict[str, Any] | None
+    persisted_text: str
+    extraction_method: str
+    layout_json: dict[str, Any]
 
 
 @dataclass
@@ -88,10 +105,75 @@ def _parse_page_segments(body: str) -> list[tuple[int, str]]:
     return segments
 
 
+def _layout_dict(layout_json: dict[str, Any] | None) -> dict[str, Any]:
+    return dict(layout_json) if isinstance(layout_json, dict) else {}
+
+
+def _already_vlm_transcribed(
+    *,
+    extraction_method: str | None,
+    layout_json: dict[str, Any] | None,
+) -> bool:
+    layout = _layout_dict(layout_json)
+    method = (extraction_method or "").strip().upper()
+    return method in _VLM_DONE_METHODS or bool(layout.get("vlm_transcribed"))
+
+
+def _page_needs_vlm(
+    *,
+    text: str,
+    extraction_method: str | None,
+    layout_json: dict[str, Any] | None,
+) -> bool:
+    if _already_vlm_transcribed(
+        extraction_method=extraction_method, layout_json=layout_json
+    ):
+        return False
+    layout = _layout_dict(layout_json)
+    return bool(layout.get("needs_vlm")) or len(text) < MIN_TEXT_CHARS_FOR_READY_PAGE
+
+
+def _build_vlm_transcription(
+    *,
+    document_id: UUID,
+    page: PageSnapshot,
+    transcribed: str,
+) -> VLMPageTranscription | None:
+    cleaned = (transcribed or "").strip()
+    if not cleaned:
+        return None
+    original = (page.extracted_text or "").strip()
+    if original:
+        persisted = f"{original}\n{cleaned}".strip()
+        method = "HYBRID"
+    else:
+        persisted = cleaned
+        method = "VLM"
+    layout = _layout_dict(page.layout_json)
+    layout["needs_vlm"] = False
+    layout["vlm_transcribed"] = True
+    layout["vlm_text_chars"] = len(cleaned)
+    layout["final_text_chars"] = len(persisted)
+    expected_layout = (
+        copy.deepcopy(page.layout_json) if isinstance(page.layout_json, dict) else None
+    )
+    return VLMPageTranscription(
+        document_id=document_id,
+        page_no=page.page_no,
+        expected_extracted_text=page.extracted_text,
+        expected_extraction_method=page.extraction_method,
+        expected_layout_json=expected_layout,
+        persisted_text=persisted,
+        extraction_method=method,
+        layout_json=layout,
+    )
+
+
 @dataclass
 class AnalysisSourceBundle:
     blocks: list[DocumentSourceBlock] = field(default_factory=list)
     total_vlm_pages: int = 0
+    vlm_transcriptions: list[VLMPageTranscription] = field(default_factory=list)
 
     @property
     def usable_blocks(self) -> list[DocumentSourceBlock]:
@@ -210,12 +292,13 @@ class AnalysisSourceBuilder:
         bundle = AnalysisSourceBundle()
         vlm_budget = int(self.settings.analysis_max_vlm_pages)
         for doc in documents:
-            block = self._build_one(
+            block, transcriptions = self._build_one(
                 doc,
                 vlm_budget=vlm_budget,
                 log_context=log_context,
             )
             bundle.blocks.append(block)
+            bundle.vlm_transcriptions.extend(transcriptions)
             bundle.total_vlm_pages += block.vlm_pages_used
             vlm_budget = max(0, vlm_budget - block.vlm_pages_used)
         return bundle
@@ -226,10 +309,11 @@ class AnalysisSourceBuilder:
         *,
         vlm_budget: int,
         log_context: dict | None,
-    ) -> DocumentSourceBlock:
+    ) -> tuple[DocumentSourceBlock, list[VLMPageTranscription]]:
         doc_id = str(doc.id)
         max_pages = int(self.settings.analysis_max_pages_per_document)
         pages = list(doc.pages)[:max_pages]
+        transcriptions: list[VLMPageTranscription] = []
         try:
             parts: list[str] = []
             vlm_used = 0
@@ -237,9 +321,11 @@ class AnalysisSourceBuilder:
             try:
                 for page in pages:
                     text = (page.extracted_text or "").strip()
-                    needs_vlm = bool(
-                        page.layout_json and page.layout_json.get("needs_vlm")
-                    ) or len(text) < MIN_TEXT_CHARS_FOR_READY_PAGE
+                    needs_vlm = _page_needs_vlm(
+                        text=text,
+                        extraction_method=page.extraction_method,
+                        layout_json=page.layout_json,
+                    )
 
                     if needs_vlm and self.vlm is not None and vlm_used < vlm_budget:
                         if pdf_doc is None:
@@ -258,8 +344,14 @@ class AnalysisSourceBuilder:
                                 },
                             )
                             vlm_used += 1
-                            if transcribed and transcribed.strip():
-                                text = f"{text}\n{transcribed.strip()}".strip()
+                            item = _build_vlm_transcription(
+                                document_id=doc.id,
+                                page=page,
+                                transcribed=transcribed,
+                            )
+                            if item is not None:
+                                transcriptions.append(item)
+                                text = item.persisted_text
                         elif self._is_image(doc) and vlm_used < vlm_budget:
                             image_bytes = self._download(doc.storage_key)
                             mime = (
@@ -277,8 +369,14 @@ class AnalysisSourceBuilder:
                                 },
                             )
                             vlm_used += 1
-                            if transcribed and transcribed.strip():
-                                text = f"{text}\n{transcribed.strip()}".strip()
+                            item = _build_vlm_transcription(
+                                document_id=doc.id,
+                                page=page,
+                                transcribed=transcribed,
+                            )
+                            if item is not None:
+                                transcriptions.append(item)
+                                text = item.persisted_text
 
                     if text:
                         parts.append(f"[PAGE {page.page_no}]\n{text}")
@@ -286,13 +384,16 @@ class AnalysisSourceBuilder:
                 if pdf_doc is not None:
                     pdf_doc.close()
 
-            return DocumentSourceBlock(
-                document_id=doc_id,
-                filename=doc.original_filename,
-                document_type=doc.document_type_code,
-                text="\n\n".join(parts),
-                page_count=len(pages),
-                vlm_pages_used=vlm_used,
+            return (
+                DocumentSourceBlock(
+                    document_id=doc_id,
+                    filename=doc.original_filename,
+                    document_type=doc.document_type_code,
+                    text="\n\n".join(parts),
+                    page_count=len(pages),
+                    vlm_pages_used=vlm_used,
+                ),
+                transcriptions,
             )
         except (AIProviderError, Exception) as exc:
             logger.info(
@@ -300,12 +401,15 @@ class AnalysisSourceBuilder:
                 doc_id,
                 type(exc).__name__,
             )
-            return DocumentSourceBlock(
-                document_id=doc_id,
-                filename=doc.original_filename,
-                document_type=doc.document_type_code,
-                error=f"{type(exc).__name__}: {str(exc)[:400]}",
-                page_count=len(pages),
+            return (
+                DocumentSourceBlock(
+                    document_id=doc_id,
+                    filename=doc.original_filename,
+                    document_type=doc.document_type_code,
+                    error=f"{type(exc).__name__}: {str(exc)[:400]}",
+                    page_count=len(pages),
+                ),
+                [],
             )
 
     def _is_image(self, doc: DocumentSnapshot) -> bool:

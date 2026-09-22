@@ -470,3 +470,51 @@ class AnalysisRepository:
             if text not in bucket:
                 bucket.append(text)
         return out
+
+    def get_document_group_id(self, document_id: UUID) -> UUID | None:
+        return self.db.execute(
+            select(Document.document_group_id).where(Document.id == document_id)
+        ).scalar_one_or_none()
+
+    def try_update_page_vlm_transcription(
+        self,
+        *,
+        document_id: UUID,
+        page_no: int,
+        expected_extracted_text: str | None,
+        expected_extraction_method: str | None,
+        expected_layout_json: dict[str, Any] | None,
+        persisted_text: str,
+        extraction_method: str,
+        layout_json: dict[str, Any],
+    ) -> bool:
+        """Optimistic compare-and-update for a VLM page transcription.
+
+        Locks the current DocumentPage row and updates only when snapshot
+        fields still match. Returns True when the row was updated.
+        """
+        page = self.db.execute(
+            select(DocumentPage)
+            .where(
+                DocumentPage.document_id == document_id,
+                DocumentPage.page_no == page_no,
+            )
+            .with_for_update()
+        ).scalar_one_or_none()
+        if page is None:
+            return False
+        if page.extracted_text != expected_extracted_text:
+            return False
+        if page.extraction_method != expected_extraction_method:
+            return False
+        current_layout = (
+            page.layout_json if isinstance(page.layout_json, dict) else None
+        )
+        if current_layout != expected_layout_json:
+            return False
+        page.extracted_text = persisted_text
+        page.extraction_method = extraction_method
+        page.layout_json = layout_json
+        self.db.add(page)
+        self.db.flush()
+        return True
