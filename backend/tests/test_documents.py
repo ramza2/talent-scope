@@ -1885,6 +1885,119 @@ def test_new_version_reuses_same_group_sha_only(
         _cleanup_user(db_session, admin.id)
 
 
+def test_new_version_same_sha_rejects_document_type_mismatch(
+    client: TestClient, db_session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reuse must not bypass NEW_VERSION document_type_code vs group checks."""
+    suffix = uuid.uuid4().hex[:8]
+    codes = [f"DOC-RESUME-{suffix}", f"DOC-OTHER-{suffix}"]
+    _ensure_code(db_session, codes[0], "DOC_TYPE", "이력서")
+    _ensure_code(db_session, codes[1], "DOC_TYPE", "기타")
+    admin = _create_user(db_session, login_id=f"a_{suffix}", password="Secret123!", role="ADMIN")
+    person_id = None
+    session_ids: list[str] = []
+    monkeypatch.setattr(
+        "app.tasks.document_tasks.enqueue_document_processing", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(
+        "app.modules.analysis.service.AnalysisService.create_analysis_for_ready_document",
+        lambda self, document_id: None,
+    )
+    try:
+        csrf = _login(client, admin.login_id)
+        person_id = _create_person(client, csrf, f"nv_mismatch_reuse_{suffix}")
+        pdf_bytes = b"%PDF-1.4 nv-mismatch-reuse-" + suffix.encode()
+
+        s1 = client.post(
+            "/api/v1/upload-sessions", headers={"X-CSRF-Token": csrf}, json={}
+        ).json()["data"]["id"]
+        session_ids.append(s1)
+        up1 = client.post(
+            f"/api/v1/upload-sessions/{s1}/files",
+            headers={"X-CSRF-Token": csrf},
+            files=[("files", ("v1.pdf", io.BytesIO(pdf_bytes), "application/pdf"))],
+        )
+        fid1 = up1.json()["data"][0]["temp_file_id"]
+        client.patch(
+            f"/api/v1/upload-sessions/{s1}/files/{fid1}",
+            headers={"X-CSRF-Token": csrf},
+            json={"document_type_code": codes[0]},
+        )
+        res1 = client.post(
+            f"/api/v1/upload-sessions/{s1}/resolve",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "mode": "LINK_EXISTING",
+                "person_id": person_id,
+                "document_resolution": [
+                    {
+                        "temp_file_id": fid1,
+                        "mode": "NEW_GROUP",
+                        "document_type_code": codes[0],
+                    }
+                ],
+            },
+        )
+        assert res1.status_code == 201, res1.text
+        doc1 = res1.json()["data"]["document_ids"][0]
+        group_id = client.get(f"/api/v1/documents/{doc1}").json()["data"][
+            "document_group_id"
+        ]
+        _mark_document_ready(db_session, uuid.UUID(doc1))
+        groups_before, docs_before = _count_person_docs(db_session, uuid.UUID(person_id))
+
+        s2 = client.post(
+            "/api/v1/upload-sessions", headers={"X-CSRF-Token": csrf}, json={}
+        ).json()["data"]["id"]
+        session_ids.append(s2)
+        up2 = client.post(
+            f"/api/v1/upload-sessions/{s2}/files",
+            headers={"X-CSRF-Token": csrf},
+            files=[("files", ("v2.pdf", io.BytesIO(pdf_bytes), "application/pdf"))],
+        )
+        fid2 = up2.json()["data"][0]["temp_file_id"]
+        # Intentionally wrong DOC_TYPE vs group — must 400 even with matching SHA.
+        client.patch(
+            f"/api/v1/upload-sessions/{s2}/files/{fid2}",
+            headers={"X-CSRF-Token": csrf},
+            json={"document_type_code": codes[1]},
+        )
+        bad = client.post(
+            f"/api/v1/upload-sessions/{s2}/resolve",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "mode": "LINK_EXISTING",
+                "person_id": person_id,
+                "document_resolution": [
+                    {
+                        "temp_file_id": fid2,
+                        "mode": "NEW_VERSION",
+                        "document_group_id": group_id,
+                        "document_type_code": codes[1],
+                    }
+                ],
+            },
+        )
+        assert bad.status_code == 400, bad.text
+        assert bad.json()["code"] == "VALIDATION_ERROR"
+        body = bad.json()
+        text = str(body.get("detail") or body.get("message") or body)
+        assert "document_type_code" in text or "문서 그룹" in text
+        assert bad.json().get("data") is None or "reused_document_ids" not in (
+            bad.json().get("data") or {}
+        )
+        groups_after, docs_after = _count_person_docs(db_session, uuid.UUID(person_id))
+        assert groups_after == groups_before
+        assert docs_after == docs_before
+    finally:
+        if person_id:
+            _cleanup_person(db_session, uuid.UUID(person_id))
+        for sid in session_ids:
+            _cleanup_session(db_session, uuid.UUID(sid))
+        _cleanup_codes(db_session, codes)
+        _cleanup_user(db_session, admin.id)
+
+
 def test_cross_person_same_sha_creates_new_document(
     client: TestClient, db_session, monkeypatch: pytest.MonkeyPatch
 ) -> None:

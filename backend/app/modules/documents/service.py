@@ -814,6 +814,18 @@ class DocumentService:
         else:
             if item.document_group_id is None:
                 return None
+            group = self.repo.get_group(item.document_group_id, for_update=True)
+            if group is None:
+                raise NotFoundError("문서 그룹을 찾을 수 없습니다.")
+            if group.person_id != person_id:
+                raise ValidationAppError("문서 그룹이 해당 인력에 속하지 않습니다.")
+            if (
+                item.document_type_code
+                and item.document_type_code != group.document_type_code
+            ):
+                raise ValidationAppError(
+                    "NEW_VERSION의 document_type_code가 문서 그룹과 일치하지 않습니다."
+                )
             existing = self.repo.find_reusable_document(
                 person_id,
                 temp.sha256,
