@@ -1111,3 +1111,990 @@ def test_new_version_document_type_mismatch(client: TestClient, db_session) -> N
             _cleanup_session(db_session, uuid.UUID(sid))
         _cleanup_codes(db_session, codes)
         _cleanup_user(db_session, admin.id)
+
+
+# --------------------------------------------------------------------------- SHA reuse (same-person READY)
+
+
+def _mark_document_ready(db_session, document_id) -> None:
+    from app.db.models.document import Document
+
+    doc = db_session.get(Document, document_id)
+    assert doc is not None
+    doc.processing_status = "READY"
+    db_session.add(doc)
+    db_session.commit()
+
+
+def _count_person_docs(db_session, person_id) -> tuple[int, int]:
+    from app.db.models.document import Document, DocumentGroup
+
+    groups = list(
+        db_session.execute(
+            select(DocumentGroup.id).where(DocumentGroup.person_id == person_id)
+        )
+        .scalars()
+        .all()
+    )
+    if not groups:
+        return 0, 0
+    docs = list(
+        db_session.execute(
+            select(Document.id).where(Document.document_group_id.in_(groups))
+        )
+        .scalars()
+        .all()
+    )
+    return len(groups), len(docs)
+
+
+def _cleanup_person_analysis(db_session, person_id) -> None:
+    from app.db.models.analysis import AnalysisDiffItem, AnalysisRun, AnalysisRunDocument
+
+    run_ids = list(
+        db_session.execute(
+            select(AnalysisRun.id).where(AnalysisRun.person_id == person_id)
+        )
+        .scalars()
+        .all()
+    )
+    if run_ids:
+        db_session.execute(
+            delete(AnalysisDiffItem).where(AnalysisDiffItem.analysis_run_id.in_(run_ids))
+        )
+        db_session.execute(
+            delete(AnalysisRunDocument).where(
+                AnalysisRunDocument.analysis_run_id.in_(run_ids)
+            )
+        )
+        db_session.execute(delete(AnalysisRun).where(AnalysisRun.id.in_(run_ids)))
+    db_session.commit()
+
+
+def test_same_person_ready_sha_reuses_document(
+    client: TestClient, db_session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.db.models.revision import AuditLog
+    from app.modules.documents.service import DocumentService
+
+    suffix = uuid.uuid4().hex[:8]
+    codes = [f"DOC-RESUME-{suffix}"]
+    _ensure_code(db_session, codes[0], "DOC_TYPE", "이력서")
+    admin = _create_user(db_session, login_id=f"a_{suffix}", password="Secret123!", role="ADMIN")
+    person_id = None
+    session_ids: list[str] = []
+    enqueue_calls: list = []
+    auto_calls: list = []
+    copy_calls: list = []
+
+    monkeypatch.setattr(
+        "app.tasks.document_tasks.enqueue_document_processing",
+        lambda doc_id: enqueue_calls.append(doc_id),
+    )
+    monkeypatch.setattr(
+        "app.modules.analysis.service.AnalysisService.create_analysis_for_ready_document",
+        lambda self, document_id: auto_calls.append(document_id) or None,
+    )
+
+    orig_init = DocumentService.__init__
+
+    def _init(self, db, storage=None, settings=None):
+        orig_init(self, db, storage=storage, settings=settings)
+        orig_copy = self.storage.copy
+
+        def _tracked_copy(src, dest):
+            copy_calls.append((src, dest))
+            return orig_copy(src, dest)
+
+        self.storage.copy = _tracked_copy  # type: ignore[method-assign]
+
+    monkeypatch.setattr(DocumentService, "__init__", _init)
+
+    try:
+        csrf = _login(client, admin.login_id)
+        person_id = _create_person(client, csrf, f"reuse_{suffix}")
+        pdf_bytes = b"%PDF-1.4 reuse-" + suffix.encode()
+
+        s1 = client.post(
+            "/api/v1/upload-sessions",
+            headers={"X-CSRF-Token": csrf},
+            json={},
+        ).json()["data"]["id"]
+        session_ids.append(s1)
+        up1 = client.post(
+            f"/api/v1/upload-sessions/{s1}/files",
+            headers={"X-CSRF-Token": csrf},
+            files=[("files", ("r.pdf", io.BytesIO(pdf_bytes), "application/pdf"))],
+        )
+        fid1 = up1.json()["data"][0]["temp_file_id"]
+        client.patch(
+            f"/api/v1/upload-sessions/{s1}/files/{fid1}",
+            headers={"X-CSRF-Token": csrf},
+            json={"document_type_code": codes[0]},
+        )
+        res1 = client.post(
+            f"/api/v1/upload-sessions/{s1}/resolve",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "mode": "LINK_EXISTING",
+                "person_id": person_id,
+                "document_resolution": [
+                    {
+                        "temp_file_id": fid1,
+                        "mode": "NEW_GROUP",
+                        "document_type_code": codes[0],
+                    }
+                ],
+            },
+        )
+        assert res1.status_code == 201, res1.text
+        doc_id = res1.json()["data"]["document_ids"][0]
+        assert res1.json()["data"].get("reused_document_ids", []) == []
+        assert enqueue_calls == [uuid.UUID(doc_id)]
+        assert len(copy_calls) >= 1
+        _mark_document_ready(db_session, uuid.UUID(doc_id))
+        groups_before, docs_before = _count_person_docs(db_session, uuid.UUID(person_id))
+        enqueue_calls.clear()
+        auto_calls.clear()
+        copy_calls.clear()
+
+        s2 = client.post(
+            "/api/v1/upload-sessions",
+            headers={"X-CSRF-Token": csrf},
+            json={},
+        ).json()["data"]["id"]
+        session_ids.append(s2)
+        up2 = client.post(
+            f"/api/v1/upload-sessions/{s2}/files",
+            headers={"X-CSRF-Token": csrf},
+            files=[("files", ("r.pdf", io.BytesIO(pdf_bytes), "application/pdf"))],
+        )
+        assert up2.json()["data"][0]["validation_status"] == "DUPLICATE"
+        fid2 = up2.json()["data"][0]["temp_file_id"]
+        client.patch(
+            f"/api/v1/upload-sessions/{s2}/files/{fid2}",
+            headers={"X-CSRF-Token": csrf},
+            json={"document_type_code": codes[0]},
+        )
+
+        res2 = client.post(
+            f"/api/v1/upload-sessions/{s2}/resolve",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "mode": "LINK_EXISTING",
+                "person_id": person_id,
+                "document_resolution": [
+                    {
+                        "temp_file_id": fid2,
+                        "mode": "NEW_GROUP",
+                        "document_type_code": codes[0],
+                    }
+                ],
+            },
+        )
+        assert res2.status_code == 201, res2.text
+        data2 = res2.json()["data"]
+        assert data2["document_ids"] == [doc_id]
+        assert data2["reused_document_ids"] == [doc_id]
+        groups_after, docs_after = _count_person_docs(db_session, uuid.UUID(person_id))
+        assert groups_after == groups_before
+        assert docs_after == docs_before
+        assert enqueue_calls == []
+        assert copy_calls == []
+        assert auto_calls == [uuid.UUID(doc_id)]
+
+        reuse_audits = list(
+            db_session.execute(
+                select(AuditLog).where(AuditLog.action_type == "DOCUMENT_REUSE")
+            )
+            .scalars()
+            .all()
+        )
+        assert any(a.target_id == uuid.UUID(doc_id) for a in reuse_audits)
+    finally:
+        if person_id:
+            _cleanup_person_analysis(db_session, uuid.UUID(person_id))
+            _cleanup_person(db_session, uuid.UUID(person_id))
+        for sid in session_ids:
+            _cleanup_session(db_session, uuid.UUID(sid))
+        _cleanup_codes(db_session, codes)
+        _cleanup_user(db_session, admin.id)
+
+
+def test_reuse_skips_auto_analysis_when_run_exists(
+    client: TestClient, db_session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.db.models.analysis import AnalysisRun, AnalysisRunDocument
+    from app.ai.prompts.profile_extract import CURRENT_PROFILE_PROMPT_VERSION, current_profile_prompt
+
+    suffix = uuid.uuid4().hex[:8]
+    codes = [f"DOC-RESUME-{suffix}"]
+    _ensure_code(db_session, codes[0], "DOC_TYPE", "이력서")
+    admin = _create_user(db_session, login_id=f"a_{suffix}", password="Secret123!", role="ADMIN")
+    person_id = None
+    session_ids: list[str] = []
+    enqueue_calls: list = []
+    real_auto_calls: list = []
+
+    monkeypatch.setattr(
+        "app.tasks.document_tasks.enqueue_document_processing",
+        lambda doc_id: enqueue_calls.append(doc_id),
+    )
+    monkeypatch.setattr(
+        "app.tasks.analysis_tasks.enqueue_profile_analysis",
+        lambda *_a, **_k: None,
+    )
+
+    # Let real create_analysis_for_ready_document run (idempotent skip).
+    from app.modules.analysis.service import AnalysisService
+
+    orig = AnalysisService.create_analysis_for_ready_document
+
+    def _wrap(self, document_id):
+        result = orig(self, document_id)
+        real_auto_calls.append((document_id, result))
+        return result
+
+    monkeypatch.setattr(AnalysisService, "create_analysis_for_ready_document", _wrap)
+
+    try:
+        csrf = _login(client, admin.login_id)
+        person_id = _create_person(client, csrf, f"reuse_run_{suffix}")
+        pdf_bytes = b"%PDF-1.4 reuse-run-" + suffix.encode()
+
+        s1 = client.post(
+            "/api/v1/upload-sessions", headers={"X-CSRF-Token": csrf}, json={}
+        ).json()["data"]["id"]
+        session_ids.append(s1)
+        up1 = client.post(
+            f"/api/v1/upload-sessions/{s1}/files",
+            headers={"X-CSRF-Token": csrf},
+            files=[("files", ("r.pdf", io.BytesIO(pdf_bytes), "application/pdf"))],
+        )
+        fid1 = up1.json()["data"][0]["temp_file_id"]
+        client.patch(
+            f"/api/v1/upload-sessions/{s1}/files/{fid1}",
+            headers={"X-CSRF-Token": csrf},
+            json={"document_type_code": codes[0]},
+        )
+        res1 = client.post(
+            f"/api/v1/upload-sessions/{s1}/resolve",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "mode": "LINK_EXISTING",
+                "person_id": person_id,
+                "document_resolution": [
+                    {
+                        "temp_file_id": fid1,
+                        "mode": "NEW_GROUP",
+                        "document_type_code": codes[0],
+                    }
+                ],
+            },
+        )
+        doc_id = uuid.UUID(res1.json()["data"]["document_ids"][0])
+        _mark_document_ready(db_session, doc_id)
+
+        prompt = current_profile_prompt()
+        run = AnalysisRun(
+            person_id=uuid.UUID(person_id),
+            status="REVIEWING",
+            candidate_json={},
+            base_profile_version=1,
+            prompt_version=prompt.prompt_version,
+            schema_version=prompt.schema_version,
+        )
+        db_session.add(run)
+        db_session.flush()
+        db_session.add(
+            AnalysisRunDocument(analysis_run_id=run.id, document_id=doc_id)
+        )
+        db_session.commit()
+        real_auto_calls.clear()
+        enqueue_calls.clear()
+
+        s2 = client.post(
+            "/api/v1/upload-sessions", headers={"X-CSRF-Token": csrf}, json={}
+        ).json()["data"]["id"]
+        session_ids.append(s2)
+        up2 = client.post(
+            f"/api/v1/upload-sessions/{s2}/files",
+            headers={"X-CSRF-Token": csrf},
+            files=[("files", ("r.pdf", io.BytesIO(pdf_bytes), "application/pdf"))],
+        )
+        fid2 = up2.json()["data"][0]["temp_file_id"]
+        client.patch(
+            f"/api/v1/upload-sessions/{s2}/files/{fid2}",
+            headers={"X-CSRF-Token": csrf},
+            json={"document_type_code": codes[0]},
+        )
+        res2 = client.post(
+            f"/api/v1/upload-sessions/{s2}/resolve",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "mode": "LINK_EXISTING",
+                "person_id": person_id,
+                "document_resolution": [
+                    {
+                        "temp_file_id": fid2,
+                        "mode": "NEW_GROUP",
+                        "document_type_code": codes[0],
+                    }
+                ],
+            },
+        )
+        assert res2.status_code == 201, res2.text
+        assert res2.json()["data"]["reused_document_ids"] == [str(doc_id)]
+        assert enqueue_calls == []
+        assert len(real_auto_calls) == 1
+        assert real_auto_calls[0][0] == doc_id
+        assert real_auto_calls[0][1] is None  # skipped — run exists
+        runs = list(
+            db_session.execute(
+                select(AnalysisRun).where(AnalysisRun.person_id == uuid.UUID(person_id))
+            )
+            .scalars()
+            .all()
+        )
+        assert len(runs) == 1
+    finally:
+        if person_id:
+            _cleanup_person_analysis(db_session, uuid.UUID(person_id))
+            _cleanup_person(db_session, uuid.UUID(person_id))
+        for sid in session_ids:
+            _cleanup_session(db_session, uuid.UUID(sid))
+        _cleanup_codes(db_session, codes)
+        _cleanup_user(db_session, admin.id)
+
+
+def test_different_doc_type_does_not_reuse(
+    client: TestClient, db_session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    suffix = uuid.uuid4().hex[:8]
+    codes = [f"DOC-RESUME-{suffix}", f"DOC-OTHER-{suffix}"]
+    _ensure_code(db_session, codes[0], "DOC_TYPE", "이력서")
+    _ensure_code(db_session, codes[1], "DOC_TYPE", "기타")
+    admin = _create_user(db_session, login_id=f"a_{suffix}", password="Secret123!", role="ADMIN")
+    person_id = None
+    session_ids: list[str] = []
+    monkeypatch.setattr(
+        "app.tasks.document_tasks.enqueue_document_processing", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(
+        "app.modules.analysis.service.AnalysisService.create_analysis_for_ready_document",
+        lambda self, document_id: None,
+    )
+    try:
+        csrf = _login(client, admin.login_id)
+        person_id = _create_person(client, csrf, f"diff_type_{suffix}")
+        pdf_bytes = b"%PDF-1.4 diff-type-" + suffix.encode()
+
+        s1 = client.post(
+            "/api/v1/upload-sessions", headers={"X-CSRF-Token": csrf}, json={}
+        ).json()["data"]["id"]
+        session_ids.append(s1)
+        up1 = client.post(
+            f"/api/v1/upload-sessions/{s1}/files",
+            headers={"X-CSRF-Token": csrf},
+            files=[("files", ("r.pdf", io.BytesIO(pdf_bytes), "application/pdf"))],
+        )
+        fid1 = up1.json()["data"][0]["temp_file_id"]
+        client.patch(
+            f"/api/v1/upload-sessions/{s1}/files/{fid1}",
+            headers={"X-CSRF-Token": csrf},
+            json={"document_type_code": codes[0]},
+        )
+        res1 = client.post(
+            f"/api/v1/upload-sessions/{s1}/resolve",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "mode": "LINK_EXISTING",
+                "person_id": person_id,
+                "document_resolution": [
+                    {
+                        "temp_file_id": fid1,
+                        "mode": "NEW_GROUP",
+                        "document_type_code": codes[0],
+                    }
+                ],
+            },
+        )
+        doc1 = res1.json()["data"]["document_ids"][0]
+        _mark_document_ready(db_session, uuid.UUID(doc1))
+
+        s2 = client.post(
+            "/api/v1/upload-sessions", headers={"X-CSRF-Token": csrf}, json={}
+        ).json()["data"]["id"]
+        session_ids.append(s2)
+        up2 = client.post(
+            f"/api/v1/upload-sessions/{s2}/files",
+            headers={"X-CSRF-Token": csrf},
+            files=[("files", ("r.pdf", io.BytesIO(pdf_bytes), "application/pdf"))],
+        )
+        fid2 = up2.json()["data"][0]["temp_file_id"]
+        client.patch(
+            f"/api/v1/upload-sessions/{s2}/files/{fid2}",
+            headers={"X-CSRF-Token": csrf},
+            json={"document_type_code": codes[1]},
+        )
+        res2 = client.post(
+            f"/api/v1/upload-sessions/{s2}/resolve",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "mode": "LINK_EXISTING",
+                "person_id": person_id,
+                "document_resolution": [
+                    {
+                        "temp_file_id": fid2,
+                        "mode": "NEW_GROUP",
+                        "document_type_code": codes[1],
+                    }
+                ],
+            },
+        )
+        assert res2.status_code == 201, res2.text
+        doc2 = res2.json()["data"]["document_ids"][0]
+        assert doc2 != doc1
+        assert res2.json()["data"]["reused_document_ids"] == []
+        _, docs = _count_person_docs(db_session, uuid.UUID(person_id))
+        assert docs == 2
+    finally:
+        if person_id:
+            _cleanup_person(db_session, uuid.UUID(person_id))
+        for sid in session_ids:
+            _cleanup_session(db_session, uuid.UUID(sid))
+        _cleanup_codes(db_session, codes)
+        _cleanup_user(db_session, admin.id)
+
+
+def test_deleted_person_sha_not_duplicate_and_soft_deleted_not_reusable(
+    client: TestClient, db_session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from datetime import UTC, datetime
+
+    from app.db.models.document import Document, DocumentGroup
+    from app.db.models.person import Person
+
+    suffix = uuid.uuid4().hex[:8]
+    codes = [f"DOC-RESUME-{suffix}"]
+    _ensure_code(db_session, codes[0], "DOC_TYPE", "이력서")
+    admin = _create_user(db_session, login_id=f"a_{suffix}", password="Secret123!", role="ADMIN")
+    person_a = None
+    person_b = None
+    session_ids: list[str] = []
+    monkeypatch.setattr(
+        "app.tasks.document_tasks.enqueue_document_processing", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(
+        "app.modules.analysis.service.AnalysisService.create_analysis_for_ready_document",
+        lambda self, document_id: None,
+    )
+    try:
+        csrf = _login(client, admin.login_id)
+        person_a = _create_person(client, csrf, f"del_a_{suffix}")
+        pdf_bytes = b"%PDF-1.4 deleted-person-" + suffix.encode()
+
+        s1 = client.post(
+            "/api/v1/upload-sessions", headers={"X-CSRF-Token": csrf}, json={}
+        ).json()["data"]["id"]
+        session_ids.append(s1)
+        up1 = client.post(
+            f"/api/v1/upload-sessions/{s1}/files",
+            headers={"X-CSRF-Token": csrf},
+            files=[("files", ("r.pdf", io.BytesIO(pdf_bytes), "application/pdf"))],
+        )
+        fid1 = up1.json()["data"][0]["temp_file_id"]
+        client.patch(
+            f"/api/v1/upload-sessions/{s1}/files/{fid1}",
+            headers={"X-CSRF-Token": csrf},
+            json={"document_type_code": codes[0]},
+        )
+        res1 = client.post(
+            f"/api/v1/upload-sessions/{s1}/resolve",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "mode": "LINK_EXISTING",
+                "person_id": person_a,
+                "document_resolution": [
+                    {
+                        "temp_file_id": fid1,
+                        "mode": "NEW_GROUP",
+                        "document_type_code": codes[0],
+                    }
+                ],
+            },
+        )
+        doc_a = uuid.UUID(res1.json()["data"]["document_ids"][0])
+        _mark_document_ready(db_session, doc_a)
+        person_row = db_session.get(Person, uuid.UUID(person_a))
+        assert person_row is not None
+        person_row.status = "DELETED"
+        db_session.commit()
+
+        person_b = _create_person(client, csrf, f"del_b_{suffix}")
+        s2 = client.post(
+            "/api/v1/upload-sessions", headers={"X-CSRF-Token": csrf}, json={}
+        ).json()["data"]["id"]
+        session_ids.append(s2)
+        up2 = client.post(
+            f"/api/v1/upload-sessions/{s2}/files",
+            headers={"X-CSRF-Token": csrf},
+            files=[("files", ("r.pdf", io.BytesIO(pdf_bytes), "application/pdf"))],
+        )
+        assert up2.json()["data"][0]["validation_status"] != "DUPLICATE"
+
+        # Soft-deleted document on active person is not reusable.
+        person_row.status = "ACTIVE"
+        db_session.commit()
+        person_c = _create_person(client, csrf, f"del_c_{suffix}")
+        # Put soft-deleted doc under person_c then upload same sha with NEW_GROUP.
+        # Simpler: soft-delete person_a's doc while ACTIVE, upload again on person_a.
+        doc = db_session.get(Document, doc_a)
+        assert doc is not None
+        doc.deleted_at = datetime.now(UTC)
+        db_session.commit()
+
+        s3 = client.post(
+            "/api/v1/upload-sessions", headers={"X-CSRF-Token": csrf}, json={}
+        ).json()["data"]["id"]
+        session_ids.append(s3)
+        up3 = client.post(
+            f"/api/v1/upload-sessions/{s3}/files",
+            headers={"X-CSRF-Token": csrf},
+            files=[("files", ("r.pdf", io.BytesIO(pdf_bytes), "application/pdf"))],
+        )
+        # Soft-deleted only — no active doc → not DUPLICATE
+        assert up3.json()["data"][0]["validation_status"] != "DUPLICATE"
+        fid3 = up3.json()["data"][0]["temp_file_id"]
+        client.patch(
+            f"/api/v1/upload-sessions/{s3}/files/{fid3}",
+            headers={"X-CSRF-Token": csrf},
+            json={"document_type_code": codes[0]},
+        )
+        res3 = client.post(
+            f"/api/v1/upload-sessions/{s3}/resolve",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "mode": "LINK_EXISTING",
+                "person_id": person_a,
+                "document_resolution": [
+                    {
+                        "temp_file_id": fid3,
+                        "mode": "NEW_GROUP",
+                        "document_type_code": codes[0],
+                    }
+                ],
+            },
+        )
+        assert res3.status_code == 201, res3.text
+        assert res3.json()["data"]["reused_document_ids"] == []
+        assert res3.json()["data"]["document_ids"][0] != str(doc_a)
+        _ = person_c  # created for isolation; cleaned below if needed
+        _cleanup_person(db_session, uuid.UUID(person_c))
+        person_c = None
+    finally:
+        if person_a:
+            _cleanup_person(db_session, uuid.UUID(person_a))
+        if person_b:
+            _cleanup_person(db_session, uuid.UUID(person_b))
+        for sid in session_ids:
+            _cleanup_session(db_session, uuid.UUID(sid))
+        _cleanup_codes(db_session, codes)
+        _cleanup_user(db_session, admin.id)
+
+
+def test_resolve_rejects_duplicate_sha_in_same_request(
+    client: TestClient, db_session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    suffix = uuid.uuid4().hex[:8]
+    codes = [f"DOC-RESUME-{suffix}"]
+    _ensure_code(db_session, codes[0], "DOC_TYPE", "이력서")
+    admin = _create_user(db_session, login_id=f"a_{suffix}", password="Secret123!", role="ADMIN")
+    person_id = None
+    session_id = None
+    monkeypatch.setattr(
+        "app.tasks.document_tasks.enqueue_document_processing", lambda *_a, **_k: None
+    )
+    try:
+        csrf = _login(client, admin.login_id)
+        person_id = _create_person(client, csrf, f"dup_req_{suffix}")
+        pdf_bytes = b"%PDF-1.4 same-req-" + suffix.encode()
+        session_id = client.post(
+            "/api/v1/upload-sessions", headers={"X-CSRF-Token": csrf}, json={}
+        ).json()["data"]["id"]
+        # Upload same content twice via two requests (session allows? second is DUPLICATE in session)
+        # Session find_sha256_in_session will mark second as DUPLICATE but still create temp.
+        up1 = client.post(
+            f"/api/v1/upload-sessions/{session_id}/files",
+            headers={"X-CSRF-Token": csrf},
+            files=[("files", ("a.pdf", io.BytesIO(pdf_bytes), "application/pdf"))],
+        )
+        # Force two temps with same SHA by uploading once then cloning via second upload —
+        # find_sha256_in_session blocks? It still creates with DUPLICATE status.
+        up2 = client.post(
+            f"/api/v1/upload-sessions/{session_id}/files",
+            headers={"X-CSRF-Token": csrf},
+            files=[("files", ("b.pdf", io.BytesIO(pdf_bytes), "application/pdf"))],
+        )
+        assert up1.status_code == 201 and up2.status_code == 201
+        fid1 = up1.json()["data"][0]["temp_file_id"]
+        fid2 = up2.json()["data"][0]["temp_file_id"]
+        assert fid1 != fid2
+        for fid in (fid1, fid2):
+            client.patch(
+                f"/api/v1/upload-sessions/{session_id}/files/{fid}",
+                headers={"X-CSRF-Token": csrf},
+                json={"document_type_code": codes[0]},
+            )
+        bad = client.post(
+            f"/api/v1/upload-sessions/{session_id}/resolve",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "mode": "LINK_EXISTING",
+                "person_id": person_id,
+                "document_resolution": [
+                    {
+                        "temp_file_id": fid1,
+                        "mode": "NEW_GROUP",
+                        "document_type_code": codes[0],
+                    },
+                    {
+                        "temp_file_id": fid2,
+                        "mode": "NEW_GROUP",
+                        "document_type_code": codes[0],
+                    },
+                ],
+            },
+        )
+        assert bad.status_code == 400, bad.text
+        assert bad.json()["code"] == "VALIDATION_ERROR"
+        body = bad.json()
+        text = str(body.get("message") or body.get("detail") or body)
+        assert "중복" in text
+        _, docs = _count_person_docs(db_session, uuid.UUID(person_id))
+        assert docs == 0
+    finally:
+        if person_id:
+            _cleanup_person(db_session, uuid.UUID(person_id))
+        if session_id:
+            _cleanup_session(db_session, uuid.UUID(session_id))
+        _cleanup_codes(db_session, codes)
+        _cleanup_user(db_session, admin.id)
+
+
+def test_new_version_reuses_same_group_sha_only(
+    client: TestClient, db_session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    suffix = uuid.uuid4().hex[:8]
+    codes = [f"DOC-RESUME-{suffix}"]
+    _ensure_code(db_session, codes[0], "DOC_TYPE", "이력서")
+    admin = _create_user(db_session, login_id=f"a_{suffix}", password="Secret123!", role="ADMIN")
+    person_id = None
+    session_ids: list[str] = []
+    enqueue_calls: list = []
+    monkeypatch.setattr(
+        "app.tasks.document_tasks.enqueue_document_processing",
+        lambda doc_id: enqueue_calls.append(doc_id),
+    )
+    monkeypatch.setattr(
+        "app.modules.analysis.service.AnalysisService.create_analysis_for_ready_document",
+        lambda self, document_id: None,
+    )
+    try:
+        csrf = _login(client, admin.login_id)
+        person_id = _create_person(client, csrf, f"nv_reuse_{suffix}")
+        pdf_bytes = b"%PDF-1.4 nv-reuse-" + suffix.encode()
+
+        s1 = client.post(
+            "/api/v1/upload-sessions", headers={"X-CSRF-Token": csrf}, json={}
+        ).json()["data"]["id"]
+        session_ids.append(s1)
+        up1 = client.post(
+            f"/api/v1/upload-sessions/{s1}/files",
+            headers={"X-CSRF-Token": csrf},
+            files=[("files", ("v1.pdf", io.BytesIO(pdf_bytes), "application/pdf"))],
+        )
+        fid1 = up1.json()["data"][0]["temp_file_id"]
+        client.patch(
+            f"/api/v1/upload-sessions/{s1}/files/{fid1}",
+            headers={"X-CSRF-Token": csrf},
+            json={"document_type_code": codes[0]},
+        )
+        res1 = client.post(
+            f"/api/v1/upload-sessions/{s1}/resolve",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "mode": "LINK_EXISTING",
+                "person_id": person_id,
+                "document_resolution": [
+                    {
+                        "temp_file_id": fid1,
+                        "mode": "NEW_GROUP",
+                        "document_type_code": codes[0],
+                    }
+                ],
+            },
+        )
+        doc1 = res1.json()["data"]["document_ids"][0]
+        group_id = client.get(f"/api/v1/documents/{doc1}").json()["data"][
+            "document_group_id"
+        ]
+        _mark_document_ready(db_session, uuid.UUID(doc1))
+        enqueue_calls.clear()
+        groups_before, docs_before = _count_person_docs(db_session, uuid.UUID(person_id))
+
+        s2 = client.post(
+            "/api/v1/upload-sessions", headers={"X-CSRF-Token": csrf}, json={}
+        ).json()["data"]["id"]
+        session_ids.append(s2)
+        up2 = client.post(
+            f"/api/v1/upload-sessions/{s2}/files",
+            headers={"X-CSRF-Token": csrf},
+            files=[("files", ("v2.pdf", io.BytesIO(pdf_bytes), "application/pdf"))],
+        )
+        fid2 = up2.json()["data"][0]["temp_file_id"]
+        res2 = client.post(
+            f"/api/v1/upload-sessions/{s2}/resolve",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "mode": "LINK_EXISTING",
+                "person_id": person_id,
+                "document_resolution": [
+                    {
+                        "temp_file_id": fid2,
+                        "mode": "NEW_VERSION",
+                        "document_group_id": group_id,
+                        "document_type_code": codes[0],
+                    }
+                ],
+            },
+        )
+        assert res2.status_code == 201, res2.text
+        assert res2.json()["data"]["document_ids"] == [doc1]
+        assert res2.json()["data"]["reused_document_ids"] == [doc1]
+        assert enqueue_calls == []
+        groups_after, docs_after = _count_person_docs(db_session, uuid.UUID(person_id))
+        assert groups_after == groups_before
+        assert docs_after == docs_before
+    finally:
+        if person_id:
+            _cleanup_person(db_session, uuid.UUID(person_id))
+        for sid in session_ids:
+            _cleanup_session(db_session, uuid.UUID(sid))
+        _cleanup_codes(db_session, codes)
+        _cleanup_user(db_session, admin.id)
+
+
+def test_new_version_same_sha_rejects_document_type_mismatch(
+    client: TestClient, db_session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reuse must not bypass NEW_VERSION document_type_code vs group checks."""
+    suffix = uuid.uuid4().hex[:8]
+    codes = [f"DOC-RESUME-{suffix}", f"DOC-OTHER-{suffix}"]
+    _ensure_code(db_session, codes[0], "DOC_TYPE", "이력서")
+    _ensure_code(db_session, codes[1], "DOC_TYPE", "기타")
+    admin = _create_user(db_session, login_id=f"a_{suffix}", password="Secret123!", role="ADMIN")
+    person_id = None
+    session_ids: list[str] = []
+    monkeypatch.setattr(
+        "app.tasks.document_tasks.enqueue_document_processing", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(
+        "app.modules.analysis.service.AnalysisService.create_analysis_for_ready_document",
+        lambda self, document_id: None,
+    )
+    try:
+        csrf = _login(client, admin.login_id)
+        person_id = _create_person(client, csrf, f"nv_mismatch_reuse_{suffix}")
+        pdf_bytes = b"%PDF-1.4 nv-mismatch-reuse-" + suffix.encode()
+
+        s1 = client.post(
+            "/api/v1/upload-sessions", headers={"X-CSRF-Token": csrf}, json={}
+        ).json()["data"]["id"]
+        session_ids.append(s1)
+        up1 = client.post(
+            f"/api/v1/upload-sessions/{s1}/files",
+            headers={"X-CSRF-Token": csrf},
+            files=[("files", ("v1.pdf", io.BytesIO(pdf_bytes), "application/pdf"))],
+        )
+        fid1 = up1.json()["data"][0]["temp_file_id"]
+        client.patch(
+            f"/api/v1/upload-sessions/{s1}/files/{fid1}",
+            headers={"X-CSRF-Token": csrf},
+            json={"document_type_code": codes[0]},
+        )
+        res1 = client.post(
+            f"/api/v1/upload-sessions/{s1}/resolve",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "mode": "LINK_EXISTING",
+                "person_id": person_id,
+                "document_resolution": [
+                    {
+                        "temp_file_id": fid1,
+                        "mode": "NEW_GROUP",
+                        "document_type_code": codes[0],
+                    }
+                ],
+            },
+        )
+        assert res1.status_code == 201, res1.text
+        doc1 = res1.json()["data"]["document_ids"][0]
+        group_id = client.get(f"/api/v1/documents/{doc1}").json()["data"][
+            "document_group_id"
+        ]
+        _mark_document_ready(db_session, uuid.UUID(doc1))
+        groups_before, docs_before = _count_person_docs(db_session, uuid.UUID(person_id))
+
+        s2 = client.post(
+            "/api/v1/upload-sessions", headers={"X-CSRF-Token": csrf}, json={}
+        ).json()["data"]["id"]
+        session_ids.append(s2)
+        up2 = client.post(
+            f"/api/v1/upload-sessions/{s2}/files",
+            headers={"X-CSRF-Token": csrf},
+            files=[("files", ("v2.pdf", io.BytesIO(pdf_bytes), "application/pdf"))],
+        )
+        fid2 = up2.json()["data"][0]["temp_file_id"]
+        # Intentionally wrong DOC_TYPE vs group — must 400 even with matching SHA.
+        client.patch(
+            f"/api/v1/upload-sessions/{s2}/files/{fid2}",
+            headers={"X-CSRF-Token": csrf},
+            json={"document_type_code": codes[1]},
+        )
+        bad = client.post(
+            f"/api/v1/upload-sessions/{s2}/resolve",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "mode": "LINK_EXISTING",
+                "person_id": person_id,
+                "document_resolution": [
+                    {
+                        "temp_file_id": fid2,
+                        "mode": "NEW_VERSION",
+                        "document_group_id": group_id,
+                        "document_type_code": codes[1],
+                    }
+                ],
+            },
+        )
+        assert bad.status_code == 400, bad.text
+        assert bad.json()["code"] == "VALIDATION_ERROR"
+        body = bad.json()
+        text = str(body.get("detail") or body.get("message") or body)
+        assert "document_type_code" in text or "문서 그룹" in text
+        assert bad.json().get("data") is None or "reused_document_ids" not in (
+            bad.json().get("data") or {}
+        )
+        groups_after, docs_after = _count_person_docs(db_session, uuid.UUID(person_id))
+        assert groups_after == groups_before
+        assert docs_after == docs_before
+    finally:
+        if person_id:
+            _cleanup_person(db_session, uuid.UUID(person_id))
+        for sid in session_ids:
+            _cleanup_session(db_session, uuid.UUID(sid))
+        _cleanup_codes(db_session, codes)
+        _cleanup_user(db_session, admin.id)
+
+
+def test_cross_person_same_sha_creates_new_document(
+    client: TestClient, db_session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    suffix = uuid.uuid4().hex[:8]
+    codes = [f"DOC-RESUME-{suffix}"]
+    _ensure_code(db_session, codes[0], "DOC_TYPE", "이력서")
+    admin = _create_user(db_session, login_id=f"a_{suffix}", password="Secret123!", role="ADMIN")
+    person_a = None
+    person_b = None
+    session_ids: list[str] = []
+    monkeypatch.setattr(
+        "app.tasks.document_tasks.enqueue_document_processing", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(
+        "app.modules.analysis.service.AnalysisService.create_analysis_for_ready_document",
+        lambda self, document_id: None,
+    )
+    try:
+        csrf = _login(client, admin.login_id)
+        person_a = _create_person(client, csrf, f"cross_a_{suffix}")
+        person_b = _create_person(client, csrf, f"cross_b_{suffix}")
+        pdf_bytes = b"%PDF-1.4 cross-" + suffix.encode()
+
+        s1 = client.post(
+            "/api/v1/upload-sessions", headers={"X-CSRF-Token": csrf}, json={}
+        ).json()["data"]["id"]
+        session_ids.append(s1)
+        up1 = client.post(
+            f"/api/v1/upload-sessions/{s1}/files",
+            headers={"X-CSRF-Token": csrf},
+            files=[("files", ("r.pdf", io.BytesIO(pdf_bytes), "application/pdf"))],
+        )
+        fid1 = up1.json()["data"][0]["temp_file_id"]
+        client.patch(
+            f"/api/v1/upload-sessions/{s1}/files/{fid1}",
+            headers={"X-CSRF-Token": csrf},
+            json={"document_type_code": codes[0]},
+        )
+        res1 = client.post(
+            f"/api/v1/upload-sessions/{s1}/resolve",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "mode": "LINK_EXISTING",
+                "person_id": person_a,
+                "document_resolution": [
+                    {
+                        "temp_file_id": fid1,
+                        "mode": "NEW_GROUP",
+                        "document_type_code": codes[0],
+                    }
+                ],
+            },
+        )
+        doc_a = res1.json()["data"]["document_ids"][0]
+        _mark_document_ready(db_session, uuid.UUID(doc_a))
+
+        s2 = client.post(
+            "/api/v1/upload-sessions", headers={"X-CSRF-Token": csrf}, json={}
+        ).json()["data"]["id"]
+        session_ids.append(s2)
+        up2 = client.post(
+            f"/api/v1/upload-sessions/{s2}/files",
+            headers={"X-CSRF-Token": csrf},
+            files=[("files", ("r.pdf", io.BytesIO(pdf_bytes), "application/pdf"))],
+        )
+        assert up2.json()["data"][0]["validation_status"] == "DUPLICATE"
+        fid2 = up2.json()["data"][0]["temp_file_id"]
+        client.patch(
+            f"/api/v1/upload-sessions/{s2}/files/{fid2}",
+            headers={"X-CSRF-Token": csrf},
+            json={"document_type_code": codes[0]},
+        )
+        res2 = client.post(
+            f"/api/v1/upload-sessions/{s2}/resolve",
+            headers={"X-CSRF-Token": csrf},
+            json={
+                "mode": "LINK_EXISTING",
+                "person_id": person_b,
+                "document_resolution": [
+                    {
+                        "temp_file_id": fid2,
+                        "mode": "NEW_GROUP",
+                        "document_type_code": codes[0],
+                    }
+                ],
+            },
+        )
+        assert res2.status_code == 201, res2.text
+        doc_b = res2.json()["data"]["document_ids"][0]
+        assert doc_b != doc_a
+        assert res2.json()["data"]["reused_document_ids"] == []
+    finally:
+        if person_a:
+            _cleanup_person(db_session, uuid.UUID(person_a))
+        if person_b:
+            _cleanup_person(db_session, uuid.UUID(person_b))
+        for sid in session_ids:
+            _cleanup_session(db_session, uuid.UUID(sid))
+        _cleanup_codes(db_session, codes)
+        _cleanup_user(db_session, admin.id)

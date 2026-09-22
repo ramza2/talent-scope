@@ -567,11 +567,28 @@ class DocumentService:
             raise NotFoundError("인력 프로필을 찾을 수 없습니다.")
         profile_version = int(profile.profile_version)
 
+        self._assert_unique_sha_in_resolution(session, payload.document_resolution)
+
         document_ids: list[UUID] = []
+        new_document_ids: list[UUID] = []
+        reused_document_ids: list[UUID] = []
         created_permanent_keys: list[str] = []
         source_temp_keys: list[str] = []
         try:
             for item in payload.document_resolution:
+                reused = self._try_reuse_temp_file(
+                    session=session,
+                    person_id=person.id,
+                    item=item,
+                    actor_user_id=actor_user_id,
+                )
+                if reused is not None:
+                    doc_id, temp_key = reused
+                    document_ids.append(doc_id)
+                    reused_document_ids.append(doc_id)
+                    source_temp_keys.append(temp_key)
+                    continue
+
                 doc_id, dest_key, temp_key = self._promote_temp_file(
                     session=session,
                     person_id=person.id,
@@ -580,6 +597,7 @@ class DocumentService:
                     created_permanent_keys=created_permanent_keys,
                 )
                 document_ids.append(doc_id)
+                new_document_ids.append(doc_id)
                 source_temp_keys.append(temp_key)
 
             session.status = "RESOLVED"
@@ -594,6 +612,7 @@ class DocumentService:
                     "mode": "LINK_EXISTING",
                     "person_id": str(person.id),
                     "document_ids": [str(i) for i in document_ids],
+                    "reused_document_ids": [str(i) for i in reused_document_ids],
                 },
             )
             self.db.commit()
@@ -616,13 +635,15 @@ class DocumentService:
                     exc_info=True,
                 )
 
-        self._enqueue_processing(document_ids)
+        self._enqueue_processing(new_document_ids)
+        self._maybe_auto_analyze_reused(reused_document_ids)
 
         return {
             "person_id": person.id,
             "document_ids": document_ids,
             "profile_version": profile_version,
             "upload_session_id": session.id,
+            "reused_document_ids": reused_document_ids,
         }
 
     def _resolve_create_new(
@@ -646,6 +667,8 @@ class DocumentService:
             raise UploadSessionStateConflictError(
                 "CREATE_NEW는 IDENTIFIED 상태에서만 가능합니다."
             )
+
+        self._assert_unique_sha_in_resolution(session, payload.document_resolution)
 
         people_repo = PeopleRepository(self.db)
         document_ids: list[UUID] = []
@@ -690,6 +713,7 @@ class DocumentService:
             people_repo.enqueue_rebuild_person(person.id, profile.profile_version)
 
             for item in payload.document_resolution:
+                # Never reuse another person's Document on CREATE_NEW.
                 doc_id, dest_key, temp_key = self._promote_temp_file(
                     session=session,
                     person_id=person.id,
@@ -712,6 +736,7 @@ class DocumentService:
                     "mode": "CREATE_NEW",
                     "person_id": str(person.id),
                     "document_ids": [str(i) for i in document_ids],
+                    "reused_document_ids": [],
                 },
                 metadata={"source": "UPLOAD_IDENTIFY"},
             )
@@ -744,13 +769,115 @@ class DocumentService:
             "document_ids": document_ids,
             "profile_version": profile_version,
             "upload_session_id": session_id,
+            "reused_document_ids": [],
         }
+
+    def _assert_unique_sha_in_resolution(
+        self,
+        session: UploadSession,
+        items: list[DocumentResolutionItem],
+    ) -> None:
+        seen: set[str] = set()
+        for item in items:
+            temp = self.repo.get_temp_file(item.temp_file_id)
+            if temp is None or temp.upload_session_id != session.id:
+                raise NotFoundError("임시 파일을 찾을 수 없습니다.")
+            if temp.sha256 in seen:
+                raise ValidationAppError("동일한 파일이 중복 선택되었습니다.")
+            seen.add(temp.sha256)
+
+    def _try_reuse_temp_file(
+        self,
+        *,
+        session: UploadSession,
+        person_id: UUID,
+        item: DocumentResolutionItem,
+        actor_user_id: UUID,
+    ) -> tuple[UUID, str] | None:
+        """Reuse same-person READY document when SHA (+ type/group) match.
+
+        Returns ``(document_id, temp_storage_key)`` or None to fall back to promote.
+        """
+        temp = self.repo.get_temp_file(item.temp_file_id, for_update=True)
+        if temp is None or temp.upload_session_id != session.id:
+            raise NotFoundError("임시 파일을 찾을 수 없습니다.")
+
+        if item.mode == "NEW_GROUP":
+            doc_type = item.document_type_code or temp.document_type_code
+            if not doc_type:
+                return None
+            existing = self.repo.find_reusable_document(
+                person_id,
+                temp.sha256,
+                document_type_code=doc_type,
+            )
+        else:
+            if item.document_group_id is None:
+                return None
+            group = self.repo.get_group(item.document_group_id, for_update=True)
+            if group is None:
+                raise NotFoundError("문서 그룹을 찾을 수 없습니다.")
+            if group.person_id != person_id:
+                raise ValidationAppError("문서 그룹이 해당 인력에 속하지 않습니다.")
+            if (
+                item.document_type_code
+                and item.document_type_code != group.document_type_code
+            ):
+                raise ValidationAppError(
+                    "NEW_VERSION의 document_type_code가 문서 그룹과 일치하지 않습니다."
+                )
+            existing = self.repo.find_reusable_document(
+                person_id,
+                temp.sha256,
+                document_group_id=item.document_group_id,
+            )
+
+        if existing is None:
+            return None
+
+        temp_key = temp.temp_storage_key
+        temp_file_id = temp.id
+        self.repo.delete_temp_file(temp_file_id)
+        self.repo.add_audit(
+            action_type="DOCUMENT_REUSE",
+            actor_user_id=actor_user_id,
+            target_type="DOCUMENT",
+            target_id=existing.id,
+            after={
+                "document_id": str(existing.id),
+                "person_id": str(person_id),
+                "temp_file_id": str(temp_file_id),
+            },
+        )
+        return existing.id, temp_key
 
     def _enqueue_processing(self, document_ids: list[UUID]) -> None:
         from app.tasks.document_tasks import enqueue_document_processing
 
         for doc_id in document_ids:
             enqueue_document_processing(doc_id)
+
+    def _maybe_auto_analyze_reused(self, document_ids: list[UUID]) -> None:
+        """Best-effort PROFILE analysis for reused READY docs (never fails resolve)."""
+        if not document_ids:
+            return
+        try:
+            from app.modules.analysis.service import AnalysisService
+
+            service = AnalysisService(self.db, storage=self.storage)
+            for doc_id in document_ids:
+                try:
+                    service.create_analysis_for_ready_document(doc_id)
+                except Exception:
+                    logger.exception(
+                        "auto analysis after reuse failed document_id=%s",
+                        doc_id,
+                    )
+        except Exception:
+            logger.exception(
+                "auto analysis after reuse setup failed document_ids=%s",
+                [str(i) for i in document_ids],
+            )
 
     def _promote_temp_file(
         self,

@@ -162,6 +162,7 @@ export function resolveUploadSession(
       document_ids: string[]
       profile_version: number
       upload_session_id: string
+      reused_document_ids?: string[]
     }
   }>(`/upload-sessions/${sessionId}/resolve`, {
     method: 'POST',
