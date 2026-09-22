@@ -54,7 +54,9 @@ from app.modules.analysis.source_builder import (
     AnalysisSourceBuilder,
     DocumentSnapshot,
     PageSnapshot,
+    VLMPageTranscription,
 )
+from app.modules.search.document_chunk_sync import DocumentChunkSyncService
 from app.storage.base import ObjectStorage
 from app.storage.s3 import get_object_storage
 
@@ -387,6 +389,13 @@ class AnalysisService:
                 list(claimed.documents),
                 log_context={"analysis_run_id": str(run_id)},
             )
+            # Persist successful VLM page text before LLM so retries/search can
+            # reuse it even when the analysis later fails.
+            if bundle.vlm_transcriptions:
+                self._persist_vlm_transcriptions(
+                    bundle.vlm_transcriptions,
+                    analysis_run_id=run_id,
+                )
             prompt_source = bundle.build_prompt_source(
                 int(self.settings.analysis_max_total_text_chars)
             )
@@ -500,6 +509,65 @@ class AnalysisService:
             logger.exception("analysis failed run_id=%s", run_id)
             self.db.rollback()
             return self._fail_run(run_id, exc, actor_user_id=actor_user_id)
+
+    def _persist_vlm_transcriptions(
+        self,
+        transcriptions: list[VLMPageTranscription],
+        *,
+        analysis_run_id: UUID,
+    ) -> None:
+        """Write successful VLM page text and re-ensure DocumentChunk sync jobs.
+
+        Failures propagate to ``run_analysis`` so analysis does not reach
+        REVIEWING without persisting acquired VLM text. Already-committed page
+        text is not rolled back if LLM fails later.
+        """
+        if not transcriptions:
+            return
+
+        persisted = 0
+        skipped = 0
+        group_ids: set[UUID] = set()
+        for item in transcriptions:
+            updated = self.repo.try_update_page_vlm_transcription(
+                document_id=item.document_id,
+                page_no=item.page_no,
+                expected_extracted_text=item.expected_extracted_text,
+                expected_extraction_method=item.expected_extraction_method,
+                expected_layout_json=item.expected_layout_json,
+                persisted_text=item.persisted_text,
+                extraction_method=item.extraction_method,
+                layout_json=item.layout_json,
+            )
+            if not updated:
+                skipped += 1
+                logger.info(
+                    "vlm page persist skipped analysis_run_id=%s document_id=%s "
+                    "page_no=%s",
+                    analysis_run_id,
+                    item.document_id,
+                    item.page_no,
+                )
+                continue
+            persisted += 1
+            group_id = self.repo.get_document_group_id(item.document_id)
+            if group_id is not None:
+                group_ids.add(group_id)
+
+        sync = DocumentChunkSyncService(self.db)
+        for group_id in sorted(group_ids, key=str):
+            sync.ensure_sync_job(group_id)
+
+        self.db.commit()
+        logger.info(
+            "vlm page persist analysis_run_id=%s persisted=%s skipped=%s "
+            "groups=%s vlm_pages=%s",
+            analysis_run_id,
+            persisted,
+            skipped,
+            len(group_ids),
+            len(transcriptions),
+        )
 
     def _claim_and_snapshot(self, run_id: UUID) -> _RunContext | str:
         claimed = self.repo.try_claim_analysis(run_id)

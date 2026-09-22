@@ -5457,3 +5457,424 @@ def test_confirm_succeeds_when_stale_cleanup_raises(
     assert profile.profile_version == 2
 
     _cleanup_person(db_session, person.id, admin.id)
+
+
+# ---------------------------------------------------------------------------
+# VLM transcription persistence (scanned PDF → DocumentPage → re-index)
+# ---------------------------------------------------------------------------
+
+
+def _minimal_blank_pdf_bytes() -> bytes:
+    import pymupdf
+
+    doc = pymupdf.open()
+    doc.new_page()
+    data = doc.tobytes()
+    doc.close()
+    return data
+
+
+def _cleanup_person_with_search(db_session, person_id, user_id) -> None:
+    from app.db.models.document import Document, DocumentChunk, DocumentGroup
+    from app.db.models.search import SearchIndexItem, SearchIndexJob
+
+    group_ids = list(
+        db_session.execute(
+            select(DocumentGroup.id).where(DocumentGroup.person_id == person_id)
+        )
+        .scalars()
+        .all()
+    )
+    doc_ids: list = []
+    if group_ids:
+        doc_ids = list(
+            db_session.execute(
+                select(Document.id).where(Document.document_group_id.in_(group_ids))
+            )
+            .scalars()
+            .all()
+        )
+    if doc_ids:
+        db_session.execute(
+            delete(DocumentChunk).where(DocumentChunk.document_id.in_(doc_ids))
+        )
+    db_session.execute(
+        delete(SearchIndexItem).where(SearchIndexItem.person_id == person_id)
+    )
+    db_session.execute(
+        delete(SearchIndexJob).where(SearchIndexJob.person_id == person_id)
+    )
+    db_session.commit()
+    _cleanup_person(db_session, person_id, user_id)
+
+
+def _seed_scanned_pdf_person(
+    db_session,
+    user_id,
+    *,
+    extracted_text: str | None = None,
+    layout_json: dict | None = None,
+    extraction_method: str = "TEXT_PARSER",
+    storage_key: str | None = None,
+):
+    """READY PDF with a page that typically needs VLM (scanned / short text)."""
+    from app.db.models.document import Document, DocumentGroup, DocumentPage
+    from app.db.models.person import Person, PersonProfile
+    from app.db.models.revision import ProfileRevision
+    from app.modules.people.snapshot import build_confirmed_profile_snapshot
+    from app.storage.s3 import build_object_storage, reset_object_storage_cache
+
+    _ensure_named_doc_type(db_session, code="DOC-RESUME", name="이력서")
+    reset_object_storage_cache()
+    storage = build_object_storage()
+    key = storage_key or f"test/vlm/{uuid.uuid4()}.pdf"
+    storage.put_bytes(key, _minimal_blank_pdf_bytes(), content_type="application/pdf")
+
+    person = Person(status="ACTIVE", created_by=user_id)
+    db_session.add(person)
+    db_session.flush()
+    profile = PersonProfile(
+        person_id=person.id,
+        name="분석대상",
+        technical_grade="ADVANCED",
+        profile_version=1,
+    )
+    db_session.add(profile)
+    db_session.flush()
+    snap = build_confirmed_profile_snapshot(db_session, person.id)
+    db_session.add(
+        ProfileRevision(
+            person_id=person.id,
+            revision_no=1,
+            snapshot_json=snap,
+            source_type="USER",
+            created_by=user_id,
+        )
+    )
+    group = DocumentGroup(
+        person_id=person.id,
+        document_type_code="DOC-RESUME",
+        title="이력서",
+    )
+    db_session.add(group)
+    db_session.flush()
+    document = Document(
+        document_group_id=group.id,
+        version_no=1,
+        is_latest=True,
+        original_filename="scanned.pdf",
+        extension="pdf",
+        mime_type="application/pdf",
+        file_size=100,
+        storage_key=key,
+        sha256="c" * 64,
+        processing_status="READY",
+        uploaded_by=user_id,
+    )
+    db_session.add(document)
+    db_session.flush()
+    page = DocumentPage(
+        document_id=document.id,
+        page_no=1,
+        extracted_text=extracted_text,
+        layout_json=layout_json
+        if layout_json is not None
+        else {"needs_vlm": True, "text_chars": 0},
+        extraction_method=extraction_method,
+    )
+    db_session.add(page)
+    db_session.commit()
+    return person, document, group, page, storage
+
+
+def test_vlm_page_needs_helpers_skip_already_transcribed():
+    from app.modules.analysis.source_builder import (
+        _already_vlm_transcribed,
+        _page_needs_vlm,
+    )
+    from app.modules.document_processing.types import MIN_TEXT_CHARS_FOR_READY_PAGE
+
+    short = "x" * max(1, MIN_TEXT_CHARS_FOR_READY_PAGE - 1)
+    assert _page_needs_vlm(
+        text=short,
+        extraction_method="TEXT_PARSER",
+        layout_json={"needs_vlm": True},
+    )
+    assert not _page_needs_vlm(
+        text=short,
+        extraction_method="VLM",
+        layout_json={"needs_vlm": False, "vlm_transcribed": True},
+    )
+    assert not _page_needs_vlm(
+        text=short,
+        extraction_method="HYBRID",
+        layout_json={"needs_vlm": True},
+    )
+    assert _already_vlm_transcribed(
+        extraction_method="TEXT_PARSER",
+        layout_json={"vlm_transcribed": True},
+    )
+    assert not _page_needs_vlm(
+        text=short,
+        extraction_method="TEXT_PARSER",
+        layout_json={"needs_vlm": True, "vlm_transcribed": True},
+    )
+
+
+def test_scanned_pdf_vlm_persists_to_document_page(db_session):
+    from app.ai.providers.llm import FakeLLMProvider
+    from app.ai.providers.vlm import FakeVLMProvider
+    from app.db.models.document import DocumentPage
+    from app.modules.analysis.service import AnalysisService
+    from app.storage.s3 import reset_object_storage_cache
+
+    admin = _create_user(
+        db_session, login_id=f"vlm_a_{uuid.uuid4().hex[:8]}", password="Passw0rd!"
+    )
+    person, document, _group, page, storage = _seed_scanned_pdf_person(
+        db_session, admin.id, extracted_text=None
+    )
+    run = _queue_run(db_session, person.id, document.id)
+    vlm = FakeVLMProvider("홍길동 Python FastAPI PostgreSQL")
+    llm = FakeLLMProvider(profile_json=_valid_candidate_json())
+    try:
+        service = AnalysisService(db_session, storage=storage, llm=llm, vlm=vlm)
+        assert service.run_analysis(run.id) == "REVIEWING"
+        assert vlm.calls == 1
+        db_session.expire_all()
+        updated = db_session.execute(
+            select(DocumentPage).where(
+                DocumentPage.document_id == document.id,
+                DocumentPage.page_no == 1,
+            )
+        ).scalar_one()
+        assert updated.extracted_text == "홍길동 Python FastAPI PostgreSQL"
+        assert updated.extraction_method == "VLM"
+        assert updated.layout_json["needs_vlm"] is False
+        assert updated.layout_json["vlm_transcribed"] is True
+        assert updated.layout_json["vlm_text_chars"] == len(
+            "홍길동 Python FastAPI PostgreSQL"
+        )
+        assert updated.layout_json["final_text_chars"] == len(
+            "홍길동 Python FastAPI PostgreSQL"
+        )
+        db_session.refresh(run)
+        assert run.status == "REVIEWING"
+    finally:
+        _cleanup_person_with_search(db_session, person.id, admin.id)
+        reset_object_storage_cache()
+
+
+def test_short_parser_text_vlm_persists_hybrid(db_session):
+    from app.ai.providers.llm import FakeLLMProvider
+    from app.ai.providers.vlm import FakeVLMProvider
+    from app.db.models.document import DocumentPage
+    from app.modules.analysis.service import AnalysisService
+    from app.storage.s3 import reset_object_storage_cache
+
+    admin = _create_user(
+        db_session, login_id=f"vlm_h_{uuid.uuid4().hex[:8]}", password="Passw0rd!"
+    )
+    person, document, _group, _page, storage = _seed_scanned_pdf_person(
+        db_session,
+        admin.id,
+        extracted_text="홍길동",
+        layout_json={"needs_vlm": True, "text_chars": 3, "source": "pdf"},
+    )
+    run = _queue_run(db_session, person.id, document.id)
+    vlm = FakeVLMProvider("Python FastAPI 개발 경력")
+    llm = FakeLLMProvider(profile_json=_valid_candidate_json())
+    try:
+        service = AnalysisService(db_session, storage=storage, llm=llm, vlm=vlm)
+        assert service.run_analysis(run.id) == "REVIEWING"
+        assert vlm.calls == 1
+        db_session.expire_all()
+        updated = db_session.execute(
+            select(DocumentPage).where(DocumentPage.document_id == document.id)
+        ).scalar_one()
+        assert updated.extracted_text == "홍길동\nPython FastAPI 개발 경력"
+        assert updated.extraction_method == "HYBRID"
+        assert updated.layout_json["needs_vlm"] is False
+        assert updated.layout_json["vlm_transcribed"] is True
+        assert updated.layout_json.get("source") == "pdf"
+    finally:
+        _cleanup_person_with_search(db_session, person.id, admin.id)
+        reset_object_storage_cache()
+
+
+def test_vlm_not_recalled_after_persist_even_if_short(db_session):
+    from app.ai.providers.llm import FakeLLMProvider
+    from app.ai.providers.vlm import FakeVLMProvider
+    from app.db.models.document import DocumentPage
+    from app.modules.analysis.service import AnalysisService
+    from app.modules.document_processing.types import MIN_TEXT_CHARS_FOR_READY_PAGE
+    from app.storage.s3 import reset_object_storage_cache
+
+    short_vlm = "짧은VLM"  # shorter than MIN_TEXT_CHARS_FOR_READY_PAGE
+    assert len(short_vlm) < MIN_TEXT_CHARS_FOR_READY_PAGE
+
+    admin = _create_user(
+        db_session, login_id=f"vlm_d_{uuid.uuid4().hex[:8]}", password="Passw0rd!"
+    )
+    person, document, _group, _page, storage = _seed_scanned_pdf_person(
+        db_session, admin.id, extracted_text=None
+    )
+    run1 = _queue_run(db_session, person.id, document.id)
+    vlm = FakeVLMProvider(short_vlm)
+    llm = FakeLLMProvider(profile_json=_valid_candidate_json())
+    try:
+        service = AnalysisService(db_session, storage=storage, llm=llm, vlm=vlm)
+        assert service.run_analysis(run1.id) == "REVIEWING"
+        assert vlm.calls == 1
+        db_session.expire_all()
+        page = db_session.execute(
+            select(DocumentPage).where(DocumentPage.document_id == document.id)
+        ).scalar_one()
+        assert page.extraction_method == "VLM"
+        assert len((page.extracted_text or "").strip()) < MIN_TEXT_CHARS_FOR_READY_PAGE
+
+        run2 = _queue_run(db_session, person.id, document.id)
+        assert service.run_analysis(run2.id, llm=llm, vlm=vlm) == "REVIEWING"
+        assert vlm.calls == 1  # no second VLM call
+    finally:
+        _cleanup_person_with_search(db_session, person.id, admin.id)
+        reset_object_storage_cache()
+
+
+def test_blank_vlm_result_does_not_persist(db_session):
+    from app.ai.providers.llm import FakeLLMProvider
+    from app.ai.providers.vlm import FakeVLMProvider
+    from app.db.models.document import DocumentPage
+    from app.modules.analysis.service import AnalysisService
+    from app.storage.s3 import reset_object_storage_cache
+
+    admin = _create_user(
+        db_session, login_id=f"vlm_b_{uuid.uuid4().hex[:8]}", password="Passw0rd!"
+    )
+    person, document, _group, page, storage = _seed_scanned_pdf_person(
+        db_session, admin.id, extracted_text=None
+    )
+    original_layout = dict(page.layout_json or {})
+    run = _queue_run(db_session, person.id, document.id)
+    vlm = FakeVLMProvider("   \n  ")
+    # Blank VLM → no usable page text → analysis fails (no usable text).
+    llm = FakeLLMProvider(profile_json=_valid_candidate_json())
+    try:
+        service = AnalysisService(db_session, storage=storage, llm=llm, vlm=vlm)
+        status = service.run_analysis(run.id)
+        assert status == "FAILED"
+        assert vlm.calls == 1
+        db_session.expire_all()
+        updated = db_session.execute(
+            select(DocumentPage).where(DocumentPage.document_id == document.id)
+        ).scalar_one()
+        assert updated.extracted_text is None
+        assert updated.extraction_method == "TEXT_PARSER"
+        assert updated.layout_json.get("vlm_transcribed") is not True
+        assert updated.layout_json.get("needs_vlm") is True
+        assert updated.layout_json.get("text_chars") == original_layout.get("text_chars")
+    finally:
+        _cleanup_person_with_search(db_session, person.id, admin.id)
+        reset_object_storage_cache()
+
+
+def test_stale_vlm_persist_skips_overwrite(db_session):
+    from app.modules.analysis.repository import AnalysisRepository
+    from app.modules.analysis.source_builder import VLMPageTranscription
+    from app.db.models.document import DocumentPage
+
+    admin = _create_user(
+        db_session, login_id=f"vlm_s_{uuid.uuid4().hex[:8]}", password="Passw0rd!"
+    )
+    person, document, _group, page, _storage = _seed_scanned_pdf_person(
+        db_session, admin.id, extracted_text=None
+    )
+    try:
+        snap_text = page.extracted_text
+        snap_method = page.extraction_method
+        snap_layout = dict(page.layout_json or {})
+
+        # Concurrent reprocess updates the page after snapshot.
+        page.extracted_text = "최신 재처리 텍스트"
+        page.extraction_method = "TEXT_PARSER"
+        page.layout_json = {"needs_vlm": False, "text_chars": 10, "source": "reprocess"}
+        db_session.add(page)
+        db_session.commit()
+
+        item = VLMPageTranscription(
+            document_id=document.id,
+            page_no=1,
+            expected_extracted_text=snap_text,
+            expected_extraction_method=snap_method,
+            expected_layout_json=snap_layout,
+            persisted_text="오래된 VLM 결과",
+            extraction_method="VLM",
+            layout_json={
+                "needs_vlm": False,
+                "vlm_transcribed": True,
+                "vlm_text_chars": 8,
+                "final_text_chars": 8,
+            },
+        )
+        repo = AnalysisRepository(db_session)
+        assert (
+            repo.try_update_page_vlm_transcription(
+                document_id=item.document_id,
+                page_no=item.page_no,
+                expected_extracted_text=item.expected_extracted_text,
+                expected_extraction_method=item.expected_extraction_method,
+                expected_layout_json=item.expected_layout_json,
+                persisted_text=item.persisted_text,
+                extraction_method=item.extraction_method,
+                layout_json=item.layout_json,
+            )
+            is False
+        )
+        db_session.commit()
+        db_session.expire_all()
+        current = db_session.execute(
+            select(DocumentPage).where(DocumentPage.document_id == document.id)
+        ).scalar_one()
+        assert current.extracted_text == "최신 재처리 텍스트"
+        assert current.extraction_method == "TEXT_PARSER"
+        assert current.layout_json.get("source") == "reprocess"
+        assert current.layout_json.get("vlm_transcribed") is not True
+    finally:
+        _cleanup_person_with_search(db_session, person.id, admin.id)
+
+
+def test_llm_fail_keeps_vlm_text_for_retry(db_session):
+    from app.ai.providers.llm import FakeLLMProvider
+    from app.ai.providers.vlm import FakeVLMProvider
+    from app.db.models.document import DocumentPage
+    from app.modules.analysis.service import AnalysisService
+    from app.storage.s3 import reset_object_storage_cache
+
+    admin = _create_user(
+        db_session, login_id=f"vlm_f_{uuid.uuid4().hex[:8]}", password="Passw0rd!"
+    )
+    person, document, _group, _page, storage = _seed_scanned_pdf_person(
+        db_session, admin.id, extracted_text=None
+    )
+    run1 = _queue_run(db_session, person.id, document.id)
+    vlm = FakeVLMProvider("홍길동 Python FastAPI PostgreSQL")
+    fail_llm = FakeLLMProvider(fail=True)
+    try:
+        service = AnalysisService(db_session, storage=storage, llm=fail_llm, vlm=vlm)
+        assert service.run_analysis(run1.id) == "FAILED"
+        assert vlm.calls == 1
+        db_session.expire_all()
+        page = db_session.execute(
+            select(DocumentPage).where(DocumentPage.document_id == document.id)
+        ).scalar_one()
+        assert page.extracted_text == "홍길동 Python FastAPI PostgreSQL"
+        assert page.extraction_method == "VLM"
+        assert page.layout_json["vlm_transcribed"] is True
+
+        run2 = _queue_run(db_session, person.id, document.id)
+        ok_llm = FakeLLMProvider(profile_json=_valid_candidate_json())
+        assert service.run_analysis(run2.id, llm=ok_llm, vlm=vlm) == "REVIEWING"
+        assert vlm.calls == 1  # reused persisted text
+    finally:
+        _cleanup_person_with_search(db_session, person.id, admin.id)
+        reset_object_storage_cache()
