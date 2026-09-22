@@ -9,12 +9,18 @@ export const PROFILE_FRESHNESS_LABELS: Record<ProfileFreshness, string> = {
 }
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000
-const FRESHNESS_WINDOW_MS = 365 * MS_PER_DAY
+const FRESHNESS_CALENDAR_DAYS = 365
+
+/** Local calendar date as UTC-midnight ms — ignores time-of-day and DST hour shifts. */
+function localCalendarDayUtcMs(d: Date): number {
+  return Date.UTC(d.getFullYear(), d.getMonth(), d.getDate())
+}
 
 /**
- * CURRENT: updated within the last 365 days (inclusive of exactly 365d).
- * STALE: older than 365 days.
+ * CURRENT: updated on or after (today − 365 calendar days), including exactly 365 days ago.
+ * STALE: updated before that calendar day.
  * UNKNOWN: missing or unparseable timestamp.
+ * Future timestamps count as CURRENT.
  */
 export function getProfileFreshness(
   profileUpdatedAt: string | null | undefined,
@@ -24,12 +30,12 @@ export function getProfileFreshness(
     return 'UNKNOWN'
   }
   const updated = new Date(profileUpdatedAt)
-  const updatedMs = updated.getTime()
-  if (Number.isNaN(updatedMs)) {
+  if (Number.isNaN(updated.getTime())) {
     return 'UNKNOWN'
   }
-  const ageMs = now.getTime() - updatedMs
-  if (ageMs <= FRESHNESS_WINDOW_MS) {
+  const dayDiff =
+    (localCalendarDayUtcMs(now) - localCalendarDayUtcMs(updated)) / MS_PER_DAY
+  if (dayDiff <= FRESHNESS_CALENDAR_DAYS) {
     return 'CURRENT'
   }
   return 'STALE'
