@@ -12,6 +12,7 @@ from app.modules.career import (
     person_career_router,
 )
 from app.modules.codes import router as codes_router
+from app.modules.dashboard import router as dashboard_router
 from app.modules.documents import (
     document_groups_router,
     documents_router,
@@ -29,6 +30,7 @@ api_router.include_router(health.router, tags=["health"])
 api_router.include_router(auth_router)
 api_router.include_router(codes_router)
 api_router.include_router(users_router)
+api_router.include_router(dashboard_router)
 api_router.include_router(people_router)
 api_router.include_router(person_projects_router)
 api_router.include_router(projects_router)
