@@ -5779,9 +5779,9 @@ def test_blank_vlm_result_does_not_persist(db_session):
 
 
 def test_stale_vlm_persist_skips_overwrite(db_session):
+    from app.db.models.document import DocumentPage
     from app.modules.analysis.repository import AnalysisRepository
     from app.modules.analysis.source_builder import VLMPageTranscription
-    from app.db.models.document import DocumentPage
 
     admin = _create_user(
         db_session, login_id=f"vlm_s_{uuid.uuid4().hex[:8]}", password="Passw0rd!"
