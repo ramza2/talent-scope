@@ -55,6 +55,7 @@ export type DocumentListItem = {
   file_size: number
   processing_status: string
   processing_error?: string | null
+  preview_available: boolean
   uploaded_at: string
   deleted_at?: string | null
 }

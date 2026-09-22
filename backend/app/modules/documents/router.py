@@ -253,7 +253,6 @@ def preview_document(
     range_header = request.headers.get("range")
     byte_range = None
     if range_header:
-        from app.modules.documents.constants import INLINE_PREVIEW_EXTENSIONS
         from app.core.exceptions import PreviewUnavailableError
 
         doc_row = service.repo.get_document(document_id, include_deleted=is_admin)
@@ -263,12 +262,9 @@ def preview_document(
             raise NotFoundError("문서를 찾을 수 없습니다.")
         # Authz via get_document
         service.get_document(document_id, is_admin=is_admin)
-        key = doc_row.preview_storage_key
-        if not key:
-            ext = (doc_row.extension or "").lower()
-            if ext not in INLINE_PREVIEW_EXTENSIONS:
-                raise PreviewUnavailableError()
-            key = doc_row.storage_key
+        if not service._preview_available(doc_row):
+            raise PreviewUnavailableError()
+        key = doc_row.preview_storage_key or doc_row.storage_key
         head = service.storage.head(key)
         byte_range = service.parse_range_header(range_header, head.content_length)
 
