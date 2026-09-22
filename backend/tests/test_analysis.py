@@ -6002,3 +6002,110 @@ def test_confirm_rejects_second_primary_job(client: TestClient, db_session):
     for code in (job_a, job_b):
         db_session.execute(delete(CodeMaster).where(CodeMaster.code == code))
     db_session.commit()
+
+
+def test_confirm_rejects_primary_when_historical_multiple_exist(
+    client: TestClient, db_session
+):
+    """Contaminated multi-PRIMARY data must fail-closed with 400, not 500."""
+    from app.db.models.analysis import AnalysisDiffItem
+    from app.db.models.code import CodeMaster
+    from app.db.models.person import PersonJob, PersonProfile
+
+    def _ensure_job(code: str, name: str) -> None:
+        if db_session.get(CodeMaster, code) is None:
+            db_session.add(
+                CodeMaster(
+                    code=code,
+                    code_type="JOB",
+                    name=name,
+                    sort_order=0,
+                    is_active=True,
+                )
+            )
+            db_session.commit()
+
+    suffix = uuid.uuid4().hex[:8]
+    job_a = f"JOB-HA-{suffix}"
+    job_b = f"JOB-HB-{suffix}"
+    job_c = f"JOB-HC-{suffix}"
+    _ensure_job(job_a, "역사주직무A")
+    _ensure_job(job_b, "역사주직무B")
+    _ensure_job(job_c, "신규주직무C")
+
+    admin = _create_user(
+        db_session, login_id=f"hm_{suffix}", password="Passw0rd!"
+    )
+    csrf = _login(client, admin.login_id, "Passw0rd!")
+    person, document = _seed_person_with_ready_doc(db_session, admin.id)
+    db_session.add(
+        PersonJob(
+            person_id=person.id,
+            job_code=job_a,
+            job_type="PRIMARY",
+            sort_order=0,
+            source_type="USER",
+            is_active=True,
+        )
+    )
+    db_session.add(
+        PersonJob(
+            person_id=person.id,
+            job_code=job_b,
+            job_type="PRIMARY",
+            sort_order=1,
+            source_type="USER",
+            is_active=True,
+        )
+    )
+    db_session.commit()
+
+    analysis_id, run = _start_reviewing_analysis(
+        client, db_session, csrf, person, document
+    )
+    db_session.add(
+        AnalysisDiffItem(
+            analysis_run_id=run.id,
+            entity_type="JOB",
+            candidate_path="jobs[0]",
+            change_type="NEW",
+            new_value={"code": job_c, "job_type": "PRIMARY"},
+            review_status="ACCEPTED",
+        )
+    )
+    db_session.commit()
+
+    resp = client.post(
+        f"/api/v1/analyses/{analysis_id}/confirm",
+        headers={"X-CSRF-Token": csrf},
+        json={"expected_profile_version": 1},
+    )
+    assert resp.status_code == 400
+    assert resp.status_code != 500
+    assert resp.json()["code"] == "CONFIRM_VALIDATION_ERROR"
+    assert "주직무" in resp.json()["detail"]
+
+    db_session.refresh(run)
+    assert run.status == "REVIEWING"
+    profile = db_session.execute(
+        select(PersonProfile).where(PersonProfile.person_id == person.id)
+    ).scalar_one()
+    assert profile.profile_version == 1
+    jobs = list(
+        db_session.execute(
+            select(PersonJob)
+            .where(PersonJob.person_id == person.id)
+            .order_by(PersonJob.sort_order.asc(), PersonJob.job_code.asc())
+        ).scalars()
+    )
+    assert len(jobs) == 2
+    assert {j.job_code for j in jobs} == {job_a, job_b}
+    assert all(j.job_type == "PRIMARY" for j in jobs)
+    assert all(j.job_code != job_c for j in jobs)
+
+    db_session.execute(delete(PersonJob).where(PersonJob.person_id == person.id))
+    db_session.commit()
+    _cleanup_person(db_session, person.id, admin.id)
+    for code in (job_a, job_b, job_c):
+        db_session.execute(delete(CodeMaster).where(CodeMaster.code == code))
+    db_session.commit()

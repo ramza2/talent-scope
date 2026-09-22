@@ -911,14 +911,16 @@ class _ConfirmContext:
             self._register(diff, "PERSON_JOB", existing.id, "job_code")
             return
         if job_type == "PRIMARY":
-            other_primary = self.db.execute(
-                select(PersonJob).where(
+            other_primary_id = self.db.execute(
+                select(PersonJob.id)
+                .where(
                     PersonJob.person_id == self.person_id,
                     PersonJob.job_type == "PRIMARY",
                     PersonJob.is_active.is_(True),
                 )
+                .limit(1)
             ).scalar_one_or_none()
-            if other_primary is not None:
+            if other_primary_id is not None:
                 raise ConfirmValidationError("주직무는 1개만 지정할 수 있습니다.")
         if diff.change_type not in {"NEW", "REVIEW"}:
             # Additive only — unexpected change types with ACCEPTED still insert.
