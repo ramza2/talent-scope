@@ -6,7 +6,9 @@ from datetime import date, datetime
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from app.core.person_name import normalize_person_name
 
 
 class UploadSessionCreateRequest(BaseModel):
@@ -75,6 +77,14 @@ class ResolveIdentity(BaseModel):
     company: str | None = Field(default=None, max_length=300)
     phone: str | None = Field(default=None, max_length=50)
     email: str | None = Field(default=None, max_length=255)
+
+    @field_validator("name")
+    @classmethod
+    def normalize_name(cls, value: str) -> str:
+        cleaned = normalize_person_name(value)
+        if not cleaned:
+            raise ValueError("이름은 필수입니다.")
+        return cleaned
 
 
 class ResolveRequest(BaseModel):

@@ -652,7 +652,7 @@ class DocumentService:
         if payload.identity is None:
             raise ValidationAppError("CREATE_NEW에는 identity가 필요합니다.")
         identity = payload.identity
-        name = identity.name.strip()
+        name = identity.name
         if not name:
             raise ValidationAppError("이름은 필수입니다.")
 
