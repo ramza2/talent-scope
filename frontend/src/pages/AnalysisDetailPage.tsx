@@ -193,6 +193,7 @@ export function AnalysisDetailPage() {
   const canConfirm = canConfirmAnalysis({
     status: analysis?.status,
     diffsQuerySuccess: allDiffsQuery.isSuccess,
+    totalDiffs: allDiffs.length,
     pendingActionable,
     baseProfileVersion: analysis?.base_profile_version,
   })
@@ -625,6 +626,17 @@ export function AnalysisDetailPage() {
         />
       ) : (
         <>
+          {analysis.status === 'REVIEWING' &&
+          allDiffsQuery.isSuccess &&
+          allDiffs.length === 0 ? (
+            <Alert
+              type="warning"
+              showIcon
+              style={{ marginBottom: 16 }}
+              message="변경 항목이 없어 최종 확정할 수 없습니다."
+              description="이 분석은 프로필에 반영할 Diff가 없습니다. 필요하지 않은 분석이면 폐기하거나 최신 문서로 다시 분석해 주세요."
+            />
+          ) : null}
           {analysis.status === 'REVIEWING' && pendingActionable > 0 ? (
             <Alert
               type="warning"
