@@ -335,16 +335,18 @@ export function countReviewedDiffs(diffs: DiffItem[]): number {
   return diffs.filter((d) => d.review_status !== 'PENDING').length
 }
 
-/** Confirm CTA gate — require diffs query success so loading ≠ pending 0. */
+/** Confirm CTA gate — require loaded, non-empty diffs and no pending decisions. */
 export function canConfirmAnalysis(input: {
   status?: AnalysisStatus | string | null
   diffsQuerySuccess: boolean
+  totalDiffs: number
   pendingActionable: number
   baseProfileVersion: number | null | undefined
 }): boolean {
   return (
     input.status === 'REVIEWING' &&
     input.diffsQuerySuccess &&
+    input.totalDiffs > 0 &&
     input.pendingActionable === 0 &&
     input.baseProfileVersion != null
   )

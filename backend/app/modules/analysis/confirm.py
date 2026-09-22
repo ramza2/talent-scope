@@ -634,6 +634,11 @@ def _idempotent_response(db: Session, run: AnalysisRun) -> ConfirmAnalysisRespon
 
 
 def _assert_review_complete(diffs: list[AnalysisDiffItem]) -> None:
+    if not diffs:
+        raise ConfirmValidationError(
+            "변경 항목(Diff)이 없는 분석은 확정할 수 없습니다."
+        )
+
     pending = [
         d
         for d in diffs

@@ -2578,6 +2578,53 @@ def test_confirm_permissions_and_incomplete(client: TestClient, db_session):
     _cleanup_person(db_session, person.id, admin.id)
 
 
+def test_confirm_rejects_zero_diffs(client: TestClient, db_session):
+    from app.db.models.analysis import AnalysisRun
+    from app.db.models.person import PersonProfile
+
+    admin = _create_user(
+        db_session, login_id=f"cz_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    csrf = _login(client, admin.login_id, "Passw0rd!")
+    person, document = _seed_person_with_ready_doc(db_session, admin.id)
+    analysis_id = client.post(
+        "/api/v1/analyses",
+        headers={"X-CSRF-Token": csrf},
+        json={
+            "person_id": str(person.id),
+            "document_ids": [str(document.id)],
+            "analysis_type": "PROFILE",
+        },
+    ).json()["data"]["analysis_id"]
+
+    run = db_session.execute(
+        select(AnalysisRun).where(AnalysisRun.id == uuid.UUID(analysis_id))
+    ).scalar_one()
+    run.status = "REVIEWING"
+    run.candidate_json = {
+        "schema_version": "profile-candidate-v1",
+        "profile": {"name": "분석대상"},
+    }
+    db_session.commit()
+
+    resp = client.post(
+        f"/api/v1/analyses/{analysis_id}/confirm",
+        headers={"X-CSRF-Token": csrf},
+        json={"expected_profile_version": 1},
+    )
+    assert resp.status_code == 400
+    assert resp.json()["code"] == "CONFIRM_VALIDATION_ERROR"
+
+    db_session.refresh(run)
+    assert run.status == "REVIEWING"
+    profile = db_session.execute(
+        select(PersonProfile).where(PersonProfile.person_id == person.id)
+    ).scalar_one()
+    assert profile.profile_version == 1
+
+    _cleanup_person(db_session, person.id, admin.id)
+
+
 def test_confirm_dates_and_version_base_lock(client: TestClient, db_session):
     from datetime import date
 
@@ -3409,7 +3456,7 @@ def test_confirm_concurrent_serialized(client: TestClient, db_session):
 
 
 def test_frontend_confirm_loading_gate_contract():
-    """Frontend Confirm CTA must require diffs query success (not loading→0)."""
+    """Frontend Confirm CTA requires loaded, non-empty diffs and no pending decisions."""
     from pathlib import Path
 
     root = Path(__file__).resolve().parents[2]
@@ -3419,27 +3466,33 @@ def test_frontend_confirm_loading_gate_contract():
     ).read_text(encoding="utf-8")
     assert "export function canConfirmAnalysis" in api
     assert "diffsQuerySuccess" in api
+    assert "totalDiffs" in api
     assert "diffsQuerySuccess: allDiffsQuery.isSuccess" in page
+    assert "totalDiffs: allDiffs.length" in page
+    assert "변경 항목이 없어 최종 확정할 수 없습니다." in page
     assert "canConfirmAnalysis" in page
 
     def can_confirm(
         *,
         status: str | None,
         diffs_ok: bool,
+        total: int,
         pending: int,
         base_ver: int | None,
     ) -> bool:
         return (
             status == "REVIEWING"
             and diffs_ok
+            and total > 0
             and pending == 0
             and base_ver is not None
         )
 
-    assert can_confirm(status="REVIEWING", diffs_ok=False, pending=0, base_ver=1) is False
-    assert can_confirm(status="REVIEWING", diffs_ok=True, pending=1, base_ver=1) is False
-    assert can_confirm(status="REVIEWING", diffs_ok=True, pending=0, base_ver=None) is False
-    assert can_confirm(status="REVIEWING", diffs_ok=True, pending=0, base_ver=1) is True
+    assert can_confirm(status="REVIEWING", diffs_ok=False, total=0, pending=0, base_ver=1) is False
+    assert can_confirm(status="REVIEWING", diffs_ok=True, total=0, pending=0, base_ver=1) is False
+    assert can_confirm(status="REVIEWING", diffs_ok=True, total=1, pending=1, base_ver=1) is False
+    assert can_confirm(status="REVIEWING", diffs_ok=True, total=1, pending=0, base_ver=None) is False
+    assert can_confirm(status="REVIEWING", diffs_ok=True, total=1, pending=0, base_ver=1) is True
 
 
 def test_frontend_explicit_decision_semantics_contract():
