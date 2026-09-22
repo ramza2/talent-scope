@@ -21,6 +21,7 @@ import { apiErrorMessage } from '@/api/errors'
 import { listCodes } from '@/api/codes'
 import {
   GRADE_LABELS,
+  PERSON_STATUS_LABELS,
   createPerson,
   formatCareerMonths,
   listPeople,
@@ -30,11 +31,11 @@ import {
 } from '@/api/people'
 import { useAuthMe } from '@/app/auth'
 
-const STATUS_OPTIONS: Array<{ value: PersonStatus | ''; label: string }> = [
+const BASE_STATUS_OPTIONS: Array<{ value: PersonStatus | ''; label: string }> = [
   { value: '', label: '상태 전체' },
-  { value: 'ACTIVE', label: 'ACTIVE' },
-  { value: 'INACTIVE', label: 'INACTIVE' },
-  { value: 'ARCHIVED', label: 'ARCHIVED' },
+  { value: 'ACTIVE', label: PERSON_STATUS_LABELS.ACTIVE },
+  { value: 'INACTIVE', label: PERSON_STATUS_LABELS.INACTIVE },
+  { value: 'ARCHIVED', label: PERSON_STATUS_LABELS.ARCHIVED },
 ]
 
 const GRADE_OPTIONS = [
@@ -62,6 +63,9 @@ export function PeopleListPage() {
   const queryClient = useQueryClient()
   const { data: me } = useAuthMe()
   const isAdmin = me?.role === 'ADMIN'
+  const statusOptions = isAdmin
+    ? [...BASE_STATUS_OPTIONS, { value: 'DELETED' as const, label: PERSON_STATUS_LABELS.DELETED }]
+    : BASE_STATUS_OPTIONS
 
   const [filters, setFilters] = useState<Filters>({
     q: '',
@@ -167,7 +171,12 @@ export function PeopleListPage() {
         dataIndex: 'status',
         key: 'status',
         width: 110,
-        render: (status: PersonStatus) => <Tag>{status}</Tag>,
+        render: (status: PersonStatus) =>
+          status === 'DELETED' ? (
+            <Tag color="error">{PERSON_STATUS_LABELS.DELETED}</Tag>
+          ) : (
+            <Tag>{PERSON_STATUS_LABELS[status] ?? status}</Tag>
+          ),
       },
       {
         title: '최근갱신',
@@ -268,7 +277,7 @@ export function PeopleListPage() {
           style={{ width: 140 }}
           value={draft.status}
           onChange={(v) => setDraft((p) => ({ ...p, status: v }))}
-          options={STATUS_OPTIONS}
+          options={statusOptions}
         />
         <Button type="primary" icon={<ReloadOutlined />} loading={isFetching} onClick={applySearch}>
           검색

@@ -28,6 +28,7 @@ import { listCodes } from '@/api/codes'
 import {
   GRADE_LABELS,
   JOB_TYPE_LABELS,
+  PERSON_STATUS_LABELS,
   formatCareerMonths,
   getPerson,
   listPersonRevisions,
@@ -267,8 +268,16 @@ export function PeopleDetailPage() {
 
   const statusMutation = useMutation({
     mutationFn: (status: PersonStatus) => updatePersonStatus(personId, status),
-    onSuccess: async () => {
-      message.success('상태가 변경되었습니다.')
+    onSuccess: async (_data, status) => {
+      if (status === 'DELETED') {
+        message.success(
+          '인력을 삭제했습니다. 프로필과 문서는 보존되며 관리자만 복원할 수 있습니다.',
+        )
+      } else if (status === 'ACTIVE' && person?.status === 'DELETED') {
+        message.success('인력을 ACTIVE 상태로 복원했습니다.')
+      } else {
+        message.success('상태가 변경되었습니다.')
+      }
       await invalidateAll()
     },
     onError: (error) => message.error(apiErrorMessage(error, '상태 변경에 실패했습니다.')),
@@ -287,6 +296,9 @@ export function PeopleDetailPage() {
   if (isLoading || !person) {
     return <Typography.Text>불러오는 중…</Typography.Text>
   }
+
+  const isDeleted = person.status === 'DELETED'
+  const canEdit = Boolean(isAdmin && !isDeleted)
 
   const openProfileEdit = () => {
     profileForm.setFieldsValue({ ...person.profile })
@@ -355,7 +367,10 @@ export function PeopleDetailPage() {
       <Space style={{ width: '100%', justifyContent: 'space-between', marginBottom: 12 }} align="start">
         <div>
           <Typography.Title level={3} style={{ marginBottom: 4 }}>
-            {person.profile.name} <Tag>{person.status}</Tag>
+            {person.profile.name}{' '}
+            <Tag color={isDeleted ? 'error' : undefined}>
+              {PERSON_STATUS_LABELS[person.status] ?? person.status}
+            </Tag>
             {person.pending_analysis &&
             ['QUEUED', 'PROCESSING', 'REVIEWING'].includes(person.pending_analysis.status) ? (
               <Tag
@@ -381,13 +396,21 @@ export function PeopleDetailPage() {
               .filter(Boolean)
               .join(' · ') || '소속 미정'}
           </Typography.Text>
+          {isDeleted ? (
+            <Alert
+              style={{ marginTop: 12, maxWidth: 640 }}
+              type="error"
+              showIcon
+              message="삭제된 인력입니다. 프로필과 문서는 보존되어 있으며 일반 사용자에게는 표시되지 않습니다. 복원 후 다시 수정할 수 있습니다."
+            />
+          ) : null}
           {primaryJobs.length > 1 ? (
             <Alert
               style={{ marginTop: 12, maxWidth: 560 }}
               type="warning"
               showIcon
               message={
-                isAdmin
+                canEdit
                   ? '주직무가 여러 개 지정되어 있습니다. 직무 수정에서 주직무를 1개만 남겨주세요.'
                   : '주직무 정보 확인이 필요합니다.'
               }
@@ -418,24 +441,57 @@ export function PeopleDetailPage() {
         </div>
         {isAdmin ? (
           <Space>
-            <Select
-              style={{ width: 140 }}
-              value={person.status}
-              onChange={(status) => {
-                Modal.confirm({
-                  title: '상태 변경',
-                  content: `상태를 ${status}로 변경할까요?`,
-                  onOk: () => statusMutation.mutateAsync(status),
-                })
-              }}
-              options={[
-                { value: 'ACTIVE', label: 'ACTIVE' },
-                { value: 'INACTIVE', label: 'INACTIVE' },
-                { value: 'ARCHIVED', label: 'ARCHIVED' },
-                { value: 'DELETED', label: 'DELETED' },
-              ]}
-            />
-            <Button onClick={openProfileEdit}>프로필 수정</Button>
+            {canEdit ? (
+              <>
+                <Select
+                  style={{ width: 140 }}
+                  value={person.status}
+                  onChange={(status) => {
+                    Modal.confirm({
+                      title: '상태 변경',
+                      content: `상태를 ${PERSON_STATUS_LABELS[status] ?? status}로 변경할까요?`,
+                      onOk: () => statusMutation.mutateAsync(status),
+                    })
+                  }}
+                  options={[
+                    { value: 'ACTIVE', label: PERSON_STATUS_LABELS.ACTIVE },
+                    { value: 'INACTIVE', label: PERSON_STATUS_LABELS.INACTIVE },
+                    { value: 'ARCHIVED', label: PERSON_STATUS_LABELS.ARCHIVED },
+                  ]}
+                />
+                <Button onClick={openProfileEdit}>프로필 수정</Button>
+                <Button
+                  danger
+                  loading={statusMutation.isPending}
+                  onClick={() => {
+                    Modal.confirm({
+                      title: '인력을 삭제할까요?',
+                      content: `${person.profile.name} 인력을 삭제 상태로 변경합니다. 일반 사용자 조회와 기본 인력 목록에서 제외되지만 프로필과 문서는 삭제되지 않으며 관리자가 다시 복원할 수 있습니다.`,
+                      okText: '삭제',
+                      okButtonProps: { danger: true },
+                      onOk: () => statusMutation.mutateAsync('DELETED'),
+                    })
+                  }}
+                >
+                  인력 삭제
+                </Button>
+              </>
+            ) : (
+              <Button
+                type="primary"
+                loading={statusMutation.isPending}
+                onClick={() => {
+                  Modal.confirm({
+                    title: '인력을 복원할까요?',
+                    content: `${person.profile.name} 인력을 ACTIVE 상태로 복원합니다.`,
+                    okText: '복원',
+                    onOk: () => statusMutation.mutateAsync('ACTIVE'),
+                  })
+                }}
+              >
+                인력 복원
+              </Button>
+            )}
           </Space>
         ) : null}
       </Space>
@@ -532,7 +588,7 @@ export function PeopleDetailPage() {
                   title="직무"
                   size="small"
                   extra={
-                    isAdmin ? (
+                    canEdit ? (
                       <Button type="link" onClick={() => openJobsEdit(person)}>
                         직무 수정
                       </Button>
@@ -553,7 +609,7 @@ export function PeopleDetailPage() {
                   title="기술 (TECH)"
                   size="small"
                   extra={
-                    isAdmin ? (
+                    canEdit ? (
                       <Button type="link" onClick={() => openSkillsEdit(person)}>
                         기술 수정
                       </Button>
@@ -579,7 +635,7 @@ export function PeopleDetailPage() {
                   title="전문분야 (EXP)"
                   size="small"
                   extra={
-                    isAdmin ? (
+                    canEdit ? (
                       <Button type="link" onClick={() => openExpertiseEdit(person)}>
                         전문분야 수정
                       </Button>
@@ -605,7 +661,7 @@ export function PeopleDetailPage() {
             children: (
               <ProjectCareerTab
                 personId={personId}
-                isAdmin={isAdmin}
+                isAdmin={canEdit}
                 onChanged={invalidateAll}
               />
             ),
@@ -616,7 +672,7 @@ export function PeopleDetailPage() {
             children: (
               <EducationCertTab
                 personId={personId}
-                isAdmin={isAdmin}
+                isAdmin={canEdit}
                 onChanged={invalidateAll}
               />
             ),
@@ -627,7 +683,7 @@ export function PeopleDetailPage() {
             children: (
               <DocumentsTab
                 personId={personId}
-                isAdmin={isAdmin}
+                isAdmin={canEdit}
                 onChanged={invalidateAll}
               />
             ),
