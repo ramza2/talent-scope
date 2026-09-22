@@ -131,6 +131,9 @@ class DocumentListItem(BaseModel):
     processing_status: str
     # Truncated / safe summary for FAILED rows — never a full stack trace.
     processing_error: str | None = None
+    # True when GET /documents/{id}/preview can open a stream (generated PDF
+    # preview key or inline-original extension). Independent of READY.
+    preview_available: bool
     uploaded_at: datetime
     deleted_at: datetime | None = None
 

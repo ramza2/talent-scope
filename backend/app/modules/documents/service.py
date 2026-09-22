@@ -972,6 +972,17 @@ class DocumentService:
 
     # --- Document queries ---
 
+    def _preview_available(self, doc: Document) -> bool:
+        """Whether ``open_preview`` can open a stream from DB metadata alone.
+
+        Matches ``open_preview`` / preview router gates: generated preview key
+        or inline-original extension. Does not call Object Storage.
+        """
+        if doc.preview_storage_key:
+            return True
+        ext = (doc.extension or "").lower().strip()
+        return ext in INLINE_PREVIEW_EXTENSIONS
+
     def _to_list_item(
         self, doc: Document, group: DocumentGroup, type_name: str | None
     ) -> DocumentListItem:
@@ -994,6 +1005,7 @@ class DocumentService:
             file_size=doc.file_size,
             processing_status=doc.processing_status,
             processing_error=error,
+            preview_available=self._preview_available(doc),
             uploaded_at=doc.uploaded_at,
             deleted_at=doc.deleted_at,
         )
@@ -1141,12 +1153,11 @@ class DocumentService:
             filename = "preview.pdf"
             media_type = "application/pdf"
         else:
-            ext = (doc.extension or "").lower()
-            if ext not in INLINE_PREVIEW_EXTENSIONS:
+            if not self._preview_available(doc):
                 raise PreviewUnavailableError()
             key = doc.storage_key
             filename = doc.original_filename
-            media_type = canonical_mime(ext)
+            media_type = canonical_mime((doc.extension or "").lower())
         obj = self.storage.get(key, byte_range=byte_range)
         return doc, filename, obj, media_type
 

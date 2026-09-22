@@ -38,6 +38,19 @@ type Props = {
   onChanged: () => Promise<void>
 }
 
+function previewUnavailableTooltip(row: DocumentListItem): string {
+  if (row.processing_status === 'READY') {
+    return '미리보기를 지원하지 않는 문서입니다. AI 분석용 텍스트는 정상 추출되었습니다.'
+  }
+  if (row.processing_status === 'UPLOADED' || row.processing_status === 'PROCESSING') {
+    return '문서 처리 중입니다. 처리 완료 후 미리보기 가능 여부가 결정됩니다.'
+  }
+  if (row.processing_status === 'FAILED') {
+    return '미리보기를 사용할 수 없습니다. 원본 파일은 다운로드할 수 있습니다.'
+  }
+  return '미리보기를 사용할 수 없습니다. 원본 파일을 다운로드해 확인해 주세요.'
+}
+
 type DocTypeSource = 'manual' | null
 
 /** High-confidence filename rules aligned with backend `_suggest_doc_type` (no DOC-OTHER fallback). */
@@ -324,9 +337,29 @@ export function DocumentsTab({ personId, isAdmin, onChanged }: Props) {
       width: 220,
       render: (_, row) => {
         const deleted = Boolean(row.deleted_at)
-        const previewReady =
-          row.processing_status === 'READY' ||
-          ['pdf', 'jpg', 'jpeg', 'png'].includes((row.extension || '').toLowerCase())
+        const previewButton = row.preview_available ? (
+          <Button
+            type="link"
+            size="small"
+            onClick={() =>
+              window.open(
+                documentPreviewUrl(row.document_id),
+                '_blank',
+                'noopener,noreferrer',
+              )
+            }
+          >
+            미리보기
+          </Button>
+        ) : (
+          <Tooltip title={previewUnavailableTooltip(row)}>
+            <span>
+              <Button type="link" size="small" disabled>
+                미리보기
+              </Button>
+            </span>
+          </Tooltip>
+        )
         return (
           <Space size="small" wrap>
             {!deleted ? (
@@ -334,20 +367,7 @@ export function DocumentsTab({ personId, isAdmin, onChanged }: Props) {
                 <Button type="link" size="small" onClick={() => void onDownload(row)}>
                   다운로드
                 </Button>
-                <Button
-                  type="link"
-                  size="small"
-                  disabled={!previewReady && row.processing_status !== 'FAILED'}
-                  onClick={() =>
-                    window.open(
-                      documentPreviewUrl(row.document_id),
-                      '_blank',
-                      'noopener,noreferrer',
-                    )
-                  }
-                >
-                  미리보기
-                </Button>
+                {previewButton}
               </>
             ) : null}
             {isAdmin && !deleted ? (
@@ -416,7 +436,8 @@ export function DocumentsTab({ personId, isAdmin, onChanged }: Props) {
       </Space>
 
       <Typography.Paragraph type="secondary" style={{ marginTop: 0 }}>
-        업로드 후 미리보기/텍스트 추출과 AI 상세 분석이 백그라운드에서 처리됩니다.
+        업로드 후 텍스트 추출과 AI 상세 분석이 백그라운드에서 처리됩니다. 문서
+        형식에 따라 미리보기가 제공되지 않을 수 있습니다.
       </Typography.Paragraph>
 
       <Table
