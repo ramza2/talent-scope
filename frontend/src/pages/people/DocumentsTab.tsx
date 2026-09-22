@@ -213,7 +213,8 @@ export function DocumentsTab({ personId, isAdmin, onChanged }: Props) {
 
   const deleteMutation = useMutation({
     mutationFn: (id: string) => deleteDocument(id),
-    onSuccess: async () => {
+    onSuccess: async (_data, deletedId) => {
+      setSelectedKeys((prev) => prev.filter((key) => String(key) !== deletedId))
       message.success('문서를 삭제했습니다.')
       await invalidateLocal()
     },
@@ -327,7 +328,8 @@ export function DocumentsTab({ personId, isAdmin, onChanged }: Props) {
             title: '삭제',
             dataIndex: 'deleted_at',
             width: 90,
-            render: (v: string | null | undefined) => (v ? '삭제됨' : '활성'),
+            render: (v: string | null | undefined) =>
+              v ? <Tag color="error">삭제됨</Tag> : <Tag>활성</Tag>,
           } as ColumnsType<DocumentListItem>[number],
         ]
       : []),
@@ -379,7 +381,7 @@ export function DocumentsTab({ personId, isAdmin, onChanged }: Props) {
                 onClick={() => {
                   Modal.confirm({
                     title: '문서를 삭제할까요?',
-                    content: row.title,
+                    content: `${row.title || row.original_filename} 문서를 삭제합니다. 삭제된 문서는 기본 목록과 AI 분석 대상에서 제외되지만 원본 데이터는 보존되며 관리자가 복원할 수 있습니다.`,
                     okText: '삭제',
                     okButtonProps: { danger: true },
                     onOk: () => deleteMutation.mutateAsync(row.document_id),
@@ -394,7 +396,14 @@ export function DocumentsTab({ personId, isAdmin, onChanged }: Props) {
                 type="link"
                 size="small"
                 loading={restoreMutation.isPending}
-                onClick={() => restoreMutation.mutate(row.document_id)}
+                onClick={() => {
+                  Modal.confirm({
+                    title: '문서를 복원할까요?',
+                    content: row.title || row.original_filename,
+                    okText: '복원',
+                    onOk: () => restoreMutation.mutateAsync(row.document_id),
+                  })
+                }}
               >
                 복원
               </Button>
@@ -414,8 +423,15 @@ export function DocumentsTab({ personId, isAdmin, onChanged }: Props) {
         <Space>
           {isAdmin ? (
             <Space size="small">
-              <Typography.Text type="secondary">삭제 포함</Typography.Text>
-              <Switch checked={showDeleted} onChange={setShowDeleted} size="small" />
+              <Typography.Text type="secondary">삭제된 문서 포함</Typography.Text>
+              <Switch
+                checked={showDeleted}
+                onChange={(checked) => {
+                  setShowDeleted(checked)
+                  setSelectedKeys([])
+                }}
+                size="small"
+              />
             </Space>
           ) : null}
           {isAdmin ? (

@@ -10,6 +10,13 @@ export type TechnicalGrade =
 
 export type JobType = 'PRIMARY' | 'SECONDARY' | 'EXPERIENCE'
 
+export const PERSON_STATUS_LABELS: Record<PersonStatus, string> = {
+  ACTIVE: '활성',
+  INACTIVE: '비활성',
+  ARCHIVED: '보관',
+  DELETED: '삭제됨',
+}
+
 export const JOB_TYPE_LABELS: Record<JobType, string> = {
   PRIMARY: '주직무',
   SECONDARY: '부직무',
