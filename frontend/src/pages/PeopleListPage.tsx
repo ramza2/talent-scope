@@ -30,6 +30,11 @@ import {
   type TechnicalGrade,
 } from '@/api/people'
 import { useAuthMe } from '@/app/auth'
+import {
+  PROFILE_FRESHNESS_LABELS,
+  getProfileFreshness,
+  profileFreshnessTagColor,
+} from '@/pages/people/profileFreshness'
 
 const BASE_STATUS_OPTIONS: Array<{ value: PersonStatus | ''; label: string }> = [
   { value: '', label: '상태 전체' },
@@ -179,11 +184,24 @@ export function PeopleListPage() {
           ),
       },
       {
+        title: '최신성',
+        key: 'freshness',
+        width: 100,
+        render: (_, row) => {
+          const freshness = getProfileFreshness(row.profile_updated_at)
+          return (
+            <Tag color={profileFreshnessTagColor(freshness)}>
+              {PROFILE_FRESHNESS_LABELS[freshness]}
+            </Tag>
+          )
+        },
+      },
+      {
         title: '최근갱신',
-        dataIndex: 'updated_at',
-        key: 'updated_at',
+        dataIndex: 'profile_updated_at',
+        key: 'profile_updated_at',
         width: 170,
-        render: (v: string) => new Date(v).toLocaleString(),
+        render: (v?: string | null) => (v ? new Date(v).toLocaleString() : '—'),
       },
     ],
     [],

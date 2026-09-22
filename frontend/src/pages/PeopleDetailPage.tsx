@@ -47,6 +47,11 @@ import { useAuthMe } from '@/app/auth'
 import { DocumentsTab } from '@/pages/people/DocumentsTab'
 import { EducationCertTab } from '@/pages/people/EducationCertTab'
 import { ProjectCareerTab } from '@/pages/people/ProjectCareerTab'
+import {
+  PROFILE_FRESHNESS_LABELS,
+  getProfileFreshness,
+  profileFreshnessTagColor,
+} from '@/pages/people/profileFreshness'
 
 type CodeOption = { value: string; label: string }
 
@@ -299,6 +304,10 @@ export function PeopleDetailPage() {
 
   const isDeleted = person.status === 'DELETED'
   const canEdit = Boolean(isAdmin && !isDeleted)
+  const profileFreshness = getProfileFreshness(person.profile.profile_updated_at)
+  const profileUpdatedLabel = person.profile.profile_updated_at
+    ? new Date(person.profile.profile_updated_at).toLocaleString()
+    : '—'
 
   const openProfileEdit = () => {
     profileForm.setFieldsValue({ ...person.profile })
@@ -371,6 +380,9 @@ export function PeopleDetailPage() {
             <Tag color={isDeleted ? 'error' : undefined}>
               {PERSON_STATUS_LABELS[person.status] ?? person.status}
             </Tag>
+            <Tag color={profileFreshnessTagColor(profileFreshness)}>
+              {PROFILE_FRESHNESS_LABELS[profileFreshness]}
+            </Tag>
             {person.pending_analysis &&
             ['QUEUED', 'PROCESSING', 'REVIEWING'].includes(person.pending_analysis.status) ? (
               <Tag
@@ -396,12 +408,25 @@ export function PeopleDetailPage() {
               .filter(Boolean)
               .join(' · ') || '소속 미정'}
           </Typography.Text>
+          <div style={{ marginTop: 8 }}>
+            <Typography.Text type="secondary">
+              프로필 갱신일: {profileUpdatedLabel}
+            </Typography.Text>
+          </div>
           {isDeleted ? (
             <Alert
               style={{ marginTop: 12, maxWidth: 640 }}
               type="error"
               showIcon
               message="삭제된 인력입니다. 프로필과 문서는 보존되어 있으며 일반 사용자에게는 표시되지 않습니다. 복원 후 다시 수정할 수 있습니다."
+            />
+          ) : null}
+          {profileFreshness === 'STALE' ? (
+            <Alert
+              style={{ marginTop: 12, maxWidth: 640 }}
+              type="warning"
+              showIcon
+              message="마지막 프로필 갱신 후 1년이 지났습니다. 최신 문서 또는 프로필 정보를 확인해 주세요."
             />
           ) : null}
           {primaryJobs.length > 1 ? (
