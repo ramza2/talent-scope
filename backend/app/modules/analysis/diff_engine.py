@@ -11,6 +11,7 @@ from app.ai.schemas.profile_candidate import (
     PROFILE_SCALAR_FIELDS,
     ProfileCandidateDocument,
 )
+from app.core.person_name import person_name_match_key
 
 EMPLOYMENT_FIELDS: tuple[str, ...] = (
     "company_name",
@@ -226,7 +227,20 @@ def _diff_profile_scalars(
             continue
         old_val = profile_snap.get(field_name)
         path = f"profile.{field_name}"
-        if _eq(old_val, new_val):
+        if field_name == "name":
+            old_key = person_name_match_key(
+                old_val if isinstance(old_val, str) else None
+            )
+            new_key = person_name_match_key(
+                new_val if isinstance(new_val, str) else None
+            )
+            if old_key is not None and old_key == new_key:
+                change = "SAME"
+            elif old_val is None or old_val == "":
+                change = "NEW"
+            else:
+                change = "CONFLICT"
+        elif _eq(old_val, new_val):
             change = "SAME"
         elif old_val is None or old_val == "":
             change = "NEW"

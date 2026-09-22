@@ -6,6 +6,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.core.person_name import normalize_person_name
+
 SCHEMA_VERSION = "profile-candidate-v1"
 ALLOWED_GRADES = frozenset(
     {"BEGINNER", "INTERMEDIATE", "ADVANCED", "EXPERT", "UNKNOWN"}
@@ -67,6 +69,15 @@ class ProfileCandidate(BaseModel):
     profile_summary: str | None = None
     # Optional per-field provenance map. Keys limited to PROFILE_SCALAR_FIELDS.
     source_refs: dict[str, list[SourceRef]] = Field(default_factory=dict)
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def _normalize_person_name(cls, value: object) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            value = str(value)
+        return normalize_person_name(value)
 
     @field_validator("source_refs", mode="before")
     @classmethod

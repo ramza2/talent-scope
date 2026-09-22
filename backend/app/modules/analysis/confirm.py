@@ -20,6 +20,7 @@ from app.core.exceptions import (
     NotFoundError,
     ProfileVersionConflictError,
 )
+from app.core.person_name import normalize_person_name
 from app.db.models.analysis import AnalysisDiffItem, AnalysisRun
 from app.db.models.person import (
     Certification,
@@ -837,7 +838,8 @@ class _ConfirmContext:
 
     def _coerce_profile_value(self, field: str, value: Any) -> Any:
         if field == "name":
-            text = _norm_str(value)
+            raw = value if isinstance(value, str) else _norm_str(value)
+            text = normalize_person_name(raw)
             if not text:
                 raise ConfirmValidationError("이름은 비어 있을 수 없습니다.")
             return _assert_str_max_len("name", text, _PROFILE_STRING_LIMITS["name"])

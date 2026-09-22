@@ -8,6 +8,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from app.core.person_name import normalize_person_name
+
 PersonStatus = Literal["ACTIVE", "INACTIVE", "ARCHIVED", "DELETED"]
 TechnicalGrade = Literal["BEGINNER", "INTERMEDIATE", "ADVANCED", "EXPERT", "UNKNOWN"]
 JobType = Literal["PRIMARY", "SECONDARY", "EXPERIENCE"]
@@ -151,7 +153,7 @@ class PersonCreateRequest(BaseModel):
     @field_validator("name")
     @classmethod
     def strip_name(cls, value: str) -> str:
-        cleaned = value.strip()
+        cleaned = normalize_person_name(value)
         if not cleaned:
             raise ValueError("이름은 필수입니다.")
         return cleaned
@@ -189,7 +191,7 @@ class ProfileUpdateRequest(BaseModel):
             return self
         if self.name is None:
             raise ValueError("이름은 null일 수 없습니다.")
-        cleaned = self.name.strip()
+        cleaned = normalize_person_name(self.name)
         if not cleaned:
             raise ValueError("이름은 비어 있을 수 없습니다.")
         if len(cleaned) > 150:

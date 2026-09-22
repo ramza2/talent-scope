@@ -10,6 +10,11 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.ai.schemas.identity import IdentityExtraction
+from app.core.person_name import (
+    is_korean_person_name,
+    normalize_person_name,
+    person_name_match_key,
+)
 from app.db.models.person import Person, PersonProfile
 
 MAX_DUPLICATE_CANDIDATES = 10
@@ -55,6 +60,10 @@ def normalize_phone_digits(value: str | None) -> str | None:
 
 
 def normalize_name(value: str | None) -> str | None:
+    return person_name_match_key(value)
+
+
+def _collapse_casefold(value: str | None) -> str | None:
     if not value:
         return None
     collapsed = re.sub(r"\s+", " ", value.strip()).casefold()
@@ -62,7 +71,7 @@ def normalize_name(value: str | None) -> str | None:
 
 
 def normalize_company(value: str | None) -> str | None:
-    return normalize_name(value)
+    return _collapse_casefold(value)
 
 
 def score_candidate(
@@ -185,10 +194,21 @@ class DuplicateMatcher:
                 func.regexp_replace(PersonProfile.phone, r"[^0-9]", "", "g") == phone
             )
         if name:
-            filters.append(
-                func.lower(func.regexp_replace(func.trim(PersonProfile.name), r"\s+", " ", "g"))
-                == name
-            )
+            if is_korean_person_name(identity.name):
+                canonical = normalize_person_name(identity.name)
+                filters.append(
+                    func.regexp_replace(func.trim(PersonProfile.name), r"\s+", "", "g")
+                    == canonical
+                )
+            else:
+                filters.append(
+                    func.lower(
+                        func.regexp_replace(
+                            func.trim(PersonProfile.name), r"\s+", " ", "g"
+                        )
+                    )
+                    == name
+                )
         if company:
             filters.append(
                 func.lower(
