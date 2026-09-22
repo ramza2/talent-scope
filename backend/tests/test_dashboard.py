@@ -270,24 +270,27 @@ def _add_failed_document(
     )
     db_session.add(group)
     db_session.flush()
-    doc = Document(
-        document_group_id=group.id,
-        version_no=1,
-        is_latest=True,
-        original_filename=filename,
-        extension="pdf",
-        mime_type="application/pdf",
-        file_size=10,
-        storage_key=f"test/dash/{uuid.uuid4()}.pdf",
-        sha256=uuid.uuid4().hex + uuid.uuid4().hex[:32],
-        processing_status="FAILED",
-        processing_error=error,
-        deleted_at=datetime.now(UTC) if deleted_doc else None,
-    )
+    # Set updated_at on INSERT only — post-flush assignment triggers
+    # trg_document_updated_at which forces NEW.updated_at = NOW().
+    doc_kwargs: dict = {
+        "document_group_id": group.id,
+        "version_no": 1,
+        "is_latest": True,
+        "original_filename": filename,
+        "extension": "pdf",
+        "mime_type": "application/pdf",
+        "file_size": 10,
+        "storage_key": f"test/dash/{uuid.uuid4()}.pdf",
+        "sha256": uuid.uuid4().hex + uuid.uuid4().hex[:32],
+        "processing_status": "FAILED",
+        "processing_error": error,
+        "deleted_at": datetime.now(UTC) if deleted_doc else None,
+    }
+    if updated_at is not None:
+        doc_kwargs["updated_at"] = updated_at
+    doc = Document(**doc_kwargs)
     db_session.add(doc)
     db_session.flush()
-    if updated_at is not None:
-        doc.updated_at = updated_at
     return doc
 
 
