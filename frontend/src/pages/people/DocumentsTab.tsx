@@ -38,6 +38,48 @@ type Props = {
   onChanged: () => Promise<void>
 }
 
+type DocTypeSource = 'manual' | null
+
+/** High-confidence filename rules aligned with backend `_suggest_doc_type` (no DOC-OTHER fallback). */
+function suggestDocTypeFromFilename(filename: string): string | undefined {
+  const lower = filename.toLowerCase()
+  const mapping: Array<[readonly string[], string]> = [
+    [['이력서', 'resume', 'cv'], 'DOC-RESUME'],
+    [['경력기술', 'career'], 'DOC-CAREER'],
+    [['프로필', 'profile'], 'DOC-PROFILE'],
+    [['자격', 'cert'], 'DOC-CERT'],
+    [['kosa', '경력증명'], 'DOC-KOSA'],
+    [['포트폴리오', 'portfolio'], 'DOC-PORTFOLIO'],
+    [['학력', 'diploma', '졸업'], 'DOC-EDU'],
+  ]
+  for (const [keys, code] of mapping) {
+    if (keys.some((k) => lower.includes(k))) {
+      return code
+    }
+  }
+  return undefined
+}
+
+/** All files must resolve to the same active DOC_TYPE; otherwise no auto-selection. */
+function consensusDocType(
+  files: UploadFile[],
+  activeCodes: ReadonlySet<string>,
+): string | undefined {
+  if (files.length === 0) return undefined
+  let agreed: string | undefined
+  for (const file of files) {
+    const name = file.name || file.originFileObj?.name || ''
+    const code = suggestDocTypeFromFilename(name)
+    if (!code || !activeCodes.has(code)) return undefined
+    if (agreed === undefined) {
+      agreed = code
+    } else if (agreed !== code) {
+      return undefined
+    }
+  }
+  return agreed
+}
+
 function statusTag(status: string) {
   const color =
     status === 'READY'
@@ -55,6 +97,7 @@ export function DocumentsTab({ personId, isAdmin, onChanged }: Props) {
   const queryClient = useQueryClient()
   const [uploadOpen, setUploadOpen] = useState(false)
   const [docType, setDocType] = useState<string | undefined>()
+  const [docTypeSource, setDocTypeSource] = useState<DocTypeSource>(null)
   const [fileList, setFileList] = useState<UploadFile[]>([])
   const [showDeleted, setShowDeleted] = useState(false)
   const [selectedKeys, setSelectedKeys] = useState<Key[]>([])
@@ -90,6 +133,26 @@ export function DocumentsTab({ personId, isAdmin, onChanged }: Props) {
     [docTypesQuery.data],
   )
 
+  const suggestedDocType = useMemo(() => {
+    if (!uploadOpen) return undefined
+    if (fileList.length === 0) return undefined
+    if (docTypesQuery.isLoading) return undefined
+    const activeCodes = new Set(docTypeOptions.map((o) => o.value))
+    return consensusDocType(fileList, activeCodes)
+  }, [uploadOpen, fileList, docTypeOptions, docTypesQuery.isLoading])
+
+  const effectiveDocType =
+    docTypeSource === 'manual' ? docType : (suggestedDocType ?? undefined)
+  const isSuggestedSelection =
+    docTypeSource !== 'manual' && Boolean(suggestedDocType)
+
+  const resetUploadModal = () => {
+    setUploadOpen(false)
+    setFileList([])
+    setDocType(undefined)
+    setDocTypeSource(null)
+  }
+
   const invalidateLocal = async () => {
     await queryClient.invalidateQueries({ queryKey: ['people', personId, 'documents'] })
     await onChanged()
@@ -97,7 +160,7 @@ export function DocumentsTab({ personId, isAdmin, onChanged }: Props) {
 
   const uploadMutation = useMutation({
     mutationFn: async () => {
-      if (!docType) throw new Error('문서 종류를 선택하세요.')
+      if (!effectiveDocType) throw new Error('문서 종류를 선택하세요.')
       const files: File[] = []
       for (const item of fileList) {
         if (item.originFileObj) {
@@ -108,7 +171,7 @@ export function DocumentsTab({ personId, isAdmin, onChanged }: Props) {
       return promoteExistingPersonDocuments({
         personId,
         files,
-        documentTypeCode: docType,
+        documentTypeCode: effectiveDocType,
         mode: 'NEW_GROUP',
       })
     },
@@ -129,9 +192,7 @@ export function DocumentsTab({ personId, isAdmin, onChanged }: Props) {
           '문서를 업로드했습니다. 문서 처리 완료 후 AI 상세 분석이 자동으로 시작됩니다.',
         )
       }
-      setUploadOpen(false)
-      setFileList([])
-      setDocType(undefined)
+      resetUploadModal()
       await invalidateLocal()
     },
     onError: (error) => message.error(apiErrorMessage(error, '문서 업로드에 실패했습니다.')),
@@ -355,8 +416,7 @@ export function DocumentsTab({ personId, isAdmin, onChanged }: Props) {
       </Space>
 
       <Typography.Paragraph type="secondary" style={{ marginTop: 0 }}>
-        업로드 후 미리보기/텍스트 추출이 백그라운드에서 처리됩니다. AI 식별·신규 인력 Wizard는
-        다음 단계에서 제공됩니다.
+        업로드 후 미리보기/텍스트 추출과 AI 상세 분석이 백그라운드에서 처리됩니다.
       </Typography.Paragraph>
 
       <Table
@@ -391,7 +451,7 @@ export function DocumentsTab({ personId, isAdmin, onChanged }: Props) {
       <Modal
         title="문서 추가"
         open={uploadOpen}
-        onCancel={() => setUploadOpen(false)}
+        onCancel={resetUploadModal}
         onOk={() => uploadMutation.mutate()}
         confirmLoading={uploadMutation.isPending}
         okText="업로드"
@@ -407,12 +467,21 @@ export function DocumentsTab({ personId, isAdmin, onChanged }: Props) {
             style={{ width: '100%', marginTop: 6 }}
             placeholder="DOC_TYPE 선택"
             options={docTypeOptions}
-            value={docType}
-            onChange={setDocType}
+            value={effectiveDocType}
+            allowClear
+            onChange={(value) => {
+              setDocType(value)
+              setDocTypeSource('manual')
+            }}
             loading={docTypesQuery.isLoading}
             showSearch
             optionFilterProp="label"
           />
+          {isSuggestedSelection ? (
+            <Typography.Text type="secondary" style={{ display: 'block', marginTop: 6 }}>
+              파일명 기준으로 문서 종류를 자동 선택했습니다.
+            </Typography.Text>
+          ) : null}
         </div>
         <Upload
           multiple
