@@ -374,8 +374,9 @@ Docker Compose + Traefik Label 기반 구조를 방해하는 구현을 하지 �
 ## 17. Git / PR Safety
 
 - `main`을 직접 수정하지 않는다. 사용자가 명시적으로 요청한 경우만 예외로 한다.
+- 새 PR은 사용자가 명시적으로 요청한 경우에만 생성한다.
 - 같은 작업의 기존 브랜치/PR이 있으면 계속 사용하고 중복 PR을 만들지 않는다.
-- 기본적으로 Draft PR 상태를 유지한다.
+- PR 생성 요청이 있는 경우 기본적으로 Draft로 생성한다.
 - Commit/Push/기존 Draft PR 갱신은 작업 범위 안에서 수행할 수 있다.
 - **Merge는 사용자가 명시적으로 `merge` 또는 `머지`라고 요청한 경우에만 수행한다.**
 - 명시적 승인 없이 force-push, branch 삭제, PR close, release/tag 생성, 운영 배포를 하지 않는다.
@@ -402,3 +403,19 @@ Docker Compose + Traefik Label 기반 구조를 방해하는 구현을 하지 �
 
 전체 diff, 긴 로그, 작업요청 재서술, 불필요한 다음 작업 목록은 보고하지 않는다.
 설계상 불확실성이나 실제 blocker는 숨기지 않는다.
+
+## 19. Agent Cost / Context Efficiency
+
+Agent 작업은 정확성을 해치지 않는 범위에서 Context와 실행 비용을 최소화한다.
+
+- 사용자가 이미 원인, 관련 파일, HEAD SHA, 테스트 결과를 제공한 경우 동일 내용을 재조사하지 않는다.
+- 전체 파일을 읽기보다 관련 symbol/function/구간부터 확인한다.
+- `git log`, `git blame`, 전체 문서/전체 저장소 검색은 현재 작업에 필요한 경우에만 수행한다.
+- Sub-agent / parallel agent는 기본적으로 사용하지 않는다. 명확한 독립 작업이 있거나 사용자가 요청한 경우만 사용한다.
+- 동일 이슈/브랜치는 새 Agent보다 기존 Agent/대화를 이어서 처리한다.
+- 구현 작업 중 PR 생성, CI 대기, 전체 regression은 사용자가 요청하지 않으면 수행하지 않는다.
+- 사용자가 서버에서 전체 regression/build를 수행하는 경우 Agent는 targeted test만 실행한다.
+- 이미 PASS한 테스트는 관련 코드가 다시 변경되지 않았다면 반복 실행하지 않는다.
+- 작업과 무관한 README/docs/TODO 정리는 하지 않는다.
+- blocker 없이 지정 범위를 넘어 탐색하지 않는다.
+- 완료 보고에는 전체 diff/로그를 붙이지 않고 Changed / Verified / Git / Notes만 작성한다.
