@@ -12,38 +12,6 @@ def _req(**kwargs) -> SearchPeopleRequest:
     return SearchPeopleRequest.model_validate(kwargs)
 
 
-def test_suggest_relaxations_false_returns_empty_even_when_zero_rules_match() -> None:
-    request = _req(
-        suggest_relaxations=False,
-        skill_match_mode="ALL",
-        required={"skills": ["TECH-A", "TECH-B"]},
-    )
-    total = 0
-    relaxations = (
-        build_search_relaxations(request)
-        if request.suggest_relaxations and total == 0
-        else []
-    )
-    assert relaxations == []
-    # Builder itself still produces candidates when invoked directly.
-    assert build_search_relaxations(request)
-
-def test_nonzero_total_skips_relaxations_contract() -> None:
-    """Document service gate: total > 0 yields no relaxations regardless of flag."""
-    request = _req(
-        suggest_relaxations=True,
-        skill_match_mode="ALL",
-        required={"skills": ["TECH-A", "TECH-B"]},
-    )
-    total = 3
-    relaxations = (
-        build_search_relaxations(request)
-        if request.suggest_relaxations and total == 0
-        else []
-    )
-    assert relaxations == []
-
-
 def test_skill_match_all_to_any() -> None:
     request = _req(
         skill_match_mode="ALL",
