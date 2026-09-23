@@ -125,6 +125,29 @@ def _quote_in_source(
     return False
 
 
+def _ensure_single_primary_job(jobs: list[JobCandidate]) -> list[JobCandidate]:
+    """Keep exactly one PRIMARY when multiple PRIMARYs are present.
+
+    Selection: highest ``confidence``; ties / all-None keep the first PRIMARY
+    in array order. Other PRIMARYs become SECONDARY. Other fields are preserved.
+    """
+    primary_indices = [i for i, job in enumerate(jobs) if job.job_type == "PRIMARY"]
+    if len(primary_indices) <= 1:
+        return jobs
+
+    def _confidence_key(index: int) -> float:
+        value = jobs[index].confidence
+        return value if value is not None else float("-inf")
+
+    # max() is stable for equal keys → earliest PRIMARY in array order wins ties.
+    keep_index = max(primary_indices, key=_confidence_key)
+    demote = set(primary_indices) - {keep_index}
+    return [
+        job.model_copy(update={"job_type": "SECONDARY"}) if i in demote else job
+        for i, job in enumerate(jobs)
+    ]
+
+
 def _normalize_source_refs(
     refs: list[SourceRef] | list[dict[str, Any]] | None,
     *,
@@ -228,7 +251,7 @@ def normalize_candidate(
                 }
             )
         )
-    doc.jobs = jobs
+    doc.jobs = _ensure_single_primary_job(jobs)
 
     skills: list[SkillCandidate] = []
     for skill in doc.skills:

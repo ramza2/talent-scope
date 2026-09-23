@@ -347,6 +347,143 @@ def test_normalize_career_document_value_length_guard():
     assert "name" in dropped.profile.source_refs
 
 
+def test_normalize_ensures_single_primary_job():
+    from app.modules.analysis.normalize import normalize_candidate
+
+    catalog = {
+        "JOB-A": ("JOB", True),
+        "JOB-B": ("JOB", True),
+        "JOB-C": ("JOB", True),
+    }
+    allowed: dict[str, set[int]] = {}
+
+    def _raw(jobs):
+        return {
+            "schema_version": "profile-candidate-v1",
+            "profile": {"name": "테스트"},
+            "jobs": jobs,
+            "skills": [],
+            "expertise": [],
+            "employment_history": [],
+            "education": [],
+            "certifications": [],
+            "projects": [],
+            "summary": {},
+            "analysis": {},
+        }
+
+    # Higher confidence PRIMARY wins; others demoted to SECONDARY.
+    high_conf = normalize_candidate(
+        _raw(
+            [
+                {
+                    "code": "JOB-A",
+                    "job_type": "PRIMARY",
+                    "confidence": 0.4,
+                    "raw_value": "A",
+                },
+                {
+                    "code": "JOB-B",
+                    "job_type": "PRIMARY",
+                    "confidence": 0.9,
+                    "raw_value": "B",
+                },
+                {
+                    "code": "JOB-C",
+                    "job_type": "SECONDARY",
+                    "confidence": 0.95,
+                    "raw_value": "C",
+                },
+            ]
+        ),
+        catalog=catalog,
+        allowed_documents=allowed,
+    )
+    assert [j.job_type for j in high_conf.jobs] == [
+        "SECONDARY",
+        "PRIMARY",
+        "SECONDARY",
+    ]
+    assert high_conf.jobs[0].code == "JOB-A"
+    assert high_conf.jobs[0].raw_value == "A"
+    assert high_conf.jobs[0].confidence == 0.4
+    assert high_conf.jobs[1].code == "JOB-B"
+    assert high_conf.jobs[1].raw_value == "B"
+    assert high_conf.jobs[1].confidence == 0.9
+    assert high_conf.jobs[2].job_type == "SECONDARY"
+
+    # Equal confidence → first PRIMARY in array order kept.
+    tied = normalize_candidate(
+        _raw(
+            [
+                {
+                    "code": "JOB-A",
+                    "job_type": "PRIMARY",
+                    "confidence": 0.7,
+                    "raw_value": "first",
+                },
+                {
+                    "code": "JOB-B",
+                    "job_type": "PRIMARY",
+                    "confidence": 0.7,
+                    "raw_value": "second",
+                },
+            ]
+        ),
+        catalog=catalog,
+        allowed_documents=allowed,
+    )
+    assert tied.jobs[0].job_type == "PRIMARY"
+    assert tied.jobs[0].raw_value == "first"
+    assert tied.jobs[1].job_type == "SECONDARY"
+    assert tied.jobs[1].raw_value == "second"
+    assert tied.jobs[1].code == "JOB-B"
+    assert tied.jobs[1].confidence == 0.7
+
+    # Single PRIMARY unchanged.
+    single = normalize_candidate(
+        _raw(
+            [
+                {"code": "JOB-A", "job_type": "PRIMARY", "raw_value": "only"},
+                {"code": "JOB-B", "job_type": "SECONDARY", "raw_value": "sec"},
+            ]
+        ),
+        catalog=catalog,
+        allowed_documents=allowed,
+    )
+    assert [j.job_type for j in single.jobs] == ["PRIMARY", "SECONDARY"]
+    assert single.jobs[0].raw_value == "only"
+
+    # Zero PRIMARY unchanged.
+    none_primary = normalize_candidate(
+        _raw(
+            [
+                {"code": "JOB-A", "job_type": "SECONDARY", "raw_value": "s1"},
+                {"code": "JOB-B", "job_type": "EXPERIENCE", "raw_value": "e1"},
+            ]
+        ),
+        catalog=catalog,
+        allowed_documents=allowed,
+    )
+    assert [j.job_type for j in none_primary.jobs] == ["SECONDARY", "EXPERIENCE"]
+    assert none_primary.jobs[0].raw_value == "s1"
+    assert none_primary.jobs[1].raw_value == "e1"
+
+    # All-None confidence among multiple PRIMARY → first wins.
+    none_conf = normalize_candidate(
+        _raw(
+            [
+                {"code": "JOB-A", "job_type": "PRIMARY", "raw_value": "n1"},
+                {"code": "JOB-B", "job_type": "PRIMARY", "raw_value": "n2"},
+            ]
+        ),
+        catalog=catalog,
+        allowed_documents=allowed,
+    )
+    assert none_conf.jobs[0].job_type == "PRIMARY"
+    assert none_conf.jobs[1].job_type == "SECONDARY"
+
+
 def test_create_run_list_review_retry_confirm(
     client: TestClient, db_session, monkeypatch: pytest.MonkeyPatch
 ):
