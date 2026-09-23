@@ -34,6 +34,7 @@ import {
   type ProjectDetail,
 } from '@/api/projects'
 import { formatPeriod, fromIsoDate, toIsoDate } from '@/pages/people/dateUtils'
+import { TargetEvidenceButton } from '@/pages/people/TargetEvidenceButton'
 
 type CodeOption = { value: string; label: string }
 
@@ -300,6 +301,14 @@ export function ProjectCareerTab({ personId, isAdmin, onChanged }: Props) {
       ellipsis: true,
       render: (v) => v || '—',
     },
+    {
+      title: '근거',
+      key: 'evidence',
+      width: 90,
+      render: (_: unknown, row: EmploymentItem) => (
+        <TargetEvidenceButton targetType="EMPLOYMENT_HISTORY" targetId={row.id} />
+      ),
+    },
     ...(isAdmin
       ? [
           {
@@ -376,28 +385,31 @@ export function ProjectCareerTab({ personId, isAdmin, onChanged }: Props) {
                 size="small"
                 title={p.project_name}
                 extra={
-                  isAdmin ? (
-                    <Space>
-                      <Button type="link" size="small" onClick={() => openProjEdit(p)}>
-                        수정
-                      </Button>
-                      <Button
-                        type="link"
-                        danger
-                        size="small"
-                        onClick={() =>
-                          Modal.confirm({
-                            title: '프로젝트 경력을 삭제하시겠습니까?',
-                            content:
-                              '검색 및 사업분야/고객유형 집계에서 제외됩니다.',
-                            onOk: () => projDeleteMutation.mutateAsync(p.id),
-                          })
-                        }
-                      >
-                        삭제
-                      </Button>
-                    </Space>
-                  ) : null
+                  <Space>
+                    <TargetEvidenceButton targetType="PROJECT" targetId={p.id} />
+                    {isAdmin ? (
+                      <>
+                        <Button type="link" size="small" onClick={() => openProjEdit(p)}>
+                          수정
+                        </Button>
+                        <Button
+                          type="link"
+                          danger
+                          size="small"
+                          onClick={() =>
+                            Modal.confirm({
+                              title: '프로젝트 경력을 삭제하시겠습니까?',
+                              content:
+                                '검색 및 사업분야/고객유형 집계에서 제외됩니다.',
+                              onOk: () => projDeleteMutation.mutateAsync(p.id),
+                            })
+                          }
+                        >
+                          삭제
+                        </Button>
+                      </>
+                    ) : null}
+                  </Space>
                 }
               >
                 <Typography.Paragraph style={{ marginBottom: 8 }}>

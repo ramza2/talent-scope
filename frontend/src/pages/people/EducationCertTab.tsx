@@ -28,6 +28,7 @@ import {
   type EducationItem,
 } from '@/api/career'
 import { formatPeriod, fromIsoDate, toIsoDate } from '@/pages/people/dateUtils'
+import { TargetEvidenceButton } from '@/pages/people/TargetEvidenceButton'
 
 type Props = {
   personId: string
@@ -169,6 +170,14 @@ export function EducationCertTab({ personId, isAdmin, onChanged }: Props) {
       render: (_, row) => formatPeriod(row.start_date, row.end_date, '—'),
     },
     { title: '상태', dataIndex: 'status', render: (v) => v || '—' },
+    {
+      title: '근거',
+      key: 'evidence',
+      width: 90,
+      render: (_: unknown, row: EducationItem) => (
+        <TargetEvidenceButton targetType="EDUCATION" targetId={row.id} />
+      ),
+    },
     ...(isAdmin
       ? [
           {
@@ -212,6 +221,14 @@ export function EducationCertTab({ personId, isAdmin, onChanged }: Props) {
       title: '만료일',
       dataIndex: 'expiry_date',
       render: (v?: string | null) => v || '—',
+    },
+    {
+      title: '근거',
+      key: 'evidence',
+      width: 90,
+      render: (_: unknown, row: CertificationItem) => (
+        <TargetEvidenceButton targetType="CERTIFICATION" targetId={row.id} />
+      ),
     },
     ...(isAdmin
       ? [

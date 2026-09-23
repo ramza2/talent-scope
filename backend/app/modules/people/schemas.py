@@ -36,6 +36,7 @@ class CodeRef(BaseModel):
 
 
 class JobItem(BaseModel):
+    id: UUID
     code: str
     name: str
     job_type: JobType
@@ -44,6 +45,7 @@ class JobItem(BaseModel):
 
 
 class SkillItem(BaseModel):
+    id: UUID
     code: str
     name: str
     last_used_year: int | None = None
@@ -53,6 +55,7 @@ class SkillItem(BaseModel):
 
 
 class ExpertiseItem(BaseModel):
+    id: UUID
     code: str
     name: str
     evidence_type: EvidenceType = "EXPLICIT"

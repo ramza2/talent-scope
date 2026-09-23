@@ -377,6 +377,9 @@ def test_jobs_skills_expertise_and_filters(client: TestClient, db_session) -> No
         detail = client.get(f"/api/v1/people/{person_id}").json()["data"]
         assert any(s["code"] == inactive_tech for s in detail["skills"])
         assert any(e["code"] == exp and e["name"] == "RAG" for e in detail["expertise"])
+        assert detail["jobs"] and detail["jobs"][0].get("id")
+        assert detail["skills"] and all(s.get("id") for s in detail["skills"])
+        assert detail["expertise"] and all(e.get("id") for e in detail["expertise"])
 
         listed = client.get(
             "/api/v1/people",
