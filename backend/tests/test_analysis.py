@@ -4610,15 +4610,20 @@ class _SequenceLLM:
         self.payloads = list(payloads)
         self.calls = 0
         self.last_user_prompt: str | None = None
+        self.user_prompts: list[str] = []
 
     def complete_json(self, **kwargs):
         self.calls += 1
-        self.last_user_prompt = kwargs.get("user_prompt")
+        prompt = kwargs.get("user_prompt")
+        self.last_user_prompt = prompt
+        if isinstance(prompt, str):
+            self.user_prompts.append(prompt)
         idx = min(self.calls - 1, len(self.payloads) - 1)
         return dict(self.payloads[idx])
 
 
-def _queue_run(db_session, person_id, document_id):
+def _queue_run(db_session, person_id, document_id, *, prompt_version: str | None = None):
+    from app.ai.prompts.profile_extract import CURRENT_PROFILE_PROMPT_VERSION
     from app.modules.analysis.repository import AnalysisRepository
 
     repo = AnalysisRepository(db_session)
@@ -4627,12 +4632,24 @@ def _queue_run(db_session, person_id, document_id):
         base_profile_version=1,
         llm_model="fake",
         vlm_model="fake",
-        prompt_version="profile-extract-v1",
+        prompt_version=prompt_version or CURRENT_PROFILE_PROMPT_VERSION,
         schema_version="profile-candidate-v1",
     )
     repo.add_run_documents(run.id, [document_id])
     db_session.commit()
     return run
+
+
+def _assert_no_recovery_retry_instruction(prompt: str | None) -> None:
+    assert prompt is not None
+    assert "BEGIN RECOVERY RETRY INSTRUCTION" not in prompt
+
+
+def _assert_has_recovery_retry_instruction(prompt: str | None) -> None:
+    assert prompt is not None
+    assert "BEGIN RECOVERY RETRY INSTRUCTION" in prompt
+    assert "직전 추출 결과가 비어 있거나 구조화 정보가 부족" in prompt
+    assert "빠짐없이 추출" in prompt
 
 
 def test_candidate_quality_helpers_ignore_summary_metadata():
@@ -4748,6 +4765,9 @@ def test_empty_candidate_retries_then_reviewing(db_session):
     service = AnalysisService(db_session, storage=get_object_storage(), llm=llm)
     assert service.run_analysis(run.id) == "REVIEWING"
     assert llm.calls == 2
+    assert len(llm.user_prompts) == 2
+    _assert_no_recovery_retry_instruction(llm.user_prompts[0])
+    _assert_has_recovery_retry_instruction(llm.user_prompts[1])
     db_session.refresh(run)
     assert run.status == "REVIEWING"
     diffs = list(
@@ -4783,6 +4803,9 @@ def test_empty_candidate_retries_then_failed(db_session):
     service = AnalysisService(db_session, storage=get_object_storage(), llm=llm)
     assert service.run_analysis(run.id) == "FAILED"
     assert llm.calls == 2
+    assert len(llm.user_prompts) == 2
+    _assert_no_recovery_retry_instruction(llm.user_prompts[0])
+    _assert_has_recovery_retry_instruction(llm.user_prompts[1])
     db_session.refresh(run)
     assert run.status == "FAILED"
     assert run.error_message == InsufficientCandidateError.USER_MESSAGE
@@ -4814,6 +4837,9 @@ def test_sparse_profile_retries_then_reviewing(db_session):
     service = AnalysisService(db_session, storage=get_object_storage(), llm=llm)
     assert service.run_analysis(run.id) == "REVIEWING"
     assert llm.calls == 2
+    assert len(llm.user_prompts) == 2
+    _assert_no_recovery_retry_instruction(llm.user_prompts[0])
+    _assert_has_recovery_retry_instruction(llm.user_prompts[1])
     db_session.refresh(run)
     assert run.status == "REVIEWING"
     _cleanup_person(db_session, person.id, admin.id)
@@ -4841,6 +4867,9 @@ def test_sparse_kosa_retries_then_failed(db_session):
     service = AnalysisService(db_session, storage=get_object_storage(), llm=llm)
     assert service.run_analysis(run.id) == "FAILED"
     assert llm.calls == 2
+    assert len(llm.user_prompts) == 2
+    _assert_no_recovery_retry_instruction(llm.user_prompts[0])
+    _assert_has_recovery_retry_instruction(llm.user_prompts[1])
     db_session.refresh(run)
     assert run.status == "FAILED"
     assert run.error_message == InsufficientCandidateError.USER_MESSAGE
@@ -4866,8 +4895,38 @@ def test_valid_candidate_single_llm_call(db_session):
     service = AnalysisService(db_session, storage=get_object_storage(), llm=llm)
     assert service.run_analysis(run.id) == "REVIEWING"
     assert llm.calls == 1
+    assert len(llm.user_prompts) == 1
+    _assert_no_recovery_retry_instruction(llm.user_prompts[0])
     db_session.refresh(run)
     assert run.status == "REVIEWING"
+    _cleanup_person(db_session, person.id, admin.id)
+
+
+def test_v1_empty_retry_does_not_inject_recovery_instruction(db_session):
+    """Stored v1 runs still retry once, but ignore recovery_retry instruction."""
+    from app.modules.analysis.service import AnalysisService
+    from app.storage.s3 import get_object_storage
+
+    admin = _create_user(
+        db_session, login_id=f"a_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    person, document = _seed_person_doc(
+        db_session,
+        admin.id,
+        doc_type_code="DOC-KOSA",
+        doc_type_name="KOSA",
+        page_text=_RICH_PAGE_TEXT,
+    )
+    run = _queue_run(
+        db_session, person.id, document.id, prompt_version="profile-extract-v1"
+    )
+    llm = _SequenceLLM([_empty_candidate_json(), _valid_candidate_json()])
+    service = AnalysisService(db_session, storage=get_object_storage(), llm=llm)
+    assert service.run_analysis(run.id) == "REVIEWING"
+    assert llm.calls == 2
+    assert all(
+        "BEGIN RECOVERY RETRY INSTRUCTION" not in p for p in llm.user_prompts
+    )
     _cleanup_person(db_session, person.id, admin.id)
 
 
