@@ -20,6 +20,7 @@ import {
   interpretSearch,
   searchPeople,
   type SearchPeopleRequest,
+  type SearchRelaxation,
 } from '@/api/search'
 import { SearchConditionPanel } from '@/pages/search/SearchConditionPanel'
 import { SearchEvidenceDrawer } from '@/pages/search/SearchEvidenceDrawer'
@@ -32,6 +33,7 @@ import {
   draftToPeopleRequest,
   draftToPreviousQuery,
   hasActiveSearchConditions,
+  hydrateDraftQuery,
   interpretDataToDraft,
   isSearchDirty,
   parseTalentSearchState,
@@ -276,6 +278,11 @@ export function SearchPage() {
     queryClient.removeQueries({ queryKey: ['search', 'people'] })
   }
 
+  const handleApplyRelaxation = (relaxation: SearchRelaxation) => {
+    setDraftQuery(hydrateDraftQuery(relaxation.suggested_query))
+    message.info('조건을 완화했습니다. 검색 버튼을 눌러 다시 검색하세요.')
+  }
+
   const handleSortChange = (sort: SearchDraftQuery['sort']) => {
     const nextDraft = { ...draftQuery, sort }
     setDraftQuery(nextDraft)
@@ -327,6 +334,7 @@ export function SearchPage() {
 
   const results = searchQuery.data?.data ?? []
   const meta = searchQuery.data?.meta
+  const relaxations = searchQuery.data?.relaxations ?? []
   const appliedTags = submittedRequest ? summarizeApplied(submittedRequest) : []
 
   return (
@@ -443,16 +451,57 @@ export function SearchPage() {
             ) : null}
 
             {!searchQuery.isFetching && meta && meta.total === 0 ? (
-              <Empty
-                description={
-                  <span>
-                    조건을 만족하는 인력이 없습니다.
-                    <br />
-                    필수조건은 자동으로 완화되지 않습니다. 조건을 직접 수정한 뒤 다시
-                    검색해주세요.
-                  </span>
-                }
-              />
+              <Space direction="vertical" size={12} style={{ width: '100%' }}>
+                <Empty
+                  description={
+                    <span>
+                      조건을 만족하는 인력이 없습니다.
+                      <br />
+                      필수조건은 자동으로 완화되지 않습니다. 조건을 직접 수정한 뒤 다시
+                      검색해주세요.
+                    </span>
+                  }
+                />
+                {relaxations.length > 0 ? (
+                  <div
+                    style={{
+                      maxWidth: 640,
+                      margin: '0 auto',
+                      width: '100%',
+                    }}
+                  >
+                    <Typography.Text strong>조건 완화 제안</Typography.Text>
+                    <Typography.Paragraph type="secondary" style={{ marginBottom: 8 }}>
+                      아래 제안을 반영한 뒤 검색 버튼을 다시 눌러 주세요. 자동으로
+                      재검색되지 않습니다.
+                    </Typography.Paragraph>
+                    <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                      {relaxations.map((item) => (
+                        <div
+                          key={item.id}
+                          style={{
+                            display: 'flex',
+                            justifyContent: 'space-between',
+                            gap: 12,
+                            alignItems: 'center',
+                            border: '1px solid #f0f0f0',
+                            borderRadius: 8,
+                            padding: '8px 12px',
+                          }}
+                        >
+                          <Typography.Text>{item.label}</Typography.Text>
+                          <Button
+                            size="small"
+                            onClick={() => handleApplyRelaxation(item)}
+                          >
+                            조건에 반영
+                          </Button>
+                        </div>
+                      ))}
+                    </Space>
+                  </div>
+                ) : null}
+              </Space>
             ) : null}
 
             <Space direction="vertical" size={12} style={{ width: '100%' }}>

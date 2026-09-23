@@ -249,8 +249,16 @@ class SearchMeta(BaseModel):
     candidate_limit_reached: bool = False
 
 
+class SearchRelaxation(BaseModel):
+    """Deterministic zero-result relaxation suggestion (no auto-apply)."""
+
+    id: str
+    label: str
+    suggested_query: dict[str, Any]
+
+
 class SearchPeopleResponse(BaseModel):
     data: list[SearchPersonResult]
     meta: SearchMeta
     query: dict[str, Any]
-    relaxations: list[dict[str, Any]] = Field(default_factory=list)
+    relaxations: list[SearchRelaxation] = Field(default_factory=list)

@@ -138,7 +138,7 @@ export function draftToPeopleRequest(
     ...normalized,
     page: opts.page,
     page_size: opts.page_size,
-    suggest_relaxations: false,
+    suggest_relaxations: true,
   }
 }
 
