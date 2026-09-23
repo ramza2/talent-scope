@@ -1,10 +1,9 @@
 import { useState } from 'react'
-import { Alert, Button, Drawer, Empty, Space, Spin, Typography } from 'antd'
+import { Button, Drawer, Empty, Space, Spin, Typography } from 'antd'
 import { FileTextOutlined } from '@ant-design/icons'
 import { useQuery } from '@tanstack/react-query'
 
 import { documentPreviewUrl } from '@/api/documents'
-import { apiErrorMessage } from '@/api/errors'
 import { listEvidence, type EvidenceListItem } from '@/api/evidence'
 
 type Props = {
@@ -50,13 +49,6 @@ export function TargetEvidenceButton({ targetType, targetId, fieldName }: Props)
         destroyOnHidden
       >
         {query.isFetching ? <Spin /> : null}
-        {query.isError ? (
-          <Alert
-            type="error"
-            showIcon
-            message={apiErrorMessage(query.error, '근거 정보를 불러오지 못했습니다.')}
-          />
-        ) : null}
         {!query.isFetching && items.length === 0 ? (
           <Empty description="근거 정보가 없습니다." />
         ) : null}
