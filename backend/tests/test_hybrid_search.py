@@ -1631,3 +1631,74 @@ def test_perf_insert_index_uses_runtime_model_version(monkeypatch) -> None:
     model2, version2 = bench._resolved_index_labels("explicit-m", "explicit-v")
     assert model2 == "explicit-m"
     assert version2 == "explicit-v"
+
+
+# ---------------------------------------------------------------------------
+# Search relaxations response gates (SRCH-16)
+# ---------------------------------------------------------------------------
+
+
+def test_search_relaxations_empty_when_suggest_false_even_if_zero_hits(
+    client: TestClient, db_session
+) -> None:
+    """API gate: suggest_relaxations=false → relaxations=[] even when total==0."""
+    suffix = uuid.uuid4().hex[:8]
+    user = _create_user(db_session, login_id=f"rx0_{suffix}", password="Secret123!")
+    t1 = f"TECH-RXA-{suffix}"
+    t2 = f"TECH-RXB-{suffix}"
+    _ensure_code(db_session, t1, "TECH", "RelaxTechA")
+    _ensure_code(db_session, t2, "TECH", "RelaxTechB")
+    payload = {
+        "required": {"skills": [t1, t2]},
+        "skill_match_mode": "ALL",
+        "page": 1,
+        "page_size": 10,
+    }
+    try:
+        _login(client, user.login_id)
+
+        resp_off = _search(client, {**payload, "suggest_relaxations": False})
+        assert resp_off.status_code == 200, resp_off.text
+        body_off = resp_off.json()
+        assert body_off["meta"]["total"] == 0
+        assert body_off["relaxations"] == []
+
+        # Same zero-hit query with flag on must be able to produce suggestions.
+        resp_on = _search(client, {**payload, "suggest_relaxations": True})
+        assert resp_on.status_code == 200, resp_on.text
+        body_on = resp_on.json()
+        assert body_on["meta"]["total"] == 0
+        assert body_on["relaxations"]
+        assert any(item["id"] == "skill_match_any" for item in body_on["relaxations"])
+    finally:
+        _cleanup_user(db_session, user.id)
+
+
+def test_search_relaxations_empty_when_total_nonzero(
+    client: TestClient, db_session
+) -> None:
+    """API gate: total > 0 → relaxations=[] even when suggest_relaxations=true."""
+    suffix = uuid.uuid4().hex[:8]
+    user = _create_user(db_session, login_id=f"rx1_{suffix}", password="Secret123!")
+    seeded = _seed_person(db_session, suffix=suffix)
+    codes = seeded["codes"]
+    try:
+        _login(client, user.login_id)
+        resp = _search(
+            client,
+            {
+                "required": {"skills": [codes["tech"], codes["tech2"]]},
+                "skill_match_mode": "ALL",
+                "suggest_relaxations": True,
+                "page": 1,
+                "page_size": 10,
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["meta"]["total"] > 0
+        assert str(seeded["person"].id) in _person_ids(body)
+        assert body["relaxations"] == []
+    finally:
+        _cleanup_person(db_session, seeded["person"].id)
+        _cleanup_user(db_session, user.id)

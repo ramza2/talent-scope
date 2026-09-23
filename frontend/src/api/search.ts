@@ -55,6 +55,12 @@ export type SearchExecutableQuery = {
   sort: SearchSort
 }
 
+export type SearchRelaxation = {
+  id: string
+  label: string
+  suggested_query: SearchExecutableQuery
+}
+
 export type SearchInterpretData = SearchExecutableQuery & {
   query_version: '1.0'
   assumptions: string[]
@@ -135,7 +141,7 @@ export type SearchPeopleResponse = {
   data: SearchPersonResult[]
   meta: SearchMeta
   query: Record<string, unknown>
-  relaxations: Array<Record<string, unknown>>
+  relaxations: SearchRelaxation[]
 }
 
 export function interpretSearch(body: SearchInterpretRequest) {

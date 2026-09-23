@@ -25,6 +25,7 @@ from app.modules.search.query_schemas import (
     SearchPeopleResponse,
     SearchPersonResult,
     SearchPersonSummary,
+    SearchRelaxation,
 )
 from app.modules.search.schemas import GRADE_LABELS
 from app.modules.search.ranking import (
@@ -48,6 +49,134 @@ from app.modules.search.result_enrichment import SearchResultEnricher
 
 
 logger = logging.getLogger(__name__)
+
+_MAX_RELAXATIONS = 3
+_CODE_FIELD_LABELS: dict[str, str] = {
+    "jobs": "직무",
+    "skills": "기술",
+    "expertise": "전문분야",
+    "business_domains": "사업분야",
+    "customer_types": "고객유형",
+}
+_TEXT_FIELD_LABELS: dict[str, str] = {
+    "affiliations": "소속",
+    "certifications": "자격",
+    "project_keywords": "프로젝트 키워드",
+}
+
+
+def _executable_query_dict(request: SearchPeopleRequest) -> dict[str, Any]:
+    return {
+        "required": request.required.model_dump(),
+        "preferred": request.preferred.model_dump(),
+        "skill_match_mode": request.skill_match_mode,
+        "semantic_query": request.semantic_query,
+        "keyword_query": request.keyword_query,
+        "sort": request.sort,
+    }
+
+
+def build_search_relaxations(request: SearchPeopleRequest) -> list[SearchRelaxation]:
+    """Build up to 3 deterministic relaxation suggestions for a zero-hit query.
+
+    Does not mutate ``request``. Does not run search / LLM / embedding.
+    """
+    out: list[SearchRelaxation] = []
+    seen: set[str] = set()
+
+    def _add(relaxation_id: str, label: str, candidate: SearchPeopleRequest) -> bool:
+        if len(out) >= _MAX_RELAXATIONS:
+            return False
+        suggested = _executable_query_dict(candidate)
+        fingerprint = repr(suggested)
+        if fingerprint in seen:
+            return True
+        seen.add(fingerprint)
+        out.append(
+            SearchRelaxation(
+                id=relaxation_id,
+                label=label,
+                suggested_query=suggested,
+            )
+        )
+        return len(out) < _MAX_RELAXATIONS
+
+    if len(request.required.skills) >= 2 and request.skill_match_mode == "ALL":
+        candidate = request.model_copy(deep=True)
+        candidate.skill_match_mode = "ANY"
+        if not _add(
+            "skill_match_any",
+            "필수 기술을 모두 만족하는 조건을 하나 이상 만족으로 완화",
+            candidate,
+        ):
+            return out
+
+    career = request.required.career
+    if career is not None and career.min_months is not None and career.min_months > 0:
+        old_min = career.min_months
+        new_min = max(0, old_min - 12)
+        candidate = request.model_copy(deep=True)
+        assert candidate.required.career is not None
+        candidate.required.career.min_months = new_min
+        if not _add(
+            "career_min_minus_12",
+            f"최소 경력을 {old_min}개월에서 {new_min}개월로 완화",
+            candidate,
+        ):
+            return out
+
+    if request.required.grade is not None and request.required.grade.values:
+        candidate = request.model_copy(deep=True)
+        candidate.required.grade = None
+        if not _add(
+            "drop_required_grade",
+            "기술등급 필수조건 제거",
+            candidate,
+        ):
+            return out
+
+    for field, label in _CODE_FIELD_LABELS.items():
+        codes = list(getattr(request.required, field) or [])
+        if not codes:
+            continue
+        code = codes[0]
+        candidate = request.model_copy(deep=True)
+        setattr(candidate.required, field, codes[1:])
+        preferred_codes = list(getattr(candidate.preferred, field) or [])
+        if code not in preferred_codes:
+            preferred_codes.append(code)
+        setattr(candidate.preferred, field, preferred_codes)
+        if not _add(
+            f"required_to_preferred_{field}_{code}",
+            f"필수 {label} {code}을(를) 우대조건으로 완화",
+            candidate,
+        ):
+            return out
+
+    for field, label in _TEXT_FIELD_LABELS.items():
+        values = list(getattr(request.required, field) or [])
+        if not values:
+            continue
+        value = values[0]
+        candidate = request.model_copy(deep=True)
+        setattr(candidate.required, field, values[1:])
+        if not _add(
+            f"drop_required_{field}",
+            f'필수 {label} 조건 "{value}" 제거',
+            candidate,
+        ):
+            return out
+
+    if request.keyword_query:
+        candidate = request.model_copy(deep=True)
+        candidate.keyword_query = None
+        _add(
+            "drop_keyword_query",
+            "키워드 검색어 제거",
+            candidate,
+        )
+
+    return out
 
 
 class SearchQueryService:
@@ -267,7 +396,11 @@ class SearchQueryService:
                 candidate_limit_reached=candidate_limit_reached,
             ),
             query=self._echo_query(request),
-            relaxations=[],
+            relaxations=(
+                build_search_relaxations(request)
+                if request.suggest_relaxations and total == 0
+                else []
+            ),
         )
 
     def _embed_semantic_query(self, semantic_query: str) -> list[float]:
