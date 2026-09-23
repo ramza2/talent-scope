@@ -85,6 +85,7 @@ export type PersonDetail = {
   profile_version: number
   profile: ProfileFields
   jobs: Array<{
+    id: string
     code: string
     name: string
     job_type: JobType
@@ -92,6 +93,7 @@ export type PersonDetail = {
     source_type?: string | null
   }>
   skills: Array<{
+    id: string
     code: string
     name: string
     last_used_year?: number | null
@@ -100,6 +102,7 @@ export type PersonDetail = {
     source_type?: string | null
   }>
   expertise: Array<{
+    id: string
     code: string
     name: string
     evidence_type: 'EXPLICIT' | 'INFERRED'

@@ -52,6 +52,7 @@ import {
   getProfileFreshness,
   profileFreshnessTagColor,
 } from '@/pages/people/profileFreshness'
+import { TargetEvidenceButton } from '@/pages/people/TargetEvidenceButton'
 
 type CodeOption = { value: string; label: string }
 
@@ -529,7 +530,16 @@ export function PeopleDetailPage() {
             children: (
               <Card>
                 <Descriptions column={2} bordered size="small">
-                  <Descriptions.Item label="이름">{person.profile.name}</Descriptions.Item>
+                  <Descriptions.Item label="이름">
+                    <Space size={4} wrap>
+                      <span>{person.profile.name}</span>
+                      <TargetEvidenceButton
+                        targetType="PERSON_PROFILE"
+                        targetId={person.id}
+                        fieldName="name"
+                      />
+                    </Space>
+                  </Descriptions.Item>
                   <Descriptions.Item label="출생연도">
                     {person.profile.birth_year ?? '—'}
                   </Descriptions.Item>
@@ -539,19 +549,51 @@ export function PeopleDetailPage() {
                     {person.profile.address_region || '—'}
                   </Descriptions.Item>
                   <Descriptions.Item label="소속회사">
-                    {person.profile.affiliation_company || '—'}
+                    <Space size={4} wrap>
+                      <span>{person.profile.affiliation_company || '—'}</span>
+                      <TargetEvidenceButton
+                        targetType="PERSON_PROFILE"
+                        targetId={person.id}
+                        fieldName="affiliation_company"
+                      />
+                    </Space>
                   </Descriptions.Item>
-                  <Descriptions.Item label="부서">{person.profile.department || '—'}</Descriptions.Item>
+                  <Descriptions.Item label="부서">
+                    <Space size={4} wrap>
+                      <span>{person.profile.department || '—'}</span>
+                      <TargetEvidenceButton
+                        targetType="PERSON_PROFILE"
+                        targetId={person.id}
+                        fieldName="department"
+                      />
+                    </Space>
+                  </Descriptions.Item>
                   <Descriptions.Item label="직함">
-                    {person.profile.current_title || '—'}
+                    <Space size={4} wrap>
+                      <span>{person.profile.current_title || '—'}</span>
+                      <TargetEvidenceButton
+                        targetType="PERSON_PROFILE"
+                        targetId={person.id}
+                        fieldName="current_title"
+                      />
+                    </Space>
                   </Descriptions.Item>
                   <Descriptions.Item label="고용형태">
                     {person.profile.employment_type || '—'}
                   </Descriptions.Item>
                   <Descriptions.Item label="기술등급">
-                    {person.profile.technical_grade
-                      ? GRADE_LABELS[person.profile.technical_grade as TechnicalGrade]
-                      : '—'}
+                    <Space size={4} wrap>
+                      <span>
+                        {person.profile.technical_grade
+                          ? GRADE_LABELS[person.profile.technical_grade as TechnicalGrade]
+                          : '—'}
+                      </span>
+                      <TargetEvidenceButton
+                        targetType="PERSON_PROFILE"
+                        targetId={person.id}
+                        fieldName="technical_grade"
+                      />
+                    </Space>
                   </Descriptions.Item>
                   <Descriptions.Item label="경력 시작일">
                     {person.profile.career_start_date || '—'}
@@ -560,7 +602,14 @@ export function PeopleDetailPage() {
                     {formatCareerMonths(person.profile.career_calculated_months)}
                   </Descriptions.Item>
                   <Descriptions.Item label="문서상 경력">
-                    {person.profile.career_document_value || '—'}
+                    <Space size={4} wrap>
+                      <span>{person.profile.career_document_value || '—'}</span>
+                      <TargetEvidenceButton
+                        targetType="PERSON_PROFILE"
+                        targetId={person.id}
+                        fieldName="career_document_value"
+                      />
+                    </Space>
                   </Descriptions.Item>
                   <Descriptions.Item label="확정 경력">
                     {formatCareerMonths(person.profile.career_confirmed_months)}
@@ -574,7 +623,14 @@ export function PeopleDetailPage() {
                       : '—'}
                   </Descriptions.Item>
                   <Descriptions.Item label="Summary" span={2}>
-                    {person.profile.profile_summary || '—'}
+                    <Space size={4} wrap align="start">
+                      <span>{person.profile.profile_summary || '—'}</span>
+                      <TargetEvidenceButton
+                        targetType="PERSON_PROFILE"
+                        targetId={person.id}
+                        fieldName="profile_summary"
+                      />
+                    </Space>
                   </Descriptions.Item>
                   <Descriptions.Item label="사업분야" span={2}>
                     {person.business_domains.length
@@ -625,7 +681,12 @@ export function PeopleDetailPage() {
                   ) : (
                     displayJobs.map((j) => (
                       <div key={`${j.code}-${j.job_type}`} style={{ marginBottom: 4 }}>
-                        {jobTypeTag(j.job_type)} {j.name}
+                        <Space size={4} wrap>
+                          <span>
+                            {jobTypeTag(j.job_type)} {j.name}
+                          </span>
+                          <TargetEvidenceButton targetType="PERSON_JOB" targetId={j.id} />
+                        </Space>
                       </div>
                     ))
                   )}
@@ -646,12 +707,17 @@ export function PeopleDetailPage() {
                   ) : (
                     person.skills.map((s) => (
                       <div key={s.code}>
-                        {s.is_representative ? <Tag color="blue">대표</Tag> : null}
-                        {s.name}{' '}
-                        <Typography.Text type="secondary">
-                          {s.last_used_year ? `${s.last_used_year} · ` : ''}
-                          {s.experience_months != null ? `${s.experience_months}개월` : ''}
-                        </Typography.Text>
+                        <Space size={4} wrap>
+                          <span>
+                            {s.is_representative ? <Tag color="blue">대표</Tag> : null}
+                            {s.name}{' '}
+                            <Typography.Text type="secondary">
+                              {s.last_used_year ? `${s.last_used_year} · ` : ''}
+                              {s.experience_months != null ? `${s.experience_months}개월` : ''}
+                            </Typography.Text>
+                          </span>
+                          <TargetEvidenceButton targetType="PERSON_SKILL" targetId={s.id} />
+                        </Space>
                       </div>
                     ))
                   )}
@@ -672,7 +738,16 @@ export function PeopleDetailPage() {
                   ) : (
                     person.expertise.map((e) => (
                       <div key={e.code}>
-                        {e.name} {e.evidence_type === 'INFERRED' ? <Tag>추론</Tag> : null}
+                        <Space size={4} wrap>
+                          <span>
+                            {e.name}{' '}
+                            {e.evidence_type === 'INFERRED' ? <Tag>추론</Tag> : null}
+                          </span>
+                          <TargetEvidenceButton
+                            targetType="PERSON_EXPERTISE"
+                            targetId={e.id}
+                          />
+                        </Space>
                       </div>
                     ))
                   )}

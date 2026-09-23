@@ -216,6 +216,7 @@ class PeopleService:
 
         jobs = [
             JobItem(
+                id=job.id,
                 code=job.job_code,
                 name=name,
                 job_type=job.job_type,  # type: ignore[arg-type]
@@ -226,6 +227,7 @@ class PeopleService:
         ]
         skills = [
             SkillItem(
+                id=skill.id,
                 code=skill.tech_code,
                 name=name,
                 last_used_year=skill.last_used_year,
@@ -237,6 +239,7 @@ class PeopleService:
         ]
         expertise = [
             ExpertiseItem(
+                id=exp.id,
                 code=exp.exp_code,
                 name=name,
                 evidence_type=exp.evidence_type,  # type: ignore[arg-type]
