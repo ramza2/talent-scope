@@ -4955,6 +4955,96 @@ def test_cert_single_item_does_not_sparse_retry(db_session):
     _cleanup_person(db_session, person.id, admin.id)
 
 
+def test_raw_candidate_top_level_keys_helper_metadata_only() -> None:
+    from app.modules.analysis.service import raw_candidate_top_level_keys
+
+    raw = {
+        "documents": [{"name": "SECRET-NAME", "ssn": "900101-1234567"}],
+        "candidates": [{"phone": "010-1234-5678"}],
+        "result": {"quote_text": "원문 인용 금지"},
+        "profile": {"name": "홍길동"},
+    }
+    keys = raw_candidate_top_level_keys(raw)
+    assert keys == ["candidates", "documents", "profile", "result"]
+    assert "SECRET-NAME" not in keys
+    assert "900101-1234567" not in keys
+    assert "010-1234-5678" not in keys
+    assert "원문 인용 금지" not in keys
+    assert "홍길동" not in keys
+
+    many = {f"k{i:02d}": f"value-{i}-SECRET" for i in range(40)}
+    limited = raw_candidate_top_level_keys(many, limit=30)
+    assert len(limited) == 30
+    assert limited == sorted(many.keys())[:30]
+    assert all("SECRET" not in key for key in limited)
+
+
+def test_llm_raw_shape_log_contains_keys_not_values(db_session, caplog):
+    import logging
+
+    from app.modules.analysis.service import AnalysisService
+    from app.storage.s3 import get_object_storage
+
+    secret_name = "DIAG-SECRET-NAME-XYZ"
+    secret_phone = "010-9999-8888"
+    secret_quote = "DIAG-SECRET-QUOTE-TEXT"
+    wrapped = {
+        "documents": [
+            {
+                "name": secret_name,
+                "phone": secret_phone,
+                "source_refs": [{"quote_text": secret_quote}],
+            }
+        ],
+        "candidates": [{"profile": {"name": secret_name}}],
+        "result": {"text": secret_quote},
+    }
+
+    admin = _create_user(
+        db_session, login_id=f"a_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    person, document = _seed_person_doc(
+        db_session,
+        admin.id,
+        doc_type_code="DOC-RESUME",
+        doc_type_name="이력서",
+        page_text=_RICH_PAGE_TEXT,
+    )
+    run = _queue_run(db_session, person.id, document.id)
+    # First call returns non-schema wrapper (empty after normalize) → retry.
+    llm = _SequenceLLM([wrapped, _valid_candidate_json()])
+    service = AnalysisService(db_session, storage=get_object_storage(), llm=llm)
+
+    with caplog.at_level(logging.INFO, logger="app.modules.analysis.service"):
+        assert service.run_analysis(run.id) == "REVIEWING"
+
+    shape_logs = [
+        rec.getMessage()
+        for rec in caplog.records
+        if "analysis llm raw shape" in rec.getMessage()
+    ]
+    assert shape_logs, "expected raw shape diagnostic log"
+    first = shape_logs[0]
+    assert f"analysis_run_id={run.id}" in first
+    assert "attempt=1" in first
+    assert "document_count=1" in first
+    assert "raw_key_count=3" in first
+    assert "raw_top_level_keys=" in first
+    assert "candidates" in first
+    assert "documents" in first
+    assert "result" in first
+    assert secret_name not in first
+    assert secret_phone not in first
+    assert secret_quote not in first
+    for message in shape_logs:
+        assert secret_name not in message
+        assert secret_phone not in message
+        assert secret_quote not in message
+
+    assert llm.calls == 2
+    _cleanup_person(db_session, person.id, admin.id)
+
+
 # --------------------------------------------------------------------------- auto PROFILE analysis on READY
 
 

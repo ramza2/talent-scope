@@ -97,6 +97,19 @@ class InsufficientCandidateError(Exception):
     )
 
 
+_RAW_TOP_LEVEL_KEYS_LOG_LIMIT = 30
+
+
+def raw_candidate_top_level_keys(
+    raw: dict[str, Any], *, limit: int = _RAW_TOP_LEVEL_KEYS_LOG_LIMIT
+) -> list[str]:
+    """Return sorted top-level key names only (never values) for diagnostic logs."""
+    keys = sorted(str(key) for key in raw.keys())
+    if limit < 0:
+        return keys
+    return keys[:limit]
+
+
 def _profile_scalar_filled(value: Any) -> bool:
     if value is None:
         return False
@@ -439,6 +452,17 @@ class AnalysisService:
                     raise AIResponseValidationError(
                         "profile JSON root is not an object"
                     )
+                # Diagnostic only: top-level key names, never values / document text.
+                top_keys = raw_candidate_top_level_keys(raw)
+                logger.info(
+                    "analysis llm raw shape analysis_run_id=%s attempt=%s "
+                    "document_count=%s raw_key_count=%s raw_top_level_keys=%s",
+                    run_id,
+                    attempt,
+                    len(claimed.documents),
+                    len(raw),
+                    top_keys,
+                )
                 # source_ref validation uses only pages actually present in the LLM prompt.
                 return normalize_candidate(
                     raw,
