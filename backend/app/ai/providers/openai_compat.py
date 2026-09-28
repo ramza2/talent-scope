@@ -45,6 +45,39 @@ def normalize_chat_completions_url(base_url: str) -> str:
     return f"{raw}/v1/chat/completions"
 
 
+def completion_response_meta(
+    data: dict[str, Any], *, fallback_model: Any = None
+) -> dict[str, Any]:
+    """Extract safe completion diagnostics (never content / tool_calls / body)."""
+    finish_reason: Any = None
+    choices = data.get("choices")
+    if isinstance(choices, list) and choices:
+        first = choices[0]
+        if isinstance(first, dict):
+            finish_reason = first.get("finish_reason")
+
+    prompt_tokens: Any = None
+    completion_tokens: Any = None
+    total_tokens: Any = None
+    usage = data.get("usage")
+    if isinstance(usage, dict):
+        prompt_tokens = usage.get("prompt_tokens")
+        completion_tokens = usage.get("completion_tokens")
+        total_tokens = usage.get("total_tokens")
+
+    model = data.get("model")
+    if model is None:
+        model = fallback_model
+
+    return {
+        "model": model,
+        "finish_reason": finish_reason,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+    }
+
+
 def post_chat_completions(
     *,
     base_url: str,
@@ -99,6 +132,18 @@ def post_chat_completions(
         raise AIProviderError("AI provider returned non-JSON response") from exc
     if not isinstance(data, dict):
         raise AIProviderError("AI provider returned unexpected JSON shape")
+
+    meta = completion_response_meta(data, fallback_model=payload.get("model"))
+    logger.info(
+        "ai_completion_meta model=%s finish_reason=%s prompt_tokens=%s "
+        "completion_tokens=%s total_tokens=%s context=%s",
+        meta["model"],
+        meta["finish_reason"],
+        meta["prompt_tokens"],
+        meta["completion_tokens"],
+        meta["total_tokens"],
+        ctx,
+    )
     return data
 
 
