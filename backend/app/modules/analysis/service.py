@@ -403,10 +403,6 @@ class AnalysisService:
             if not blocks.strip():
                 raise AIProviderError("no usable text for profile analysis")
 
-            user_prompt = prompt.build_user_prompt(
-                code_catalog=claimed.code_catalog_text,
-                document_blocks=blocks,
-            )
             catalog_map = {
                 code: (code_type, active)
                 for code, code_type, active in claimed.catalog
@@ -420,11 +416,24 @@ class AnalysisService:
                 "source_char_count": source_char_count,
             }
 
-            def _llm_normalize(*, attempt: int) -> ProfileCandidateDocument:
+            def _llm_normalize(
+                *, attempt: int, recovery_retry: bool = False
+            ) -> ProfileCandidateDocument:
+                # First call: unchanged prompt. Empty/sparse retry: v4 adds
+                # RECOVERY_RETRY_INSTRUCTION via recovery_retry=True.
+                user_prompt = prompt.build_user_prompt(
+                    code_catalog=claimed.code_catalog_text,
+                    document_blocks=blocks,
+                    recovery_retry=recovery_retry,
+                )
                 raw = self.llm.complete_json(
                     system_prompt=prompt.system_prompt,
                     user_prompt=user_prompt,
-                    log_context={**base_log, "attempt": attempt},
+                    log_context={
+                        **base_log,
+                        "attempt": attempt,
+                        "recovery_retry": recovery_retry,
+                    },
                 )
                 if not isinstance(raw, dict):
                     raise AIResponseValidationError(
@@ -459,7 +468,7 @@ class AnalysisService:
                     candidate_quality_score(candidate),
                 )
 
-            candidate = _llm_normalize(attempt=1)
+            candidate = _llm_normalize(attempt=1, recovery_retry=False)
             _log_quality(attempt=1, candidate=candidate)
             if candidate_needs_llm_retry(
                 candidate,
@@ -467,7 +476,8 @@ class AnalysisService:
                 source_char_count=source_char_count,
             ):
                 # Reuse the same prompt source; do not rebuild VLM/source.
-                candidate = _llm_normalize(attempt=2)
+                # Second call adds recovery retry instruction (prompt v4+).
+                candidate = _llm_normalize(attempt=2, recovery_retry=True)
                 _log_quality(attempt=2, candidate=candidate)
                 if candidate_needs_llm_retry(
                     candidate,

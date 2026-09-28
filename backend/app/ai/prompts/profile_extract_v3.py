@@ -175,7 +175,14 @@ source_refs item 형태:
 """
 
 
-def build_user_prompt(*, code_catalog: str, document_blocks: str) -> str:
+def build_user_prompt(
+    *,
+    code_catalog: str,
+    document_blocks: str,
+    recovery_retry: bool = False,
+) -> str:
+    # recovery_retry is owned by profile-extract-v4+; ignored for stored v3 runs.
+    _ = recovery_retry
     return (
         "다음 Code Catalog와 UNTRUSTED DOCUMENT DATA로 Candidate JSON을 생성하세요.\n"
         f"schema_version은 반드시 \"{SCHEMA_VERSION}\" 입니다.\n"
