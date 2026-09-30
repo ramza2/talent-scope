@@ -69,6 +69,7 @@ _PROFILE_SCALAR_FIELDS = frozenset(
         "technical_grade",
         "career_start_date",
         "career_document_value",
+        "career_confirmed_months",
         "profile_summary",
     }
 )
@@ -867,6 +868,8 @@ class _ConfirmContext:
                 str(value),
                 _PROFILE_STRING_LIMITS["career_document_value"],
             )
+        if field == "career_confirmed_months":
+            return _as_optional_months(value, field="career_confirmed_months")
         if field == "profile_summary":
             # Text — no arbitrary length cap.
             if value is None:

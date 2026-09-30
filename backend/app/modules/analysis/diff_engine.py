@@ -12,6 +12,7 @@ from app.ai.schemas.profile_candidate import (
     ProfileCandidateDocument,
 )
 from app.core.person_name import person_name_match_key
+from app.modules.analysis.career_document_months import parse_career_document_months
 
 EMPLOYMENT_FIELDS: tuple[str, ...] = (
     "company_name",
@@ -258,7 +259,49 @@ def _diff_profile_scalars(
                 source_refs=_refs_dump(profile_refs.get(field_name)),
             )
         )
+    derived = _derived_career_confirmed_months_diff(candidate, profile_snap)
+    if derived is not None:
+        specs.append(derived)
     return specs
+
+
+def _derived_career_confirmed_months_diff(
+    candidate: ProfileCandidateDocument, profile_snap: dict[str, Any]
+) -> DiffSpec | None:
+    """Derive career_confirmed_months Diff from parseable career_document_value.
+
+    Not part of LLM ProfileCandidate schema. Reuses career_document_value
+    source_refs. Never overwrites an existing confirmed value automatically.
+    """
+    raw_value = candidate.profile.career_document_value
+    months = parse_career_document_months(
+        raw_value if isinstance(raw_value, str) else None
+    )
+    if months is None:
+        return None
+
+    old_val = profile_snap.get("career_confirmed_months")
+    if old_val is None or old_val == "":
+        change = "NEW"
+        old_out: Any = None
+    elif _eq(old_val, months):
+        change = "SAME"
+        old_out = old_val
+    else:
+        # Existing non-null confirmed months: CONFLICT, never auto-UPDATE.
+        change = "CONFLICT"
+        old_out = old_val
+
+    profile_refs = candidate.profile.source_refs or {}
+    return DiffSpec(
+        entity_type="PROFILE",
+        candidate_path="profile.career_confirmed_months",
+        field_name="career_confirmed_months",
+        change_type=change,
+        old_value=old_out,
+        new_value=months,
+        source_refs=_refs_dump(profile_refs.get("career_document_value")),
+    )
 
 
 def _diff_jobs(
