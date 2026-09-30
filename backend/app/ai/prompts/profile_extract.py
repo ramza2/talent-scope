@@ -10,10 +10,11 @@ from app.ai.prompts import (
     profile_extract_v2,
     profile_extract_v3,
     profile_extract_v4,
+    profile_extract_v5,
 )
 from app.ai.providers.errors import AIProviderError
 
-CURRENT_PROFILE_PROMPT_VERSION = "profile-extract-v4"
+CURRENT_PROFILE_PROMPT_VERSION = "profile-extract-v5"
 
 
 class UnknownProfilePromptVersionError(AIProviderError):
@@ -42,6 +43,7 @@ _REGISTRY: dict[str, ProfilePromptSpec] = {
     profile_extract_v2.PROMPT_VERSION: _spec_from_module(profile_extract_v2),
     profile_extract_v3.PROMPT_VERSION: _spec_from_module(profile_extract_v3),
     profile_extract_v4.PROMPT_VERSION: _spec_from_module(profile_extract_v4),
+    profile_extract_v5.PROMPT_VERSION: _spec_from_module(profile_extract_v5),
 }
 
 

@@ -4992,13 +4992,19 @@ def _queue_run(db_session, person_id, document_id, *, prompt_version: str | None
 def _assert_no_recovery_retry_instruction(prompt: str | None) -> None:
     assert prompt is not None
     assert "BEGIN RECOVERY RETRY INSTRUCTION" not in prompt
+    assert "[RECOVERY]" not in prompt
 
 
 def _assert_has_recovery_retry_instruction(prompt: str | None) -> None:
     assert prompt is not None
-    assert "BEGIN RECOVERY RETRY INSTRUCTION" in prompt
-    assert "직전 추출 결과가 비어 있거나 구조화 정보가 부족" in prompt
-    assert "빠짐없이 추출" in prompt
+    # v4 long marker or v5 compact marker.
+    has_v4 = "BEGIN RECOVERY RETRY INSTRUCTION" in prompt
+    has_v5 = "[RECOVERY]" in prompt
+    assert has_v4 or has_v5
+    if has_v4:
+        assert "직전 추출 결과가 비어 있거나 구조화 정보가 부족" in prompt
+    if has_v5:
+        assert "complete root Candidate JSON" in prompt
 
 
 def test_candidate_quality_helpers_ignore_summary_metadata():
@@ -5274,7 +5280,8 @@ def test_v1_empty_retry_does_not_inject_recovery_instruction(db_session):
     assert service.run_analysis(run.id) == "REVIEWING"
     assert llm.calls == 2
     assert all(
-        "BEGIN RECOVERY RETRY INSTRUCTION" not in p for p in llm.user_prompts
+        "BEGIN RECOVERY RETRY INSTRUCTION" not in p and "[RECOVERY]" not in p
+        for p in llm.user_prompts
     )
     _cleanup_person(db_session, person.id, admin.id)
 

@@ -1932,7 +1932,7 @@ def test_old_candidate_without_new_provenance_fields_loads():
     assert doc.projects[0].skills[0].source_refs == []
 
 
-def test_new_analysis_uses_profile_extract_v4(client: TestClient, db_session):
+def test_new_analysis_uses_profile_extract_v5(client: TestClient, db_session):
     from app.ai.prompts.profile_extract import CURRENT_PROFILE_PROMPT_VERSION
 
     admin = _create_user(
@@ -1950,7 +1950,7 @@ def test_new_analysis_uses_profile_extract_v4(client: TestClient, db_session):
     detail = client.get(f"/api/v1/analyses/{analysis_id}")
     assert detail.status_code == 200
     assert detail.json()["data"]["prompt_version"] == CURRENT_PROFILE_PROMPT_VERSION
-    assert CURRENT_PROFILE_PROMPT_VERSION == "profile-extract-v4"
+    assert CURRENT_PROFILE_PROMPT_VERSION == "profile-extract-v5"
 
     _cleanup_person(db_session, person.id, admin.id)
 
@@ -2064,11 +2064,7 @@ def test_profile_extract_v3_career_document_value_rules():
 
 
 def test_profile_extract_v4_recovery_retry_instruction():
-    from app.ai.prompts.profile_extract import (
-        CURRENT_PROFILE_PROMPT_VERSION,
-        current_profile_prompt,
-        resolve_profile_prompt,
-    )
+    from app.ai.prompts.profile_extract import resolve_profile_prompt
     from app.ai.prompts.profile_extract_v4 import (
         PROMPT_VERSION,
         RECOVERY_RETRY_INSTRUCTION,
@@ -2078,19 +2074,9 @@ def test_profile_extract_v4_recovery_retry_instruction():
 
     assert PROMPT_VERSION == "profile-extract-v4"
     assert SCHEMA_VERSION == "profile-candidate-v1"
-    assert CURRENT_PROFILE_PROMPT_VERSION == "profile-extract-v4"
-    assert current_profile_prompt().prompt_version == "profile-extract-v4"
     assert (
-        resolve_profile_prompt("profile-extract-v1").prompt_version
-        == "profile-extract-v1"
-    )
-    assert (
-        resolve_profile_prompt("profile-extract-v2").prompt_version
-        == "profile-extract-v2"
-    )
-    assert (
-        resolve_profile_prompt("profile-extract-v3").prompt_version
-        == "profile-extract-v3"
+        resolve_profile_prompt("profile-extract-v4").prompt_version
+        == "profile-extract-v4"
     )
     assert "BEGIN RECOVERY RETRY INSTRUCTION" in RECOVERY_RETRY_INSTRUCTION
     first = build_user_prompt(code_catalog="C", document_blocks="D", recovery_retry=False)
@@ -2098,6 +2084,48 @@ def test_profile_extract_v4_recovery_retry_instruction():
     assert "BEGIN RECOVERY RETRY INSTRUCTION" not in first
     assert "BEGIN RECOVERY RETRY INSTRUCTION" in second
     assert second.startswith(RECOVERY_RETRY_INSTRUCTION)
+
+
+def test_profile_extract_v5_is_compact_and_current():
+    from app.ai.prompts.profile_extract import (
+        CURRENT_PROFILE_PROMPT_VERSION,
+        current_profile_prompt,
+        resolve_profile_prompt,
+    )
+    from app.ai.prompts import profile_extract_v4 as v4
+    from app.ai.prompts import profile_extract_v5 as v5
+
+    assert CURRENT_PROFILE_PROMPT_VERSION == "profile-extract-v5"
+    assert current_profile_prompt().prompt_version == "profile-extract-v5"
+    for ver in (
+        "profile-extract-v1",
+        "profile-extract-v2",
+        "profile-extract-v3",
+        "profile-extract-v4",
+        "profile-extract-v5",
+    ):
+        assert resolve_profile_prompt(ver).prompt_version == ver
+
+    # Deterministic size check (chars) — v5 must be meaningfully smaller than v4.
+    assert len(v5.SYSTEM_PROMPT) < len(v4.SYSTEM_PROMPT) * 0.70
+    assert len(v5.CANDIDATE_SCHEMA_GUIDE) < len(v4.CANDIDATE_JSON_TEMPLATE) * 0.65
+    assert len(v5.RECOVERY_RETRY_INSTRUCTION) < len(v4.RECOVERY_RETRY_INSTRUCTION) * 0.75
+    assert '"name": null' not in v5.SYSTEM_PROMPT
+    assert "Omit null optional scalars" in v5.CANDIDATE_SCHEMA_GUIDE
+    assert "career_confirmed_months" in v5.SYSTEM_PROMPT
+    assert "추측" in v5.SYSTEM_PROMPT
+
+    first = v5.build_user_prompt(
+        code_catalog="C", document_blocks="D", recovery_retry=False
+    )
+    second = v5.build_user_prompt(
+        code_catalog="C", document_blocks="D", recovery_retry=True
+    )
+    assert "[RECOVERY]" not in first
+    assert second.startswith(v5.RECOVERY_RETRY_INSTRUCTION)
+    # Recovery adds only the short instruction (+ separator), not another catalog/doc copy.
+    assert len(second) - len(first) <= len(v5.RECOVERY_RETRY_INSTRUCTION) + 2
+    assert len(v5.RECOVERY_RETRY_INSTRUCTION) < 280
 
 
 # --------------------------------------------------------------------------- prompt version + nested project + invalidation
