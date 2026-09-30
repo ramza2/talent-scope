@@ -19,6 +19,13 @@ def test_coerce_optional_text_helpers() -> None:
     assert coerce_optional_text(["", "  "]) is None
     assert coerce_optional_text(["설계", "개발"]) == "설계\n개발"
     assert coerce_optional_text([" 설계 ", "", "개발"]) == "설계\n개발"
+    assert (
+        coerce_optional_text(["설계", {"x": 1}, 123, None, "개발"]) == "설계\n개발"
+    )
+    assert coerce_optional_text({"x": 1}) is None
+    assert coerce_optional_text(123) is None
+    assert coerce_optional_text(12.5) is None
+    assert coerce_optional_text(True) is None
 
 
 def test_employment_and_project_responsibilities_list_coerce() -> None:

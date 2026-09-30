@@ -39,8 +39,10 @@ def coerce_optional_text(value: object) -> str | None:
     """Normalize LLM text fields that may arrive as ``str`` or ``list[str]``.
 
     - ``str`` → stripped string (empty → None)
-    - ``list`` → non-empty items joined with ``\\n`` (empty list → None)
+    - ``list`` → only ``str`` items are trimmed/joined with ``\\n``;
+      ``None`` / non-string items are ignored (empty result → None)
     - ``None`` → None
+    - other types (dict/int/float/bool/...) → None (never ``str(value)``)
     """
     if value is None:
         return None
@@ -50,16 +52,15 @@ def coerce_optional_text(value: object) -> str | None:
     if isinstance(value, list):
         parts: list[str] = []
         for item in value:
-            if item is None:
+            if not isinstance(item, str):
                 continue
-            text = item.strip() if isinstance(item, str) else str(item).strip()
+            text = item.strip()
             if text:
                 parts.append(text)
         if not parts:
             return None
         return "\n".join(parts)
-    text = str(value).strip()
-    return text or None
+    return None
 
 
 class SourceRef(BaseModel):
