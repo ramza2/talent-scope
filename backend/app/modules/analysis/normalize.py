@@ -193,6 +193,29 @@ def _normalize_source_refs(
     return out
 
 
+def _migrate_dotted_profile_source_refs(cleaned: dict[str, Any]) -> None:
+    """Move literal root key ``profile.source_refs`` into ``profile.source_refs``.
+
+    Nested ``profile.source_refs`` wins on key conflicts; missing keys are filled
+    from the dotted root value. Only this exact dotted key is handled.
+    """
+    if "profile.source_refs" not in cleaned:
+        return
+    dotted = cleaned.pop("profile.source_refs")
+    if not isinstance(dotted, dict):
+        return
+    profile = cleaned.get("profile")
+    if not isinstance(profile, dict):
+        return
+    nested = profile.get("source_refs")
+    if not isinstance(nested, dict):
+        profile["source_refs"] = dict(dotted)
+        return
+    for key, refs in dotted.items():
+        if key not in nested:
+            nested[key] = refs
+
+
 def normalize_candidate(
     raw: dict[str, Any],
     *,
@@ -216,6 +239,7 @@ def normalize_candidate(
     if not isinstance(cleaned, dict):
         cleaned = {}
     _sanitize_career_document_value(cleaned)
+    _migrate_dotted_profile_source_refs(cleaned)
 
     doc = ProfileCandidateDocument.model_validate(cleaned)
     doc.schema_version = SCHEMA_VERSION

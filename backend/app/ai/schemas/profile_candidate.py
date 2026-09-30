@@ -63,6 +63,41 @@ def coerce_optional_text(value: object) -> str | None:
     return None
 
 
+_CONFIDENCE_LABELS: dict[str, float] = {
+    "HIGH": 0.9,
+    "MEDIUM": 0.6,
+    "LOW": 0.3,
+}
+
+
+def coerce_confidence(value: object) -> float | None:
+    """Normalize LLM confidence into ``float`` in ``[0, 1]`` or ``None``.
+
+    Allowed: int/float 0..1, numeric string, HIGH/MEDIUM/LOW labels.
+    Rejected (→ None): bool, dict/list, out-of-range numbers, unknown strings.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+        return number if 0.0 <= number <= 1.0 else None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        label = _CONFIDENCE_LABELS.get(text.upper())
+        if label is not None:
+            return label
+        try:
+            number = float(text)
+        except ValueError:
+            return None
+        return number if 0.0 <= number <= 1.0 else None
+    return None
+
+
 class SourceRef(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -159,6 +194,11 @@ class JobCandidate(BaseModel):
         text = str(value or "PRIMARY").strip().upper()
         return text if text in JOB_TYPES else "PRIMARY"
 
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def _confidence(cls, value: object) -> float | None:
+        return coerce_confidence(value)
+
 
 class SkillCandidate(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -170,6 +210,11 @@ class SkillCandidate(BaseModel):
     is_representative: bool = False
     confidence: float | None = Field(default=None, ge=0, le=1)
     source_refs: list[SourceRef] = Field(default_factory=list)
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def _confidence(cls, value: object) -> float | None:
+        return coerce_confidence(value)
 
 
 class ExpertiseCandidate(BaseModel):
@@ -186,6 +231,11 @@ class ExpertiseCandidate(BaseModel):
     def _ev(cls, value: object) -> str:
         text = str(value or "EXPLICIT").strip().upper()
         return text if text in EVIDENCE_TYPES else "EXPLICIT"
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def _confidence(cls, value: object) -> float | None:
+        return coerce_confidence(value)
 
 
 class EmploymentCandidate(BaseModel):
@@ -205,6 +255,11 @@ class EmploymentCandidate(BaseModel):
     def _responsibilities_text(cls, value: object) -> str | None:
         return coerce_optional_text(value)
 
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def _confidence(cls, value: object) -> float | None:
+        return coerce_confidence(value)
+
 
 class EducationCandidate(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -218,6 +273,11 @@ class EducationCandidate(BaseModel):
     confidence: float | None = Field(default=None, ge=0, le=1)
     source_refs: list[SourceRef] = Field(default_factory=list)
 
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def _confidence(cls, value: object) -> float | None:
+        return coerce_confidence(value)
+
 
 class CertificationCandidate(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -228,6 +288,11 @@ class CertificationCandidate(BaseModel):
     expiry_date: str | None = None
     confidence: float | None = Field(default=None, ge=0, le=1)
     source_refs: list[SourceRef] = Field(default_factory=list)
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def _confidence(cls, value: object) -> float | None:
+        return coerce_confidence(value)
 
 
 class CodeRefCandidate(BaseModel):
@@ -261,6 +326,11 @@ class ProjectCandidate(BaseModel):
     def _project_text_fields(cls, value: object) -> str | None:
         return coerce_optional_text(value)
 
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def _confidence(cls, value: object) -> float | None:
+        return coerce_confidence(value)
+
 
 class SummaryCandidate(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -273,6 +343,11 @@ class AnalysisMetaCandidate(BaseModel):
 
     overall_confidence: float | None = Field(default=None, ge=0, le=1)
     notes: str | None = None
+
+    @field_validator("overall_confidence", mode="before")
+    @classmethod
+    def _overall_confidence(cls, value: object) -> float | None:
+        return coerce_confidence(value)
 
 
 class ProfileCandidateDocument(BaseModel):
