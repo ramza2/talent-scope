@@ -18,29 +18,32 @@ Root object keys (required):
   schema_version, profile, jobs, skills, expertise,
   employment_history, education, certifications, projects, summary, analysis
 
-profile scalars (include only when present in documents):
-  name, birth_year, phone, email, address_region, affiliation_company,
-  department, current_title, employment_type, technical_grade,
-  career_start_date, career_document_value, profile_summary
-profile.source_refs: map of field_name → [source_ref]; omit empty keys
+profile: {
+  scalars: name, birth_year, phone, email, address_region, affiliation_company,
+    department, current_title, employment_type, technical_grade,
+    career_start_date, career_document_value, profile_summary,
+  source_refs: {field_name: [source_ref]}  # nested under profile only
+}
+Never emit root key "profile.source_refs".
 
-jobs[]: raw_value, code, job_type(PRIMARY|SECONDARY|EXPERIENCE), confidence, source_refs
-skills[]: raw_value, code, last_used_year, experience_months, is_representative, confidence, source_refs
-expertise[]: raw_value, code, evidence_type(EXPLICIT|INFERRED), confidence, source_refs
+jobs[]: raw_value, code, job_type(PRIMARY|SECONDARY|EXPERIENCE), confidence:number(0..1), source_refs
+skills[]: raw_value, code, last_used_year, experience_months, is_representative, confidence:number(0..1), source_refs
+expertise[]: raw_value, code, evidence_type(EXPLICIT|INFERRED), confidence:number(0..1), source_refs
 employment_history[]: company_name, department, title, start_date, end_date,
-  responsibilities:string, confidence, source_refs
-education[]: school_name, major, degree, start_date, end_date, status, confidence, source_refs
-certifications[]: certification_name, issuer, acquired_date, expiry_date, confidence, source_refs
+  responsibilities:string, confidence:number(0..1), source_refs
+education[]: school_name, major, degree, start_date, end_date, status, confidence:number(0..1), source_refs
+certifications[]: certification_name, issuer, acquired_date, expiry_date, confidence:number(0..1), source_refs
 projects[]: project_name, customer_name, start_date, end_date, duration_months,
-  responsibilities:string, project_summary:string, confidence, source_refs,
+  responsibilities:string, project_summary:string, confidence:number(0..1), source_refs,
   jobs/skills/expertise/business_domains/customer_types as [{raw_value, code, source_refs}]
 summary: {text:string}
-analysis: {overall_confidence, notes:string}
+analysis: {overall_confidence:number(0..1), notes:string}
 
 source_ref item: {"document_id":"...","page_no":1,"quote_text":"실제 원문"}
 
 Output rules:
 - schema_version must be "profile-candidate-v1"
+- confidence/overall_confidence are numbers 0..1 (not HIGH/MEDIUM/LOW)
 - responsibilities/project_summary/summary.text/notes are strings, not arrays
 - Omit null optional scalars; [] only for truly empty lists
 - Do not invent empty source_refs keys
