@@ -27,20 +27,22 @@ profile.source_refs: map of field_name → [source_ref]; omit empty keys
 jobs[]: raw_value, code, job_type(PRIMARY|SECONDARY|EXPERIENCE), confidence, source_refs
 skills[]: raw_value, code, last_used_year, experience_months, is_representative, confidence, source_refs
 expertise[]: raw_value, code, evidence_type(EXPLICIT|INFERRED), confidence, source_refs
-employment_history[]: company_name, department, title, start_date, end_date, responsibilities, confidence, source_refs
+employment_history[]: company_name, department, title, start_date, end_date,
+  responsibilities:string, confidence, source_refs
 education[]: school_name, major, degree, start_date, end_date, status, confidence, source_refs
 certifications[]: certification_name, issuer, acquired_date, expiry_date, confidence, source_refs
 projects[]: project_name, customer_name, start_date, end_date, duration_months,
-  responsibilities, project_summary, confidence, source_refs,
+  responsibilities:string, project_summary:string, confidence, source_refs,
   jobs/skills/expertise/business_domains/customer_types as [{raw_value, code, source_refs}]
-summary: {text}
-analysis: {overall_confidence, notes}
+summary: {text:string}
+analysis: {overall_confidence, notes:string}
 
 source_ref item: {"document_id":"...","page_no":1,"quote_text":"실제 원문"}
 
 Output rules:
 - schema_version must be "profile-candidate-v1"
-- Omit null optional scalars; use [] only when the list truly has no items to emit
+- responsibilities/project_summary/summary.text/notes are strings, not arrays
+- Omit null optional scalars; [] only for truly empty lists
 - Do not invent empty source_refs keys
 - Return one complete root JSON object only (no markdown fence)
 """.strip()
