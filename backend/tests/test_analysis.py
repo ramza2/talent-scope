@@ -347,6 +347,355 @@ def test_normalize_career_document_value_length_guard():
     assert "name" in dropped.profile.source_refs
 
 
+def test_derived_career_confirmed_months_diff_from_document_value():
+    from app.ai.schemas.profile_candidate import ProfileCandidateDocument
+    from app.modules.analysis.diff_engine import build_diffs
+
+    doc_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    candidate = ProfileCandidateDocument.model_validate(
+        {
+            "schema_version": "profile-candidate-v1",
+            "profile": {
+                "name": "홍길동",
+                "career_document_value": "11년 10개월",
+                "source_refs": {
+                    "career_document_value": [
+                        {
+                            "document_id": doc_id,
+                            "page_no": 1,
+                            "quote_text": "기술경력 11년 10개월",
+                        }
+                    ]
+                },
+            },
+            "jobs": [],
+            "skills": [],
+            "expertise": [],
+            "employment_history": [],
+            "education": [],
+            "certifications": [],
+            "projects": [],
+            "summary": {},
+            "analysis": {},
+        }
+    )
+
+    # No existing confirmed months → NEW derived Diff, evidence reused.
+    specs_new = build_diffs(candidate, {"profile": {"name": "홍길동"}})
+    derived = [
+        s
+        for s in specs_new
+        if s.entity_type == "PROFILE" and s.field_name == "career_confirmed_months"
+    ]
+    assert len(derived) == 1
+    assert derived[0].change_type == "NEW"
+    assert derived[0].old_value is None
+    assert derived[0].new_value == 142
+    assert derived[0].candidate_path == "profile.career_confirmed_months"
+    assert derived[0].source_refs
+    assert derived[0].source_refs[0]["quote_text"] == "기술경력 11년 10개월"
+    assert derived[0].source_refs[0]["document_id"] == doc_id
+
+    # Existing equal value → SAME (no overwrite path).
+    specs_same = build_diffs(
+        candidate, {"profile": {"name": "홍길동", "career_confirmed_months": 142}}
+    )
+    derived_same = [
+        s
+        for s in specs_same
+        if s.field_name == "career_confirmed_months"
+    ]
+    assert len(derived_same) == 1
+    assert derived_same[0].change_type == "SAME"
+    assert derived_same[0].old_value == 142
+    assert derived_same[0].new_value == 142
+
+    # Existing different value → CONFLICT, never auto UPDATE.
+    specs_conflict = build_diffs(
+        candidate, {"profile": {"name": "홍길동", "career_confirmed_months": 100}}
+    )
+    derived_conflict = [
+        s
+        for s in specs_conflict
+        if s.field_name == "career_confirmed_months"
+    ]
+    assert len(derived_conflict) == 1
+    assert derived_conflict[0].change_type == "CONFLICT"
+    assert derived_conflict[0].old_value == 100
+    assert derived_conflict[0].new_value == 142
+
+    # Unparseable document value → no derived Diff.
+    unparsed = ProfileCandidateDocument.model_validate(
+        {
+            "schema_version": "profile-candidate-v1",
+            "profile": {"name": "홍길동", "career_document_value": "경력 풍부"},
+            "jobs": [],
+            "skills": [],
+            "expertise": [],
+            "employment_history": [],
+            "education": [],
+            "certifications": [],
+            "projects": [],
+            "summary": {},
+            "analysis": {},
+        }
+    )
+    specs_none = build_diffs(unparsed, {"profile": {}})
+    assert not any(s.field_name == "career_confirmed_months" for s in specs_none)
+
+
+def test_confirm_career_confirmed_months_accept_reject_modify_and_search(
+    client: TestClient, db_session, monkeypatch: pytest.MonkeyPatch
+):
+    """ACCEPTED/MODIFIED persist months; REJECTED does not; search uses confirmed."""
+    from app.ai.providers.llm import FakeLLMProvider
+    from app.db.models.person import PersonProfile
+    from app.modules.analysis.service import AnalysisService
+    from app.storage.s3 import get_object_storage
+
+    from app.db.models.document import DocumentPage
+
+    login_id = f"ccm_{uuid.uuid4().hex[:10]}"
+    password = "Passw0rd!"
+    user = _create_user(db_session, login_id=login_id, password=password)
+    person, document = _seed_person_with_ready_doc(db_session, user.id)
+    page = db_session.execute(
+        select(DocumentPage).where(DocumentPage.document_id == document.id)
+    ).scalar_one()
+    page.extracted_text = "분석대상 / 기술경력 11년 10개월 / 2012-07-01 입사"
+    db_session.commit()
+    csrf = _login(client, login_id, password)
+
+    create = client.post(
+        "/api/v1/analyses",
+        headers={"X-CSRF-Token": csrf},
+        json={
+            "person_id": str(person.id),
+            "document_ids": [str(document.id)],
+            "analysis_type": "PROFILE",
+        },
+    )
+    assert create.status_code == 202, create.text
+    analysis_id = create.json()["data"]["analysis_id"]
+
+    profile_json = {
+        "schema_version": "profile-candidate-v1",
+        "profile": {
+            "name": "분석대상",
+            "career_start_date": "2012-07-01",
+            "career_document_value": "11년 10개월",
+            "source_refs": {
+                "career_document_value": [
+                    {
+                        "document_id": str(document.id),
+                        "page_no": 1,
+                        "quote_text": "11년 10개월",
+                    }
+                ]
+            },
+        },
+        "jobs": [],
+        "skills": [],
+        "expertise": [],
+        "employment_history": [],
+        "education": [],
+        "certifications": [],
+        "projects": [],
+        "summary": {},
+        "analysis": {"overall_confidence": 0.9},
+    }
+    fake_llm = FakeLLMProvider(profile_json=profile_json)
+    service = AnalysisService(db_session, storage=get_object_storage(), llm=fake_llm)
+    assert service.run_analysis(uuid.UUID(analysis_id), llm=fake_llm) == "REVIEWING"
+
+    diffs = client.get(f"/api/v1/analyses/{analysis_id}/diffs").json()["data"]
+    career_diff = next(
+        d for d in diffs if d.get("field_name") == "career_confirmed_months"
+    )
+    assert career_diff["change_type"] == "NEW"
+    assert career_diff["new_value"] == 142
+    assert career_diff["evidence"]
+    assert career_diff["evidence"][0]["quote_text"] == "11년 10개월"
+
+    # REJECTED → not persisted.
+    reject = client.patch(
+        f"/api/v1/analyses/{analysis_id}/diffs/{career_diff['id']}",
+        headers={"X-CSRF-Token": csrf},
+        json={"review_status": "REJECTED"},
+    )
+    assert reject.status_code == 200, reject.text
+    for row in diffs:
+        if row["id"] == career_diff["id"]:
+            continue
+        if row["review_status"] != "PENDING" or row["change_type"] == "SAME":
+            continue
+        patch = client.patch(
+            f"/api/v1/analyses/{analysis_id}/diffs/{row['id']}",
+            headers={"X-CSRF-Token": csrf},
+            json={"review_status": "ACCEPTED"},
+        )
+        assert patch.status_code == 200, patch.text
+
+    profile = db_session.get(PersonProfile, person.id)
+    assert profile is not None
+    expected_version = profile.profile_version
+    confirm_reject = client.post(
+        f"/api/v1/analyses/{analysis_id}/confirm",
+        headers={"X-CSRF-Token": csrf},
+        json={"expected_profile_version": expected_version},
+    )
+    assert confirm_reject.status_code == 200, confirm_reject.text
+    db_session.refresh(profile)
+    assert profile.career_confirmed_months is None
+    assert profile.career_document_value == "11년 10개월"
+
+    # Second analysis: ACCEPTED → 142, searchable by min_months.
+    create2 = client.post(
+        "/api/v1/analyses",
+        headers={"X-CSRF-Token": csrf},
+        json={
+            "person_id": str(person.id),
+            "document_ids": [str(document.id)],
+            "analysis_type": "PROFILE",
+        },
+    )
+    assert create2.status_code == 202, create2.text
+    analysis_id2 = create2.json()["data"]["analysis_id"]
+    assert (
+        service.run_analysis(uuid.UUID(analysis_id2), llm=fake_llm) == "REVIEWING"
+    )
+    diffs2 = client.get(f"/api/v1/analyses/{analysis_id2}/diffs").json()["data"]
+    career_diff2 = next(
+        d for d in diffs2 if d.get("field_name") == "career_confirmed_months"
+    )
+    for row in diffs2:
+        if row["review_status"] != "PENDING" or row["change_type"] == "SAME":
+            continue
+        status = "ACCEPTED"
+        body: dict = {"review_status": status}
+        if row["id"] == career_diff2["id"]:
+            body = {"review_status": "ACCEPTED"}
+        patch = client.patch(
+            f"/api/v1/analyses/{analysis_id2}/diffs/{row['id']}",
+            headers={"X-CSRF-Token": csrf},
+            json=body,
+        )
+        assert patch.status_code == 200, patch.text
+
+    db_session.refresh(profile)
+    confirm_ok = client.post(
+        f"/api/v1/analyses/{analysis_id2}/confirm",
+        headers={"X-CSRF-Token": csrf},
+        json={"expected_profile_version": profile.profile_version},
+    )
+    assert confirm_ok.status_code == 200, confirm_ok.text
+    db_session.expire_all()
+    profile = db_session.get(PersonProfile, person.id)
+    assert profile is not None
+    assert profile.career_confirmed_months == 142
+
+    search = client.post(
+        "/api/v1/search/people",
+        json={"required": {"career": {"min_months": 18}}, "page": 1, "page_size": 20},
+    )
+    assert search.status_code == 200, search.text
+    ids = [row["person_id"] for row in search.json()["data"]]
+    assert str(person.id) in ids
+    hit = next(r for r in search.json()["data"] if r["person_id"] == str(person.id))
+    assert hit["person"]["career_months"] == 142
+
+    # Third analysis with existing confirmed: CONFLICT; MODIFIED overrides value.
+    create3 = client.post(
+        "/api/v1/analyses",
+        headers={"X-CSRF-Token": csrf},
+        json={
+            "person_id": str(person.id),
+            "document_ids": [str(document.id)],
+            "analysis_type": "PROFILE",
+        },
+    )
+    analysis_id3 = create3.json()["data"]["analysis_id"]
+    assert (
+        service.run_analysis(uuid.UUID(analysis_id3), llm=fake_llm) == "REVIEWING"
+    )
+    diffs3 = client.get(f"/api/v1/analyses/{analysis_id3}/diffs").json()["data"]
+    # Same document value → SAME for career_document_value; career_confirmed SAME too.
+    career_diff3 = next(
+        d for d in diffs3 if d.get("field_name") == "career_confirmed_months"
+    )
+    assert career_diff3["change_type"] == "SAME"
+
+    # Force CONFLICT path via unit-level already covered; MODIFIED on a NEW run
+    # with different decided_value: create conflict by changing profile then re-run.
+    profile.career_confirmed_months = 100
+    db_session.commit()
+    # Rebuild revision snapshot so base reflects 100.
+    from app.db.models.revision import ProfileRevision
+    from app.modules.people.snapshot import build_confirmed_profile_snapshot
+
+    snap = build_confirmed_profile_snapshot(db_session, person.id)
+    rev = db_session.execute(
+        select(ProfileRevision)
+        .where(ProfileRevision.person_id == person.id)
+        .order_by(ProfileRevision.revision_no.desc())
+    ).scalars().first()
+    assert rev is not None
+    rev.snapshot_json = snap
+    profile.profile_version = rev.revision_no
+    db_session.commit()
+
+    create4 = client.post(
+        "/api/v1/analyses",
+        headers={"X-CSRF-Token": csrf},
+        json={
+            "person_id": str(person.id),
+            "document_ids": [str(document.id)],
+            "analysis_type": "PROFILE",
+        },
+    )
+    analysis_id4 = create4.json()["data"]["analysis_id"]
+    assert (
+        service.run_analysis(uuid.UUID(analysis_id4), llm=fake_llm) == "REVIEWING"
+    )
+    diffs4 = client.get(f"/api/v1/analyses/{analysis_id4}/diffs").json()["data"]
+    career_diff4 = next(
+        d for d in diffs4 if d.get("field_name") == "career_confirmed_months"
+    )
+    assert career_diff4["change_type"] == "CONFLICT"
+    assert career_diff4["old_value"] == 100
+    mod = client.patch(
+        f"/api/v1/analyses/{analysis_id4}/diffs/{career_diff4['id']}",
+        headers={"X-CSRF-Token": csrf},
+        json={"review_status": "MODIFIED", "decided_value": 150},
+    )
+    assert mod.status_code == 200, mod.text
+    for row in diffs4:
+        if row["id"] == career_diff4["id"]:
+            continue
+        if row["review_status"] != "PENDING" or row["change_type"] == "SAME":
+            continue
+        patch = client.patch(
+            f"/api/v1/analyses/{analysis_id4}/diffs/{row['id']}",
+            headers={"X-CSRF-Token": csrf},
+            json={"review_status": "ACCEPTED"},
+        )
+        assert patch.status_code == 200, patch.text
+
+    db_session.refresh(profile)
+    confirm_mod = client.post(
+        f"/api/v1/analyses/{analysis_id4}/confirm",
+        headers={"X-CSRF-Token": csrf},
+        json={"expected_profile_version": profile.profile_version},
+    )
+    assert confirm_mod.status_code == 200, confirm_mod.text
+    db_session.expire_all()
+    profile = db_session.get(PersonProfile, person.id)
+    assert profile is not None
+    assert profile.career_confirmed_months == 150
+
+    _cleanup_person(db_session, person.id, user.id)
+
+
 def test_normalize_ensures_single_primary_job():
     from app.modules.analysis.normalize import normalize_candidate
 
