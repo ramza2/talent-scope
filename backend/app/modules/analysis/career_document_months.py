@@ -8,6 +8,11 @@ from __future__ import annotations
 
 import re
 
+# Safe upper bound for a total career duration (not a calendar year).
+# Values like ``2012년`` are rejected as unrealistic career lengths.
+MAX_CAREER_YEARS = 60
+MAX_CAREER_MONTHS = MAX_CAREER_YEARS * 12
+
 # Reject decimal fragments like "11.5년" by requiring the number is not
 # preceded by a digit or decimal point.
 _YEARS_AND_MONTHS = re.compile(
@@ -15,6 +20,12 @@ _YEARS_AND_MONTHS = re.compile(
 )
 _YEARS_ONLY = re.compile(r"(?<![\d.])(?P<years>\d+)\s*년")
 _MONTHS_ONLY = re.compile(r"(?<![\d.])(?P<months>\d+)\s*개월")
+
+# Approximate / range markers that must not be converted to exact months.
+_APPROX_OR_RANGE_MARKER = re.compile(
+    r"(약|이상|미만|내외|정도|최소|최대|"
+    r"(?<![\d.])\d+\s*(?:년|개월)\s*\+)"
+)
 
 
 def parse_career_document_months(value: str | None) -> int | None:
@@ -27,7 +38,7 @@ def parse_career_document_months(value: str | None) -> int | None:
     - ``기술경력 16년`` → 192
     - ``SW기술자 경력 12년 4개월`` → 148
 
-    Ambiguous / unparseable strings return ``None``. Never guesses.
+    Approximate / range / unrealistic expressions return ``None``. Never guesses.
     """
     if value is None:
         return None
@@ -35,6 +46,8 @@ def parse_career_document_months(value: str | None) -> int | None:
         return None
     text = value.strip()
     if not text:
+        return None
+    if _has_approx_or_range_marker(text):
         return None
 
     match = _YEARS_AND_MONTHS.search(text)
@@ -45,8 +58,10 @@ def parse_career_document_months(value: str | None) -> int | None:
         months = int(match.group("months"))
         if months >= 12:
             return None
+        if not _years_within_bound(years):
+            return None
         total = years * 12 + months
-        return total if total >= 0 else None
+        return total if _months_within_bound(total) else None
 
     match = _YEARS_ONLY.search(text)
     if match is not None:
@@ -57,16 +72,30 @@ def parse_career_document_months(value: str | None) -> int | None:
         if _MONTHS_ONLY.search(text):
             return None
         years = int(match.group("years"))
-        return years * 12 if years >= 0 else None
+        if not _years_within_bound(years):
+            return None
+        return years * 12
 
     match = _MONTHS_ONLY.search(text)
     if match is not None:
         if _has_other_duration(text, match.span()):
             return None
         months = int(match.group("months"))
-        return months if months >= 0 else None
+        return months if _months_within_bound(months) else None
 
     return None
+
+
+def _has_approx_or_range_marker(text: str) -> bool:
+    return _APPROX_OR_RANGE_MARKER.search(text) is not None
+
+
+def _years_within_bound(years: int) -> bool:
+    return 0 <= years <= MAX_CAREER_YEARS
+
+
+def _months_within_bound(months: int) -> bool:
+    return 0 <= months <= MAX_CAREER_MONTHS
 
 
 def _has_other_duration(text: str, span: tuple[int, int]) -> bool:
