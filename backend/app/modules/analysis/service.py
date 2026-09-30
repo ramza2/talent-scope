@@ -17,7 +17,11 @@ from app.ai.prompts.profile_extract import (
     current_profile_prompt,
     resolve_profile_prompt,
 )
-from app.ai.providers.errors import AIProviderError, AIResponseValidationError
+from app.ai.providers.errors import (
+    AIProviderError,
+    AIResponseTruncatedError,
+    AIResponseValidationError,
+)
 from app.ai.providers.llm import LLMProvider, OpenAICompatibleLLMProvider
 from app.ai.providers.vlm import OpenAICompatibleVLMProvider, VLMProvider
 from app.ai.schemas.profile_candidate import (
@@ -432,8 +436,8 @@ class AnalysisService:
             def _llm_normalize(
                 *, attempt: int, recovery_retry: bool = False
             ) -> ProfileCandidateDocument:
-                # First call: unchanged prompt. Empty/sparse retry: v4 adds
-                # RECOVERY_RETRY_INSTRUCTION via recovery_retry=True.
+                # First call: base prompt. Empty/sparse/truncated retry: compact
+                # recovery instruction via recovery_retry=True (v4+/v5).
                 user_prompt = prompt.build_user_prompt(
                     code_catalog=claimed.code_catalog_text,
                     document_blocks=blocks,
@@ -492,15 +496,30 @@ class AnalysisService:
                     candidate_quality_score(candidate),
                 )
 
-            candidate = _llm_normalize(attempt=1, recovery_retry=False)
-            _log_quality(attempt=1, candidate=candidate)
-            if candidate_needs_llm_retry(
-                candidate,
-                documents=claimed.documents,
-                source_char_count=source_char_count,
-            ):
+            needs_recovery_retry = False
+            try:
+                candidate = _llm_normalize(attempt=1, recovery_retry=False)
+                _log_quality(attempt=1, candidate=candidate)
+                needs_recovery_retry = candidate_needs_llm_retry(
+                    candidate,
+                    documents=claimed.documents,
+                    source_char_count=source_char_count,
+                )
+            except AIResponseTruncatedError as trunc_exc:
+                # finish_reason=length: do not treat partial JSON as a candidate.
+                # Reuse the single existing retry budget with compact recovery.
+                logger.info(
+                    "analysis llm truncated analysis_run_id=%s attempt=1 "
+                    "document_count=%s meta=%s",
+                    run_id,
+                    len(claimed.documents),
+                    trunc_exc.meta,
+                )
+                needs_recovery_retry = True
+                candidate = None
+
+            if needs_recovery_retry:
                 # Reuse the same prompt source; do not rebuild VLM/source.
-                # Second call adds recovery retry instruction (prompt v4+).
                 candidate = _llm_normalize(attempt=2, recovery_retry=True)
                 _log_quality(attempt=2, candidate=candidate)
                 if candidate_needs_llm_retry(

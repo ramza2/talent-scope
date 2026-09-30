@@ -4,8 +4,13 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from app.ai.providers.errors import AIProviderError, AIResponseValidationError
+from app.ai.providers.errors import (
+    AIProviderError,
+    AIResponseTruncatedError,
+    AIResponseValidationError,
+)
 from app.ai.providers.openai_compat import (
+    completion_response_meta,
     extract_message_content,
     post_chat_completions,
 )
@@ -96,6 +101,19 @@ class OpenAICompatibleLLMProvider:
             timeout_seconds=timeout_seconds,
             log_context=ctx,
         )
+        meta = completion_response_meta(data, fallback_model=payload.get("model"))
+        if meta.get("finish_reason") == "length":
+            # Do not parse/repair truncated content — nested objects must not
+            # become a false root Candidate.
+            raise AIResponseTruncatedError(
+                meta={
+                    "model": meta.get("model"),
+                    "finish_reason": meta.get("finish_reason"),
+                    "prompt_tokens": meta.get("prompt_tokens"),
+                    "completion_tokens": meta.get("completion_tokens"),
+                    "total_tokens": meta.get("total_tokens"),
+                }
+            )
         return extract_message_content(data)
 
 
