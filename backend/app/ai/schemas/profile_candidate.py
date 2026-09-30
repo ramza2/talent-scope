@@ -35,6 +35,33 @@ PROFILE_SCALAR_FIELDS: tuple[str, ...] = (
 PROFILE_SCALAR_FIELD_NAMES = frozenset(PROFILE_SCALAR_FIELDS)
 
 
+def coerce_optional_text(value: object) -> str | None:
+    """Normalize LLM text fields that may arrive as ``str`` or ``list[str]``.
+
+    - ``str`` → stripped string (empty → None)
+    - ``list`` → non-empty items joined with ``\\n`` (empty list → None)
+    - ``None`` → None
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        return text or None
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            if item is None:
+                continue
+            text = item.strip() if isinstance(item, str) else str(item).strip()
+            if text:
+                parts.append(text)
+        if not parts:
+            return None
+        return "\n".join(parts)
+    text = str(value).strip()
+    return text or None
+
+
 class SourceRef(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -172,6 +199,11 @@ class EmploymentCandidate(BaseModel):
     confidence: float | None = Field(default=None, ge=0, le=1)
     source_refs: list[SourceRef] = Field(default_factory=list)
 
+    @field_validator("responsibilities", mode="before")
+    @classmethod
+    def _responsibilities_text(cls, value: object) -> str | None:
+        return coerce_optional_text(value)
+
 
 class EducationCandidate(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -222,6 +254,11 @@ class ProjectCandidate(BaseModel):
     customer_types: list[CodeRefCandidate] = Field(default_factory=list)
     confidence: float | None = Field(default=None, ge=0, le=1)
     source_refs: list[SourceRef] = Field(default_factory=list)
+
+    @field_validator("responsibilities", "project_summary", mode="before")
+    @classmethod
+    def _project_text_fields(cls, value: object) -> str | None:
+        return coerce_optional_text(value)
 
 
 class SummaryCandidate(BaseModel):
