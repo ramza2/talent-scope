@@ -13,10 +13,12 @@ from uuid import UUID
 from sqlalchemy.orm import Session
 
 from app.ai.prompts.profile_extract import (
+    ProfilePromptSpec,
     UnknownProfilePromptVersionError,
     current_profile_prompt,
     resolve_profile_prompt,
 )
+from app.ai.prompts import profile_extract_v7 as profile_extract_v7_mod
 from app.ai.providers.errors import (
     AIProviderError,
     AIResponseTruncatedError,
@@ -433,101 +435,32 @@ class AnalysisService:
                 "source_char_count": source_char_count,
             }
 
-            def _llm_normalize(
-                *, attempt: int, recovery_retry: bool = False
-            ) -> ProfileCandidateDocument:
-                # First call: base prompt. Empty/sparse/truncated retry: compact
-                # recovery instruction via recovery_retry=True (v4+/v5).
-                user_prompt = prompt.build_user_prompt(
-                    code_catalog=claimed.code_catalog_text,
+            if prompt.extraction_mode == "staged":
+                candidate = self._extract_staged_candidate(
+                    prompt=prompt,
+                    code_catalog_text=claimed.code_catalog_text,
                     document_blocks=blocks,
-                    recovery_retry=recovery_retry,
-                )
-                raw = self.llm.complete_json(
-                    system_prompt=prompt.system_prompt,
-                    user_prompt=user_prompt,
-                    log_context={
-                        **base_log,
-                        "attempt": attempt,
-                        "recovery_retry": recovery_retry,
-                    },
-                )
-                if not isinstance(raw, dict):
-                    raise AIResponseValidationError(
-                        "profile JSON root is not an object"
-                    )
-                # Diagnostic only: top-level key names, never values / document text.
-                top_keys = raw_candidate_top_level_keys(raw)
-                logger.info(
-                    "analysis llm raw shape analysis_run_id=%s attempt=%s "
-                    "document_count=%s raw_key_count=%s raw_top_level_keys=%s",
-                    run_id,
-                    attempt,
-                    len(claimed.documents),
-                    len(raw),
-                    top_keys,
-                )
-                # source_ref validation uses only pages actually present in the LLM prompt.
-                return normalize_candidate(
-                    raw,
-                    catalog=catalog_map,
+                    catalog_map=catalog_map,
                     allowed_documents=prompt_source.allowed_documents,
-                    settings=self.settings,
                     page_texts=prompt_source.page_texts,
-                )
-
-            def _log_quality(*, attempt: int, candidate: ProfileCandidateDocument) -> None:
-                empty = candidate_is_empty(candidate)
-                sparse = candidate_is_sparse(
-                    candidate,
                     documents=claimed.documents,
                     source_char_count=source_char_count,
+                    base_log=base_log,
+                    vlm_pages=bundle.total_vlm_pages,
                 )
-                logger.info(
-                    "analysis candidate quality run_id=%s attempt=%s "
-                    "document_count=%s vlm_pages=%s empty=%s sparse=%s "
-                    "quality_score=%s",
-                    run_id,
-                    attempt,
-                    len(claimed.documents),
-                    bundle.total_vlm_pages,
-                    empty,
-                    sparse,
-                    candidate_quality_score(candidate),
-                )
-
-            needs_recovery_retry = False
-            try:
-                candidate = _llm_normalize(attempt=1, recovery_retry=False)
-                _log_quality(attempt=1, candidate=candidate)
-                needs_recovery_retry = candidate_needs_llm_retry(
-                    candidate,
+            else:
+                candidate = self._extract_single_candidate(
+                    prompt=prompt,
+                    code_catalog_text=claimed.code_catalog_text,
+                    document_blocks=blocks,
+                    catalog_map=catalog_map,
+                    allowed_documents=prompt_source.allowed_documents,
+                    page_texts=prompt_source.page_texts,
                     documents=claimed.documents,
                     source_char_count=source_char_count,
+                    base_log=base_log,
+                    vlm_pages=bundle.total_vlm_pages,
                 )
-            except AIResponseTruncatedError as trunc_exc:
-                # finish_reason=length: do not treat partial JSON as a candidate.
-                # Reuse the single existing retry budget with compact recovery.
-                logger.info(
-                    "analysis llm truncated analysis_run_id=%s attempt=1 "
-                    "document_count=%s meta=%s",
-                    run_id,
-                    len(claimed.documents),
-                    trunc_exc.meta,
-                )
-                needs_recovery_retry = True
-                candidate = None
-
-            if needs_recovery_retry:
-                # Reuse the same prompt source; do not rebuild VLM/source.
-                candidate = _llm_normalize(attempt=2, recovery_retry=True)
-                _log_quality(attempt=2, candidate=candidate)
-                if candidate_needs_llm_retry(
-                    candidate,
-                    documents=claimed.documents,
-                    source_char_count=source_char_count,
-                ):
-                    raise InsufficientCandidateError()
 
             if claimed.base_profile_version is None:
                 raise AIProviderError("missing base_profile_version")
@@ -562,6 +495,348 @@ class AnalysisService:
             logger.exception("analysis failed run_id=%s", run_id)
             self.db.rollback()
             return self._fail_run(run_id, exc, actor_user_id=actor_user_id)
+
+    def _extract_single_candidate(
+        self,
+        *,
+        prompt: ProfilePromptSpec,
+        code_catalog_text: str,
+        document_blocks: str,
+        catalog_map: dict[str, tuple[str, bool]],
+        allowed_documents: dict[str, set[int]],
+        page_texts: dict[tuple[str, int], str] | None,
+        documents: tuple[DocumentSnapshot, ...] | list[DocumentSnapshot],
+        source_char_count: int,
+        base_log: dict[str, Any],
+        vlm_pages: int,
+    ) -> ProfileCandidateDocument:
+        """Historical single-call extraction (v1–v6) with one recovery retry."""
+
+        def _llm_normalize(
+            *, attempt: int, recovery_retry: bool = False
+        ) -> ProfileCandidateDocument:
+            user_prompt = prompt.build_user_prompt(
+                code_catalog=code_catalog_text,
+                document_blocks=document_blocks,
+                recovery_retry=recovery_retry,
+            )
+            raw = self.llm.complete_json(
+                system_prompt=prompt.system_prompt,
+                user_prompt=user_prompt,
+                log_context={
+                    **base_log,
+                    "attempt": attempt,
+                    "recovery_retry": recovery_retry,
+                },
+            )
+            if not isinstance(raw, dict):
+                raise AIResponseValidationError(
+                    "profile JSON root is not an object"
+                )
+            top_keys = raw_candidate_top_level_keys(raw)
+            logger.info(
+                "analysis llm raw shape analysis_run_id=%s attempt=%s "
+                "document_count=%s raw_key_count=%s raw_top_level_keys=%s",
+                base_log.get("analysis_run_id"),
+                attempt,
+                base_log.get("document_count"),
+                len(raw),
+                top_keys,
+            )
+            return normalize_candidate(
+                raw,
+                catalog=catalog_map,
+                allowed_documents=allowed_documents,
+                settings=self.settings,
+                page_texts=page_texts,
+            )
+
+        def _log_quality(*, attempt: int, candidate: ProfileCandidateDocument) -> None:
+            empty = candidate_is_empty(candidate)
+            sparse = candidate_is_sparse(
+                candidate,
+                documents=documents,
+                source_char_count=source_char_count,
+            )
+            logger.info(
+                "analysis candidate quality run_id=%s attempt=%s "
+                "document_count=%s vlm_pages=%s empty=%s sparse=%s "
+                "quality_score=%s",
+                base_log.get("analysis_run_id"),
+                attempt,
+                base_log.get("document_count"),
+                vlm_pages,
+                empty,
+                sparse,
+                candidate_quality_score(candidate),
+            )
+
+        needs_recovery_retry = False
+        try:
+            candidate = _llm_normalize(attempt=1, recovery_retry=False)
+            _log_quality(attempt=1, candidate=candidate)
+            needs_recovery_retry = candidate_needs_llm_retry(
+                candidate,
+                documents=documents,
+                source_char_count=source_char_count,
+            )
+        except AIResponseTruncatedError as trunc_exc:
+            logger.info(
+                "analysis llm truncated analysis_run_id=%s attempt=1 "
+                "document_count=%s meta=%s",
+                base_log.get("analysis_run_id"),
+                base_log.get("document_count"),
+                trunc_exc.meta,
+            )
+            needs_recovery_retry = True
+            candidate = None
+
+        if needs_recovery_retry:
+            candidate = _llm_normalize(attempt=2, recovery_retry=True)
+            _log_quality(attempt=2, candidate=candidate)
+            if candidate_needs_llm_retry(
+                candidate,
+                documents=documents,
+                source_char_count=source_char_count,
+            ):
+                raise InsufficientCandidateError()
+        assert candidate is not None
+        return candidate
+
+    def _extract_staged_candidate(
+        self,
+        *,
+        prompt: ProfilePromptSpec,
+        code_catalog_text: str,
+        document_blocks: str,
+        catalog_map: dict[str, tuple[str, bool]],
+        allowed_documents: dict[str, set[int]],
+        page_texts: dict[tuple[str, int], str] | None,
+        documents: tuple[DocumentSnapshot, ...] | list[DocumentSnapshot],
+        source_char_count: int,
+        base_log: dict[str, Any],
+        vlm_pages: int,
+    ) -> ProfileCandidateDocument:
+        """v7 staged extraction: CORE then PROJECTS; at most one recovery total."""
+        if (
+            prompt.build_core_user_prompt is None
+            or prompt.build_projects_user_prompt is None
+            or prompt.core_system_prompt is None
+            or prompt.projects_system_prompt is None
+        ):
+            raise AIProviderError("staged prompt builders are not configured")
+
+        call_count = 0
+        recovery_budget = 1
+
+        def _phase_call(
+            *,
+            phase: str,
+            system_prompt: str,
+            build_user_prompt: Any,
+            recovery_retry: bool,
+        ) -> dict[str, Any]:
+            nonlocal call_count
+            if call_count >= 3:
+                raise AIProviderError("staged extraction exceeded LLM call budget")
+            call_count += 1
+            user_prompt = build_user_prompt(
+                code_catalog=code_catalog_text,
+                document_blocks=document_blocks,
+                recovery_retry=recovery_retry,
+            )
+            raw = self.llm.complete_json(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                log_context={
+                    **base_log,
+                    "phase": phase,
+                    "attempt": call_count,
+                    "recovery_retry": recovery_retry,
+                },
+            )
+            if not isinstance(raw, dict):
+                raise AIResponseValidationError(
+                    f"profile JSON root is not an object (phase={phase})"
+                )
+            top_keys = raw_candidate_top_level_keys(raw)
+            logger.info(
+                "analysis llm raw shape analysis_run_id=%s phase=%s attempt=%s "
+                "document_count=%s raw_key_count=%s raw_top_level_keys=%s",
+                base_log.get("analysis_run_id"),
+                phase,
+                call_count,
+                base_log.get("document_count"),
+                len(raw),
+                top_keys,
+            )
+            return raw
+
+        def _run_phase(
+            *,
+            phase: str,
+            system_prompt: str,
+            build_user_prompt: Any,
+            normalize_raw: Any,
+            needs_retry: Any,
+            fail_closed_if_bad: bool,
+        ) -> ProfileCandidateDocument:
+            nonlocal recovery_budget
+            try:
+                raw = _phase_call(
+                    phase=phase,
+                    system_prompt=system_prompt,
+                    build_user_prompt=build_user_prompt,
+                    recovery_retry=False,
+                )
+                candidate = normalize_raw(raw)
+            except AIResponseTruncatedError as trunc_exc:
+                logger.info(
+                    "analysis llm truncated analysis_run_id=%s phase=%s "
+                    "document_count=%s meta=%s",
+                    base_log.get("analysis_run_id"),
+                    phase,
+                    base_log.get("document_count"),
+                    trunc_exc.meta,
+                )
+                if recovery_budget <= 0:
+                    if fail_closed_if_bad:
+                        raise InsufficientCandidateError() from trunc_exc
+                    return normalize_raw({"projects": []})
+                recovery_budget -= 1
+                try:
+                    raw = _phase_call(
+                        phase=phase,
+                        system_prompt=system_prompt,
+                        build_user_prompt=build_user_prompt,
+                        recovery_retry=True,
+                    )
+                    candidate = normalize_raw(raw)
+                except AIResponseTruncatedError:
+                    if fail_closed_if_bad:
+                        raise InsufficientCandidateError() from trunc_exc
+                    return normalize_raw({"projects": []})
+            else:
+                if needs_retry(candidate) and recovery_budget > 0:
+                    recovery_budget -= 1
+                    try:
+                        raw = _phase_call(
+                            phase=phase,
+                            system_prompt=system_prompt,
+                            build_user_prompt=build_user_prompt,
+                            recovery_retry=True,
+                        )
+                        candidate = normalize_raw(raw)
+                    except AIResponseTruncatedError:
+                        if fail_closed_if_bad:
+                            raise InsufficientCandidateError()
+                        return normalize_raw({"projects": []})
+
+            # CORE must produce a usable profile; empty PROJECTS is allowed
+            # (some documents have no project rows).
+            if fail_closed_if_bad and needs_retry(candidate):
+                raise InsufficientCandidateError()
+            return candidate
+
+        def _normalize_core(raw: dict[str, Any]) -> ProfileCandidateDocument:
+            # CORE is authoritative for non-project fields; drop any projects.
+            core_raw = dict(raw)
+            core_raw["projects"] = []
+            return normalize_candidate(
+                core_raw,
+                catalog=catalog_map,
+                allowed_documents=allowed_documents,
+                settings=self.settings,
+                page_texts=page_texts,
+            )
+
+        def _normalize_projects(raw: dict[str, Any]) -> ProfileCandidateDocument:
+            projects_raw = {
+                "schema_version": profile_extract_v7_mod.SCHEMA_VERSION,
+                "projects": raw.get("projects") if isinstance(raw.get("projects"), list) else [],
+            }
+            return normalize_candidate(
+                projects_raw,
+                catalog=catalog_map,
+                allowed_documents=allowed_documents,
+                settings=self.settings,
+                page_texts=page_texts,
+            )
+
+        def _core_needs_retry(candidate: ProfileCandidateDocument) -> bool:
+            return candidate_needs_llm_retry(
+                candidate,
+                documents=documents,
+                source_char_count=source_char_count,
+            )
+
+        def _projects_needs_retry(candidate: ProfileCandidateDocument) -> bool:
+            # Empty projects on rich sources may use the shared recovery budget.
+            if len(candidate.projects) > 0:
+                return False
+            if source_char_count < _SPARSE_MIN_SOURCE_CHARS:
+                return False
+            return _documents_are_rich_profile_type(documents)
+
+        core = _run_phase(
+            phase="core",
+            system_prompt=prompt.core_system_prompt,
+            build_user_prompt=prompt.build_core_user_prompt,
+            normalize_raw=_normalize_core,
+            needs_retry=_core_needs_retry,
+            fail_closed_if_bad=True,
+        )
+        logger.info(
+            "analysis candidate quality run_id=%s phase=core "
+            "document_count=%s vlm_pages=%s empty=%s sparse=%s quality_score=%s "
+            "skills=%s expertise=%s projects=%s",
+            base_log.get("analysis_run_id"),
+            base_log.get("document_count"),
+            vlm_pages,
+            candidate_is_empty(core),
+            candidate_is_sparse(
+                core, documents=documents, source_char_count=source_char_count
+            ),
+            candidate_quality_score(core),
+            len(core.skills),
+            len(core.expertise),
+            len(core.projects),
+        )
+
+        projects_doc = _run_phase(
+            phase="projects",
+            system_prompt=prompt.projects_system_prompt,
+            build_user_prompt=prompt.build_projects_user_prompt,
+            normalize_raw=_normalize_projects,
+            needs_retry=_projects_needs_retry,
+            fail_closed_if_bad=False,
+        )
+        logger.info(
+            "analysis candidate quality run_id=%s phase=projects "
+            "document_count=%s vlm_pages=%s project_count=%s",
+            base_log.get("analysis_run_id"),
+            base_log.get("document_count"),
+            vlm_pages,
+            len(projects_doc.projects),
+        )
+
+        merged = core.model_copy(update={"projects": list(projects_doc.projects)})
+        logger.info(
+            "analysis staged merge analysis_run_id=%s core_skills=%s "
+            "core_expertise=%s projects=%s llm_calls=%s",
+            base_log.get("analysis_run_id"),
+            len(merged.skills),
+            len(merged.expertise),
+            len(merged.projects),
+            call_count,
+        )
+        if candidate_needs_llm_retry(
+            merged,
+            documents=documents,
+            source_char_count=source_char_count,
+        ):
+            raise InsufficientCandidateError()
+        return merged
 
     def _persist_vlm_transcriptions(
         self,

@@ -204,7 +204,13 @@ def test_length_triggers_recovery_retry_then_reviewing(db_session):
         doc_type_name="이력서",
         page_text=_RICH_PAGE_TEXT,
     )
-    run = _queue_run(db_session, person.id, document.id)
+    # Pin historical single-call prompt; staged v7 uses a different call budget.
+    run = _queue_run(
+        db_session,
+        person.id,
+        document.id,
+        prompt_version="profile-extract-v5",
+    )
     llm = _LengthThenValidLLM()
     service = AnalysisService(db_session, storage=get_object_storage(), llm=llm)
     assert service.run_analysis(run.id) == "REVIEWING"

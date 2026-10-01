@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Literal
 
 from app.ai.prompts import (
     profile_extract_v1,
@@ -12,10 +13,13 @@ from app.ai.prompts import (
     profile_extract_v4,
     profile_extract_v5,
     profile_extract_v6,
+    profile_extract_v7,
 )
 from app.ai.providers.errors import AIProviderError
 
-CURRENT_PROFILE_PROMPT_VERSION = "profile-extract-v6"
+CURRENT_PROFILE_PROMPT_VERSION = "profile-extract-v7"
+
+ExtractionMode = Literal["single", "staged"]
 
 
 class UnknownProfilePromptVersionError(AIProviderError):
@@ -28,6 +32,11 @@ class ProfilePromptSpec:
     schema_version: str
     system_prompt: str
     build_user_prompt: Callable[..., str]
+    extraction_mode: ExtractionMode = "single"
+    core_system_prompt: str | None = None
+    projects_system_prompt: str | None = None
+    build_core_user_prompt: Callable[..., str] | None = None
+    build_projects_user_prompt: Callable[..., str] | None = None
 
 
 def _spec_from_module(module) -> ProfilePromptSpec:
@@ -36,6 +45,21 @@ def _spec_from_module(module) -> ProfilePromptSpec:
         schema_version=module.SCHEMA_VERSION,
         system_prompt=module.SYSTEM_PROMPT,
         build_user_prompt=module.build_user_prompt,
+        extraction_mode="single",
+    )
+
+
+def _spec_from_staged_module(module) -> ProfilePromptSpec:
+    return ProfilePromptSpec(
+        prompt_version=module.PROMPT_VERSION,
+        schema_version=module.SCHEMA_VERSION,
+        system_prompt=module.CORE_SYSTEM_PROMPT,
+        build_user_prompt=module.build_core_user_prompt,
+        extraction_mode="staged",
+        core_system_prompt=module.CORE_SYSTEM_PROMPT,
+        projects_system_prompt=module.PROJECTS_SYSTEM_PROMPT,
+        build_core_user_prompt=module.build_core_user_prompt,
+        build_projects_user_prompt=module.build_projects_user_prompt,
     )
 
 
@@ -46,6 +70,7 @@ _REGISTRY: dict[str, ProfilePromptSpec] = {
     profile_extract_v4.PROMPT_VERSION: _spec_from_module(profile_extract_v4),
     profile_extract_v5.PROMPT_VERSION: _spec_from_module(profile_extract_v5),
     profile_extract_v6.PROMPT_VERSION: _spec_from_module(profile_extract_v6),
+    profile_extract_v7.PROMPT_VERSION: _spec_from_staged_module(profile_extract_v7),
 }
 
 

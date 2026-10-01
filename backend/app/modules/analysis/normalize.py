@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 from uuid import UUID
 
@@ -19,6 +20,47 @@ from app.ai.schemas.profile_candidate import (
     SourceRef,
 )
 from app.core.config import Settings, get_settings
+
+# Fail-closed skill temporal provenance: keep last_used_year / experience_months
+# only when a retained source_ref quote carries year/date/duration evidence.
+_TEMPORAL_EVIDENCE_RE = re.compile(
+    r"(?:"
+    r"\d{4}\s*[.\-/년]"  # 2012. / 2012- / 2012년
+    r"|"
+    r"\d{4}"  # bare year
+    r"|"
+    r"\d+\s*년\s*\d+\s*개월"  # 2년 8개월
+    r"|"
+    r"\d+\s*년"  # N년
+    r"|"
+    r"\d+\s*개월"  # N개월
+    r")"
+)
+
+
+def source_refs_have_temporal_evidence(refs: list[SourceRef] | None) -> bool:
+    """True when any quote contains year/date/month/duration evidence."""
+    if not refs:
+        return False
+    for ref in refs:
+        quote = (ref.quote_text or "").strip()
+        if quote and _TEMPORAL_EVIDENCE_RE.search(quote):
+            return True
+    return False
+
+
+def apply_skill_temporal_provenance(skill: SkillCandidate) -> SkillCandidate:
+    """Clear skill temporal fields when source_refs lack period/year evidence."""
+    has_temporal = (
+        skill.last_used_year is not None or skill.experience_months is not None
+    )
+    if not has_temporal:
+        return skill
+    if source_refs_have_temporal_evidence(skill.source_refs):
+        return skill
+    return skill.model_copy(
+        update={"last_used_year": None, "experience_months": None}
+    )
 
 SENSITIVE_KEYS = frozenset(
     {
@@ -281,14 +323,13 @@ def normalize_candidate(
     for skill in doc.skills:
         # TECH only — reject EXP (and any other) codes in skills.
         code = _code_lookup(catalog, skill.code, expected_type="TECH")
-        skills.append(
-            skill.model_copy(
-                update={
-                    "code": code,
-                    "source_refs": _refs(skill.source_refs),
-                }
-            )
+        normalized_skill = skill.model_copy(
+            update={
+                "code": code,
+                "source_refs": _refs(skill.source_refs),
+            }
         )
+        skills.append(apply_skill_temporal_provenance(normalized_skill))
     doc.skills = skills
 
     expertise: list[ExpertiseCandidate] = []
