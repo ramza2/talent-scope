@@ -103,6 +103,18 @@ React, Vue.js, Angular, Next.js, HTML, CSS, JavaScript, TypeScript
 ### Data `TECH-DATA`
 Hadoop, Spark, Kafka, Airflow, NiFi, Flink, ETL, CDC, Data Warehouse, Data Lake
 
+### Security `TECH-SEC`
+구체 보안 제품/플랫폼만 TECH로 관리한다. 업무 활동 표현(정보보안 운영 등)은 TECH가 아니다.
+
+- `TECH-SEC-AD` Active Directory
+- `TECH-SEC-NAC` NAC
+- `TECH-SEC-SEP` Symantec Endpoint Protection
+
+대표 Alias:
+- AD / 액티브 디렉터리 → Active Directory
+- Network Access Control → NAC
+- SEP → Symantec Endpoint Protection
+
 ## 4. EXP - 전문분야
 
 ### AI `EXP-AI`
@@ -144,6 +156,17 @@ DB 설계, DB 구축, DB 운영, DB 튜닝, DB 마이그레이션, DB 이중화,
 
 ### Management `EXP-MGT`
 대규모 프로젝트 관리, 공공 SI 관리, Agile 관리, 일정관리, 인력관리, 품질관리, 위험관리, 요구사항관리, 고객/발주처 대응, 컨소시엄 관리, 제안/기획
+
+### Security `EXP-SEC`
+정보보안/정보보호 전문분야. 문서에서 보안 운영 또는 보안 구축이 명시적으로 확인될 때 해당 하위 코드를 사용한다.
+
+- `EXP-SEC-OPS` 정보보안 운영
+- `EXP-SEC-BUILD` 정보보안 구축
+
+대표 Alias:
+- 보안 / 정보보안 / 정보보호 → EXP-SEC
+- 보안 운영 / 보안시스템 운영 / 정보보안시스템 운영 → EXP-SEC-OPS
+- 보안 구축 / 보안시스템 구축 / 정보보호 강화 → EXP-SEC-BUILD
 
 ## 5. BIZ - 사업분야
 
@@ -203,6 +226,11 @@ JOB-SYS-SE          시스템SE            System Engineer
 JOB-MGT-PM          PM                  Project Manager
 TECH-DB-ORACLE      Oracle              오라클
 EXP-AI-RAG          RAG                 검색증강생성
+EXP-SEC             Security            정보보안
+EXP-SEC-OPS         정보보안 운영       보안시스템 운영
+TECH-SEC-AD         Active Directory    AD
+TECH-SEC-NAC        NAC                 Network Access Control
+TECH-SEC-SEP        Symantec Endpoint Protection  SEP
 ```
 
 AI가 Alias를 추출해도 DB에는 표준 코드로 정규화한다.
