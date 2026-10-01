@@ -17,12 +17,44 @@ from __future__ import annotations
 from alembic import op
 from sqlalchemy import text
 
-from app.modules.codes.normalize import prepare_aliases
-
 revision = "0003_seed_security_taxonomy"
 down_revision = "0002_seed_default_codes"
 branch_labels = None
 depends_on = None
+
+
+def _normalize_alias(alias: str) -> str:
+    """Trim, collapse internal whitespace, and casefold (migration-local)."""
+    return " ".join(alias.strip().split()).casefold()
+
+
+def _prepare_aliases(
+    aliases: tuple[str, ...] | list[str],
+    *,
+    standard_name: str | None = None,
+) -> list[tuple[str, str]]:
+    """Return unique (alias, normalized_alias) pairs.
+
+    Migration-local helper: strip, collapse whitespace, casefold, dedupe, and
+    skip aliases equal to the canonical standard name.
+    """
+    name_norm = _normalize_alias(standard_name) if standard_name else None
+    seen: set[str] = set()
+    result: list[tuple[str, str]] = []
+    for raw in aliases:
+        cleaned = " ".join(raw.strip().split())
+        if not cleaned:
+            continue
+        normalized = _normalize_alias(cleaned)
+        if not normalized:
+            continue
+        if name_norm and normalized == name_norm:
+            continue
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append((cleaned, normalized))
+    return result
 
 
 ROOT_CODES = (
@@ -82,8 +114,8 @@ CHILD_CODES = (
     },
 )
 
-# Aliases that normalize equal to the standard name are skipped by prepare_aliases
-# (name matching still resolves via code_master.name).
+# Aliases that normalize equal to the standard name are skipped by
+# _prepare_aliases (name matching still resolves via code_master.name).
 CODE_ALIASES: dict[str, tuple[str, ...]] = {
     "EXP-SEC": ("보안", "정보보안", "정보보호"),
     "EXP-SEC-OPS": (
@@ -148,8 +180,8 @@ def _alias_rows() -> list[dict[str, str]]:
     }
     out: list[dict[str, str]] = []
     for code, aliases in CODE_ALIASES.items():
-        for alias, normalized in prepare_aliases(
-            list(aliases),
+        for alias, normalized in _prepare_aliases(
+            aliases,
             standard_name=name_by_code.get(code),
         ):
             out.append(

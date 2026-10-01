@@ -76,7 +76,10 @@ def test_security_taxonomy_migration_source_idempotent() -> None:
     assert '"TECH-SEC-AD"' in source
     assert '"TECH-SEC-NAC"' in source
     assert '"TECH-SEC-SEP"' in source
-    assert "prepare_aliases" in source
+    assert "_prepare_aliases" in source
+    assert "_normalize_alias" in source
+    assert "from app.modules" not in source
+    assert "app.modules.codes.normalize" not in source
 
 
 def test_security_taxonomy_codes_and_aliases_seeded(db_engine) -> None:
@@ -100,7 +103,7 @@ def test_security_taxonomy_codes_and_aliases_seeded(db_engine) -> None:
             assert code_type == expected_type, code
             assert parent == expected_parent, code
 
-        # Name-equal aliases may be omitted by prepare_aliases; standard name
+        # Name-equal aliases may be omitted by _prepare_aliases; standard name
         # still resolves. Assert required alias rows or name match.
         name_rows = conn.execute(
             text(
