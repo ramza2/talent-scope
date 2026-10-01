@@ -1196,3 +1196,133 @@ def test_interpret_short_substring_does_not_flood_priority(db_session, monkeypat
     )
     assert "TECH-MAINFRAME" in {c.code for c in included3}
     assert "TECH-AI" not in {c.code for c in included3}
+
+
+def test_interpret_unresolved_token_logs_safe_diagnostics(db_session, caplog):
+    """Unresolved LLM code token must log stage/block/field/token only."""
+    import logging
+
+    from app.ai.providers.llm import FakeLLMProvider
+    from app.core.exceptions import SearchInterpretationInvalidError
+    from app.modules.search.interpret_policy import SEARCH_INTERPRET_PROMPT_VERSION
+    from app.modules.search.interpret_schemas import SearchInterpretRequest
+    from app.modules.search.interpret_service import SearchInterpretService
+
+    _seed_catalog(db_session)
+    payload = _llm_payload(
+        required=_empty_required(jobs=["NOT-A-REAL-JOB"]),
+        preferred=_empty_preferred(),
+        semantic_query=None,
+    )
+    svc = SearchInterpretService(
+        db_session, llm=FakeLLMProvider(profile_json=payload)
+    )
+    with caplog.at_level(logging.INFO, logger="app.modules.search.interpret_service"):
+        with pytest.raises(SearchInterpretationInvalidError):
+            svc.interpret(SearchInterpretRequest(text="PM 경험이 있는 인력"))
+
+    resolve_logs = [
+        rec
+        for rec in caplog.records
+        if "resolve_ai_codes unresolved token" in rec.getMessage()
+    ]
+    assert resolve_logs, "expected resolve_ai_codes diagnostic log"
+    msg = resolve_logs[0].getMessage()
+    assert "stage=resolve_ai_codes" in msg
+    assert "block=required" in msg
+    assert "field=jobs" in msg
+    assert "token=NOT-A-REAL-JOB" in msg
+    assert "expected_type=JOB" in msg
+    assert f"prompt_version={SEARCH_INTERPRET_PROMPT_VERSION}" in msg
+    # Must not leak the user natural-language query text.
+    assert "PM 경험이 있는 인력" not in msg
+    joined = " ".join(rec.getMessage() for rec in caplog.records)
+    assert "PM 경험이 있는 인력" not in joined
+
+
+def test_interpret_inactive_code_logs_active_code_diagnostics(db_session, caplog):
+    """Inactive/mismatched code after resolve must log code + expected_type."""
+    import logging
+
+    from app.ai.providers.llm import FakeLLMProvider
+    from app.core.exceptions import SearchInterpretationInvalidError
+    from app.db.models.code import CodeMaster
+    from app.modules.search.interpret_policy import SEARCH_INTERPRET_PROMPT_VERSION
+    from app.modules.search.interpret_schemas import SearchInterpretRequest
+    from app.modules.search.interpret_service import SearchInterpretService
+
+    _seed_catalog(db_session)
+    _ensure_code(db_session, "TECH-TEMP", "TECH", "TempSkill", is_active=True)
+
+    class FlipLLM(FakeLLMProvider):
+        def complete_json(self, **kwargs):  # type: ignore[no-untyped-def]
+            out = super().complete_json(**kwargs)
+            row = db_session.get(CodeMaster, "TECH-TEMP")
+            assert row is not None
+            row.is_active = False
+            db_session.commit()
+            return out
+
+    payload = _llm_payload(
+        required=_empty_required(skills=["TECH-TEMP"]),
+        preferred=_empty_preferred(),
+        semantic_query=None,
+    )
+    svc = SearchInterpretService(db_session, llm=FlipLLM(profile_json=payload))
+    with caplog.at_level(logging.INFO, logger="app.modules.search.interpret_service"):
+        with pytest.raises(SearchInterpretationInvalidError):
+            svc.interpret(SearchInterpretRequest(text="TempSkill"))
+
+    active_logs = [
+        rec
+        for rec in caplog.records
+        if "active_code_validation failed" in rec.getMessage()
+    ]
+    assert active_logs, "expected active_code_validation diagnostic log"
+    msg = active_logs[0].getMessage()
+    assert "stage=active_code_validation" in msg
+    assert "code=TECH-TEMP" in msg
+    assert "expected_type=TECH" in msg
+    assert f"prompt_version={SEARCH_INTERPRET_PROMPT_VERSION}" in msg
+
+
+def test_interpret_success_regression_no_failure_stage_logs(db_session, caplog):
+    """Happy-path interpret must succeed without failure-stage diagnostics."""
+    import logging
+
+    from app.ai.providers.llm import FakeLLMProvider
+    from app.modules.search.interpret_schemas import SearchInterpretRequest
+    from app.modules.search.interpret_service import SearchInterpretService
+
+    _seed_catalog(db_session)
+    payload = _llm_payload()
+    svc = SearchInterpretService(
+        db_session, llm=FakeLLMProvider(profile_json=payload)
+    )
+    with caplog.at_level(logging.INFO, logger="app.modules.search.interpret_service"):
+        result = svc.interpret(
+            SearchInterpretRequest(
+                text="AI 개발 경험 있고 RAG 프로젝트 해본 특급 인력 찾아줘"
+            )
+        )
+
+    assert result.data.required.jobs == ["JOB-AI-DEV"]
+    assert result.data.preferred.expertise == ["EXP-AI-RAG"]
+    assert result.data.query_version == "1.0"
+    failure_msgs = [
+        rec.getMessage()
+        for rec in caplog.records
+        if any(
+            marker in rec.getMessage()
+            for marker in (
+                "stage=llm_schema_validation",
+                "stage=resolve_ai_codes",
+                "stage=people_request_validation",
+                "stage=active_code_validation",
+            )
+        )
+    ]
+    assert failure_msgs == []
+    assert any(
+        "search_interpret completed" in rec.getMessage() for rec in caplog.records
+    )

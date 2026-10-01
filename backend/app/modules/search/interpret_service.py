@@ -105,9 +105,12 @@ class SearchInterpretService:
             llm_out = SearchInterpretLLMOutput.model_validate(raw)
         except ValidationError:
             logger.info(
-                "search_interpret invalid_llm_schema",
+                "search_interpret invalid_llm_schema "
+                "stage=llm_schema_validation "
+                f"prompt_version={SEARCH_INTERPRET_PROMPT_VERSION}",
                 extra={
                     "operation": "search_interpret",
+                    "stage": "llm_schema_validation",
                     "prompt_version": SEARCH_INTERPRET_PROMPT_VERSION,
                     "query_version": SEARCH_QUERY_VERSION,
                 },
@@ -126,9 +129,12 @@ class SearchInterpretService:
             )
         except ValidationError:
             logger.info(
-                "search_interpret people_request_invalid",
+                "search_interpret people_request_invalid "
+                "stage=people_request_validation "
+                f"prompt_version={SEARCH_INTERPRET_PROMPT_VERSION}",
                 extra={
                     "operation": "search_interpret",
+                    "stage": "people_request_validation",
                     "prompt_version": SEARCH_INTERPRET_PROMPT_VERSION,
                 },
             )
@@ -231,6 +237,19 @@ class SearchInterpretService:
                 for code in values:
                     row = active.get(code)
                     if row is None or row.code_type != expected_type:
+                        logger.info(
+                            "search_interpret active_code_validation failed "
+                            "stage=active_code_validation "
+                            f"code={code} expected_type={expected_type} "
+                            f"prompt_version={SEARCH_INTERPRET_PROMPT_VERSION}",
+                            extra={
+                                "operation": "search_interpret",
+                                "stage": "active_code_validation",
+                                "code": code,
+                                "expected_type": expected_type,
+                                "prompt_version": SEARCH_INTERPRET_PROMPT_VERSION,
+                            },
+                        )
                         raise SearchInterpretationInvalidError()
 
     def _resolve_ai_codes(
@@ -254,16 +273,62 @@ class SearchInterpretService:
             for field, expected_type in CODE_FIELD_EXPECTED_TYPE.items():
                 raw_values = block.get(field) or []
                 if not isinstance(raw_values, list):
+                    logger.info(
+                        "search_interpret resolve_ai_codes invalid field "
+                        "stage=resolve_ai_codes "
+                        f"block={block_name} field={field} "
+                        f"prompt_version={SEARCH_INTERPRET_PROMPT_VERSION}",
+                        extra={
+                            "operation": "search_interpret",
+                            "stage": "resolve_ai_codes",
+                            "block": block_name,
+                            "field": field,
+                            "prompt_version": SEARCH_INTERPRET_PROMPT_VERSION,
+                        },
+                    )
                     raise SearchInterpretationInvalidError()
                 resolved: list[str] = []
                 seen: set[str] = set()
                 for token in raw_values:
                     if not isinstance(token, str):
+                        logger.info(
+                            "search_interpret resolve_ai_codes invalid token type "
+                            "stage=resolve_ai_codes "
+                            f"block={block_name} field={field} "
+                            f"expected_type={expected_type} "
+                            f"prompt_version={SEARCH_INTERPRET_PROMPT_VERSION}",
+                            extra={
+                                "operation": "search_interpret",
+                                "stage": "resolve_ai_codes",
+                                "block": block_name,
+                                "field": field,
+                                "expected_type": expected_type,
+                                "prompt_version": SEARCH_INTERPRET_PROMPT_VERSION,
+                            },
+                        )
                         raise SearchInterpretationInvalidError()
                     code = self._resolve_token(
                         token, expected_type=expected_type, indexes=indexes
                     )
                     if code is None:
+                        # Safe: LLM code/name token only — never user text / raw JSON.
+                        safe_token = token.strip()[:100]
+                        logger.info(
+                            "search_interpret resolve_ai_codes unresolved token "
+                            "stage=resolve_ai_codes "
+                            f"block={block_name} field={field} "
+                            f"token={safe_token} expected_type={expected_type} "
+                            f"prompt_version={SEARCH_INTERPRET_PROMPT_VERSION}",
+                            extra={
+                                "operation": "search_interpret",
+                                "stage": "resolve_ai_codes",
+                                "block": block_name,
+                                "field": field,
+                                "token": safe_token,
+                                "expected_type": expected_type,
+                                "prompt_version": SEARCH_INTERPRET_PROMPT_VERSION,
+                            },
+                        )
                         raise SearchInterpretationInvalidError()
                     if code not in seen:
                         seen.add(code)
