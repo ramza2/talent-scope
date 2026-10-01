@@ -40,6 +40,28 @@ from app.modules.search.query_schemas import SearchPeopleRequest
 
 logger = logging.getLogger(__name__)
 
+_UNRESOLVED_TOKEN_MAX_LEN = 100
+_UNRESOLVED_TOKEN_PLACEHOLDER = "<empty>"
+# CR/LF/tab and other C0 controls + DEL → single space before collapse/trim.
+_UNRESOLVED_TOKEN_CONTROLS = re.compile(r"[\x00-\x1f\x7f]+")
+
+
+def sanitize_unresolved_code_token(value: object) -> str:
+    """Normalize an unresolved structured-code token for logs / correction prompts.
+
+    - Replace CR/LF/tab and other control characters with a space
+    - Collapse whitespace and trim
+    - Cap at 100 characters
+    - Empty / non-str → safe placeholder
+    """
+    if not isinstance(value, str):
+        return _UNRESOLVED_TOKEN_PLACEHOLDER
+    text = _UNRESOLVED_TOKEN_CONTROLS.sub(" ", value)
+    text = " ".join(text.split())
+    if not text:
+        return _UNRESOLVED_TOKEN_PLACEHOLDER
+    return text[:_UNRESOLVED_TOKEN_MAX_LEN]
+
 
 class _UnresolvedCodeTokenError(Exception):
     """Internal: structured code token missing from the exact prompt catalog."""
@@ -389,8 +411,8 @@ class SearchInterpretService:
                         token, expected_type=expected_type, indexes=indexes
                     )
                     if code is None:
-                        # Safe: LLM code/name token only — never user text / raw JSON.
-                        safe_token = token.strip()[:100]
+                        # Safe single-line token for logs / correction prompt data only.
+                        safe_token = sanitize_unresolved_code_token(token)
                         logger.info(
                             "search_interpret resolve_ai_codes unresolved token "
                             "stage=resolve_ai_codes "
