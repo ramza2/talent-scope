@@ -699,10 +699,9 @@ class AnalysisService:
                     base_log.get("document_count"),
                     trunc_exc.meta,
                 )
+                # Explicit truncation never degrades to projects=[] success.
                 if recovery_budget <= 0:
-                    if fail_closed_if_bad:
-                        raise InsufficientCandidateError() from trunc_exc
-                    return normalize_raw({"projects": []})
+                    raise InsufficientCandidateError() from trunc_exc
                 recovery_budget -= 1
                 try:
                     raw = _phase_call(
@@ -713,9 +712,7 @@ class AnalysisService:
                     )
                     candidate = normalize_raw(raw)
                 except AIResponseTruncatedError:
-                    if fail_closed_if_bad:
-                        raise InsufficientCandidateError() from trunc_exc
-                    return normalize_raw({"projects": []})
+                    raise InsufficientCandidateError() from trunc_exc
             else:
                 if needs_retry(candidate) and recovery_budget > 0:
                     recovery_budget -= 1
@@ -728,12 +725,11 @@ class AnalysisService:
                         )
                         candidate = normalize_raw(raw)
                     except AIResponseTruncatedError:
-                        if fail_closed_if_bad:
-                            raise InsufficientCandidateError()
-                        return normalize_raw({"projects": []})
+                        # Recovery itself truncated — fail closed (both phases).
+                        raise InsufficientCandidateError()
 
-            # CORE must produce a usable profile; empty PROJECTS is allowed
-            # (some documents have no project rows).
+            # CORE must produce a usable profile; non-truncated empty PROJECTS
+            # is allowed (some documents have no project rows).
             if fail_closed_if_bad and needs_retry(candidate):
                 raise InsufficientCandidateError()
             return candidate

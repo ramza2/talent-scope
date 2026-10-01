@@ -515,3 +515,132 @@ def test_legacy_v6_run_remains_single_call(db_session):
     assert service.run_analysis(run.id) == "REVIEWING"
     assert llm.calls == 1
     _cleanup_person(db_session, person.id, admin.id)
+
+
+def test_staged_projects_truncation_recovers_without_rerunning_core(db_session):
+    """A: core ok → projects truncates → projects recovery ok (3 calls)."""
+    from app.ai.providers.errors import AIResponseTruncatedError
+    from app.modules.analysis.service import AnalysisService
+    from app.storage.s3 import get_object_storage
+    from tests.test_analysis import (
+        _RICH_PAGE_TEXT,
+        _cleanup_person,
+        _create_user,
+        _queue_run,
+        _seed_person_doc,
+    )
+
+    admin = _create_user(
+        db_session, login_id=f"v7pt_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    person, document = _seed_person_doc(
+        db_session,
+        admin.id,
+        doc_type_code="DOC-RESUME",
+        doc_type_name="이력서",
+        page_text=_RICH_PAGE_TEXT,
+    )
+    run = _queue_run(db_session, person.id, document.id)
+    llm = _StagedSequenceLLM(
+        [
+            _core_payload(),
+            AIResponseTruncatedError(
+                meta={"finish_reason": "length", "total_tokens": 8192}
+            ),
+            _projects_payload(4),
+        ]
+    )
+    service = AnalysisService(db_session, storage=get_object_storage(), llm=llm)
+    assert service.run_analysis(run.id) == "REVIEWING"
+    assert llm.calls == 3
+    assert llm.phases == ["core", "projects", "projects"]
+    assert "[RECOVERY]" not in llm.user_prompts[0]
+    assert "[RECOVERY]" in llm.user_prompts[2]
+    db_session.refresh(run)
+    assert run.status == "REVIEWING"
+    assert len(run.candidate_json["projects"]) == 4
+    _cleanup_person(db_session, person.id, admin.id)
+
+
+def test_staged_projects_truncation_fails_when_recovery_budget_exhausted(db_session):
+    """B: core truncates+recovers → projects truncates → FAILED (no projects=[])."""
+    from app.ai.providers.errors import AIResponseTruncatedError
+    from app.modules.analysis.service import AnalysisService
+    from app.storage.s3 import get_object_storage
+    from tests.test_analysis import (
+        _RICH_PAGE_TEXT,
+        _cleanup_person,
+        _create_user,
+        _queue_run,
+        _seed_person_doc,
+    )
+
+    admin = _create_user(
+        db_session, login_id=f"v7pe_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    person, document = _seed_person_doc(
+        db_session,
+        admin.id,
+        doc_type_code="DOC-RESUME",
+        doc_type_name="이력서",
+        page_text=_RICH_PAGE_TEXT,
+    )
+    run = _queue_run(db_session, person.id, document.id)
+    llm = _StagedSequenceLLM(
+        [
+            AIResponseTruncatedError(
+                meta={"finish_reason": "length", "total_tokens": 8192}
+            ),
+            _core_payload(),
+            AIResponseTruncatedError(
+                meta={"finish_reason": "length", "total_tokens": 8192}
+            ),
+        ]
+    )
+    service = AnalysisService(db_session, storage=get_object_storage(), llm=llm)
+    assert service.run_analysis(run.id) == "FAILED"
+    assert llm.calls <= 3
+    assert llm.phases == ["core", "core", "projects"]
+    db_session.refresh(run)
+    assert run.status == "FAILED"
+    # Must not persist a successful empty-project candidate.
+    assert run.candidate_json is None or run.candidate_json == {}
+    _cleanup_person(db_session, person.id, admin.id)
+
+
+def test_staged_projects_double_truncation_fails_closed(db_session):
+    """C: core ok → projects truncates → projects recovery truncates → FAILED."""
+    from app.ai.providers.errors import AIResponseTruncatedError
+    from app.modules.analysis.service import AnalysisService
+    from app.storage.s3 import get_object_storage
+    from tests.test_analysis import (
+        _RICH_PAGE_TEXT,
+        _cleanup_person,
+        _create_user,
+        _queue_run,
+        _seed_person_doc,
+    )
+
+    admin = _create_user(
+        db_session, login_id=f"v7pd_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    person, document = _seed_person_doc(
+        db_session,
+        admin.id,
+        doc_type_code="DOC-RESUME",
+        doc_type_name="이력서",
+        page_text=_RICH_PAGE_TEXT,
+    )
+    run = _queue_run(db_session, person.id, document.id)
+    trunc = AIResponseTruncatedError(
+        meta={"finish_reason": "length", "total_tokens": 8192}
+    )
+    llm = _StagedSequenceLLM([_core_payload(), trunc, trunc])
+    service = AnalysisService(db_session, storage=get_object_storage(), llm=llm)
+    assert service.run_analysis(run.id) == "FAILED"
+    assert llm.calls == 3
+    assert llm.phases == ["core", "projects", "projects"]
+    db_session.refresh(run)
+    assert run.status == "FAILED"
+    assert run.candidate_json is None or run.candidate_json == {}
+    _cleanup_person(db_session, person.id, admin.id)
