@@ -41,6 +41,24 @@ from app.modules.search.query_schemas import SearchPeopleRequest
 logger = logging.getLogger(__name__)
 
 
+class _UnresolvedCodeTokenError(Exception):
+    """Internal: structured code token missing from the exact prompt catalog."""
+
+    def __init__(
+        self,
+        *,
+        block: str,
+        field: str,
+        token: str,
+        expected_type: str,
+    ) -> None:
+        self.block = block
+        self.field = field
+        self.token = token
+        self.expected_type = expected_type
+        super().__init__(f"{block}.{field} token unresolved")
+
+
 class SearchInterpretService:
     def __init__(
         self,
@@ -92,55 +110,61 @@ class SearchInterpretService:
             else None
         )
 
+        base_user_prompt = prompt_mod.build_user_prompt(
+            text=request.text,
+            code_catalog=catalog_text,
+            previous_query=previous_for_prompt,
+        )
         raw = self._call_llm(
             system_prompt=prompt_mod.SYSTEM_PROMPT,
-            user_prompt=prompt_mod.build_user_prompt(
-                text=request.text,
-                code_catalog=catalog_text,
-                previous_query=previous_for_prompt,
-            ),
+            user_prompt=base_user_prompt,
         )
 
         try:
-            llm_out = SearchInterpretLLMOutput.model_validate(raw)
-        except ValidationError:
+            llm_out, people_req = self._parse_and_validate_llm_output(
+                raw, catalog=included_catalog
+            )
+        except _UnresolvedCodeTokenError as unresolved:
+            # At most one corrective retry — only for prompt-catalog unresolved tokens.
             logger.info(
-                "search_interpret invalid_llm_schema "
-                "stage=llm_schema_validation "
+                "search_interpret corrective retry "
+                "operation=search_interpret "
+                "retry_reason=unresolved_code retry_attempt=1 "
+                f"block={unresolved.block} field={unresolved.field} "
+                f"token={unresolved.token} "
+                f"expected_type={unresolved.expected_type} "
                 f"prompt_version={SEARCH_INTERPRET_PROMPT_VERSION}",
                 extra={
                     "operation": "search_interpret",
-                    "stage": "llm_schema_validation",
-                    "prompt_version": SEARCH_INTERPRET_PROMPT_VERSION,
-                    "query_version": SEARCH_QUERY_VERSION,
-                },
-            )
-            raise SearchInterpretationInvalidError() from None
-
-        # Resolve only against codes actually present in the prompt subset.
-        resolved = self._resolve_ai_codes(
-            llm_out.model_dump(mode="python"),
-            catalog=included_catalog,
-        )
-
-        try:
-            people_req = SearchPeopleRequest.model_validate(
-                executable_query_dict(resolved)
-            )
-        except ValidationError:
-            logger.info(
-                "search_interpret people_request_invalid "
-                "stage=people_request_validation "
-                f"prompt_version={SEARCH_INTERPRET_PROMPT_VERSION}",
-                extra={
-                    "operation": "search_interpret",
-                    "stage": "people_request_validation",
+                    "retry_reason": "unresolved_code",
+                    "retry_attempt": 1,
+                    "block": unresolved.block,
+                    "field": unresolved.field,
+                    "token": unresolved.token,
+                    "expected_type": unresolved.expected_type,
                     "prompt_version": SEARCH_INTERPRET_PROMPT_VERSION,
                 },
             )
-            raise SearchInterpretationInvalidError() from None
-
-        self._assert_ai_codes_active(people_req)
+            raw = self._call_llm(
+                system_prompt=prompt_mod.SYSTEM_PROMPT,
+                user_prompt=prompt_mod.build_user_prompt(
+                    text=request.text,
+                    code_catalog=catalog_text,
+                    previous_query=previous_for_prompt,
+                    unresolved_correction={
+                        "block": unresolved.block,
+                        "field": unresolved.field,
+                        "token": unresolved.token,
+                        "expected_type": unresolved.expected_type,
+                    },
+                ),
+            )
+            try:
+                llm_out, people_req = self._parse_and_validate_llm_output(
+                    raw, catalog=included_catalog
+                )
+            except _UnresolvedCodeTokenError:
+                raise SearchInterpretationInvalidError() from None
 
         data = SearchInterpretData(
             query_version=SEARCH_QUERY_VERSION,  # type: ignore[arg-type]
@@ -202,6 +226,60 @@ class SearchInterpretService:
         if not isinstance(result, dict):
             raise SearchInterpretationInvalidError()
         return result
+
+    def _parse_and_validate_llm_output(
+        self,
+        raw: dict[str, Any],
+        *,
+        catalog: list[CatalogCode],
+    ) -> tuple[SearchInterpretLLMOutput, SearchPeopleRequest]:
+        """Schema → resolve → people request → active codes.
+
+        Raises ``_UnresolvedCodeTokenError`` only when a structured code token
+        cannot be resolved against the exact prompt catalog. All other failures
+        raise ``SearchInterpretationInvalidError``.
+        """
+        try:
+            llm_out = SearchInterpretLLMOutput.model_validate(raw)
+        except ValidationError:
+            logger.info(
+                "search_interpret invalid_llm_schema "
+                "stage=llm_schema_validation "
+                f"prompt_version={SEARCH_INTERPRET_PROMPT_VERSION}",
+                extra={
+                    "operation": "search_interpret",
+                    "stage": "llm_schema_validation",
+                    "prompt_version": SEARCH_INTERPRET_PROMPT_VERSION,
+                    "query_version": SEARCH_QUERY_VERSION,
+                },
+            )
+            raise SearchInterpretationInvalidError() from None
+
+        # Resolve only against codes actually present in the prompt subset.
+        resolved = self._resolve_ai_codes(
+            llm_out.model_dump(mode="python"),
+            catalog=catalog,
+        )
+
+        try:
+            people_req = SearchPeopleRequest.model_validate(
+                executable_query_dict(resolved)
+            )
+        except ValidationError:
+            logger.info(
+                "search_interpret people_request_invalid "
+                "stage=people_request_validation "
+                f"prompt_version={SEARCH_INTERPRET_PROMPT_VERSION}",
+                extra={
+                    "operation": "search_interpret",
+                    "stage": "people_request_validation",
+                    "prompt_version": SEARCH_INTERPRET_PROMPT_VERSION,
+                },
+            )
+            raise SearchInterpretationInvalidError() from None
+
+        self._assert_ai_codes_active(people_req)
+        return llm_out, people_req
 
     def _assert_client_query_codes(self, data: dict[str, Any], *, source: str) -> None:
         try:
@@ -329,7 +407,12 @@ class SearchInterpretService:
                                 "prompt_version": SEARCH_INTERPRET_PROMPT_VERSION,
                             },
                         )
-                        raise SearchInterpretationInvalidError()
+                        raise _UnresolvedCodeTokenError(
+                            block=block_name,
+                            field=field,
+                            token=safe_token,
+                            expected_type=expected_type,
+                        )
                     if code not in seen:
                         seen.add(code)
                         resolved.append(code)

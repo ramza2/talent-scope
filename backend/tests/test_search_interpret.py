@@ -1214,13 +1214,14 @@ def test_interpret_unresolved_token_logs_safe_diagnostics(db_session, caplog):
         preferred=_empty_preferred(),
         semantic_query=None,
     )
-    svc = SearchInterpretService(
-        db_session, llm=FakeLLMProvider(profile_json=payload)
-    )
+    llm = FakeLLMProvider(profile_json=payload)
+    svc = SearchInterpretService(db_session, llm=llm)
     with caplog.at_level(logging.INFO, logger="app.modules.search.interpret_service"):
         with pytest.raises(SearchInterpretationInvalidError):
             svc.interpret(SearchInterpretRequest(text="PM 경험이 있는 인력"))
 
+    # One corrective retry then fail-closed — never a third LLM call.
+    assert llm.calls == 2
     resolve_logs = [
         rec
         for rec in caplog.records
@@ -1234,6 +1235,14 @@ def test_interpret_unresolved_token_logs_safe_diagnostics(db_session, caplog):
     assert "token=NOT-A-REAL-JOB" in msg
     assert "expected_type=JOB" in msg
     assert f"prompt_version={SEARCH_INTERPRET_PROMPT_VERSION}" in msg
+    retry_logs = [
+        rec.getMessage()
+        for rec in caplog.records
+        if "retry_reason=unresolved_code" in rec.getMessage()
+    ]
+    assert retry_logs, "expected corrective retry diagnostic"
+    assert "retry_attempt=1" in retry_logs[0]
+    assert "token=NOT-A-REAL-JOB" in retry_logs[0]
     # Must not leak the user natural-language query text.
     assert "PM 경험이 있는 인력" not in msg
     joined = " ".join(rec.getMessage() for rec in caplog.records)
@@ -1326,3 +1335,188 @@ def test_interpret_success_regression_no_failure_stage_logs(db_session, caplog):
     assert any(
         "search_interpret completed" in rec.getMessage() for rec in caplog.records
     )
+
+
+class _SequenceInterpretLLM:
+    """Return successive profile_json payloads for interpret retry tests."""
+
+    def __init__(self, payloads: list[dict[str, Any]]) -> None:
+        self._payloads = list(payloads)
+        self.calls = 0
+        self.last_system_prompt: str | None = None
+        self.last_user_prompt: str | None = None
+        self.user_prompts: list[str] = []
+
+    def complete_json(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        log_context: dict | None = None,
+    ) -> dict:
+        _ = log_context
+        self.calls += 1
+        self.last_system_prompt = system_prompt
+        self.last_user_prompt = user_prompt
+        self.user_prompts.append(user_prompt)
+        if self.calls > len(self._payloads):
+            raise AssertionError("unexpected third+ LLM call")
+        return dict(self._payloads[self.calls - 1])
+
+
+def test_interpret_unresolved_exp_sec_corrective_retry_succeeds(db_session, caplog):
+    """Unknown EXP-SEC triggers one retry; corrected result keeps PM/career."""
+    import logging
+
+    from app.modules.search.interpret_schemas import SearchInterpretRequest
+    from app.modules.search.interpret_service import SearchInterpretService
+
+    _seed_catalog(db_session)
+    _ensure_code(db_session, "JOB-PM", "JOB", "PM", aliases=["프로젝트매니저"])
+
+    first = _llm_payload(
+        required=_empty_required(
+            jobs=["JOB-PM"],
+            expertise=["EXP-SEC"],
+            career={"min_months": 60, "max_months": None},
+        ),
+        preferred=_empty_preferred(),
+        semantic_query=None,
+        assumptions=[],
+    )
+    corrected = _llm_payload(
+        required=_empty_required(
+            jobs=["JOB-PM"],
+            expertise=[],
+            career={"min_months": 60, "max_months": None},
+        ),
+        preferred=_empty_preferred(),
+        semantic_query="정보보안 프로젝트 수행 경험",
+        assumptions=[
+            "정보보안은 Catalog에 매칭 EXP 코드가 없어 semantic_query로 보존했습니다."
+        ],
+    )
+    llm = _SequenceInterpretLLM([first, corrected])
+    svc = SearchInterpretService(db_session, llm=llm)
+
+    with caplog.at_level(logging.INFO, logger="app.modules.search.interpret_service"):
+        result = svc.interpret(
+            SearchInterpretRequest(
+                text="PM 경험이 있고 정보보안 프로젝트를 수행한 경력 5년 이상 인력"
+            )
+        )
+
+    assert llm.calls == 2
+    assert result.data.required.jobs == ["JOB-PM"]
+    assert result.data.required.expertise == []
+    assert result.data.required.career is not None
+    assert result.data.required.career.min_months == 60
+    assert result.data.semantic_query is not None
+    assert "정보보안" in result.data.semantic_query
+    assert "EXP-SEC" not in (result.data.required.expertise or [])
+    assert any(
+        "retry_reason=unresolved_code" in rec.getMessage() for rec in caplog.records
+    )
+    assert "[CORRECTION]" in llm.user_prompts[1]
+    assert "token=EXP-SEC" in llm.user_prompts[1]
+    assert "field=expertise" in llm.user_prompts[1]
+    # User text must not appear in diagnostic logs (prompt to LLM is fine).
+    joined_logs = " ".join(rec.getMessage() for rec in caplog.records)
+    assert "PM 경험이 있고 정보보안" not in joined_logs
+
+
+def test_interpret_corrective_retry_still_unresolved_fails_closed(db_session):
+    """Retry that still invents unknown codes fails with SEARCH_INTERPRETATION_INVALID."""
+    from app.core.exceptions import SearchInterpretationInvalidError
+    from app.modules.search.interpret_schemas import SearchInterpretRequest
+    from app.modules.search.interpret_service import SearchInterpretService
+
+    _seed_catalog(db_session)
+    bad = _llm_payload(
+        required=_empty_required(expertise=["EXP-SEC"]),
+        preferred=_empty_preferred(),
+        semantic_query=None,
+    )
+    still_bad = _llm_payload(
+        required=_empty_required(expertise=["EXP-SEC-V2"]),
+        preferred=_empty_preferred(),
+        semantic_query=None,
+    )
+    llm = _SequenceInterpretLLM([bad, still_bad])
+    svc = SearchInterpretService(db_session, llm=llm)
+    with pytest.raises(SearchInterpretationInvalidError):
+        svc.interpret(SearchInterpretRequest(text="정보보안 인력"))
+    assert llm.calls == 2
+
+
+def test_interpret_valid_first_response_single_llm_call(db_session):
+    """Valid first LLM output must not trigger corrective retry."""
+    from app.ai.providers.llm import FakeLLMProvider
+    from app.modules.search.interpret_schemas import SearchInterpretRequest
+    from app.modules.search.interpret_service import SearchInterpretService
+
+    _seed_catalog(db_session)
+    llm = FakeLLMProvider(profile_json=_llm_payload())
+    svc = SearchInterpretService(db_session, llm=llm)
+    result = svc.interpret(
+        SearchInterpretRequest(text="AI 개발 경험 있고 RAG 해본 특급 인력")
+    )
+    assert llm.calls == 1
+    assert result.data.required.jobs == ["JOB-AI-DEV"]
+    assert result.data.preferred.expertise == ["EXP-AI-RAG"]
+
+
+def test_interpret_corrective_retry_at_most_two_llm_calls(db_session):
+    """Correction path uses exactly two LLM calls even if second is also bad."""
+    from app.core.exceptions import SearchInterpretationInvalidError
+    from app.modules.search.interpret_schemas import SearchInterpretRequest
+    from app.modules.search.interpret_service import SearchInterpretService
+
+    _seed_catalog(db_session)
+    payloads = [
+        _llm_payload(
+            required=_empty_required(expertise=["EXP-SEC"]),
+            preferred=_empty_preferred(),
+            semantic_query=None,
+        ),
+        _llm_payload(
+            required=_empty_required(expertise=["EXP-SEC"]),
+            preferred=_empty_preferred(),
+            semantic_query=None,
+        ),
+        # Would be a third call if retry loop were unbounded — must not be reached.
+        _llm_payload(
+            required=_empty_required(jobs=["JOB-AI-DEV"]),
+            preferred=_empty_preferred(),
+            semantic_query=None,
+        ),
+    ]
+    llm = _SequenceInterpretLLM(payloads)
+    svc = SearchInterpretService(db_session, llm=llm)
+    with pytest.raises(SearchInterpretationInvalidError):
+        svc.interpret(SearchInterpretRequest(text="정보보안 인력"))
+    assert llm.calls == 2
+
+
+def test_interpret_does_not_silently_drop_unresolved_code(db_session):
+    """Unresolved structured code must not be stripped to force a partial success."""
+    from app.core.exceptions import SearchInterpretationInvalidError
+    from app.modules.search.interpret_schemas import SearchInterpretRequest
+    from app.modules.search.interpret_service import SearchInterpretService
+
+    _seed_catalog(db_session)
+    # First (and retry) keep inventing EXP-SEC while also returning a valid job.
+    # Silent-drop would wrongly succeed with JOB-AI-DEV only.
+    payload = _llm_payload(
+        required=_empty_required(
+            jobs=["JOB-AI-DEV"],
+            expertise=["EXP-SEC"],
+        ),
+        preferred=_empty_preferred(),
+        semantic_query=None,
+    )
+    llm = _SequenceInterpretLLM([payload, payload])
+    svc = SearchInterpretService(db_session, llm=llm)
+    with pytest.raises(SearchInterpretationInvalidError):
+        svc.interpret(SearchInterpretRequest(text="AI 개발 정보보안"))
+    assert llm.calls == 2
