@@ -15,15 +15,14 @@ _V6_SYSTEM_PROMPT_MAX_CHARS = 4200
 _V6_RECOVERY_MAX_CHARS = 220
 
 
-def test_profile_extract_registry_current_is_v6() -> None:
-    assert CURRENT_PROFILE_PROMPT_VERSION == "profile-extract-v6"
-    assert current_profile_prompt().prompt_version == "profile-extract-v6"
+def test_profile_extract_registry_v6_still_resolves() -> None:
     assert resolve_profile_prompt("profile-extract-v5").prompt_version == (
         "profile-extract-v5"
     )
     assert resolve_profile_prompt("profile-extract-v6").prompt_version == (
         "profile-extract-v6"
     )
+    assert resolve_profile_prompt("profile-extract-v6").extraction_mode == "single"
     assert (
         resolve_profile_prompt("profile-extract-v5").system_prompt
         == v5.SYSTEM_PROMPT
@@ -32,6 +31,12 @@ def test_profile_extract_registry_current_is_v6() -> None:
         resolve_profile_prompt("profile-extract-v6").system_prompt
         == v6.SYSTEM_PROMPT
     )
+    # v6 stays historically resolvable even when current advances.
+    assert CURRENT_PROFILE_PROMPT_VERSION in {
+        "profile-extract-v6",
+        "profile-extract-v7",
+    }
+    _ = current_profile_prompt()
 
 
 def test_profile_extract_v5_immutable_without_security_policy() -> None:

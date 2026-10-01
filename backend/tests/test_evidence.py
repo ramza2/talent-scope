@@ -1952,7 +1952,7 @@ def test_new_analysis_uses_current_profile_extract_prompt(
     detail = client.get(f"/api/v1/analyses/{analysis_id}")
     assert detail.status_code == 200
     assert detail.json()["data"]["prompt_version"] == CURRENT_PROFILE_PROMPT_VERSION
-    assert CURRENT_PROFILE_PROMPT_VERSION == "profile-extract-v6"
+    assert CURRENT_PROFILE_PROMPT_VERSION == "profile-extract-v7"
 
     _cleanup_person(db_session, person.id, admin.id)
 
@@ -2103,6 +2103,7 @@ def test_profile_extract_v5_is_compact_and_resolvable():
         "profile-extract-v4",
         "profile-extract-v5",
         "profile-extract-v6",
+        "profile-extract-v7",
     ):
         assert resolve_profile_prompt(ver).prompt_version == ver
 
