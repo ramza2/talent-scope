@@ -77,6 +77,15 @@ Skill match mode:
 - 기본 ANY
 - "둘 다/모두/전부/모든 기술"처럼 명시될 때만 ALL
 
+JOB vs thematic project experience:
+- JOB으로 해석: "~ 직무", "~ 역할", "~ 엔지니어인 사람", "보안엔지니어", "PM"처럼
+  사람의 역할/직무를 명시한 경우만 (Catalog JOB exact match일 때)
+- JOB으로 해석 금지: "~ 프로젝트 수행", "~ 프로젝트 경험", "~ 구축 경험" 등
+  주제/도메인 프로젝트 경험 표현. Catalog JOB 이름과 비슷해도 JOB으로 변환하지 말 것
+  (예: "정보보안 프로젝트를 수행한" ≠ 보안엔지니어 직무)
+- thematic project experience는 semantic_query 우선
+- literal 고유명/제품/시스템은 기존 keyword_query / project_keywords 정책 유지
+
 Keyword vs Semantic:
 - keyword_query: 고유명/제품/시스템/정확한 literal
 - semantic_query: 의미적으로 비슷한 경험 탐색
@@ -132,9 +141,15 @@ def build_unresolved_code_retry_instruction(
         "Rules:\n"
         "- Use only codes present in the Code Catalog below.\n"
         "- Never invent a replacement code.\n"
-        "- If the concept has no matching structured catalog code, preserve the "
+        f"- Do not move this {expected_type} concept into another structured "
+        "category (JOB/TECH/EXP/BIZ/CUSTOMER_TYPE).\n"
+        "- Keep already-valid structured conditions from the prior attempt "
+        "(e.g. valid jobs/career/skills). Correct only the invalid token.\n"
+        "- Do not add new structured codes in other fields to work around the "
+        "invalid token.\n"
+        "- If there is no exact catalog match for that concept, preserve the "
         "intent in semantic_query and/or assumptions instead.\n"
-        "- Keep other valid user conditions.\n"
+        "- Thematic project experience is not a JOB title.\n"
         "Return one complete Search Query JSON object only."
     )
 

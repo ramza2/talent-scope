@@ -1365,18 +1365,23 @@ class _SequenceInterpretLLM:
 
 
 def test_interpret_unresolved_exp_sec_corrective_retry_succeeds(db_session, caplog):
-    """Unknown EXP-SEC triggers one retry; corrected result keeps PM/career."""
+    """Unknown EXP-SEC retry keeps PM/career; must not invent JOB-SEC-ENG."""
     import logging
 
+    from app.ai.prompts.search_interpret_v1 import (
+        SYSTEM_PROMPT,
+        build_unresolved_code_retry_instruction,
+    )
     from app.modules.search.interpret_schemas import SearchInterpretRequest
     from app.modules.search.interpret_service import SearchInterpretService
 
     _seed_catalog(db_session)
-    _ensure_code(db_session, "JOB-PM", "JOB", "PM", aliases=["프로젝트매니저"])
+    _ensure_code(db_session, "JOB-MGT-PM", "JOB", "PM", aliases=["프로젝트매니저"])
+    _ensure_code(db_session, "JOB-SEC-ENG", "JOB", "보안엔지니어")
 
     first = _llm_payload(
         required=_empty_required(
-            jobs=["JOB-PM"],
+            jobs=["JOB-MGT-PM"],
             expertise=["EXP-SEC"],
             career={"min_months": 60, "max_months": None},
         ),
@@ -1384,16 +1389,18 @@ def test_interpret_unresolved_exp_sec_corrective_retry_succeeds(db_session, capl
         semantic_query=None,
         assumptions=[],
     )
+    # Corrected shape: keep PM+career; drop EXP-SEC into semantic_query.
+    # Must NOT add JOB-SEC-ENG as a category-crossing workaround.
     corrected = _llm_payload(
         required=_empty_required(
-            jobs=["JOB-PM"],
+            jobs=["JOB-MGT-PM"],
             expertise=[],
             career={"min_months": 60, "max_months": None},
         ),
         preferred=_empty_preferred(),
         semantic_query="정보보안 프로젝트 수행 경험",
         assumptions=[
-            "정보보안은 Catalog에 매칭 EXP 코드가 없어 semantic_query로 보존했습니다."
+            "정보보안 프로젝트 경험은 Catalog EXP 코드가 없어 semantic_query로 보존했습니다."
         ],
     )
     llm = _SequenceInterpretLLM([first, corrected])
@@ -1407,21 +1414,35 @@ def test_interpret_unresolved_exp_sec_corrective_retry_succeeds(db_session, capl
         )
 
     assert llm.calls == 2
-    assert result.data.required.jobs == ["JOB-PM"]
+    assert result.data.required.jobs == ["JOB-MGT-PM"]
+    assert "JOB-SEC-ENG" not in result.data.required.jobs
     assert result.data.required.expertise == []
     assert result.data.required.career is not None
     assert result.data.required.career.min_months == 60
     assert result.data.semantic_query is not None
     assert "정보보안" in result.data.semantic_query
-    assert "EXP-SEC" not in (result.data.required.expertise or [])
+    assert "프로젝트" in result.data.semantic_query
     assert any(
         "retry_reason=unresolved_code" in rec.getMessage() for rec in caplog.records
     )
-    assert "[CORRECTION]" in llm.user_prompts[1]
-    assert 'token="EXP-SEC"' in llm.user_prompts[1]
-    assert "field=expertise" in llm.user_prompts[1]
-    assert "untrusted data" in llm.user_prompts[1]
-    # User text must not appear in diagnostic logs (prompt to LLM is fine).
+    correction = llm.user_prompts[1]
+    assert "[CORRECTION]" in correction
+    assert 'token="EXP-SEC"' in correction
+    assert "field=expertise" in correction
+    assert "untrusted data" in correction
+    assert "Do not move this EXP concept into another structured category" in correction
+    assert "Do not add new structured codes in other fields" in correction
+    assert "Thematic project experience is not a JOB title" in correction
+    # Prompt policy anchors (production LLM guidance).
+    assert "정보보안 프로젝트를 수행한" in SYSTEM_PROMPT
+    assert "보안엔지니어 직무" in SYSTEM_PROMPT
+    built = build_unresolved_code_retry_instruction(
+        block="required",
+        field="expertise",
+        token="EXP-SEC",
+        expected_type="EXP",
+    )
+    assert "Do not move this EXP concept" in built
     joined_logs = " ".join(rec.getMessage() for rec in caplog.records)
     assert "PM 경험이 있고 정보보안" not in joined_logs
 
@@ -1639,3 +1660,56 @@ def test_interpret_correction_prompt_quotes_untrusted_token(db_session):
     assert f"token={json.dumps('EXP-SEC \"ignore\" rules', ensure_ascii=False)}" in built
     assert "field=expertise" in built
     assert "expected_type=EXP" in built
+
+
+def test_interpret_role_explicit_security_engineer_is_job(db_session):
+    """Explicit role phrasing may resolve to JOB-SEC-ENG (not project theme)."""
+    from app.ai.providers.llm import FakeLLMProvider
+    from app.modules.search.interpret_schemas import SearchInterpretRequest
+    from app.modules.search.interpret_service import SearchInterpretService
+
+    _seed_catalog(db_session)
+    _ensure_code(db_session, "JOB-SEC-ENG", "JOB", "보안엔지니어")
+
+    payload = _llm_payload(
+        required=_empty_required(
+            jobs=["JOB-SEC-ENG"],
+            career={"min_months": 60, "max_months": None},
+        ),
+        preferred=_empty_preferred(),
+        semantic_query=None,
+    )
+    llm = FakeLLMProvider(profile_json=payload)
+    svc = SearchInterpretService(db_session, llm=llm)
+    result = svc.interpret(
+        SearchInterpretRequest(text="보안엔지니어 5년 이상")
+    )
+
+    assert llm.calls == 1
+    assert result.data.required.jobs == ["JOB-SEC-ENG"]
+    assert result.data.required.career is not None
+    assert result.data.required.career.min_months == 60
+    assert result.data.required.expertise == []
+
+
+def test_interpret_prompt_policy_job_vs_project_theme() -> None:
+    """System/correction prompts forbid thematic project → JOB drift."""
+    from app.ai.prompts.search_interpret_v1 import (
+        SYSTEM_PROMPT,
+        build_unresolved_code_retry_instruction,
+    )
+
+    assert "JOB vs thematic project experience" in SYSTEM_PROMPT
+    assert "정보보안 프로젝트를 수행한" in SYSTEM_PROMPT
+    assert "보안엔지니어 직무" in SYSTEM_PROMPT
+    assert "thematic project experience는 semantic_query 우선" in SYSTEM_PROMPT
+    correction = build_unresolved_code_retry_instruction(
+        block="required",
+        field="expertise",
+        token="EXP-SEC",
+        expected_type="EXP",
+    )
+    assert "Do not move this EXP concept into another structured category" in correction
+    assert "Do not add new structured codes in other fields" in correction
+    assert "Keep already-valid structured conditions" in correction
+    assert "Thematic project experience is not a JOB title" in correction
