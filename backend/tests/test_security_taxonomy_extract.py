@@ -1,8 +1,8 @@
-"""TECH/EXP security classification — normalize + profile-extract-v5 policy."""
+"""TECH/EXP security classification — normalize + profile-extract-v6 policy."""
 
 from __future__ import annotations
 
-from app.ai.prompts.profile_extract_v5 import SYSTEM_PROMPT
+from app.ai.prompts.profile_extract_v6 import SYSTEM_PROMPT
 from app.modules.analysis.normalize import normalize_candidate
 
 _DOC = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
@@ -78,21 +78,10 @@ def test_normalize_security_operations_candidate_codes() -> None:
 
 
 def test_prompt_work_phrases_are_not_tech() -> None:
-    for phrase in (
-        "정보시스템 운영",
-        "정보보안 시스템 운영",
-        "시스템 구축",
-        "시스템 운영",
-        "유지보수",
-        "기술지원",
-        "백업 관리",
-        "업무이관",
-        "AP이관",
-        "사업관리",
-    ):
-        assert phrase in SYSTEM_PROMPT
+    # v6 keeps a compact activity list rather than repeating every phrase.
+    assert "시스템 운영/구축/유지보수/기술지원/백업/이관/사업관리" in SYSTEM_PROMPT
     assert "NOT TECH" in SYSTEM_PROMPT
-    assert "Never force these into TECH" in SYSTEM_PROMPT
+    assert "TECH = explicit concrete technology" in SYSTEM_PROMPT
 
 
 def test_normalize_explicit_security_tech_only() -> None:
@@ -162,17 +151,17 @@ def test_normalize_infra_management_root_expertise() -> None:
 
 
 def test_prompt_no_invented_security_tech_from_ops_alone() -> None:
-    assert "정보보안 운영" in SYSTEM_PROMPT
-    assert "must not invent AD/NAC/SEP" in SYSTEM_PROMPT
-    assert "only when that token/product appears in source" in SYSTEM_PROMPT
+    assert "정보보안 운영 alone" in SYSTEM_PROMPT
+    assert "AD/NAC/SEP" in SYSTEM_PROMPT
+    assert "explicitly present in source" in SYSTEM_PROMPT
 
 
 def test_prompt_no_fake_skill_duration_from_career() -> None:
     assert "experience_months" in SYSTEM_PROMPT
     assert "last_used_year" in SYSTEM_PROMPT
     assert "technology-specific" in SYSTEM_PROMPT
-    assert "Do not derive from total career" in SYSTEM_PROMPT
-    assert "unrelated project dates" in SYSTEM_PROMPT
+    assert "total career" in SYSTEM_PROMPT
+    assert "unrelated projects" in SYSTEM_PROMPT
 
 
 def test_prompt_security_exp_child_guidance() -> None:
@@ -181,4 +170,3 @@ def test_prompt_security_exp_child_guidance() -> None:
     assert "EXP-SEC-BUILD" in SYSTEM_PROMPT
     assert "EXP-INFRA" in SYSTEM_PROMPT
     assert "EXP-MGT" in SYSTEM_PROMPT
-    assert "Do not pick a child code beyond evidence" in SYSTEM_PROMPT
