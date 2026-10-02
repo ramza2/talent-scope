@@ -8,6 +8,10 @@ from typing import Any
 from app.ai.schemas.profile_candidate import (
     PROFILE_SCALAR_FIELD_NAMES,
     SCHEMA_VERSION,
+    CodeRefCandidate,
+    ProfileCandidateDocument,
+    ProjectCandidate,
+    SourceRef,
 )
 
 _DOCUMENT_BLOCK_RE = re.compile(
@@ -83,6 +87,44 @@ def _optional_int(value: Any) -> int | None:
             return int(text)
         return None
     return None
+
+
+_YM_RE = re.compile(r"^(\d{4})[.\-](\d{2})$")
+_STRICT_RELATION_KEYS = frozenset({"j", "t", "x"})
+_CUSTOMER_CODE_TYPES = frozenset({"BIZ", "CUSTOMER_TYPE"})
+
+
+def parse_year_month(value: Any) -> tuple[int, int] | None:
+    """Parse exact YYYY.MM / YYYY-MM; otherwise None."""
+    text = _optional_text(value)
+    if text is None:
+        return None
+    match = _YM_RE.match(text)
+    if match is None:
+        return None
+    year = int(match.group(1))
+    month = int(match.group(2))
+    if month < 1 or month > 12:
+        return None
+    return year, month
+
+
+def derive_duration_months(start: Any, end: Any) -> int | None:
+    """Deterministic month delta for exact year-month dates.
+
+    ``(end_year - start_year) * 12 + (end_month - start_month)``.
+    Reversed / insufficient precision => None.
+    """
+    start_ym = parse_year_month(start)
+    end_ym = parse_year_month(end)
+    if start_ym is None or end_ym is None:
+        return None
+    start_year, start_month = start_ym
+    end_year, end_month = end_ym
+    delta = (end_year - start_year) * 12 + (end_month - start_month)
+    if delta < 0:
+        return None
+    return delta
 
 
 def build_document_alias_view(document_blocks: str) -> tuple[str, dict[str, str]]:
@@ -300,15 +342,20 @@ def _expand_certification(
 ) -> dict[str, Any] | None:
     if not isinstance(item, dict):
         return None
-    text_mapping = {
-        "n": "certification_name",
-        "is": "issuer",
-        "ad": "acquired_date",
-        "ex": "expiry_date",
-    }
     out: dict[str, Any] = {}
-    for short, long in text_mapping.items():
-        _set_optional_text(out, long, item.get(short))
+    _set_optional_text(out, "certification_name", item.get("n"))
+    _set_optional_text(out, "issuer", item.get("is"))
+    # v10: acq/exp preferred; legacy v8/v9 ad/ex fallback.
+    acquired = _optional_text(item.get("acq"))
+    if acquired is None:
+        acquired = _optional_text(item.get("ad"))
+    if acquired is not None:
+        out["acquired_date"] = acquired
+    expiry = _optional_text(item.get("exp"))
+    if expiry is None:
+        expiry = _optional_text(item.get("ex"))
+    if expiry is not None:
+        out["expiry_date"] = expiry
     if item.get("f") is not None:
         out["confidence"] = item["f"]
     refs = expand_compact_refs(item.get("r"), alias_to_id)
@@ -379,15 +426,25 @@ def _relation_refs_for_code(
     relation_map: dict[str, Any] | None,
     relation_key: str,
     alias_to_id: dict[str, str],
+    strict_relation_evidence: bool = False,
 ) -> list[dict[str, Any]]:
-    """Prefer relation-specific compact map; else project-level refs."""
+    """Prefer relation-specific compact map; else project-level refs.
+
+    Under ``strict_relation_evidence`` (v10), j/t/x never fall back to
+    project-level ``r`` when ``rm`` lacks usable refs.
+    """
     if isinstance(relation_map, dict):
         bucket = relation_map.get(relation_key)
         if isinstance(bucket, dict) and code in bucket:
-            return expand_compact_refs(bucket[code], alias_to_id)
+            refs = expand_compact_refs(bucket[code], alias_to_id)
+            if refs:
+                return refs
         if isinstance(bucket, list):
-            # Shared refs for the whole relation list.
-            return expand_compact_refs(bucket, alias_to_id)
+            refs = expand_compact_refs(bucket, alias_to_id)
+            if refs:
+                return refs
+    if strict_relation_evidence and relation_key in _STRICT_RELATION_KEYS:
+        return []
     return list(project_refs)
 
 
@@ -398,6 +455,7 @@ def _expand_code_array(
     relation_map: dict[str, Any] | None,
     relation_key: str,
     alias_to_id: dict[str, str],
+    strict_relation_evidence: bool = False,
 ) -> list[dict[str, Any]]:
     if not isinstance(codes, list):
         return []
@@ -413,7 +471,14 @@ def _expand_code_array(
                 relation_map=relation_map,
                 relation_key=relation_key,
                 alias_to_id=alias_to_id,
+                strict_relation_evidence=strict_relation_evidence,
             )
+            if (
+                strict_relation_evidence
+                and relation_key in _STRICT_RELATION_KEYS
+                and not refs
+            ):
+                continue
             entry: dict[str, Any] = {"code": code}
             if refs:
                 entry["source_refs"] = refs
@@ -431,8 +496,15 @@ def _expand_code_array(
                     relation_map=relation_map,
                     relation_key=relation_key,
                     alias_to_id=alias_to_id,
+                    strict_relation_evidence=strict_relation_evidence,
                 )
-            entry: dict[str, Any] = {"code": code_s}
+            if (
+                strict_relation_evidence
+                and relation_key in _STRICT_RELATION_KEYS
+                and not refs
+            ):
+                continue
+            entry = {"code": code_s}
             raw_value = _optional_text(item.get("v"))
             if raw_value is None:
                 raw_value = _optional_text(item.get("raw_value"))
@@ -444,8 +516,27 @@ def _expand_code_array(
     return out
 
 
+def _customer_is_catalog_code(
+    customer: str,
+    catalog: dict[str, tuple[str, bool]] | None,
+) -> bool:
+    if not catalog:
+        return False
+    info = catalog.get(customer)
+    if info is None:
+        return False
+    code_type, active = info
+    return bool(active) and code_type in _CUSTOMER_CODE_TYPES
+
+
 def _expand_project(
-    item: Any, alias_to_id: dict[str, str]
+    item: Any,
+    alias_to_id: dict[str, str],
+    *,
+    strict_relation_evidence: bool = False,
+    derive_duration: bool = False,
+    clear_catalog_code_customer: bool = False,
+    catalog: dict[str, tuple[str, bool]] | None = None,
 ) -> dict[str, Any] | None:
     if not isinstance(item, dict):
         return None
@@ -453,21 +544,31 @@ def _expand_project(
     relation_map = item.get("rm") if isinstance(item.get("rm"), dict) else None
 
     out: dict[str, Any] = {}
-    text_mapping = {
-        "n": "project_name",
-        "cu": "customer_name",
-        "s": "start_date",
-        "e": "end_date",
-        "resp": "responsibilities",
-        "sum": "project_summary",
-    }
-    for short, long in text_mapping.items():
-        _set_optional_text(out, long, item.get(short))
-    # v9: mo = duration_months. Legacy v8: d only when a valid integer.
-    # Never treat root d="D1" as a source ref (refs come from r only).
-    duration = _optional_int(item.get("mo"))
-    if duration is None and "mo" not in item:
-        duration = _optional_int(item.get("d"))
+    _set_optional_text(out, "project_name", item.get("n"))
+    # v10: cust preferred; legacy cu fallback.
+    customer = _optional_text(item.get("cust"))
+    if customer is None:
+        customer = _optional_text(item.get("cu"))
+    if customer is not None:
+        if clear_catalog_code_customer and _customer_is_catalog_code(
+            customer, catalog
+        ):
+            customer = None
+        if customer is not None:
+            out["customer_name"] = customer
+    _set_optional_text(out, "start_date", item.get("s"))
+    _set_optional_text(out, "end_date", item.get("e"))
+    _set_optional_text(out, "responsibilities", item.get("resp"))
+    _set_optional_text(out, "project_summary", item.get("sum"))
+
+    if derive_duration:
+        # v10: ignore LLM mo/d; derive from exact YYYY.MM / YYYY-MM dates.
+        duration = derive_duration_months(out.get("start_date"), out.get("end_date"))
+    else:
+        # v9: mo = duration_months. Legacy v8: d only when a valid integer.
+        duration = _optional_int(item.get("mo"))
+        if duration is None and "mo" not in item:
+            duration = _optional_int(item.get("d"))
     if duration is not None:
         out["duration_months"] = duration
     if item.get("f") is not None:
@@ -492,6 +593,7 @@ def _expand_project(
             relation_map=relation_map,
             relation_key=rel_key,
             alias_to_id=alias_to_id,
+            strict_relation_evidence=strict_relation_evidence,
         )
         if expanded:
             out[canon_key] = expanded
@@ -505,13 +607,84 @@ def expand_compact_projects(
     raw: dict[str, Any],
     *,
     alias_to_id: dict[str, str],
+    strict_relation_evidence: bool = False,
+    derive_duration: bool = False,
+    clear_catalog_code_customer: bool = False,
+    catalog: dict[str, tuple[str, bool]] | None = None,
 ) -> dict[str, Any]:
     """Expand compact PROJECTS JSON into a projects-only candidate-v1 dict."""
     projects_raw = raw.get("pr")
     if projects_raw is None:
         projects_raw = raw.get("projects")
-    projects = _map_list(projects_raw, _expand_project, alias_to_id)
+    if not isinstance(projects_raw, list):
+        return {"schema_version": SCHEMA_VERSION, "projects": []}
+    projects: list[dict[str, Any]] = []
+    for item in projects_raw:
+        expanded = _expand_project(
+            item,
+            alias_to_id,
+            strict_relation_evidence=strict_relation_evidence,
+            derive_duration=derive_duration,
+            clear_catalog_code_customer=clear_catalog_code_customer,
+            catalog=catalog,
+        )
+        if expanded is not None:
+            projects.append(expanded)
     return {
         "schema_version": SCHEMA_VERSION,
         "projects": projects,
     }
+
+
+def _source_ref_has_quote(ref: SourceRef) -> bool:
+    return bool((ref.quote_text or "").strip())
+
+
+def _relation_has_quote_evidence(rel: CodeRefCandidate) -> bool:
+    return any(_source_ref_has_quote(ref) for ref in (rel.source_refs or []))
+
+
+def apply_normalized_quote_evidence(
+    candidate: ProfileCandidateDocument,
+) -> ProfileCandidateDocument:
+    """v10 post-normalize filter: require non-empty quote_text evidence.
+
+    After ``normalize_candidate`` may discard invalid document/page refs or
+    clear invalid quotes to ``None``:
+    - drop projects with no retained source_ref that still has quote_text
+    - drop project jobs/skills/expertise lacking quoted source_refs
+    - BIZ / CUSTOMER_TYPE relations are unchanged
+    """
+    kept: list[ProjectCandidate] = []
+    for project in candidate.projects:
+        if not any(_source_ref_has_quote(ref) for ref in (project.source_refs or [])):
+            continue
+        kept.append(
+            project.model_copy(
+                update={
+                    "jobs": [
+                        rel
+                        for rel in project.jobs
+                        if _relation_has_quote_evidence(rel)
+                    ],
+                    "skills": [
+                        rel
+                        for rel in project.skills
+                        if _relation_has_quote_evidence(rel)
+                    ],
+                    "expertise": [
+                        rel
+                        for rel in project.expertise
+                        if _relation_has_quote_evidence(rel)
+                    ],
+                }
+            )
+        )
+    if len(kept) == len(candidate.projects) and all(
+        len(kept[i].jobs) == len(candidate.projects[i].jobs)
+        and len(kept[i].skills) == len(candidate.projects[i].skills)
+        and len(kept[i].expertise) == len(candidate.projects[i].expertise)
+        for i in range(len(kept))
+    ):
+        return candidate
+    return candidate.model_copy(update={"projects": kept})

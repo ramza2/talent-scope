@@ -45,6 +45,7 @@ from app.modules.analysis.code_catalog import (
     format_code_catalog,
 )
 from app.modules.analysis.compact_v8 import (
+    apply_normalized_quote_evidence,
     build_document_alias_view,
     expand_compact_core,
     expand_compact_projects,
@@ -1026,20 +1027,32 @@ class AnalysisService:
             )
 
         def _normalize_projects(raw: dict[str, Any]) -> ProfileCandidateDocument:
-            expanded = expand_compact_projects(raw, alias_to_id=alias_to_id)
+            expanded = expand_compact_projects(
+                raw,
+                alias_to_id=alias_to_id,
+                strict_relation_evidence=prompt.strict_relation_evidence,
+                derive_duration=prompt.derive_project_duration,
+                clear_catalog_code_customer=prompt.clear_catalog_code_customer,
+                catalog=catalog_map,
+            )
             projects_raw = {
                 "schema_version": CANDIDATE_SCHEMA_VERSION,
                 "projects": expanded.get("projects")
                 if isinstance(expanded.get("projects"), list)
                 else [],
             }
-            return normalize_candidate(
+            doc = normalize_candidate(
                 projects_raw,
                 catalog=catalog_map,
                 allowed_documents=allowed_documents,
                 settings=self.settings,
                 page_texts=page_texts,
             )
+            # v10: after normalize may clear quotes / drop invalid refs, re-check
+            # that projects and j/t/x still have non-empty quote_text evidence.
+            if prompt.strict_relation_evidence:
+                doc = apply_normalized_quote_evidence(doc)
+            return doc
 
         def _core_needs_retry(candidate: ProfileCandidateDocument) -> bool:
             return candidate_needs_llm_retry(
