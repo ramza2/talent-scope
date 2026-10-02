@@ -78,20 +78,12 @@ def db_session():
 # ---------------------------------------------------------------------------
 
 
-def test_profile_extract_registry_current_is_v8_compact() -> None:
+def test_profile_extract_registry_v8_remains_staged_compact_historical() -> None:
+    """v8 stays resolvable as historical staged+compact; current may advance."""
     from app.ai.prompts import profile_extract_v7 as v7
     from app.ai.prompts import profile_extract_v8 as v8
-    from app.ai.prompts.profile_extract import (
-        CURRENT_PROFILE_PROMPT_VERSION,
-        current_profile_prompt,
-        resolve_profile_prompt,
-    )
+    from app.ai.prompts.profile_extract import resolve_profile_prompt
 
-    assert CURRENT_PROFILE_PROMPT_VERSION == "profile-extract-v8"
-    cur = current_profile_prompt()
-    assert cur.prompt_version == "profile-extract-v8"
-    assert cur.extraction_mode == "staged"
-    assert cur.compact_protocol is True
     for ver in (
         "profile-extract-v1",
         "profile-extract-v2",
@@ -106,6 +98,8 @@ def test_profile_extract_registry_current_is_v8_compact() -> None:
     assert v7_spec.compact_protocol is False
     assert v7_spec.core_system_prompt == v7.CORE_SYSTEM_PROMPT
     v8_spec = resolve_profile_prompt("profile-extract-v8")
+    assert v8_spec.extraction_mode == "staged"
+    assert v8_spec.compact_protocol is True
     assert v8_spec.core_system_prompt == v8.CORE_SYSTEM_PROMPT
     assert v8_spec.projects_system_prompt == v8.PROJECTS_SYSTEM_PROMPT
     assert v8.COMPACT_PROTOCOL is True
@@ -528,7 +522,6 @@ def _compact_projects_payload(count: int = 7) -> dict:
 
 
 def test_v8_happy_path_two_calls_aliases_and_phase_catalogs(db_session, monkeypatch):
-    from app.ai.prompts.profile_extract import CURRENT_PROFILE_PROMPT_VERSION
     from app.modules.analysis.service import AnalysisService
     from app.storage.s3 import get_object_storage
     from tests.test_analysis import (
@@ -540,7 +533,6 @@ def test_v8_happy_path_two_calls_aliases_and_phase_catalogs(db_session, monkeypa
         _seed_person_doc,
     )
 
-    assert CURRENT_PROFILE_PROMPT_VERSION == "profile-extract-v8"
     admin = _create_user(
         db_session, login_id=f"v8_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
     )
@@ -562,7 +554,12 @@ def test_v8_happy_path_two_calls_aliases_and_phase_catalogs(db_session, monkeypa
         doc_type_name="이력서",
         page_text=_RICH_PAGE_TEXT + " AD SEP NAC 시스템 운영 사업관리",
     )
-    run = _queue_run(db_session, person.id, document.id)
+    run = _queue_run(
+        db_session,
+        person.id,
+        document.id,
+        prompt_version="profile-extract-v8",
+    )
     assert run.prompt_version == "profile-extract-v8"
 
     llm = _StagedSequenceLLM([_compact_core_payload(), _compact_projects_payload(7)])
@@ -595,7 +592,7 @@ def test_v8_happy_path_two_calls_aliases_and_phase_catalogs(db_session, monkeypa
 
 
 def test_v8_two_docs_aliases_in_prompt(db_session):
-    from app.ai.prompts.profile_extract import current_profile_prompt
+    from app.ai.prompts.profile_extract import resolve_profile_prompt
     from app.db.models.document import Document, DocumentGroup, DocumentPage
     from app.modules.analysis.repository import AnalysisRepository
     from app.modules.analysis.service import AnalysisService
@@ -652,7 +649,7 @@ def test_v8_two_docs_aliases_in_prompt(db_session):
     )
     db_session.commit()
 
-    prompt = current_profile_prompt()
+    prompt = resolve_profile_prompt("profile-extract-v8")
     repo = AnalysisRepository(db_session)
     run = repo.create_run(
         person_id=person.id,
@@ -697,7 +694,12 @@ def test_v8_recovery_budget_max_three_calls(db_session):
         doc_type_name="이력서",
         page_text=_RICH_PAGE_TEXT,
     )
-    run = _queue_run(db_session, person.id, document.id)
+    run = _queue_run(
+        db_session,
+        person.id,
+        document.id,
+        prompt_version="profile-extract-v8",
+    )
     llm = _StagedSequenceLLM(
         [
             AIResponseTruncatedError(
@@ -737,7 +739,12 @@ def test_v8_unrecovered_projects_truncation_fails_closed(db_session):
         doc_type_name="이력서",
         page_text=_RICH_PAGE_TEXT,
     )
-    run = _queue_run(db_session, person.id, document.id)
+    run = _queue_run(
+        db_session,
+        person.id,
+        document.id,
+        prompt_version="profile-extract-v8",
+    )
     trunc = AIResponseTruncatedError(
         meta={"finish_reason": "length", "total_tokens": 8192}
     )
@@ -989,7 +996,7 @@ def test_profile_extract_v8_prompt_file_unchanged_from_base() -> None:
     path = "backend/app/ai/prompts/profile_extract_v8.py"
     current = Path("/workspace") / path
     base = subprocess.check_output(
-        ["git", "show", "24e3c9d71d324fc05406d69c5e56d3d0b2f490e5:" + path],
+        ["git", "show", "f9209addc4bb4f75277f2fa24d2eaa3db0c4cb1e:" + path],
         cwd="/workspace",
     )
     assert hashlib.sha256(current.read_bytes()).digest() == hashlib.sha256(base).digest()
