@@ -830,3 +830,166 @@ def test_v8_static_prompts_materially_smaller_than_v7() -> None:
     # Full PROJECTS static prompt (guide + instructions) must shrink even if
     # the isolated schema-guide string alone is comparable.
     assert len(v8.PROJECTS_SYSTEM_PROMPT) < len(v7.PROJECTS_SYSTEM_PROMPT)
+
+
+# ---------------------------------------------------------------------------
+# #58 — compact adapter type guards for malformed optional scalars
+# ---------------------------------------------------------------------------
+
+
+def test_compact_certification_issuer_bool_omitted() -> None:
+    """A: production shape ``is: true`` must not fail validation or become \"True\"."""
+    from app.ai.schemas.profile_candidate import ProfileCandidateDocument
+    from app.modules.analysis.compact_v8 import expand_compact_core
+    from app.modules.analysis.normalize import normalize_candidate
+
+    expanded = expand_compact_core(
+        {"c": [{"n": "정보처리산업기사", "is": True}]},
+        alias_to_id={},
+    )
+    assert expanded["certifications"][0]["certification_name"] == "정보처리산업기사"
+    assert "issuer" not in expanded["certifications"][0]
+    # Direct model validation + normalize must both succeed.
+    ProfileCandidateDocument.model_validate(expanded)
+    doc = normalize_candidate(expanded, catalog={}, allowed_documents={})
+    assert len(doc.certifications) == 1
+    assert doc.certifications[0].certification_name == "정보처리산업기사"
+    assert doc.certifications[0].issuer is None
+    dumped = doc.model_dump(mode="json")
+    assert dumped["certifications"][0].get("issuer") in (None, "")
+    assert "True" not in str(dumped["certifications"])
+
+
+def test_compact_certification_issuer_string_preserved() -> None:
+    """B: valid issuer string is preserved exactly."""
+    from app.modules.analysis.compact_v8 import expand_compact_core
+    from app.modules.analysis.normalize import normalize_candidate
+
+    expanded = expand_compact_core(
+        {"c": [{"n": "정보처리산업기사", "is": "한국산업인력공단"}]},
+        alias_to_id={},
+    )
+    assert expanded["certifications"][0]["issuer"] == "한국산업인력공단"
+    doc = normalize_candidate(expanded, catalog={}, allowed_documents={})
+    assert doc.certifications[0].issuer == "한국산업인력공단"
+
+
+def test_compact_malformed_optional_text_fields_omitted() -> None:
+    """C: bool/list/dict optional text values are omitted; no ValidationError."""
+    from app.ai.schemas.profile_candidate import ProfileCandidateDocument
+    from app.modules.analysis.compact_v8 import (
+        expand_compact_core,
+        expand_compact_projects,
+    )
+    from app.modules.analysis.normalize import normalize_candidate
+
+    expanded = expand_compact_core(
+        {
+            "p": {
+                "n": "홍길동",
+                "ac": True,  # affiliation_company bool
+                "ph": ["010"],  # list
+                "em": {"x": 1},  # dict
+                "by": 1990,  # typed numeric kept
+            },
+            "j": [{"v": True, "c": "JOB-PL", "t": ["PRIMARY"]}],
+            "s": [{"v": "AD", "c": True, "y": 2015, "m": 12, "rep": True}],
+            "x": [{"v": "보안", "c": "EXP-SEC-OPS", "e": False}],
+            "w": [{"co": True, "ti": "책임", "s": "2020-01", "resp": ["a"]}],
+            "e": [{"sc": "서울대", "mj": True, "dg": {"x": 1}}],
+            "c": [{"n": "정보처리산업기사", "is": True, "ad": ["2020"]}],
+            "sum": True,
+        },
+        alias_to_id={},
+    )
+    profile = expanded["profile"]
+    assert profile["name"] == "홍길동"
+    assert profile["birth_year"] == 1990
+    assert "affiliation_company" not in profile
+    assert "phone" not in profile
+    assert "email" not in profile
+    assert expanded["jobs"][0].get("raw_value") is None
+    assert "raw_value" not in expanded["jobs"][0]
+    assert expanded["jobs"][0]["code"] == "JOB-PL"
+    assert "job_type" not in expanded["jobs"][0]
+    assert "code" not in expanded["skills"][0]
+    assert expanded["skills"][0]["raw_value"] == "AD"
+    assert expanded["skills"][0]["last_used_year"] == 2015
+    assert expanded["skills"][0]["is_representative"] is True
+    assert "evidence_type" not in expanded["expertise"][0]
+    assert "company_name" not in expanded["employment_history"][0]
+    assert expanded["employment_history"][0]["title"] == "책임"
+    assert "responsibilities" not in expanded["employment_history"][0]
+    assert "major" not in expanded["education"][0]
+    assert "degree" not in expanded["education"][0]
+    assert "issuer" not in expanded["certifications"][0]
+    assert "acquired_date" not in expanded["certifications"][0]
+    assert expanded["summary"] == {}
+
+    projects = expand_compact_projects(
+        {
+            "pr": [
+                {
+                    "n": "프로젝트-1",
+                    "cu": True,
+                    "s": "2012-01",
+                    "e": ["2015"],
+                    "resp": {"x": 1},
+                    "sum": False,
+                    "d": 32,
+                    "f": 1.0,
+                }
+            ]
+        },
+        alias_to_id={},
+    )
+    proj = projects["projects"][0]
+    assert proj["project_name"] == "프로젝트-1"
+    assert "customer_name" not in proj
+    assert proj["start_date"] == "2012-01"
+    assert "end_date" not in proj
+    assert "responsibilities" not in proj
+    assert "project_summary" not in proj
+    assert proj["duration_months"] == 32
+
+    ProfileCandidateDocument.model_validate(expanded)
+    ProfileCandidateDocument.model_validate(projects)
+    normalize_candidate(expanded, catalog={}, allowed_documents={})
+    normalize_candidate(projects, catalog={}, allowed_documents={})
+
+
+def test_compact_source_ref_quote_bool_omitted() -> None:
+    """D: malformed quote_text omitted; document/page kept; unknown alias dropped."""
+    from app.modules.analysis.compact_v8 import expand_compact_refs
+
+    doc_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    alias_map = {"D1": doc_id}
+    refs = expand_compact_refs(
+        [
+            {"d": "D1", "p": 1, "q": True},
+            {"d": "D1", "p": 2, "q": "정상 인용"},
+            {"d": "D9", "p": 1, "q": "ghost"},
+            {"d": True, "p": 1, "q": "bad alias"},
+        ],
+        alias_map,
+    )
+    assert refs == [
+        {"document_id": doc_id, "page_no": 1},
+        {"document_id": doc_id, "page_no": 2, "quote_text": "정상 인용"},
+    ]
+    assert "quote_text" not in refs[0]
+    assert "True" not in str(refs)
+
+
+def test_profile_extract_v8_prompt_file_unchanged_from_base() -> None:
+    """F: prompt module remains immutable vs merge base."""
+    import hashlib
+    import subprocess
+
+    path = "backend/app/ai/prompts/profile_extract_v8.py"
+    current = Path("/workspace") / path
+    base = subprocess.check_output(
+        ["git", "show", "24e3c9d71d324fc05406d69c5e56d3d0b2f490e5:" + path],
+        cwd="/workspace",
+    )
+    assert hashlib.sha256(current.read_bytes()).digest() == hashlib.sha256(base).digest()
