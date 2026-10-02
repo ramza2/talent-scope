@@ -8,6 +8,10 @@ from typing import Any
 from app.ai.schemas.profile_candidate import (
     PROFILE_SCALAR_FIELD_NAMES,
     SCHEMA_VERSION,
+    CodeRefCandidate,
+    ProfileCandidateDocument,
+    ProjectCandidate,
+    SourceRef,
 )
 
 _DOCUMENT_BLOCK_RE = re.compile(
@@ -630,3 +634,57 @@ def expand_compact_projects(
         "schema_version": SCHEMA_VERSION,
         "projects": projects,
     }
+
+
+def _source_ref_has_quote(ref: SourceRef) -> bool:
+    return bool((ref.quote_text or "").strip())
+
+
+def _relation_has_quote_evidence(rel: CodeRefCandidate) -> bool:
+    return any(_source_ref_has_quote(ref) for ref in (rel.source_refs or []))
+
+
+def apply_normalized_quote_evidence(
+    candidate: ProfileCandidateDocument,
+) -> ProfileCandidateDocument:
+    """v10 post-normalize filter: require non-empty quote_text evidence.
+
+    After ``normalize_candidate`` may discard invalid document/page refs or
+    clear invalid quotes to ``None``:
+    - drop projects with no retained source_ref that still has quote_text
+    - drop project jobs/skills/expertise lacking quoted source_refs
+    - BIZ / CUSTOMER_TYPE relations are unchanged
+    """
+    kept: list[ProjectCandidate] = []
+    for project in candidate.projects:
+        if not any(_source_ref_has_quote(ref) for ref in (project.source_refs or [])):
+            continue
+        kept.append(
+            project.model_copy(
+                update={
+                    "jobs": [
+                        rel
+                        for rel in project.jobs
+                        if _relation_has_quote_evidence(rel)
+                    ],
+                    "skills": [
+                        rel
+                        for rel in project.skills
+                        if _relation_has_quote_evidence(rel)
+                    ],
+                    "expertise": [
+                        rel
+                        for rel in project.expertise
+                        if _relation_has_quote_evidence(rel)
+                    ],
+                }
+            )
+        )
+    if len(kept) == len(candidate.projects) and all(
+        len(kept[i].jobs) == len(candidate.projects[i].jobs)
+        and len(kept[i].skills) == len(candidate.projects[i].skills)
+        and len(kept[i].expertise) == len(candidate.projects[i].expertise)
+        for i in range(len(kept))
+    ):
+        return candidate
+    return candidate.model_copy(update={"projects": kept})

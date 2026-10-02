@@ -688,3 +688,270 @@ def test_v10_recovery_budget_max_three_calls(db_session):
     assert llm.calls == 3
     assert llm.phases == ["core", "core", "projects"]
     _cleanup_person(db_session, person.id, admin.id)
+
+
+# ---------------------------------------------------------------------------
+# Corrective: normalized quote evidence (post-normalize v10 filter)
+# ---------------------------------------------------------------------------
+
+
+def _v10_normalize_projects(
+    compact: dict,
+    *,
+    page_texts: dict[tuple[str, int], str],
+    allowed: dict[str, set[int]] | None = None,
+    catalog: dict[str, tuple[str, bool]] | None = None,
+    strict: bool = True,
+):
+    from app.modules.analysis.compact_v8 import (
+        apply_normalized_quote_evidence,
+        expand_compact_projects,
+    )
+    from app.modules.analysis.normalize import normalize_candidate
+
+    expanded = expand_compact_projects(
+        compact,
+        alias_to_id=_ALIAS,
+        strict_relation_evidence=strict,
+        derive_duration=True,
+        clear_catalog_code_customer=True,
+        catalog=catalog or {},
+    )
+    doc = normalize_candidate(
+        expanded,
+        catalog=catalog or {},
+        allowed_documents=allowed if allowed is not None else {_DOC: {1, 2}},
+        page_texts=page_texts,
+    )
+    if strict:
+        doc = apply_normalized_quote_evidence(doc)
+    return doc
+
+
+def test_v10_project_without_r_dropped_after_normalize() -> None:
+    """A: project with no r => dropped under v10 post-normalize filter."""
+    doc = _v10_normalize_projects(
+        {"pr": [{"n": "프로젝트-무증거", "s": "2019.01", "e": "2021.12"}]},
+        page_texts={(_DOC, 1): "프로젝트-무증거"},
+    )
+    assert doc.projects == []
+
+
+def test_v10_project_invalid_ref_after_normalize_dropped() -> None:
+    """B: invalid alias/page/quote after normalize => project dropped."""
+    # Unknown alias expands to no refs.
+    doc_alias = _v10_normalize_projects(
+        {
+            "pr": [
+                {
+                    "n": "P1",
+                    "r": [{"d": "D9", "p": 1, "q": "P1"}],
+                }
+            ]
+        },
+        page_texts={(_DOC, 1): "P1 원문"},
+    )
+    assert doc_alias.projects == []
+
+    # Invalid page discarded by normalize.
+    doc_page = _v10_normalize_projects(
+        {
+            "pr": [
+                {
+                    "n": "P1",
+                    "r": [{"d": "D1", "p": 99, "q": "P1"}],
+                }
+            ]
+        },
+        page_texts={(_DOC, 1): "P1 원문"},
+        allowed={_DOC: {1}},
+    )
+    assert doc_page.projects == []
+
+    # Quote not in page_texts => quote_text cleared to None => not sufficient.
+    doc_quote = _v10_normalize_projects(
+        {
+            "pr": [
+                {
+                    "n": "P1",
+                    "r": [{"d": "D1", "p": 1, "q": "없는인용문"}],
+                }
+            ]
+        },
+        page_texts={(_DOC, 1): "다른 내용만 있음"},
+    )
+    assert doc_quote.projects == []
+    # Sanity: normalize alone would keep a quote-less SourceRef.
+    from app.modules.analysis.compact_v8 import expand_compact_projects
+    from app.modules.analysis.normalize import normalize_candidate
+
+    expanded = expand_compact_projects(
+        {"pr": [{"n": "P1", "r": [{"d": "D1", "p": 1, "q": "없는인용문"}]}]},
+        alias_to_id=_ALIAS,
+        strict_relation_evidence=True,
+    )
+    raw = normalize_candidate(
+        expanded,
+        catalog={},
+        allowed_documents={_DOC: {1}},
+        page_texts={(_DOC, 1): "다른 내용만 있음"},
+    )
+    assert len(raw.projects) == 1
+    assert raw.projects[0].source_refs
+    assert raw.projects[0].source_refs[0].quote_text is None
+
+
+def test_v10_project_valid_r_retained() -> None:
+    """C: valid project r with quote in page_texts => retained."""
+    doc = _v10_normalize_projects(
+        {
+            "pr": [
+                {
+                    "n": "현대보안운영",
+                    "r": [{"d": "D1", "p": 1, "q": "현대보안운영"}],
+                }
+            ]
+        },
+        page_texts={(_DOC, 1): "현대보안운영 PL AD"},
+    )
+    assert len(doc.projects) == 1
+    assert doc.projects[0].project_name == "현대보안운영"
+    assert doc.projects[0].source_refs[0].quote_text == "현대보안운영"
+
+
+def test_v10_relation_invalid_page_dropped() -> None:
+    """D: j/t/x rm with invalid page => relation dropped; project may remain."""
+    catalog = {"TECH-SEC-AD": ("TECH", True), "JOB-PL": ("JOB", True)}
+    doc = _v10_normalize_projects(
+        {
+            "pr": [
+                {
+                    "n": "P1",
+                    "t": ["TECH-SEC-AD"],
+                    "j": ["JOB-PL"],
+                    "r": [{"d": "D1", "p": 1, "q": "P1"}],
+                    "rm": {
+                        "t": [{"d": "D1", "p": 99, "q": "AD"}],
+                        "j": [{"d": "D1", "p": 99, "q": "PL"}],
+                    },
+                }
+            ]
+        },
+        page_texts={(_DOC, 1): "P1 AD PL"},
+        allowed={_DOC: {1}},
+        catalog=catalog,
+    )
+    assert len(doc.projects) == 1
+    assert doc.projects[0].skills == []
+    assert doc.projects[0].jobs == []
+
+
+def test_v10_relation_quote_missing_from_page_dropped() -> None:
+    """E: rm quote not in page_texts => quote cleared => relation dropped."""
+    catalog = {"TECH-SEC-AD": ("TECH", True)}
+    doc = _v10_normalize_projects(
+        {
+            "pr": [
+                {
+                    "n": "P1",
+                    "t": ["TECH-SEC-AD"],
+                    "r": [{"d": "D1", "p": 1, "q": "P1"}],
+                    "rm": {
+                        "t": [{"d": "D1", "p": 1, "q": "없는TECH인용"}],
+                    },
+                }
+            ]
+        },
+        page_texts={(_DOC, 1): "P1 만 있음"},
+        catalog=catalog,
+    )
+    assert len(doc.projects) == 1
+    assert doc.projects[0].skills == []
+
+
+def test_v10_relation_valid_normalized_rm_retained() -> None:
+    """F: valid normalized rm quote => relation retained."""
+    catalog = {
+        "TECH-SEC-AD": ("TECH", True),
+        "JOB-PL": ("JOB", True),
+        "EXP-SEC-OPS": ("EXP", True),
+    }
+    page = "P1 보안솔루션 운영(AD,SEP,NAC 등) PL 운영"
+    doc = _v10_normalize_projects(
+        {
+            "pr": [
+                {
+                    "n": "P1",
+                    "t": ["TECH-SEC-AD"],
+                    "j": ["JOB-PL"],
+                    "x": ["EXP-SEC-OPS"],
+                    "r": [{"d": "D1", "p": 1, "q": "P1"}],
+                    "rm": {
+                        "t": [
+                            {
+                                "d": "D1",
+                                "p": 1,
+                                "q": "보안솔루션 운영(AD,SEP,NAC 등)",
+                            }
+                        ],
+                        "j": [{"d": "D1", "p": 1, "q": "PL 운영"}],
+                        "x": [{"d": "D1", "p": 1, "q": "보안솔루션 운영"}],
+                    },
+                }
+            ]
+        },
+        page_texts={(_DOC, 1): page},
+        catalog=catalog,
+    )
+    assert len(doc.projects) == 1
+    assert [s.code for s in doc.projects[0].skills] == ["TECH-SEC-AD"]
+    assert doc.projects[0].skills[0].source_refs[0].quote_text
+    assert [j.code for j in doc.projects[0].jobs] == ["JOB-PL"]
+    assert [e.code for e in doc.projects[0].expertise] == ["EXP-SEC-OPS"]
+
+
+def test_v9_legacy_keeps_project_without_quote_filter() -> None:
+    """G: v9 non-strict path does not apply post-normalize quote filter."""
+    from app.modules.analysis.compact_v8 import expand_compact_projects
+    from app.modules.analysis.normalize import normalize_candidate
+
+    # No r — v9 still keeps the project after normalize.
+    expanded = expand_compact_projects(
+        {"pr": [{"n": "레거시프로젝트", "mo": 12}]},
+        alias_to_id=_ALIAS,
+        strict_relation_evidence=False,
+    )
+    doc = normalize_candidate(
+        expanded,
+        catalog={},
+        allowed_documents={_DOC: {1}},
+        page_texts={(_DOC, 1): "irrelevant"},
+    )
+    assert len(doc.projects) == 1
+    assert doc.projects[0].project_name == "레거시프로젝트"
+    assert doc.projects[0].source_refs == []
+
+    # Quote cleared to None — v9 keeps project and relation without filter.
+    expanded2 = expand_compact_projects(
+        {
+            "pr": [
+                {
+                    "n": "P1",
+                    "t": ["TECH-SEC-AD"],
+                    "r": [{"d": "D1", "p": 1, "q": "없는인용"}],
+                }
+            ]
+        },
+        alias_to_id=_ALIAS,
+        strict_relation_evidence=False,
+    )
+    doc2 = normalize_candidate(
+        expanded2,
+        catalog={"TECH-SEC-AD": ("TECH", True)},
+        allowed_documents={_DOC: {1}},
+        page_texts={(_DOC, 1): "다른내용"},
+    )
+    assert len(doc2.projects) == 1
+    assert doc2.projects[0].source_refs[0].quote_text is None
+    assert len(doc2.projects[0].skills) == 1
+    assert doc2.projects[0].skills[0].source_refs[0].quote_text is None
