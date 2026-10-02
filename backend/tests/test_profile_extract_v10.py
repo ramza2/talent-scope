@@ -21,7 +21,7 @@ os.environ.setdefault("REDIS_URL", "redis://127.0.0.1:6379/0")
 os.environ.setdefault("APP_SECRET_KEY", "test-secret")
 os.environ["APP_ENV"] = "test"
 
-_BASE_SHA = "17dce703b20f9faeb15e0a51ce3a3c1464154dbb"
+_BASE_SHA = "8145d1d7a828c6bfaab3db5dd1de7a3e2912029a"
 _DOC = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 _ALIAS = {"D1": _DOC}
 
@@ -159,25 +159,21 @@ def _v10_project_page_text(count: int = 7) -> str:
 # ---------------------------------------------------------------------------
 
 
-def test_profile_extract_registry_current_is_v10() -> None:
+def test_profile_extract_registry_v10_remains_staged_compact_historical() -> None:
+    """v10 stays resolvable as historical staged+compact; current may advance."""
     from app.ai.prompts import profile_extract_v10 as v10
     from app.ai.prompts import profile_extract_v8 as v8
     from app.ai.prompts import profile_extract_v9 as v9
-    from app.ai.prompts.profile_extract import (
-        CURRENT_PROFILE_PROMPT_VERSION,
-        current_profile_prompt,
-        resolve_profile_prompt,
-    )
+    from app.ai.prompts.profile_extract import resolve_profile_prompt
 
-    assert CURRENT_PROFILE_PROMPT_VERSION == "profile-extract-v10"
-    cur = current_profile_prompt()
-    assert cur.prompt_version == "profile-extract-v10"
-    assert cur.extraction_mode == "staged"
-    assert cur.compact_protocol is True
-    assert cur.strict_relation_evidence is True
-    assert cur.derive_project_duration is True
-    assert cur.clear_catalog_code_customer is True
-    assert cur.core_system_prompt == v10.CORE_SYSTEM_PROMPT
+    v10_spec = resolve_profile_prompt("profile-extract-v10")
+    assert v10_spec.extraction_mode == "staged"
+    assert v10_spec.compact_protocol is True
+    assert v10_spec.strict_relation_evidence is True
+    assert v10_spec.derive_project_duration is True
+    assert v10_spec.clear_catalog_code_customer is True
+    assert v10_spec.promote_exact_catalog_codes is False
+    assert v10_spec.core_system_prompt == v10.CORE_SYSTEM_PROMPT
 
     for ver, mod in (
         ("profile-extract-v8", v8),
@@ -616,7 +612,6 @@ def test_core_completeness_five_employment_education_cert() -> None:
 
 
 def test_v10_happy_path_two_calls(db_session):
-    from app.ai.prompts.profile_extract import CURRENT_PROFILE_PROMPT_VERSION
     from app.modules.analysis.service import AnalysisService
     from app.storage.s3 import get_object_storage
     from tests.test_analysis import (
@@ -627,7 +622,6 @@ def test_v10_happy_path_two_calls(db_session):
         _seed_person_doc,
     )
 
-    assert CURRENT_PROFILE_PROMPT_VERSION == "profile-extract-v10"
     admin = _create_user(
         db_session, login_id=f"v10_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
     )
@@ -640,7 +634,12 @@ def test_v10_happy_path_two_calls(db_session):
         doc_type_name="이력서",
         page_text=_v10_project_page_text(7),
     )
-    run = _queue_run(db_session, person.id, document.id)
+    run = _queue_run(
+        db_session,
+        person.id,
+        document.id,
+        prompt_version="profile-extract-v10",
+    )
     assert run.prompt_version == "profile-extract-v10"
 
     llm = _StagedSequenceLLM([_v10_core(), _v10_projects(7)])
@@ -679,7 +678,12 @@ def test_v10_recovery_budget_max_three_calls(db_session):
         doc_type_name="이력서",
         page_text=_v10_project_page_text(3),
     )
-    run = _queue_run(db_session, person.id, document.id)
+    run = _queue_run(
+        db_session,
+        person.id,
+        document.id,
+        prompt_version="profile-extract-v10",
+    )
     llm = _StagedSequenceLLM(
         [
             AIResponseTruncatedError(
