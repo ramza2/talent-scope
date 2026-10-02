@@ -49,6 +49,7 @@ from app.modules.analysis.compact_v8 import (
     build_document_alias_view,
     expand_compact_core,
     expand_compact_projects,
+    promote_exact_root_catalog_codes,
 )
 from app.modules.analysis.diff_engine import DiffSpec, build_diffs
 from app.modules.analysis.normalize import normalize_candidate
@@ -1018,13 +1019,17 @@ class AnalysisService:
         def _normalize_core(raw: dict[str, Any]) -> ProfileCandidateDocument:
             expanded = expand_compact_core(raw, alias_to_id=alias_to_id)
             expanded["projects"] = []
-            return normalize_candidate(
+            doc = normalize_candidate(
                 expanded,
                 catalog=catalog_map,
                 allowed_documents=allowed_documents,
                 settings=self.settings,
                 page_texts=page_texts,
             )
+            # v11: promote raw_value that exactly equals an active typed catalog code.
+            if prompt.promote_exact_catalog_codes:
+                doc = promote_exact_root_catalog_codes(doc, catalog=catalog_map)
+            return doc
 
         def _normalize_projects(raw: dict[str, Any]) -> ProfileCandidateDocument:
             expanded = expand_compact_projects(
@@ -1048,7 +1053,7 @@ class AnalysisService:
                 settings=self.settings,
                 page_texts=page_texts,
             )
-            # v10: after normalize may clear quotes / drop invalid refs, re-check
+            # v10+: after normalize may clear quotes / drop invalid refs, re-check
             # that projects and j/t/x still have non-empty quote_text evidence.
             if prompt.strict_relation_evidence:
                 doc = apply_normalized_quote_evidence(doc)

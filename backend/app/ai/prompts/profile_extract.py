@@ -17,10 +17,11 @@ from app.ai.prompts import (
     profile_extract_v8,
     profile_extract_v9,
     profile_extract_v10,
+    profile_extract_v11,
 )
 from app.ai.providers.errors import AIProviderError
 
-CURRENT_PROFILE_PROMPT_VERSION = "profile-extract-v10"
+CURRENT_PROFILE_PROMPT_VERSION = "profile-extract-v11"
 
 ExtractionMode = Literal["single", "staged"]
 
@@ -44,6 +45,7 @@ class ProfilePromptSpec:
     strict_relation_evidence: bool = False
     derive_project_duration: bool = False
     clear_catalog_code_customer: bool = False
+    promote_exact_catalog_codes: bool = False
 
 
 def _spec_from_module(module) -> ProfilePromptSpec:
@@ -77,6 +79,9 @@ def _spec_from_staged_module(module) -> ProfilePromptSpec:
         clear_catalog_code_customer=bool(
             getattr(module, "CLEAR_CATALOG_CODE_CUSTOMER", False)
         ),
+        promote_exact_catalog_codes=bool(
+            getattr(module, "PROMOTE_EXACT_CATALOG_CODES", False)
+        ),
     )
 
 
@@ -91,6 +96,7 @@ _REGISTRY: dict[str, ProfilePromptSpec] = {
     profile_extract_v8.PROMPT_VERSION: _spec_from_staged_module(profile_extract_v8),
     profile_extract_v9.PROMPT_VERSION: _spec_from_staged_module(profile_extract_v9),
     profile_extract_v10.PROMPT_VERSION: _spec_from_staged_module(profile_extract_v10),
+    profile_extract_v11.PROMPT_VERSION: _spec_from_staged_module(profile_extract_v11),
 }
 
 

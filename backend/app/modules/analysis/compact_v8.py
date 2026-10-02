@@ -9,8 +9,11 @@ from app.ai.schemas.profile_candidate import (
     PROFILE_SCALAR_FIELD_NAMES,
     SCHEMA_VERSION,
     CodeRefCandidate,
+    ExpertiseCandidate,
+    JobCandidate,
     ProfileCandidateDocument,
     ProjectCandidate,
+    SkillCandidate,
     SourceRef,
 )
 
@@ -642,6 +645,67 @@ def _source_ref_has_quote(ref: SourceRef) -> bool:
 
 def _relation_has_quote_evidence(rel: CodeRefCandidate) -> bool:
     return any(_source_ref_has_quote(ref) for ref in (rel.source_refs or []))
+
+
+def promote_exact_root_catalog_codes(
+    candidate: ProfileCandidateDocument,
+    *,
+    catalog: dict[str, tuple[str, bool]],
+) -> ProfileCandidateDocument:
+    """v11-only: if root code is null and raw_value exactly matches an active
+    catalog code of the expected type, set code to that exact value.
+
+    No alias/fuzzy/name inference. Wrong type / inactive / unknown stay null.
+    Applies only to root jobs / skills / expertise (not project relations).
+    """
+
+    def _promote_one(
+        code: str | None,
+        raw_value: str | None,
+        *,
+        expected_type: str,
+    ) -> str | None:
+        if code is not None and str(code).strip():
+            return code
+        raw = (raw_value or "").strip()
+        if not raw:
+            return None
+        entry = catalog.get(raw)
+        if entry is None:
+            return None
+        code_type, is_active = entry
+        if not is_active or code_type != expected_type:
+            return None
+        return raw
+
+    jobs: list[JobCandidate] = []
+    for job in candidate.jobs:
+        promoted = _promote_one(job.code, job.raw_value, expected_type="JOB")
+        jobs.append(job if promoted == job.code else job.model_copy(update={"code": promoted}))
+
+    skills: list[SkillCandidate] = []
+    for skill in candidate.skills:
+        promoted = _promote_one(skill.code, skill.raw_value, expected_type="TECH")
+        skills.append(
+            skill if promoted == skill.code else skill.model_copy(update={"code": promoted})
+        )
+
+    expertise: list[ExpertiseCandidate] = []
+    for exp in candidate.expertise:
+        promoted = _promote_one(exp.code, exp.raw_value, expected_type="EXP")
+        expertise.append(
+            exp if promoted == exp.code else exp.model_copy(update={"code": promoted})
+        )
+
+    if (
+        jobs == list(candidate.jobs)
+        and skills == list(candidate.skills)
+        and expertise == list(candidate.expertise)
+    ):
+        return candidate
+    return candidate.model_copy(
+        update={"jobs": jobs, "skills": skills, "expertise": expertise}
+    )
 
 
 def apply_normalized_quote_evidence(
