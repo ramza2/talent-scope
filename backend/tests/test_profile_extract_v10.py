@@ -131,6 +131,7 @@ def _v10_core(**overrides: Any) -> dict:
 
 
 def _v10_projects(count: int = 7) -> dict:
+    # Quotes must appear in seeded page text so post-normalize evidence is retained.
     return {
         "pr": [
             {
@@ -144,6 +145,13 @@ def _v10_projects(count: int = 7) -> dict:
             for i in range(1, count + 1)
         ]
     }
+
+
+def _v10_project_page_text(count: int = 7) -> str:
+    from tests.test_analysis import _RICH_PAGE_TEXT
+
+    names = " ".join(f"프로젝트-{i}" for i in range(1, count + 1))
+    return _RICH_PAGE_TEXT + " AD SEP NAC 시스템 운영 " + names
 
 
 # ---------------------------------------------------------------------------
@@ -612,7 +620,6 @@ def test_v10_happy_path_two_calls(db_session):
     from app.modules.analysis.service import AnalysisService
     from app.storage.s3 import get_object_storage
     from tests.test_analysis import (
-        _RICH_PAGE_TEXT,
         _cleanup_person,
         _create_user,
         _ensure_analysis_code,
@@ -631,7 +638,7 @@ def test_v10_happy_path_two_calls(db_session):
         admin.id,
         doc_type_code="DOC-RESUME",
         doc_type_name="이력서",
-        page_text=_RICH_PAGE_TEXT + " AD SEP NAC 시스템 운영",
+        page_text=_v10_project_page_text(7),
     )
     run = _queue_run(db_session, person.id, document.id)
     assert run.prompt_version == "profile-extract-v10"
@@ -656,7 +663,6 @@ def test_v10_recovery_budget_max_three_calls(db_session):
     from app.modules.analysis.service import AnalysisService
     from app.storage.s3 import get_object_storage
     from tests.test_analysis import (
-        _RICH_PAGE_TEXT,
         _cleanup_person,
         _create_user,
         _queue_run,
@@ -671,7 +677,7 @@ def test_v10_recovery_budget_max_three_calls(db_session):
         admin.id,
         doc_type_code="DOC-RESUME",
         doc_type_name="이력서",
-        page_text=_RICH_PAGE_TEXT,
+        page_text=_v10_project_page_text(3),
     )
     run = _queue_run(db_session, person.id, document.id)
     llm = _StagedSequenceLLM(
