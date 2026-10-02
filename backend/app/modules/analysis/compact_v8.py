@@ -37,6 +37,30 @@ _PROFILE_KEY_MAP: dict[str, str] = {
 # Reverse for optional long-key passthrough in compact profile.
 _PROFILE_LONG_KEYS = frozenset(PROFILE_SCALAR_FIELD_NAMES)
 
+# Profile fields that are optional text (not birth_year).
+_PROFILE_TEXT_FIELDS = frozenset(PROFILE_SCALAR_FIELD_NAMES) - {"birth_year"}
+
+
+def _optional_text(value: Any) -> str | None:
+    """Fail-soft optional canonical text: keep clean non-empty strings only.
+
+    - str → strip; empty → omit
+    - None / bool / list / dict / other non-str → omit
+    Never stringifies malformed values (e.g. True → \"True\").
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        return text if text else None
+    return None
+
+
+def _set_optional_text(out: dict[str, Any], key: str, value: Any) -> None:
+    text = _optional_text(value)
+    if text is not None:
+        out[key] = text
+
 
 def build_document_alias_view(document_blocks: str) -> tuple[str, dict[str, str]]:
     """Replace UUID document headers with D1/D2… aliases for the LLM prompt.
@@ -73,15 +97,20 @@ def _expand_ref(item: Any, alias_to_id: dict[str, str]) -> dict[str, Any] | None
     alias = item.get("d")
     doc_id = item.get("document_id")
     if alias is not None:
-        mapped = alias_to_id.get(str(alias).strip())
+        alias_key = _optional_text(alias)
+        if alias_key is None:
+            return None
+        mapped = alias_to_id.get(alias_key)
         if mapped is None:
             return None  # unknown alias — drop safely
         doc_id = mapped
+    else:
+        doc_id = _optional_text(doc_id)
     if doc_id is None:
         return None
     page_no = item.get("p", item.get("page_no"))
-    quote = item.get("q", item.get("quote_text"))
-    out: dict[str, Any] = {"document_id": str(doc_id)}
+    quote = _optional_text(item.get("q", item.get("quote_text")))
+    out: dict[str, Any] = {"document_id": doc_id}
     if page_no is not None:
         out["page_no"] = page_no
     if quote is not None:
@@ -121,6 +150,14 @@ def _expand_profile(
             continue
         if value is None:
             continue
+        if field == "birth_year":
+            profile[field] = value
+            continue
+        if field in _PROFILE_TEXT_FIELDS:
+            text = _optional_text(value)
+            if text is not None:
+                profile[field] = text
+            continue
         profile[field] = value
 
     for ref_key, refs in raw_refs.items():
@@ -139,12 +176,9 @@ def _expand_job(item: Any, alias_to_id: dict[str, str]) -> dict[str, Any] | None
     if not isinstance(item, dict):
         return None
     out: dict[str, Any] = {}
-    if item.get("v") is not None:
-        out["raw_value"] = item["v"]
-    if item.get("c") is not None:
-        out["code"] = item["c"]
-    if item.get("t") is not None:
-        out["job_type"] = item["t"]
+    _set_optional_text(out, "raw_value", item.get("v"))
+    _set_optional_text(out, "code", item.get("c"))
+    _set_optional_text(out, "job_type", item.get("t"))
     if item.get("f") is not None:
         out["confidence"] = item["f"]
     refs = expand_compact_refs(item.get("r"), alias_to_id)
@@ -157,10 +191,8 @@ def _expand_skill(item: Any, alias_to_id: dict[str, str]) -> dict[str, Any] | No
     if not isinstance(item, dict):
         return None
     out: dict[str, Any] = {}
-    if item.get("v") is not None:
-        out["raw_value"] = item["v"]
-    if item.get("c") is not None:
-        out["code"] = item["c"]
+    _set_optional_text(out, "raw_value", item.get("v"))
+    _set_optional_text(out, "code", item.get("c"))
     if item.get("y") is not None:
         out["last_used_year"] = item["y"]
     if item.get("m") is not None:
@@ -181,12 +213,9 @@ def _expand_expertise(
     if not isinstance(item, dict):
         return None
     out: dict[str, Any] = {}
-    if item.get("v") is not None:
-        out["raw_value"] = item["v"]
-    if item.get("c") is not None:
-        out["code"] = item["c"]
-    if item.get("e") is not None:
-        out["evidence_type"] = item["e"]
+    _set_optional_text(out, "raw_value", item.get("v"))
+    _set_optional_text(out, "code", item.get("c"))
+    _set_optional_text(out, "evidence_type", item.get("e"))
     if item.get("f") is not None:
         out["confidence"] = item["f"]
     refs = expand_compact_refs(item.get("r"), alias_to_id)
@@ -200,19 +229,19 @@ def _expand_employment(
 ) -> dict[str, Any] | None:
     if not isinstance(item, dict):
         return None
-    mapping = {
+    text_mapping = {
         "co": "company_name",
         "dp": "department",
         "ti": "title",
         "s": "start_date",
         "e": "end_date",
         "resp": "responsibilities",
-        "f": "confidence",
     }
     out: dict[str, Any] = {}
-    for short, long in mapping.items():
-        if item.get(short) is not None:
-            out[long] = item[short]
+    for short, long in text_mapping.items():
+        _set_optional_text(out, long, item.get(short))
+    if item.get("f") is not None:
+        out["confidence"] = item["f"]
     refs = expand_compact_refs(item.get("r"), alias_to_id)
     if refs:
         out["source_refs"] = refs
@@ -224,19 +253,19 @@ def _expand_education(
 ) -> dict[str, Any] | None:
     if not isinstance(item, dict):
         return None
-    mapping = {
+    text_mapping = {
         "sc": "school_name",
         "mj": "major",
         "dg": "degree",
         "s": "start_date",
         "e": "end_date",
         "st": "status",
-        "f": "confidence",
     }
     out: dict[str, Any] = {}
-    for short, long in mapping.items():
-        if item.get(short) is not None:
-            out[long] = item[short]
+    for short, long in text_mapping.items():
+        _set_optional_text(out, long, item.get(short))
+    if item.get("f") is not None:
+        out["confidence"] = item["f"]
     refs = expand_compact_refs(item.get("r"), alias_to_id)
     if refs:
         out["source_refs"] = refs
@@ -248,17 +277,17 @@ def _expand_certification(
 ) -> dict[str, Any] | None:
     if not isinstance(item, dict):
         return None
-    mapping = {
+    text_mapping = {
         "n": "certification_name",
         "is": "issuer",
         "ad": "acquired_date",
         "ex": "expiry_date",
-        "f": "confidence",
     }
     out: dict[str, Any] = {}
-    for short, long in mapping.items():
-        if item.get(short) is not None:
-            out[long] = item[short]
+    for short, long in text_mapping.items():
+        _set_optional_text(out, long, item.get(short))
+    if item.get("f") is not None:
+        out["confidence"] = item["f"]
     refs = expand_compact_refs(item.get("r"), alias_to_id)
     if refs:
         out["source_refs"] = refs
@@ -286,12 +315,14 @@ def expand_compact_core(
     alias_to_id: dict[str, str],
 ) -> dict[str, Any]:
     """Expand compact CORE JSON into a profile-candidate-v1 dict (projects=[])."""
-    summary_text = raw.get("sum")
+    summary_text = _optional_text(raw.get("sum"))
     summary: dict[str, Any] = {}
-    if isinstance(summary_text, str) and summary_text.strip():
-        summary = {"text": summary_text.strip()}
+    if summary_text is not None:
+        summary = {"text": summary_text}
     elif isinstance(raw.get("summary"), dict):
-        summary = dict(raw["summary"])
+        summary_obj = dict(raw["summary"])
+        text = _optional_text(summary_obj.get("text"))
+        summary = {"text": text} if text is not None else {}
 
     analysis: dict[str, Any] = {}
     if raw.get("conf") is not None:
@@ -366,10 +397,7 @@ def _expand_code_array(
             out.append(entry)
         elif isinstance(item, dict):
             # Tolerate already-expanded / hybrid shapes without inventing codes.
-            code = item.get("c") or item.get("code")
-            if not code:
-                continue
-            code_s = str(code).strip()
+            code_s = _optional_text(item.get("c") or item.get("code"))
             if not code_s:
                 continue
             refs = expand_compact_refs(item.get("r"), alias_to_id)
@@ -381,11 +409,12 @@ def _expand_code_array(
                     relation_key=relation_key,
                     alias_to_id=alias_to_id,
                 )
-            entry = {"code": code_s}
-            if item.get("v") is not None:
-                entry["raw_value"] = item["v"]
-            elif item.get("raw_value") is not None:
-                entry["raw_value"] = item["raw_value"]
+            entry: dict[str, Any] = {"code": code_s}
+            raw_value = _optional_text(item.get("v"))
+            if raw_value is None:
+                raw_value = _optional_text(item.get("raw_value"))
+            if raw_value is not None:
+                entry["raw_value"] = raw_value
             if refs:
                 entry["source_refs"] = refs
             out.append(entry)
@@ -401,19 +430,20 @@ def _expand_project(
     relation_map = item.get("rm") if isinstance(item.get("rm"), dict) else None
 
     out: dict[str, Any] = {}
-    mapping = {
+    text_mapping = {
         "n": "project_name",
         "cu": "customer_name",
         "s": "start_date",
         "e": "end_date",
-        "d": "duration_months",
         "resp": "responsibilities",
         "sum": "project_summary",
-        "f": "confidence",
     }
-    for short, long in mapping.items():
-        if item.get(short) is not None:
-            out[long] = item[short]
+    for short, long in text_mapping.items():
+        _set_optional_text(out, long, item.get(short))
+    if item.get("d") is not None:
+        out["duration_months"] = item["d"]
+    if item.get("f") is not None:
+        out["confidence"] = item["f"]
 
     for compact_key, canon_key, rel_key in (
         ("j", "jobs", "j"),
