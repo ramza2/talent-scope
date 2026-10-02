@@ -71,18 +71,12 @@ def db_session():
         session.close()
 
 
-def test_profile_extract_registry_current_is_v7_staged() -> None:
+def test_profile_extract_registry_v7_remains_staged_historical() -> None:
+    """v7 stays resolvable as historical staged; current may advance past v7."""
     from app.ai.prompts import profile_extract_v6 as v6
     from app.ai.prompts import profile_extract_v7 as v7
-    from app.ai.prompts.profile_extract import (
-        CURRENT_PROFILE_PROMPT_VERSION,
-        current_profile_prompt,
-        resolve_profile_prompt,
-    )
+    from app.ai.prompts.profile_extract import resolve_profile_prompt
 
-    assert CURRENT_PROFILE_PROMPT_VERSION == "profile-extract-v7"
-    assert current_profile_prompt().prompt_version == "profile-extract-v7"
-    assert current_profile_prompt().extraction_mode == "staged"
     for ver in (
         "profile-extract-v1",
         "profile-extract-v2",
@@ -96,6 +90,8 @@ def test_profile_extract_registry_current_is_v7_staged() -> None:
         assert spec.extraction_mode == "single"
     assert resolve_profile_prompt("profile-extract-v6").system_prompt == v6.SYSTEM_PROMPT
     v7_spec = resolve_profile_prompt("profile-extract-v7")
+    assert v7_spec.extraction_mode == "staged"
+    assert v7_spec.compact_protocol is False
     assert v7_spec.core_system_prompt == v7.CORE_SYSTEM_PROMPT
     assert v7_spec.projects_system_prompt == v7.PROJECTS_SYSTEM_PROMPT
     assert "EVERY explicitly named" in v7.CORE_SYSTEM_PROMPT
@@ -342,7 +338,6 @@ def _projects_payload(count: int = 7) -> dict:
 
 
 def test_staged_happy_path_two_calls_merge_reviewing(db_session, monkeypatch):
-    from app.ai.prompts.profile_extract import CURRENT_PROFILE_PROMPT_VERSION
     from app.modules.analysis.service import AnalysisService
     from app.storage.s3 import get_object_storage
     from tests.test_analysis import (
@@ -354,7 +349,6 @@ def test_staged_happy_path_two_calls_merge_reviewing(db_session, monkeypatch):
         _seed_person_doc,
     )
 
-    assert CURRENT_PROFILE_PROMPT_VERSION == "profile-extract-v7"
     admin = _create_user(
         db_session, login_id=f"v7_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
     )
@@ -373,7 +367,12 @@ def test_staged_happy_path_two_calls_merge_reviewing(db_session, monkeypatch):
         doc_type_name="이력서",
         page_text=_RICH_PAGE_TEXT + " AD SEP NAC 시스템 운영 사업관리",
     )
-    run = _queue_run(db_session, person.id, document.id)
+    run = _queue_run(
+        db_session,
+        person.id,
+        document.id,
+        prompt_version="profile-extract-v7",
+    )
     assert run.prompt_version == "profile-extract-v7"
 
     llm = _StagedSequenceLLM([_core_payload(), _projects_payload(7)])
@@ -429,7 +428,12 @@ def test_staged_projects_completeness_seven_rows(db_session, monkeypatch):
         doc_type_name="이력서",
         page_text=_RICH_PAGE_TEXT,
     )
-    run = _queue_run(db_session, person.id, document.id)
+    run = _queue_run(
+        db_session,
+        person.id,
+        document.id,
+        prompt_version="profile-extract-v7",
+    )
     llm = _StagedSequenceLLM([_core_payload(), _projects_payload(7)])
     service = AnalysisService(db_session, storage=get_object_storage(), llm=llm)
     assert service.run_analysis(run.id) == "REVIEWING"
@@ -461,7 +465,12 @@ def test_staged_recovery_budget_max_three_calls(db_session):
         doc_type_name="이력서",
         page_text=_RICH_PAGE_TEXT,
     )
-    run = _queue_run(db_session, person.id, document.id)
+    run = _queue_run(
+        db_session,
+        person.id,
+        document.id,
+        prompt_version="profile-extract-v7",
+    )
     # core truncates once → recovery → projects success => 3 calls
     llm = _StagedSequenceLLM(
         [
@@ -540,7 +549,12 @@ def test_staged_projects_truncation_recovers_without_rerunning_core(db_session):
         doc_type_name="이력서",
         page_text=_RICH_PAGE_TEXT,
     )
-    run = _queue_run(db_session, person.id, document.id)
+    run = _queue_run(
+        db_session,
+        person.id,
+        document.id,
+        prompt_version="profile-extract-v7",
+    )
     llm = _StagedSequenceLLM(
         [
             _core_payload(),
@@ -585,7 +599,12 @@ def test_staged_projects_truncation_fails_when_recovery_budget_exhausted(db_sess
         doc_type_name="이력서",
         page_text=_RICH_PAGE_TEXT,
     )
-    run = _queue_run(db_session, person.id, document.id)
+    run = _queue_run(
+        db_session,
+        person.id,
+        document.id,
+        prompt_version="profile-extract-v7",
+    )
     llm = _StagedSequenceLLM(
         [
             AIResponseTruncatedError(
@@ -631,7 +650,12 @@ def test_staged_projects_double_truncation_fails_closed(db_session):
         doc_type_name="이력서",
         page_text=_RICH_PAGE_TEXT,
     )
-    run = _queue_run(db_session, person.id, document.id)
+    run = _queue_run(
+        db_session,
+        person.id,
+        document.id,
+        prompt_version="profile-extract-v7",
+    )
     trunc = AIResponseTruncatedError(
         meta={"finish_reason": "length", "total_tokens": 8192}
     )

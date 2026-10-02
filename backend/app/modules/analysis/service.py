@@ -28,6 +28,7 @@ from app.ai.providers.llm import LLMProvider, OpenAICompatibleLLMProvider
 from app.ai.providers.vlm import OpenAICompatibleVLMProvider, VLMProvider
 from app.ai.schemas.profile_candidate import (
     PROFILE_SCALAR_FIELDS,
+    SCHEMA_VERSION as CANDIDATE_SCHEMA_VERSION,
     ProfileCandidateDocument,
 )
 from app.core.config import Settings, get_settings
@@ -38,6 +39,16 @@ from app.core.exceptions import (
     ValidationAppError,
 )
 from app.db.models.analysis import AnalysisDiffItem, AnalysisRun
+from app.modules.analysis.code_catalog import (
+    CORE_CATALOG_TYPES,
+    PROJECTS_CATALOG_TYPES,
+    format_code_catalog,
+)
+from app.modules.analysis.compact_v8 import (
+    build_document_alias_view,
+    expand_compact_core,
+    expand_compact_projects,
+)
 from app.modules.analysis.diff_engine import DiffSpec, build_diffs
 from app.modules.analysis.normalize import normalize_candidate
 from app.modules.analysis.repository import AnalysisRepository
@@ -436,18 +447,31 @@ class AnalysisService:
             }
 
             if prompt.extraction_mode == "staged":
-                candidate = self._extract_staged_candidate(
-                    prompt=prompt,
-                    code_catalog_text=claimed.code_catalog_text,
-                    document_blocks=blocks,
-                    catalog_map=catalog_map,
-                    allowed_documents=prompt_source.allowed_documents,
-                    page_texts=prompt_source.page_texts,
-                    documents=claimed.documents,
-                    source_char_count=source_char_count,
-                    base_log=base_log,
-                    vlm_pages=bundle.total_vlm_pages,
-                )
+                if prompt.compact_protocol:
+                    candidate = self._extract_staged_compact_candidate(
+                        prompt=prompt,
+                        document_blocks=blocks,
+                        catalog_map=catalog_map,
+                        allowed_documents=prompt_source.allowed_documents,
+                        page_texts=prompt_source.page_texts,
+                        documents=claimed.documents,
+                        source_char_count=source_char_count,
+                        base_log=base_log,
+                        vlm_pages=bundle.total_vlm_pages,
+                    )
+                else:
+                    candidate = self._extract_staged_candidate(
+                        prompt=prompt,
+                        code_catalog_text=claimed.code_catalog_text,
+                        document_blocks=blocks,
+                        catalog_map=catalog_map,
+                        allowed_documents=prompt_source.allowed_documents,
+                        page_texts=prompt_source.page_texts,
+                        documents=claimed.documents,
+                        source_char_count=source_char_count,
+                        base_log=base_log,
+                        vlm_pages=bundle.total_vlm_pages,
+                    )
             else:
                 candidate = self._extract_single_candidate(
                     prompt=prompt,
@@ -834,6 +858,268 @@ class AnalysisService:
             raise InsufficientCandidateError()
         return merged
 
+    def _extract_staged_compact_candidate(
+        self,
+        *,
+        prompt: ProfilePromptSpec,
+        document_blocks: str,
+        catalog_map: dict[str, tuple[str, bool]],
+        allowed_documents: dict[str, set[int]],
+        page_texts: dict[tuple[str, int], str] | None,
+        documents: tuple[DocumentSnapshot, ...] | list[DocumentSnapshot],
+        source_char_count: int,
+        base_log: dict[str, Any],
+        vlm_pages: int,
+    ) -> ProfileCandidateDocument:
+        """v8 compact staged extraction: aliases + short keys; max 1 recovery."""
+        if (
+            prompt.build_core_user_prompt is None
+            or prompt.build_projects_user_prompt is None
+            or prompt.core_system_prompt is None
+            or prompt.projects_system_prompt is None
+        ):
+            raise AIProviderError("staged prompt builders are not configured")
+
+        aliased_blocks, alias_to_id = build_document_alias_view(document_blocks)
+        codes = self.repo.list_active_codes()
+        aliases = self.repo.list_aliases_for_codes([c.code for c in codes])
+        core_catalog = self._format_code_catalog(
+            codes, aliases, code_types=CORE_CATALOG_TYPES
+        )
+        projects_catalog = self._format_code_catalog(
+            codes, aliases, code_types=PROJECTS_CATALOG_TYPES
+        )
+
+        logger.info(
+            "analysis compact protocol analysis_run_id=%s compact_protocol=v8 "
+            "doc_alias_count=%s document_count=%s",
+            base_log.get("analysis_run_id"),
+            len(alias_to_id),
+            base_log.get("document_count"),
+        )
+
+        call_count = 0
+        recovery_budget = 1
+
+        def _phase_call(
+            *,
+            phase: str,
+            system_prompt: str,
+            build_user_prompt: Any,
+            code_catalog_text: str,
+            recovery_retry: bool,
+        ) -> dict[str, Any]:
+            nonlocal call_count
+            if call_count >= 3:
+                raise AIProviderError("staged extraction exceeded LLM call budget")
+            call_count += 1
+            user_prompt = build_user_prompt(
+                code_catalog=code_catalog_text,
+                document_blocks=aliased_blocks,
+                recovery_retry=recovery_retry,
+            )
+            raw = self.llm.complete_json(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                log_context={
+                    **base_log,
+                    "phase": phase,
+                    "attempt": call_count,
+                    "recovery_retry": recovery_retry,
+                    "compact_protocol": "v8",
+                    "doc_alias_count": len(alias_to_id),
+                },
+            )
+            if not isinstance(raw, dict):
+                raise AIResponseValidationError(
+                    f"profile JSON root is not an object (phase={phase})"
+                )
+            top_keys = raw_candidate_top_level_keys(raw)
+            logger.info(
+                "analysis llm raw shape analysis_run_id=%s phase=%s attempt=%s "
+                "document_count=%s compact_protocol=v8 raw_key_count=%s "
+                "raw_top_level_keys=%s",
+                base_log.get("analysis_run_id"),
+                phase,
+                call_count,
+                base_log.get("document_count"),
+                len(raw),
+                top_keys,
+            )
+            return raw
+
+        def _run_phase(
+            *,
+            phase: str,
+            system_prompt: str,
+            build_user_prompt: Any,
+            code_catalog_text: str,
+            normalize_raw: Any,
+            needs_retry: Any,
+            fail_closed_if_bad: bool,
+        ) -> ProfileCandidateDocument:
+            nonlocal recovery_budget
+            try:
+                raw = _phase_call(
+                    phase=phase,
+                    system_prompt=system_prompt,
+                    build_user_prompt=build_user_prompt,
+                    code_catalog_text=code_catalog_text,
+                    recovery_retry=False,
+                )
+                candidate = normalize_raw(raw)
+            except AIResponseTruncatedError as trunc_exc:
+                logger.info(
+                    "analysis llm truncated analysis_run_id=%s phase=%s "
+                    "document_count=%s compact_protocol=v8 meta=%s",
+                    base_log.get("analysis_run_id"),
+                    phase,
+                    base_log.get("document_count"),
+                    trunc_exc.meta,
+                )
+                if recovery_budget <= 0:
+                    raise InsufficientCandidateError() from trunc_exc
+                recovery_budget -= 1
+                try:
+                    raw = _phase_call(
+                        phase=phase,
+                        system_prompt=system_prompt,
+                        build_user_prompt=build_user_prompt,
+                        code_catalog_text=code_catalog_text,
+                        recovery_retry=True,
+                    )
+                    candidate = normalize_raw(raw)
+                except AIResponseTruncatedError:
+                    raise InsufficientCandidateError() from trunc_exc
+            else:
+                if needs_retry(candidate) and recovery_budget > 0:
+                    recovery_budget -= 1
+                    try:
+                        raw = _phase_call(
+                            phase=phase,
+                            system_prompt=system_prompt,
+                            build_user_prompt=build_user_prompt,
+                            code_catalog_text=code_catalog_text,
+                            recovery_retry=True,
+                        )
+                        candidate = normalize_raw(raw)
+                    except AIResponseTruncatedError:
+                        raise InsufficientCandidateError()
+
+            if fail_closed_if_bad and needs_retry(candidate):
+                raise InsufficientCandidateError()
+            return candidate
+
+        def _normalize_core(raw: dict[str, Any]) -> ProfileCandidateDocument:
+            expanded = expand_compact_core(raw, alias_to_id=alias_to_id)
+            expanded["projects"] = []
+            return normalize_candidate(
+                expanded,
+                catalog=catalog_map,
+                allowed_documents=allowed_documents,
+                settings=self.settings,
+                page_texts=page_texts,
+            )
+
+        def _normalize_projects(raw: dict[str, Any]) -> ProfileCandidateDocument:
+            expanded = expand_compact_projects(raw, alias_to_id=alias_to_id)
+            projects_raw = {
+                "schema_version": CANDIDATE_SCHEMA_VERSION,
+                "projects": expanded.get("projects")
+                if isinstance(expanded.get("projects"), list)
+                else [],
+            }
+            return normalize_candidate(
+                projects_raw,
+                catalog=catalog_map,
+                allowed_documents=allowed_documents,
+                settings=self.settings,
+                page_texts=page_texts,
+            )
+
+        def _core_needs_retry(candidate: ProfileCandidateDocument) -> bool:
+            return candidate_needs_llm_retry(
+                candidate,
+                documents=documents,
+                source_char_count=source_char_count,
+            )
+
+        def _projects_needs_retry(candidate: ProfileCandidateDocument) -> bool:
+            if len(candidate.projects) > 0:
+                return False
+            if source_char_count < _SPARSE_MIN_SOURCE_CHARS:
+                return False
+            return _documents_are_rich_profile_type(documents)
+
+        core = _run_phase(
+            phase="core",
+            system_prompt=prompt.core_system_prompt,
+            build_user_prompt=prompt.build_core_user_prompt,
+            code_catalog_text=core_catalog,
+            normalize_raw=_normalize_core,
+            needs_retry=_core_needs_retry,
+            fail_closed_if_bad=True,
+        )
+        logger.info(
+            "analysis candidate quality run_id=%s phase=core compact_protocol=v8 "
+            "document_count=%s vlm_pages=%s empty=%s sparse=%s quality_score=%s "
+            "skills=%s expertise=%s jobs=%s employment=%s education=%s "
+            "certifications=%s projects=%s",
+            base_log.get("analysis_run_id"),
+            base_log.get("document_count"),
+            vlm_pages,
+            candidate_is_empty(core),
+            candidate_is_sparse(
+                core, documents=documents, source_char_count=source_char_count
+            ),
+            candidate_quality_score(core),
+            len(core.skills),
+            len(core.expertise),
+            len(core.jobs),
+            len(core.employment_history),
+            len(core.education),
+            len(core.certifications),
+            len(core.projects),
+        )
+
+        projects_doc = _run_phase(
+            phase="projects",
+            system_prompt=prompt.projects_system_prompt,
+            build_user_prompt=prompt.build_projects_user_prompt,
+            code_catalog_text=projects_catalog,
+            normalize_raw=_normalize_projects,
+            needs_retry=_projects_needs_retry,
+            fail_closed_if_bad=False,
+        )
+        logger.info(
+            "analysis candidate quality run_id=%s phase=projects "
+            "compact_protocol=v8 document_count=%s vlm_pages=%s project_count=%s",
+            base_log.get("analysis_run_id"),
+            base_log.get("document_count"),
+            vlm_pages,
+            len(projects_doc.projects),
+        )
+
+        merged = core.model_copy(update={"projects": list(projects_doc.projects)})
+        logger.info(
+            "analysis staged merge analysis_run_id=%s compact_protocol=v8 "
+            "core_skills=%s core_expertise=%s projects=%s llm_calls=%s "
+            "doc_alias_count=%s",
+            base_log.get("analysis_run_id"),
+            len(merged.skills),
+            len(merged.expertise),
+            len(merged.projects),
+            call_count,
+            len(alias_to_id),
+        )
+        if candidate_needs_llm_retry(
+            merged,
+            documents=documents,
+            source_char_count=source_char_count,
+        ):
+            raise InsufficientCandidateError()
+        return merged
+
     def _persist_vlm_transcriptions(
         self,
         transcriptions: list[VLMPageTranscription],
@@ -952,31 +1238,18 @@ class AnalysisService:
         )
 
     def _format_code_catalog(
-        self, codes: list, aliases: dict[str, list[str]] | None = None
+        self,
+        codes: list,
+        aliases: dict[str, list[str]] | None = None,
+        *,
+        code_types: tuple[str, ...] | frozenset[str] | None = None,
     ) -> str:
-        max_chars = int(self.settings.analysis_code_context_max_chars)
-        alias_map = aliases or {}
-        lines: list[str] = []
-        used = 0
-        current_type: str | None = None
-        for row in codes:
-            if row.code_type != current_type:
-                current_type = row.code_type
-                header = f"\n[{current_type}]\n"
-                if used + len(header) > max_chars:
-                    break
-                lines.append(header)
-                used += len(header)
-            alias_part = "|".join(alias_map.get(row.code, []))
-            if alias_part:
-                line = f"{row.code}\t{row.name}\t{alias_part}\n"
-            else:
-                line = f"{row.code}\t{row.name}\n"
-            if used + len(line) > max_chars:
-                break
-            lines.append(line)
-            used += len(line)
-        return "".join(lines).strip()
+        return format_code_catalog(
+            codes,
+            aliases,
+            max_chars=int(self.settings.analysis_code_context_max_chars),
+            code_types=code_types,
+        )
 
     def _persist_reviewing(
         self,

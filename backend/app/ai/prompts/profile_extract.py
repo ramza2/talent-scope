@@ -14,10 +14,11 @@ from app.ai.prompts import (
     profile_extract_v5,
     profile_extract_v6,
     profile_extract_v7,
+    profile_extract_v8,
 )
 from app.ai.providers.errors import AIProviderError
 
-CURRENT_PROFILE_PROMPT_VERSION = "profile-extract-v7"
+CURRENT_PROFILE_PROMPT_VERSION = "profile-extract-v8"
 
 ExtractionMode = Literal["single", "staged"]
 
@@ -37,6 +38,7 @@ class ProfilePromptSpec:
     projects_system_prompt: str | None = None
     build_core_user_prompt: Callable[..., str] | None = None
     build_projects_user_prompt: Callable[..., str] | None = None
+    compact_protocol: bool = False
 
 
 def _spec_from_module(module) -> ProfilePromptSpec:
@@ -60,6 +62,7 @@ def _spec_from_staged_module(module) -> ProfilePromptSpec:
         projects_system_prompt=module.PROJECTS_SYSTEM_PROMPT,
         build_core_user_prompt=module.build_core_user_prompt,
         build_projects_user_prompt=module.build_projects_user_prompt,
+        compact_protocol=bool(getattr(module, "COMPACT_PROTOCOL", False)),
     )
 
 
@@ -71,6 +74,7 @@ _REGISTRY: dict[str, ProfilePromptSpec] = {
     profile_extract_v5.PROMPT_VERSION: _spec_from_module(profile_extract_v5),
     profile_extract_v6.PROMPT_VERSION: _spec_from_module(profile_extract_v6),
     profile_extract_v7.PROMPT_VERSION: _spec_from_staged_module(profile_extract_v7),
+    profile_extract_v8.PROMPT_VERSION: _spec_from_staged_module(profile_extract_v8),
 }
 
 
