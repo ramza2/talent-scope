@@ -1026,7 +1026,14 @@ class AnalysisService:
             )
 
         def _normalize_projects(raw: dict[str, Any]) -> ProfileCandidateDocument:
-            expanded = expand_compact_projects(raw, alias_to_id=alias_to_id)
+            expanded = expand_compact_projects(
+                raw,
+                alias_to_id=alias_to_id,
+                strict_relation_evidence=prompt.strict_relation_evidence,
+                derive_duration=prompt.derive_project_duration,
+                clear_catalog_code_customer=prompt.clear_catalog_code_customer,
+                catalog=catalog_map,
+            )
             projects_raw = {
                 "schema_version": CANDIDATE_SCHEMA_VERSION,
                 "projects": expanded.get("projects")

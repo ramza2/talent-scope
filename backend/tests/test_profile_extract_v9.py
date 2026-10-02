@@ -145,28 +145,25 @@ def _compact_projects_mo(count: int = 7) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def test_profile_extract_registry_current_is_v9_compact() -> None:
+def test_profile_extract_registry_v9_remains_staged_compact_historical() -> None:
+    """v9 stays resolvable as historical staged+compact; current may advance."""
     from app.ai.prompts import profile_extract_v8 as v8
     from app.ai.prompts import profile_extract_v9 as v9
-    from app.ai.prompts.profile_extract import (
-        CURRENT_PROFILE_PROMPT_VERSION,
-        current_profile_prompt,
-        resolve_profile_prompt,
-    )
-
-    assert CURRENT_PROFILE_PROMPT_VERSION == "profile-extract-v9"
-    cur = current_profile_prompt()
-    assert cur.prompt_version == "profile-extract-v9"
-    assert cur.extraction_mode == "staged"
-    assert cur.compact_protocol is True
+    from app.ai.prompts.profile_extract import resolve_profile_prompt
 
     v8_spec = resolve_profile_prompt("profile-extract-v8")
     assert v8_spec.extraction_mode == "staged"
     assert v8_spec.compact_protocol is True
     assert v8_spec.core_system_prompt == v8.CORE_SYSTEM_PROMPT
+    assert v8_spec.strict_relation_evidence is False
+    assert v8_spec.derive_project_duration is False
 
     v9_spec = resolve_profile_prompt("profile-extract-v9")
+    assert v9_spec.extraction_mode == "staged"
+    assert v9_spec.compact_protocol is True
     assert v9_spec.core_system_prompt == v9.CORE_SYSTEM_PROMPT
+    assert v9_spec.strict_relation_evidence is False
+    assert v9_spec.derive_project_duration is False
     assert v9.COMPACT_PROTOCOL is True
 
 
@@ -281,7 +278,6 @@ def test_production_root_d_alias_duration_omitted_seven_projects() -> None:
 
 
 def test_v9_happy_path_seven_projects_with_mo(db_session):
-    from app.ai.prompts.profile_extract import CURRENT_PROFILE_PROMPT_VERSION
     from app.modules.analysis.service import AnalysisService
     from app.storage.s3 import get_object_storage
     from tests.test_analysis import (
@@ -293,7 +289,6 @@ def test_v9_happy_path_seven_projects_with_mo(db_session):
         _seed_person_doc,
     )
 
-    assert CURRENT_PROFILE_PROMPT_VERSION == "profile-extract-v9"
     admin = _create_user(
         db_session, login_id=f"v9_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
     )
@@ -305,7 +300,12 @@ def test_v9_happy_path_seven_projects_with_mo(db_session):
         doc_type_name="이력서",
         page_text=_RICH_PAGE_TEXT + " AD SEP NAC",
     )
-    run = _queue_run(db_session, person.id, document.id)
+    run = _queue_run(
+        db_session,
+        person.id,
+        document.id,
+        prompt_version="profile-extract-v9",
+    )
     assert run.prompt_version == "profile-extract-v9"
 
     llm = _StagedSequenceLLM([_compact_core_payload(), _compact_projects_mo(7)])
@@ -345,7 +345,12 @@ def test_v9_call_budget_two_primary_calls(db_session):
         doc_type_name="이력서",
         page_text=_RICH_PAGE_TEXT,
     )
-    run = _queue_run(db_session, person.id, document.id)
+    run = _queue_run(
+        db_session,
+        person.id,
+        document.id,
+        prompt_version="profile-extract-v9",
+    )
     llm = _StagedSequenceLLM([_compact_core_payload(), _compact_projects_mo(3)])
     service = AnalysisService(db_session, storage=get_object_storage(), llm=llm)
     assert service.run_analysis(run.id) == "REVIEWING"
