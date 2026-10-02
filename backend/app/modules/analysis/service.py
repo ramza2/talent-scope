@@ -871,7 +871,7 @@ class AnalysisService:
         base_log: dict[str, Any],
         vlm_pages: int,
     ) -> ProfileCandidateDocument:
-        """v8 compact staged extraction: aliases + short keys; max 1 recovery."""
+        """Compact staged extraction (v8+): aliases + short keys; max 1 recovery."""
         if (
             prompt.build_core_user_prompt is None
             or prompt.build_projects_user_prompt is None
@@ -889,11 +889,13 @@ class AnalysisService:
         projects_catalog = self._format_code_catalog(
             codes, aliases, code_types=PROJECTS_CATALOG_TYPES
         )
+        compact_tag = prompt.prompt_version.rsplit("-", 1)[-1]
 
         logger.info(
-            "analysis compact protocol analysis_run_id=%s compact_protocol=v8 "
+            "analysis compact protocol analysis_run_id=%s compact_protocol=%s "
             "doc_alias_count=%s document_count=%s",
             base_log.get("analysis_run_id"),
+            compact_tag,
             len(alias_to_id),
             base_log.get("document_count"),
         )
@@ -926,7 +928,7 @@ class AnalysisService:
                     "phase": phase,
                     "attempt": call_count,
                     "recovery_retry": recovery_retry,
-                    "compact_protocol": "v8",
+                    "compact_protocol": compact_tag,
                     "doc_alias_count": len(alias_to_id),
                 },
             )
@@ -937,12 +939,13 @@ class AnalysisService:
             top_keys = raw_candidate_top_level_keys(raw)
             logger.info(
                 "analysis llm raw shape analysis_run_id=%s phase=%s attempt=%s "
-                "document_count=%s compact_protocol=v8 raw_key_count=%s "
+                "document_count=%s compact_protocol=%s raw_key_count=%s "
                 "raw_top_level_keys=%s",
                 base_log.get("analysis_run_id"),
                 phase,
                 call_count,
                 base_log.get("document_count"),
+                compact_tag,
                 len(raw),
                 top_keys,
             )
@@ -971,10 +974,11 @@ class AnalysisService:
             except AIResponseTruncatedError as trunc_exc:
                 logger.info(
                     "analysis llm truncated analysis_run_id=%s phase=%s "
-                    "document_count=%s compact_protocol=v8 meta=%s",
+                    "document_count=%s compact_protocol=%s meta=%s",
                     base_log.get("analysis_run_id"),
                     phase,
                     base_log.get("document_count"),
+                    compact_tag,
                     trunc_exc.meta,
                 )
                 if recovery_budget <= 0:
@@ -1061,11 +1065,12 @@ class AnalysisService:
             fail_closed_if_bad=True,
         )
         logger.info(
-            "analysis candidate quality run_id=%s phase=core compact_protocol=v8 "
+            "analysis candidate quality run_id=%s phase=core compact_protocol=%s "
             "document_count=%s vlm_pages=%s empty=%s sparse=%s quality_score=%s "
             "skills=%s expertise=%s jobs=%s employment=%s education=%s "
             "certifications=%s projects=%s",
             base_log.get("analysis_run_id"),
+            compact_tag,
             base_log.get("document_count"),
             vlm_pages,
             candidate_is_empty(core),
@@ -1093,8 +1098,9 @@ class AnalysisService:
         )
         logger.info(
             "analysis candidate quality run_id=%s phase=projects "
-            "compact_protocol=v8 document_count=%s vlm_pages=%s project_count=%s",
+            "compact_protocol=%s document_count=%s vlm_pages=%s project_count=%s",
             base_log.get("analysis_run_id"),
+            compact_tag,
             base_log.get("document_count"),
             vlm_pages,
             len(projects_doc.projects),
@@ -1102,10 +1108,11 @@ class AnalysisService:
 
         merged = core.model_copy(update={"projects": list(projects_doc.projects)})
         logger.info(
-            "analysis staged merge analysis_run_id=%s compact_protocol=v8 "
+            "analysis staged merge analysis_run_id=%s compact_protocol=%s "
             "core_skills=%s core_expertise=%s projects=%s llm_calls=%s "
             "doc_alias_count=%s",
             base_log.get("analysis_run_id"),
+            compact_tag,
             len(merged.skills),
             len(merged.expertise),
             len(merged.projects),

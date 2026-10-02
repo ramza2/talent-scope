@@ -62,6 +62,29 @@ def _set_optional_text(out: dict[str, Any], key: str, value: Any) -> None:
         out[key] = text
 
 
+def _optional_int(value: Any) -> int | None:
+    """Fail-soft optional integer for compact numeric scalars.
+
+    Accepts ``int`` (not bool) and strictly numeric integer strings.
+    Rejects floats, bools, containers, and arbitrary text (e.g. ``D1``).
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        # Strict integer string only (no floats, signs beyond optional +/-, aliases).
+        if text[0] in "+-" and text[1:].isdigit():
+            return int(text)
+        if text.isdigit():
+            return int(text)
+        return None
+    return None
+
+
 def build_document_alias_view(document_blocks: str) -> tuple[str, dict[str, str]]:
     """Replace UUID document headers with D1/D2… aliases for the LLM prompt.
 
@@ -440,8 +463,13 @@ def _expand_project(
     }
     for short, long in text_mapping.items():
         _set_optional_text(out, long, item.get(short))
-    if item.get("d") is not None:
-        out["duration_months"] = item["d"]
+    # v9: mo = duration_months. Legacy v8: d only when a valid integer.
+    # Never treat root d="D1" as a source ref (refs come from r only).
+    duration = _optional_int(item.get("mo"))
+    if duration is None and "mo" not in item:
+        duration = _optional_int(item.get("d"))
+    if duration is not None:
+        out["duration_months"] = duration
     if item.get("f") is not None:
         out["confidence"] = item["f"]
 
