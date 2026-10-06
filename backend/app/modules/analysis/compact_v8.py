@@ -261,10 +261,13 @@ def _expand_skill(item: Any, alias_to_id: dict[str, str]) -> dict[str, Any] | No
     out: dict[str, Any] = {}
     _set_optional_text(out, "raw_value", item.get("v"))
     _set_optional_text(out, "code", item.get("c"))
-    if item.get("y") is not None:
-        out["last_used_year"] = item["y"]
-    if item.get("m") is not None:
-        out["experience_months"] = item["m"]
+    # Fail-soft: omit malformed y/m (e.g. "2012.07") rather than failing validation.
+    year = _optional_int(item.get("y"))
+    if year is not None:
+        out["last_used_year"] = year
+    months = _optional_int(item.get("m"))
+    if months is not None:
+        out["experience_months"] = months
     if item.get("rep") is not None:
         out["is_representative"] = item["rep"]
     if item.get("f") is not None:
