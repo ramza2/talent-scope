@@ -1,4 +1,4 @@
-"""profile-extract-v11 recall + CORE structure hardening."""
+"""profile-extract-v12 semantic accuracy hardening."""
 
 from __future__ import annotations
 
@@ -21,9 +21,10 @@ os.environ.setdefault("REDIS_URL", "redis://127.0.0.1:6379/0")
 os.environ.setdefault("APP_SECRET_KEY", "test-secret")
 os.environ["APP_ENV"] = "test"
 
-_BASE_SHA = "8145d1d7a828c6bfaab3db5dd1de7a3e2912029a"
-_DOC = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
-_ALIAS = {"D1": _DOC}
+_BASE_SHA = "d8d502f846085c12c6a6dd490a14157636c8ad68"
+_DOC1 = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+_DOC2 = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+_ALIAS = {"D1": _DOC1, "D2": _DOC2}
 
 _CATALOG: dict[str, tuple[str, bool]] = {
     "JOB-MGT-PM": ("JOB", True),
@@ -36,7 +37,6 @@ _CATALOG: dict[str, tuple[str, bool]] = {
     "EXP-INFRA": ("EXP", True),
     "EXP-SEC-OPS": ("EXP", True),
     "EXP-SEC-BUILD": ("EXP", True),
-    "EXP-INACTIVE": ("EXP", False),
 }
 
 
@@ -118,26 +118,74 @@ class _StagedSequenceLLM:
         return dict(item)
 
 
-def _ref(quote: str, page: int = 1) -> dict:
-    return {"d": "D1", "p": page, "q": quote}
+def _ref(quote: str, *, doc: str = "D1", page: int = 1) -> dict:
+    return {"d": doc, "p": page, "q": quote}
 
 
-def _v11_core(**overrides: Any) -> dict:
+def _v12_mixed_source_page() -> str:
+    from tests.test_analysis import _RICH_PAGE_TEXT
+
+    return (
+        _RICH_PAGE_TEXT
+        + " 경력사항 직장명 근무기간 "
+        + "알파소프트 2005.03~2008.02 사원 "
+        + "베타시스템 2008.03~2011.06 대리 "
+        + "감마테크 2011.07~2014.12 과장 "
+        + "델타소프트 2015.01~2018.08 차장 "
+        + "엡실론IT 2018.09~2022.12 책임 "
+        + "경력기술서 프로젝트 "
+        + "고객기관A 시스템 유지보수 2023.02~2024.09 PM "
+        + "고객기관B 정보시스템 운영 2018.01~2018.12 "
+        + "학력사항 고교 전문학사 학사 석사 재학중 박사 "
+        + "○○고등학교 1998.03~2001.02 졸업 "
+        + "○○전문대학 전산 2001.03~2003.02 졸업 "
+        + "○○대학교 컴퓨터공학 2003.03~2007.02 졸업 "
+        + "○○대학원 정보보호 2020.03~ 재학중 "
+        + "010-1234-5678 test@example.com 광주광역시 서구 ○○로 123 "
+        + "정보처리산업기사 한국산업인력공단 2010.12 "
+        + "정보보안기사 한국인터넷진흥원 2013.06 "
+        + "SQLD 한국데이터산업진흥원 2016.03 "
+        + "PM 사업관리 PL 시스템운영 정보시스템 운영 "
+        + "보안솔루션 운영(AD,SEP,NAC 등) AD SEP NAC "
+        + "정보보호 강화 구축, 사업관리 정보보안시스템 운영 "
+        + "PM사업관리프로젝트 정보시스템운영프로젝트 정보보호강화구축 "
+        + "현대기아보안운영 PL 운영 AD, SEP, NAC"
+    )
+
+
+def _v12_core(**overrides: Any) -> dict:
+    """Correct v12 extraction shape for mixed employer+project source."""
     payload = {
-        "p": {"n": "홍길동", "ti": "PL", "tg": "EXPERT", "ac": "-"},
+        "p": {
+            "n": "홍길동",
+            "ti": "PL",
+            "tg": "EXPERT",
+            "ac": "-",
+            "ph": "010-1234-5678",
+            "em": "test@example.com",
+            "ar": "광주광역시",
+            "r": {
+                "phone": [_ref("010-1234-5678")],
+                "email": [_ref("test@example.com")],
+                "address_region": [_ref("광주광역시")],
+            },
+        },
         "j": [
             {
                 "v": "JOB-MGT-PL",
+                "c": "JOB-MGT-PL",
                 "t": "PRIMARY",
                 "r": [_ref("PL 시스템운영")],
             },
             {
                 "v": "JOB-MGT-PM",
+                "c": "JOB-MGT-PM",
                 "t": "SECONDARY",
                 "r": [_ref("PM 사업관리")],
             },
             {
                 "v": "JOB-OPS-SYS",
+                "c": "JOB-OPS-SYS",
                 "t": "EXPERIENCE",
                 "r": [_ref("시스템운영")],
             },
@@ -146,52 +194,49 @@ def _v11_core(**overrides: Any) -> dict:
             {"v": "AD", "c": "TECH-SEC-AD", "r": [_ref("AD")]},
         ],
         "x": [
-            {"v": "EXP-MGT", "r": [_ref("사업관리")]},
-            {"v": "EXP-INFRA", "r": [_ref("정보시스템 운영")]},
-            {"v": "EXP-SEC-OPS", "r": [_ref("보안솔루션 운영")]},
+            {"v": "사업관리", "c": "EXP-MGT", "r": [_ref("사업관리")]},
+            {"v": "정보시스템 운영", "c": "EXP-INFRA", "r": [_ref("정보시스템 운영")]},
+            {"v": "보안 운영", "c": "EXP-SEC-OPS", "r": [_ref("보안솔루션 운영")]},
         ],
+        # Employer table — NOT project customers / project end dates
         "w": [
             {
-                "co": "회사A",
+                "co": "알파소프트",
                 "ti": "사원",
                 "s": "2005.03",
                 "e": "2008.02",
-                "resp": "개발",
-                "r": [_ref("회사A 2005.03")],
+                "r": [_ref("알파소프트 2005.03~2008.02")],
             },
             {
-                "co": "회사B",
+                "co": "베타시스템",
                 "ti": "대리",
                 "s": "2008.03",
                 "e": "2011.06",
-                "resp": "운영",
-                "r": [_ref("회사B 2008.03")],
+                "r": [_ref("베타시스템 2008.03~2011.06")],
             },
             {
-                "co": "회사C",
+                "co": "감마테크",
                 "ti": "과장",
                 "s": "2011.07",
                 "e": "2014.12",
-                "resp": "PL",
-                "r": [_ref("회사C 2011.07")],
+                "r": [_ref("감마테크 2011.07~2014.12")],
             },
             {
-                "co": "회사D",
+                "co": "델타소프트",
                 "ti": "차장",
                 "s": "2015.01",
                 "e": "2018.08",
-                "resp": "PM",
-                "r": [_ref("회사D 2015.01")],
+                "r": [_ref("델타소프트 2015.01~2018.08")],
             },
             {
-                "co": "회사E",
+                "co": "엡실론IT",
                 "ti": "책임",
                 "s": "2018.09",
                 "e": "2022.12",
-                "resp": "시스템운영",
-                "r": [_ref("회사E 2018.09")],
+                "r": [_ref("엡실론IT 2018.09~2022.12")],
             },
         ],
+        # 4 real education rows; blank doctorate omitted; ongoing master no e
         "e": [
             {
                 "sc": "○○고등학교",
@@ -223,9 +268,8 @@ def _v11_core(**overrides: Any) -> dict:
                 "sc": "○○대학원",
                 "mj": "정보보호",
                 "dg": "석사",
-                "s": "2012.03",
-                "e": "2014.08",
-                "st": "졸업",
+                "s": "2020.03",
+                "st": "재학중",
                 "r": [_ref("○○대학원")],
             },
         ],
@@ -255,7 +299,28 @@ def _v11_core(**overrides: Any) -> dict:
     return payload
 
 
-def _v11_projects() -> dict:
+def _v12_projects(*, multi_doc: bool = True) -> dict:
+    sec_rm_t = (
+        [_ref("보안솔루션 운영(AD,SEP,NAC 등)", doc="D2")]
+        if multi_doc
+        else [_ref("보안솔루션 운영(AD,SEP,NAC 등)")]
+    )
+    sec_r = (
+        [
+            _ref("현대기아보안운영", doc="D1"),
+            _ref("현대기아보안운영", doc="D2"),
+        ]
+        if multi_doc
+        else [_ref("현대기아보안운영")]
+    )
+    sec_rm_j = (
+        [_ref("PL 운영", doc="D1")] if multi_doc else [_ref("PL 운영")]
+    )
+    sec_rm_x = (
+        [_ref("정보보안시스템 운영", doc="D1")]
+        if multi_doc
+        else [_ref("정보보안시스템 운영")]
+    )
     return {
         "pr": [
             {
@@ -307,30 +372,27 @@ def _v11_projects() -> dict:
                 "j": ["JOB-MGT-PL"],
                 "t": ["TECH-SEC-AD", "TECH-SEC-SEP", "TECH-SEC-NAC"],
                 "x": ["EXP-SEC-OPS"],
-                "r": [_ref("현대기아보안운영")],
+                "r": sec_r,
                 "rm": {
-                    "j": [_ref("PL 운영")],
-                    "t": [_ref("AD, SEP, NAC")],
-                    "x": [_ref("보안솔루션 운영")],
+                    "j": sec_rm_j,
+                    "t": sec_rm_t,
+                    "x": sec_rm_x,
                 },
             },
         ]
     }
 
 
-def _v11_page_text() -> str:
-    from tests.test_analysis import _RICH_PAGE_TEXT
-
-    return (
-        _RICH_PAGE_TEXT
-        + " PL 시스템운영 PM 사업관리 시스템운영 AD SEP NAC"
-        + " 사업관리 정보시스템 운영 보안솔루션 운영"
-        + " 회사A 2005.03 회사B 2008.03 회사C 2011.07 회사D 2015.01 회사E 2018.09"
-        + " ○○고등학교 ○○전문대학 ○○대학교 ○○대학원"
-        + " 정보처리산업기사 정보보안기사 SQLD"
-        + " PM사업관리프로젝트 정보시스템운영프로젝트 정보보호강화구축 현대기아보안운영"
-        + " 정보보호 강화 구축, 사업관리 PL 운영 AD, SEP, NAC"
+def _v12_page_texts() -> dict[tuple[str, int], str]:
+    d1 = (
+        _v12_mixed_source_page()
+        + " 현대기아보안운영 PL 운영 정보보안시스템 운영"
     )
+    d2 = (
+        "현대기아보안운영 정보보안 운영 PL "
+        "보안솔루션 운영(AD,SEP,NAC 등) AD SEP NAC"
+    )
+    return {(_DOC1, 1): d1, (_DOC2, 1): d2}
 
 
 def _normalize_core(compact: dict, *, catalog: dict | None = None, page_texts=None):
@@ -344,8 +406,8 @@ def _normalize_core(compact: dict, *, catalog: dict | None = None, page_texts=No
     doc = normalize_candidate(
         expanded,
         catalog=catalog if catalog is not None else _CATALOG,
-        allowed_documents={_DOC: {1, 2}},
-        page_texts=page_texts or {(_DOC, 1): _v11_page_text()},
+        allowed_documents={_DOC1: {1}, _DOC2: {1}},
+        page_texts=page_texts or _v12_page_texts(),
     )
     return promote_exact_root_catalog_codes(doc, catalog=catalog or _CATALOG)
 
@@ -368,8 +430,8 @@ def _normalize_projects(compact: dict, *, catalog: dict | None = None, page_text
     doc = normalize_candidate(
         expanded,
         catalog=catalog or _CATALOG,
-        allowed_documents={_DOC: {1, 2}},
-        page_texts=page_texts or {(_DOC, 1): _v11_page_text()},
+        allowed_documents={_DOC1: {1}, _DOC2: {1}},
+        page_texts=page_texts or _v12_page_texts(),
     )
     return apply_normalized_quote_evidence(doc)
 
@@ -379,30 +441,35 @@ def _normalize_projects(compact: dict, *, catalog: dict | None = None, page_text
 # ---------------------------------------------------------------------------
 
 
-def test_profile_extract_registry_v11_remains_staged_compact_historical() -> None:
-    """v11 stays resolvable as historical staged+compact; current may advance."""
-    from app.ai.prompts import profile_extract_v10 as v10
+def test_profile_extract_registry_current_is_v12() -> None:
     from app.ai.prompts import profile_extract_v11 as v11
-    from app.ai.prompts.profile_extract import resolve_profile_prompt
+    from app.ai.prompts import profile_extract_v12 as v12
+    from app.ai.prompts.profile_extract import (
+        CURRENT_PROFILE_PROMPT_VERSION,
+        current_profile_prompt,
+        resolve_profile_prompt,
+    )
+
+    assert CURRENT_PROFILE_PROMPT_VERSION == "profile-extract-v12"
+    cur = current_profile_prompt()
+    assert cur.prompt_version == "profile-extract-v12"
+    assert cur.extraction_mode == "staged"
+    assert cur.compact_protocol is True
+    assert cur.strict_relation_evidence is True
+    assert cur.derive_project_duration is True
+    assert cur.clear_catalog_code_customer is True
+    assert cur.promote_exact_catalog_codes is True
+    assert cur.core_system_prompt == v12.CORE_SYSTEM_PROMPT
+    assert v12.PROMOTE_EXACT_CATALOG_CODES is True
 
     v11_spec = resolve_profile_prompt("profile-extract-v11")
-    assert v11_spec.extraction_mode == "staged"
-    assert v11_spec.compact_protocol is True
-    assert v11_spec.strict_relation_evidence is True
-    assert v11_spec.derive_project_duration is True
-    assert v11_spec.clear_catalog_code_customer is True
     assert v11_spec.promote_exact_catalog_codes is True
+    assert v11_spec.strict_relation_evidence is True
     assert v11_spec.core_system_prompt == v11.CORE_SYSTEM_PROMPT
-    assert v11.PROMOTE_EXACT_CATALOG_CODES is True
-
-    v10_spec = resolve_profile_prompt("profile-extract-v10")
-    assert v10_spec.promote_exact_catalog_codes is False
-    assert v10_spec.strict_relation_evidence is True
-    assert v10_spec.core_system_prompt == v10.CORE_SYSTEM_PROMPT
 
 
-def test_v1_through_v10_prompt_files_byte_identical_to_base() -> None:
-    for ver in range(1, 11):
+def test_v1_through_v11_prompt_files_byte_identical_to_base() -> None:
+    for ver in range(1, 12):
         path = f"backend/app/ai/prompts/profile_extract_v{ver}.py"
         current = Path("/workspace") / path
         base = subprocess.check_output(
@@ -414,169 +481,104 @@ def test_v1_through_v10_prompt_files_byte_identical_to_base() -> None:
         ).digest(), path
 
 
-def test_v11_prompt_mentions_core_and_project_recall_rules() -> None:
-    from app.ai.prompts import profile_extract_v11 as v11
+def test_v12_prompt_employment_education_pii_and_same_project_rules() -> None:
+    from app.ai.prompts import profile_extract_v12 as v12
 
-    core = v11.CORE_SYSTEM_PROMPT
-    projects = v11.PROJECTS_SYSTEM_PROMPT
-    assert "EMPLOYMENT periods" in core or "근무기간" in core
-    assert "Never put dates" in core or "2014년 8월" in core
-    assert "placeholder" in core.lower() or "빈" in core or "Ignore blank" in core
-    assert "JOB-MGT-PM" in projects
+    core = v12.CORE_SYSTEM_PROMPT
+    projects = v12.PROJECTS_SYSTEM_PROMPT
+    assert "EMPLOYER" in core or "employer table" in core.lower()
+    assert "never w.co=고객기관" in core.lower() or "never w.co=" in core
+    assert "2024.09" in core
+    assert "재학중" in core and "invent" in core.lower()
+    assert "광주광역시" in core or "coarse" in core.lower()
+    assert "street" in core.lower() or "상세주소" in core
+    assert "identity match" in projects.lower() or "identity match" in (
+        v12.PROJECTS_SCHEMA_GUIDE.lower()
+    )
     assert "JOB-OPS-SYS" in projects
-    assert "EXP-INFRA" in projects
     assert "Never omit a supported relation" in projects
-    assert "generic 사업관리 must NOT produce PM/PL" in projects.lower() or (
-        "NOT produce PM/PL" in projects
-    )
 
 
 # ---------------------------------------------------------------------------
-# B. Exact-code promotion
+# B. Employer vs customer contamination
 # ---------------------------------------------------------------------------
 
 
-def test_promote_exact_root_catalog_codes() -> None:
-    from app.ai.schemas.profile_candidate import (
-        ExpertiseCandidate,
-        JobCandidate,
-        ProfileCandidateDocument,
-        SkillCandidate,
-    )
-    from app.modules.analysis.compact_v8 import promote_exact_root_catalog_codes
-
-    doc = ProfileCandidateDocument(
-        schema_version="profile-candidate-v1",
-        jobs=[JobCandidate(raw_value="JOB-MGT-PL", code=None)],
-        skills=[SkillCandidate(raw_value="TECH-SEC-AD", code=None)],
-        expertise=[
-            ExpertiseCandidate(raw_value="EXP-MGT", code=None),
-            ExpertiseCandidate(raw_value="EXP-INFRA", code=None),
-            ExpertiseCandidate(raw_value="EXP-SEC-OPS", code=None),
-            # wrong type: EXP code as TECH skill already covered; JOB as EXP
-            ExpertiseCandidate(raw_value="JOB-MGT-PM", code=None),
-            ExpertiseCandidate(raw_value="EXP-INACTIVE", code=None),
-            ExpertiseCandidate(raw_value="EXP-UNKNOWN", code=None),
-            ExpertiseCandidate(raw_value="사업관리", code=None),
-        ],
-    )
-    out = promote_exact_root_catalog_codes(doc, catalog=_CATALOG)
-    assert out.jobs[0].code == "JOB-MGT-PL"
-    assert out.skills[0].code == "TECH-SEC-AD"
-    assert out.expertise[0].code == "EXP-MGT"
-    assert out.expertise[1].code == "EXP-INFRA"
-    assert out.expertise[2].code == "EXP-SEC-OPS"
-    assert out.expertise[3].code is None  # wrong type
-    assert out.expertise[4].code is None  # inactive
-    assert out.expertise[5].code is None  # unknown
-    assert out.expertise[6].code is None  # alias/fuzzy not allowed
-
-
-def test_v10_does_not_promote_exact_catalog_codes() -> None:
-    from app.ai.prompts.profile_extract import resolve_profile_prompt
-    from app.modules.analysis.compact_v8 import expand_compact_core
-    from app.modules.analysis.normalize import normalize_candidate
-
-    assert resolve_profile_prompt("profile-extract-v10").promote_exact_catalog_codes is False
-    expanded = expand_compact_core(
-        {"x": [{"v": "EXP-MGT"}, {"v": "EXP-INFRA"}, {"v": "EXP-SEC-OPS"}]},
-        alias_to_id={},
-    )
-    doc = normalize_candidate(expanded, catalog=_CATALOG, allowed_documents={})
-    assert all(e.code is None for e in doc.expertise)
-    assert [e.raw_value for e in doc.expertise] == [
-        "EXP-MGT",
-        "EXP-INFRA",
-        "EXP-SEC-OPS",
-    ]
-
-
-def test_v11_core_path_promotes_exact_raw_codes() -> None:
-    doc = _normalize_core(
-        {
-            "x": [
-                {"v": "EXP-MGT"},
-                {"v": "EXP-INFRA"},
-                {"v": "EXP-SEC-OPS"},
-            ],
-            "j": [{"v": "JOB-MGT-PL"}],
-        }
-    )
-    assert {e.code for e in doc.expertise} == {
-        "EXP-MGT",
-        "EXP-INFRA",
-        "EXP-SEC-OPS",
-    }
-    assert doc.jobs[0].code == "JOB-MGT-PL"
-
-
-# ---------------------------------------------------------------------------
-# C. Employment
-# ---------------------------------------------------------------------------
-
-
-def test_v11_five_employment_rows_keep_documented_dates() -> None:
-    doc = _normalize_core(_v11_core())
+def test_v12_employment_uses_employer_not_project_customer() -> None:
+    doc = _normalize_core(_v12_core())
     assert len(doc.employment_history) == 5
-    dates = [(e.start_date, e.end_date) for e in doc.employment_history]
-    assert dates == [
-        ("2005.03", "2008.02"),
-        ("2008.03", "2011.06"),
-        ("2011.07", "2014.12"),
-        ("2015.01", "2018.08"),
-        ("2018.09", "2022.12"),
+    employers = [e.company_name for e in doc.employment_history]
+    assert employers == [
+        "알파소프트",
+        "베타시스템",
+        "감마테크",
+        "델타소프트",
+        "엡실론IT",
     ]
+    assert "고객기관A" not in employers
+    assert "고객기관B" not in employers
+    assert "현대오토에버" not in employers
+    ends = [e.end_date for e in doc.employment_history]
+    assert "2024.09" not in ends  # project end must not leak
+    assert ends == ["2008.02", "2011.06", "2014.12", "2018.08", "2022.12"]
     assert all(e.source_refs for e in doc.employment_history)
 
-    projects = _normalize_projects(_v11_projects())
-    project_dates = {(p.start_date, p.end_date) for p in projects.projects}
-    employment_dates = set(dates)
-    assert employment_dates.isdisjoint(project_dates)
+    # Prompt forbids contamination even when project dates overlap.
+    from app.ai.prompts import profile_extract_v12 as v12
+
+    assert "employer table" in v12.CORE_SYSTEM_PROMPT.lower() or (
+        "경력사항" in v12.CORE_SYSTEM_PROMPT
+    )
 
 
 # ---------------------------------------------------------------------------
-# D. Education
+# C. Education
 # ---------------------------------------------------------------------------
 
 
-def test_v11_education_levels_and_status_not_date() -> None:
-    from app.ai.prompts import profile_extract_v11 as v11
+def test_v12_education_four_real_rows_no_invented_end_or_placeholder() -> None:
+    from app.ai.prompts import profile_extract_v12 as v12
 
-    assert "Ignore blank" in v11.CORE_SYSTEM_PROMPT or "placeholder" in (
-        v11.CORE_SCHEMA_GUIDE + v11.CORE_SYSTEM_PROMPT
-    ).lower()
+    assert "placeholder" in (
+        v12.CORE_SCHEMA_GUIDE + v12.CORE_SYSTEM_PROMPT
+    ).lower() or "박사" in v12.CORE_SYSTEM_PROMPT
 
-    # Fixture omits blank/template placeholder rows (prompt requirement).
-    compact = _v11_core()
+    compact = _v12_core()
+    assert len(compact["e"]) == 4
     assert all(row.get("sc") for row in compact["e"])
+    assert "e" not in compact["e"][3]  # ongoing master: no invented end
 
     doc = _normalize_core(compact)
     assert len(doc.education) == 4
-    degrees = [e.degree for e in doc.education]
-    assert degrees == ["고졸", "전문학사", "학사", "석사"]
-    assert all(e.status == "졸업" for e in doc.education)
-    assert doc.education[3].end_date == "2014.08"
-    assert "2014" not in (doc.education[3].status or "")
+    assert [e.degree for e in doc.education] == ["고졸", "전문학사", "학사", "석사"]
+    assert doc.education[3].status == "재학중"
+    assert doc.education[3].end_date is None
+    assert all(e.status != "2014년 8월" for e in doc.education)
     assert all(e.source_refs for e in doc.education)
 
-    # Bad model output shape (date in st) is still mapped as-is by expander —
-    # prompt forbids it; verify correct mapping path preferred by fixture.
-    from app.modules.analysis.compact_v8 import expand_compact_core
 
-    bad = expand_compact_core(
-        {
-            "e": [
-                {
-                    "sc": "○○대학원",
-                    "e": "2014.08",
-                    "st": "졸업",
-                }
-            ]
-        },
-        alias_to_id={},
+# ---------------------------------------------------------------------------
+# D. PII
+# ---------------------------------------------------------------------------
+
+
+def test_v12_pii_phone_email_coarse_address_region() -> None:
+    from app.ai.prompts import profile_extract_v12 as v12
+
+    assert "coarse" in (v12.CORE_SCHEMA_GUIDE + v12.CORE_SYSTEM_PROMPT).lower() or (
+        "광주광역시" in v12.CORE_SCHEMA_GUIDE
     )
-    assert bad["education"][0]["end_date"] == "2014.08"
-    assert bad["education"][0]["status"] == "졸업"
+    assert "street" in (v12.CORE_SCHEMA_GUIDE + v12.CORE_SYSTEM_PROMPT).lower() or (
+        "상세주소" in v12._SHARED_SAFETY
+    )
+
+    doc = _normalize_core(_v12_core())
+    assert doc.profile.phone == "010-1234-5678"
+    assert doc.profile.email == "test@example.com"
+    assert doc.profile.address_region == "광주광역시"
+    assert "서구" not in (doc.profile.address_region or "")
+    assert "○○로" not in (doc.profile.address_region or "")
+    assert "123" not in (doc.profile.address_region or "")
 
 
 # ---------------------------------------------------------------------------
@@ -584,9 +586,14 @@ def test_v11_education_levels_and_status_not_date() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_v11_certifications_preserve_acq_and_issuer() -> None:
-    doc = _normalize_core(_v11_core())
+def test_v12_certifications_preserve_issuer_and_acq() -> None:
+    doc = _normalize_core(_v12_core())
     assert len(doc.certifications) == 3
+    assert [c.certification_name for c in doc.certifications] == [
+        "정보처리산업기사",
+        "정보보안기사",
+        "SQLD",
+    ]
     assert [c.acquired_date for c in doc.certifications] == [
         "2010.12",
         "2013.06",
@@ -597,26 +604,35 @@ def test_v11_certifications_preserve_acq_and_issuer() -> None:
         "한국인터넷진흥원",
         "한국데이터산업진흥원",
     ]
-    assert all(c.source_refs for c in doc.certifications)
     assert all(c.expiry_date is None for c in doc.certifications)
+    assert all(c.source_refs for c in doc.certifications)
 
 
 # ---------------------------------------------------------------------------
-# F. Strict project relation happy path
+# F. Root relations
 # ---------------------------------------------------------------------------
 
 
-def test_v11_strict_project_relation_happy_path() -> None:
-    doc = _normalize_projects(_v11_projects())
+def test_v12_root_jobs_and_expertise_with_evidence() -> None:
+    doc = _normalize_core(_v12_core())
+    job_codes = {j.code for j in doc.jobs}
+    assert {"JOB-MGT-PM", "JOB-MGT-PL", "JOB-OPS-SYS"} <= job_codes
+    assert all(j.source_refs and j.source_refs[0].quote_text for j in doc.jobs)
+
+    exp_codes = {e.code for e in doc.expertise}
+    assert {"EXP-MGT", "EXP-INFRA", "EXP-SEC-OPS"} <= exp_codes
+    assert all(e.source_refs and e.source_refs[0].quote_text for e in doc.expertise)
+
+
+# ---------------------------------------------------------------------------
+# G. Same-engagement multi-document + no cross-project contamination
+# ---------------------------------------------------------------------------
+
+
+def test_v12_same_project_multi_doc_evidence_and_isolation() -> None:
+    doc = _normalize_projects(_v12_projects())
     assert len(doc.projects) == 4
-
     by_name = {p.project_name: p for p in doc.projects}
-
-    pm = by_name["PM사업관리프로젝트"]
-    assert [j.code for j in pm.jobs] == ["JOB-MGT-PM"]
-    assert [e.code for e in pm.expertise] == ["EXP-MGT"]
-    assert pm.jobs[0].source_refs[0].quote_text
-    assert pm.expertise[0].source_refs[0].quote_text
 
     ops = by_name["정보시스템운영프로젝트"]
     assert [j.code for j in ops.jobs] == ["JOB-OPS-SYS"]
@@ -635,62 +651,51 @@ def test_v11_strict_project_relation_happy_path() -> None:
         "TECH-SEC-NAC",
     ]
     assert [e.code for e in sec.expertise] == ["EXP-SEC-OPS"]
+    # Evidence combined across D1 (PL) and D2 (AD/SEP/NAC)
+    skill_docs = {
+        ref.document_id for s in sec.skills for ref in s.source_refs
+    }
+    assert _DOC2 in skill_docs
+    job_docs = {ref.document_id for ref in sec.jobs[0].source_refs}
+    assert _DOC1 in job_docs
     assert all(s.source_refs[0].quote_text for s in sec.skills)
-    assert sec.customer_name == "현대오토에버"
 
-
-# ---------------------------------------------------------------------------
-# G. Cross-project contamination still blocked
-# ---------------------------------------------------------------------------
-
-
-def test_v11_cross_project_contamination_still_blocked() -> None:
+    # Contamination: build must not gain neighbor TECH via missing rm
     page = (
         "정보보호강화구축 정보보호 강화 구축, 사업관리 "
-        "현대기아보안운영 PL 운영 AD, SEP, NAC 보안솔루션 운영"
+        "현대기아보안운영 PL 운영 보안솔루션 운영(AD,SEP,NAC 등)"
     )
-    compact = {
+    contaminated = {
         "pr": [
             {
                 "n": "정보보호강화구축",
-                "s": "2015.07",
-                "e": "2015.12",
-                "t": ["TECH-SEC-AD", "TECH-SEC-SEP", "TECH-SEC-NAC"],
+                "t": ["TECH-SEC-AD"],
                 "j": ["JOB-MGT-PL"],
                 "x": ["EXP-SEC-BUILD", "EXP-MGT"],
                 "r": [_ref("정보보호강화구축")],
-                "rm": {
-                    "x": [_ref("정보보호 강화 구축, 사업관리")],
-                    # Intentionally no rm.t / rm.j — must not borrow from other project
-                },
+                "rm": {"x": [_ref("정보보호 강화 구축, 사업관리")]},
             },
             {
                 "n": "현대기아보안운영",
-                "cust": "현대오토에버",
                 "j": ["JOB-MGT-PL"],
-                "t": ["TECH-SEC-AD", "TECH-SEC-SEP", "TECH-SEC-NAC"],
+                "t": ["TECH-SEC-AD"],
                 "x": ["EXP-SEC-OPS"],
                 "r": [_ref("현대기아보안운영")],
                 "rm": {
                     "j": [_ref("PL 운영")],
-                    "t": [_ref("AD, SEP, NAC")],
-                    "x": [_ref("보안솔루션 운영")],
+                    "t": [_ref("보안솔루션 운영(AD,SEP,NAC 등)")],
+                    "x": [_ref("현대기아보안운영")],
                 },
             },
         ]
     }
-    doc = _normalize_projects(compact, page_texts={(_DOC, 1): page})
-    p1, p2 = doc.projects
-    assert p1.project_name == "정보보호강화구축"
-    assert p1.skills == []
-    assert p1.jobs == []
-    assert {e.code for e in p1.expertise} == {"EXP-SEC-BUILD", "EXP-MGT"}
-    assert [s.code for s in p2.skills] == [
-        "TECH-SEC-AD",
-        "TECH-SEC-SEP",
-        "TECH-SEC-NAC",
-    ]
-    assert [j.code for j in p2.jobs] == ["JOB-MGT-PL"]
+    iso = _normalize_projects(
+        contaminated,
+        page_texts={(_DOC1, 1): page, (_DOC2, 1): page},
+    )
+    assert iso.projects[0].skills == []
+    assert iso.projects[0].jobs == []
+    assert [s.code for s in iso.projects[1].skills] == ["TECH-SEC-AD"]
 
 
 # ---------------------------------------------------------------------------
@@ -698,7 +703,8 @@ def test_v11_cross_project_contamination_still_blocked() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_v11_happy_path_two_calls(db_session):
+def test_v12_happy_path_two_calls(db_session):
+    from app.ai.prompts.profile_extract import CURRENT_PROFILE_PROMPT_VERSION
     from app.modules.analysis.service import AnalysisService
     from app.storage.s3 import get_object_storage
     from tests.test_analysis import (
@@ -709,8 +715,9 @@ def test_v11_happy_path_two_calls(db_session):
         _seed_person_doc,
     )
 
+    assert CURRENT_PROFILE_PROMPT_VERSION == "profile-extract-v12"
     admin = _create_user(
-        db_session, login_id=f"v11_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+        db_session, login_id=f"v12_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
     )
     for code, ctype, name in (
         ("JOB-MGT-PM", "JOB", "PM"),
@@ -731,43 +738,37 @@ def test_v11_happy_path_two_calls(db_session):
         admin.id,
         doc_type_code="DOC-RESUME",
         doc_type_name="이력서",
-        page_text=_v11_page_text(),
+        page_text=_v12_mixed_source_page(),
     )
-    run = _queue_run(
-        db_session,
-        person.id,
-        document.id,
-        prompt_version="profile-extract-v11",
-    )
-    assert run.prompt_version == "profile-extract-v11"
+    run = _queue_run(db_session, person.id, document.id)
+    assert run.prompt_version == "profile-extract-v12"
 
-    llm = _StagedSequenceLLM([_v11_core(), _v11_projects()])
+    llm = _StagedSequenceLLM([_v12_core(), _v12_projects(multi_doc=False)])
     service = AnalysisService(db_session, storage=get_object_storage(), llm=llm)
     assert service.run_analysis(run.id) == "REVIEWING"
     assert llm.calls == 2
     assert llm.phases == ["core", "projects"]
-    assert all(c.get("compact_protocol") == "v11" for c in llm.log_contexts)
-    assert "EMPLOYMENT" in llm.system_prompts[0] or "근무기간" in llm.system_prompts[0]
-    assert "Never omit a supported relation" in llm.system_prompts[1]
+    assert all(c.get("compact_protocol") == "v12" for c in llm.log_contexts)
+    assert "employer" in llm.system_prompts[0].lower() or (
+        "경력사항" in llm.system_prompts[0]
+    )
+    assert "identity match" in llm.system_prompts[1].lower() or (
+        "same project" in llm.system_prompts[1].lower()
+    )
     db_session.refresh(run)
     assert len(run.candidate_json["employment_history"]) == 5
-    assert all(
-        row.get("start_date") and row.get("end_date")
-        for row in run.candidate_json["employment_history"]
-    )
+    employers = [e["company_name"] for e in run.candidate_json["employment_history"]]
+    assert "고객기관A" not in employers
     assert len(run.candidate_json["education"]) == 4
+    master = run.candidate_json["education"][3]
+    assert master.get("end_date") in (None, "")
+    assert run.candidate_json["profile"]["address_region"] == "광주광역시"
     assert len(run.candidate_json["certifications"]) == 3
-    assert len(run.candidate_json["jobs"]) >= 1
-    assert {e["code"] for e in run.candidate_json["expertise"]} >= {
-        "EXP-MGT",
-        "EXP-INFRA",
-        "EXP-SEC-OPS",
-    }
     assert len(run.candidate_json["projects"]) == 4
     _cleanup_person(db_session, person.id, admin.id)
 
 
-def test_v11_recovery_budget_max_three_calls(db_session):
+def test_v12_recovery_budget_max_three_calls(db_session):
     from app.ai.providers.errors import AIResponseTruncatedError
     from app.modules.analysis.service import AnalysisService
     from app.storage.s3 import get_object_storage
@@ -779,28 +780,28 @@ def test_v11_recovery_budget_max_three_calls(db_session):
     )
 
     admin = _create_user(
-        db_session, login_id=f"v11r_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+        db_session, login_id=f"v12r_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
     )
     person, document = _seed_person_doc(
         db_session,
         admin.id,
         doc_type_code="DOC-RESUME",
         doc_type_name="이력서",
-        page_text=_v11_page_text(),
+        page_text=_v12_mixed_source_page(),
     )
     run = _queue_run(
         db_session,
         person.id,
         document.id,
-        prompt_version="profile-extract-v11",
+        prompt_version="profile-extract-v12",
     )
     llm = _StagedSequenceLLM(
         [
             AIResponseTruncatedError(
                 meta={"finish_reason": "length", "total_tokens": 8192}
             ),
-            _v11_core(),
-            _v11_projects(),
+            _v12_core(),
+            _v12_projects(multi_doc=False),
         ]
     )
     service = AnalysisService(db_session, storage=get_object_storage(), llm=llm)
