@@ -340,6 +340,9 @@ class PeopleService:
         person.status = payload.status
         if payload.status == "DELETED":
             person.deleted_at = datetime.now(UTC)
+            self._cancel_active_analyses_for_deleted_person(
+                person.id, actor_user_id=actor_user_id
+            )
         else:
             person.deleted_at = None
         self.repo.touch_person(person)
@@ -380,6 +383,37 @@ class PeopleService:
         )
         self.db.commit()
         return self.get_detail(person.id, is_admin=True)
+
+    def _cancel_active_analyses_for_deleted_person(
+        self, person_id: UUID, *, actor_user_id: UUID
+    ) -> None:
+        """Cancel QUEUED/PROCESSING runs when a person is soft-deleted.
+
+        Does not change REVIEWING/FAILED/CONFIRMED/CANCELLED history.
+        Does not revoke workers; PROCESSING→CANCELLED is honored by
+        ``_persist_reviewing`` status re-check.
+        """
+        from app.modules.analysis.repository import AnalysisRepository
+
+        analysis_repo = AnalysisRepository(self.db)
+        active_runs = analysis_repo.list_active_runs_for_person_for_update(person_id)
+        for run in active_runs:
+            before = {"status": run.status}
+            analysis_repo.mark_cancelled(
+                run,
+                "인력이 삭제되어 진행 중 분석이 자동 폐기되었습니다.",
+            )
+            analysis_repo.add_audit(
+                action_type="ANALYSIS_CANCEL",
+                actor_user_id=actor_user_id,
+                target_id=run.id,
+                before=before,
+                after={"status": "CANCELLED"},
+                metadata={
+                    "reason": "PERSON_DELETED",
+                    "person_id": str(person_id),
+                },
+            )
 
     def update_profile(
         self,
