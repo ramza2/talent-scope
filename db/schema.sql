@@ -490,7 +490,7 @@ CREATE TABLE analysis_run (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     person_id UUID NOT NULL REFERENCES person(id) ON DELETE CASCADE,
     status VARCHAR(30) NOT NULL DEFAULT 'QUEUED'
-        CHECK (status IN ('QUEUED', 'PROCESSING', 'REVIEWING', 'CONFIRMED', 'FAILED', 'CANCELLED')),
+        CHECK (status IN ('DEFERRED', 'QUEUED', 'PROCESSING', 'REVIEWING', 'CONFIRMED', 'FAILED', 'CANCELLED')),
     candidate_json JSONB NOT NULL DEFAULT '{}'::jsonb,
     base_profile_version INTEGER,
     llm_model VARCHAR(200),

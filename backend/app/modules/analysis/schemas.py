@@ -10,7 +10,13 @@ from uuid import UUID
 from pydantic import BaseModel, Field, field_validator
 
 AnalysisStatus = Literal[
-    "QUEUED", "PROCESSING", "REVIEWING", "CONFIRMED", "FAILED", "CANCELLED"
+    "DEFERRED",
+    "QUEUED",
+    "PROCESSING",
+    "REVIEWING",
+    "CONFIRMED",
+    "FAILED",
+    "CANCELLED",
 ]
 AnalysisType = Literal["PROFILE"]
 ChangeType = Literal["SAME", "NEW", "UPDATE", "CONFLICT", "REVIEW"]

@@ -22,6 +22,7 @@ type Filters = {
 
 const STATUS_OPTIONS: Array<{ value: AnalysisStatus | ''; label: string }> = [
   { value: '', label: '상태 전체' },
+  { value: 'DEFERRED', label: 'DEFERRED' },
   { value: 'QUEUED', label: 'QUEUED' },
   { value: 'PROCESSING', label: 'PROCESSING' },
   { value: 'REVIEWING', label: 'REVIEWING' },
@@ -47,9 +48,11 @@ function statusTag(status: AnalysisStatus, errorMessage?: string | null) {
         ? 'success'
         : status === 'REVIEWING'
           ? 'processing'
-          : status === 'PROCESSING' || status === 'QUEUED'
-            ? 'blue'
-            : 'default'
+          : status === 'DEFERRED'
+            ? 'gold'
+            : status === 'PROCESSING' || status === 'QUEUED'
+              ? 'blue'
+              : 'default'
   const tag = <Tag color={color}>{status}</Tag>
   if (status === 'FAILED' && errorMessage) {
     return <Tooltip title={errorMessage}>{tag}</Tooltip>

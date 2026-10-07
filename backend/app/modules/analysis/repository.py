@@ -49,10 +49,11 @@ class AnalysisRepository:
         vlm_model: str | None,
         prompt_version: str,
         schema_version: str,
+        status: str = "QUEUED",
     ) -> AnalysisRun:
         run = AnalysisRun(
             person_id=person_id,
-            status="QUEUED",
+            status=status,
             candidate_json={},
             base_profile_version=base_profile_version,
             llm_model=llm_model,
@@ -107,12 +108,32 @@ class AnalysisRepository:
         return row is not None
 
     def get_active_run_for_person(self, person_id: UUID) -> AnalysisRun | None:
-        """Return a QUEUED/PROCESSING run for the person, if any."""
+        """Return an executable QUEUED/PROCESSING run for the person, if any.
+
+        DEFERRED waits are not executable and are intentionally excluded.
+        """
         return self.db.execute(
             select(AnalysisRun)
             .where(
                 AnalysisRun.person_id == person_id,
                 AnalysisRun.status.in_(("QUEUED", "PROCESSING")),
+            )
+            .order_by(AnalysisRun.created_at.asc())
+            .limit(1)
+        ).scalar_one_or_none()
+
+    def get_manual_create_blocking_run(
+        self, person_id: UUID
+    ) -> AnalysisRun | None:
+        """Return a run that blocks manual analysis create, if any.
+
+        Manual create is blocked by DEFERRED as well as QUEUED/PROCESSING.
+        """
+        return self.db.execute(
+            select(AnalysisRun)
+            .where(
+                AnalysisRun.person_id == person_id,
+                AnalysisRun.status.in_(("DEFERRED", "QUEUED", "PROCESSING")),
             )
             .order_by(AnalysisRun.created_at.asc())
             .limit(1)
@@ -198,13 +219,13 @@ class AnalysisRepository:
     def list_active_runs_for_person_for_update(
         self, person_id: UUID
     ) -> list[AnalysisRun]:
-        """QUEUED/PROCESSING runs for a person, locked for update."""
+        """DEFERRED/QUEUED/PROCESSING runs for a person, locked for update."""
         return list(
             self.db.execute(
                 select(AnalysisRun)
                 .where(
                     AnalysisRun.person_id == person_id,
-                    AnalysisRun.status.in_(("QUEUED", "PROCESSING")),
+                    AnalysisRun.status.in_(("DEFERRED", "QUEUED", "PROCESSING")),
                 )
                 .order_by(AnalysisRun.created_at.asc(), AnalysisRun.id.asc())
                 .with_for_update()

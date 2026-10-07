@@ -144,7 +144,10 @@ export function DocumentsTab({ personId, isAdmin, onChanged }: Props) {
     refetchInterval: (query) => {
       const items = query.state.data?.data ?? []
       const active = items.some(
-        (a) => a.status === 'QUEUED' || a.status === 'PROCESSING',
+        (a) =>
+          a.status === 'DEFERRED' ||
+          a.status === 'QUEUED' ||
+          a.status === 'PROCESSING',
       )
       return active ? 3000 : false
     },
@@ -152,7 +155,12 @@ export function DocumentsTab({ personId, isAdmin, onChanged }: Props) {
 
   const hasActiveAnalysis = useMemo(() => {
     const items = analysesQuery.data?.data ?? []
-    return items.some((a) => a.status === 'QUEUED' || a.status === 'PROCESSING')
+    return items.some(
+      (a) =>
+        a.status === 'DEFERRED' ||
+        a.status === 'QUEUED' ||
+        a.status === 'PROCESSING',
+    )
   }, [analysesQuery.data])
 
   const docTypesQuery = useQuery({
@@ -464,7 +472,9 @@ export function DocumentsTab({ personId, isAdmin, onChanged }: Props) {
           {isAdmin ? (
             <Tooltip
               title={
-                hasActiveAnalysis ? 'AI 분석이 진행 중입니다.' : undefined
+                hasActiveAnalysis
+                  ? '이미 진행 중이거나 대기 중인 AI 분석이 있습니다.'
+                  : undefined
               }
             >
               <span>

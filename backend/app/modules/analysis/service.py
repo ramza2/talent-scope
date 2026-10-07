@@ -271,12 +271,13 @@ class AnalysisService:
         if person is None or person.deleted_at is not None or person.status == "DELETED":
             raise NotFoundError("인력을 찾을 수 없습니다.")
 
-        # Active-run guard must run after person FOR UPDATE so concurrent creates
-        # serialize on the person row and at most one QUEUED/PROCESSING run exists.
-        active = self.repo.get_active_run_for_person(payload.person_id)
-        if active is not None:
+        # Manual create is blocked by DEFERRED as well as QUEUED/PROCESSING.
+        # Guard runs after person FOR UPDATE so concurrent creates serialize.
+        blocking = self.repo.get_manual_create_blocking_run(payload.person_id)
+        if blocking is not None:
             raise AnalysisStateConflictError(
-                "이미 진행 중인 AI 분석이 있습니다. 완료 후 다시 시도해 주세요."
+                "이미 진행 중이거나 대기 중인 AI 분석이 있습니다. "
+                "완료 후 다시 시도해 주세요."
             )
 
         profile = self.repo.get_profile(payload.person_id, for_update=True)
@@ -353,9 +354,9 @@ class AnalysisService:
         - Requires every batch document to exist, share one person, and be READY.
         - Skips when ``new_document_ids`` is provided and empty / disjoint (all-reused).
         - After person FOR UPDATE, skips when any historical run already covers
-          the full batch (status-independent, including FAILED).
-        - Propagates ``AnalysisStateConflictError`` when another QUEUED/PROCESSING
-          run blocks create so callers can schedule a bounded delayed retry.
+          the full batch (status-independent, including DEFERRED/FAILED).
+        - When another QUEUED/PROCESSING run exists, creates a DEFERRED run
+          (visible in UI) and schedules bounded promotion retries by run id.
         - Returns None when skipped for non-conflict reasons.
         """
         batch = list(dict.fromkeys(batch_document_ids))
@@ -407,7 +408,7 @@ class AnalysisService:
             )
             return None
 
-        # Historical idempotency under person lock (covers FAILED/REVIEWING/…).
+        # Historical idempotency under person lock (covers DEFERRED/FAILED/…).
         if self.repo.has_run_covering_document_batch(person_id, batch):
             logger.info(
                 "auto analysis skipped batch=%s reason=batch_run_exists",
@@ -416,20 +417,280 @@ class AnalysisService:
             return None
 
         actor_user_id = docs[0][0].uploaded_by
+        # Executable active only — DEFERRED waits do not block another DEFERRED.
+        if self.repo.get_active_run_for_person(person_id) is not None:
+            return self._create_deferred_analysis(
+                person_id=person_id,
+                document_ids=batch,
+                actor_user_id=actor_user_id,
+            )
+
         payload = CreateAnalysisRequest(
             person_id=person_id,
             document_ids=batch,
             analysis_type="PROFILE",
         )
-        # Active-run conflicts propagate for deferred retry by the caller.
-        result = self.create_analysis(payload, actor_user_id)
+        # Under person lock there is no QUEUED/PROCESSING; create as QUEUED.
+        # Manual DEFERRED block is irrelevant for this auto path (no DEFERRED
+        # covering batch after historical check).
+        profile = self.repo.get_profile(person_id, for_update=True)
+        if profile is None:
+            logger.info(
+                "auto analysis skipped batch=%s reason=profile_unavailable",
+                [str(i) for i in batch],
+            )
+            return None
+        prompt = current_profile_prompt()
+        run = self.repo.create_run(
+            person_id=person_id,
+            base_profile_version=profile.profile_version,
+            llm_model=self.settings.llm_model,
+            vlm_model=self.settings.vlm_model,
+            prompt_version=prompt.prompt_version,
+            schema_version=prompt.schema_version,
+            status="QUEUED",
+        )
+        self.repo.add_run_documents(run.id, batch)
+        self.repo.add_audit(
+            action_type="ANALYSIS_CREATE",
+            actor_user_id=actor_user_id,
+            target_id=run.id,
+            after={
+                "status": "QUEUED",
+                "person_id": str(person_id),
+                "document_ids": [str(i) for i in batch],
+                "base_profile_version": profile.profile_version,
+            },
+        )
+        self.db.commit()
+
+        from app.tasks.analysis_tasks import enqueue_profile_analysis
+
+        try:
+            enqueue_profile_analysis(run.id, actor_user_id)
+        except Exception:
+            logger.exception("analysis enqueue failed run_id=%s", run.id)
+            run = self.repo.get_run(run.id, for_update=True)
+            if run is not None and run.status == "QUEUED":
+                self.repo.mark_failed(run, "AI queue unavailable")
+                self.repo.add_audit(
+                    action_type="ANALYSIS_ENQUEUE_FAILED",
+                    actor_user_id=actor_user_id,
+                    target_id=run.id,
+                    after={"status": "FAILED"},
+                )
+                self.db.commit()
+            raise AIQueueUnavailableError(
+                "분석 작업을 큐에 등록할 수 없습니다. 잠시 후 다시 시도해 주세요."
+            )
 
         logger.info(
             "auto analysis started batch=%s analysis_run_id=%s",
             [str(i) for i in batch],
-            result.analysis_id,
+            run.id,
         )
-        return result
+        return CreateAnalysisResponseData(analysis_id=run.id, status="QUEUED")
+
+    def _create_deferred_analysis(
+        self,
+        *,
+        person_id: UUID,
+        document_ids: list[UUID],
+        actor_user_id: UUID | None,
+    ) -> CreateAnalysisResponseData:
+        """Create a DEFERRED AnalysisRun and schedule promotion retries."""
+        profile = self.repo.get_profile(person_id, for_update=True)
+        if profile is None:
+            raise NotFoundError("인력 프로필을 찾을 수 없습니다.")
+
+        prompt = current_profile_prompt()
+        run = self.repo.create_run(
+            person_id=person_id,
+            base_profile_version=profile.profile_version,
+            llm_model=self.settings.llm_model,
+            vlm_model=self.settings.vlm_model,
+            prompt_version=prompt.prompt_version,
+            schema_version=prompt.schema_version,
+            status="DEFERRED",
+        )
+        self.repo.add_run_documents(run.id, document_ids)
+        self.repo.add_audit(
+            action_type="ANALYSIS_CREATE",
+            actor_user_id=actor_user_id,
+            target_id=run.id,
+            after={
+                "status": "DEFERRED",
+                "person_id": str(person_id),
+                "document_ids": [str(i) for i in document_ids],
+                "base_profile_version": profile.profile_version,
+            },
+            metadata={"reason": "ACTIVE_RUN_CONFLICT"},
+        )
+        self.db.commit()
+
+        from app.tasks.analysis_tasks import enqueue_deferred_auto_profile_analysis
+
+        try:
+            enqueue_deferred_auto_profile_analysis(run.id, attempt=1)
+        except Exception:
+            logger.exception(
+                "deferred analysis schedule failed analysis_run_id=%s",
+                run.id,
+            )
+            run = self.repo.get_run(run.id, for_update=True)
+            if run is not None and run.status == "DEFERRED":
+                self.repo.mark_failed(run, "AI queue unavailable")
+                self.repo.add_audit(
+                    action_type="ANALYSIS_ENQUEUE_FAILED",
+                    actor_user_id=actor_user_id,
+                    target_id=run.id,
+                    after={"status": "FAILED"},
+                    metadata={
+                        "reason": "DEFERRED_QUEUE_UNAVAILABLE",
+                        "person_id": str(person_id),
+                        "document_ids": [str(i) for i in document_ids],
+                    },
+                )
+                self.db.commit()
+                logger.info(
+                    "auto analysis deferred enqueue failed analysis_run_id=%s "
+                    "person_id=%s",
+                    run.id,
+                    person_id,
+                )
+                return CreateAnalysisResponseData(
+                    analysis_id=run.id, status="FAILED"
+                )
+
+        logger.info(
+            "auto analysis deferred analysis_run_id=%s person_id=%s docs=%s",
+            run.id,
+            person_id,
+            [str(i) for i in document_ids],
+        )
+        return CreateAnalysisResponseData(analysis_id=run.id, status="DEFERRED")
+
+    def promote_deferred_analysis(
+        self,
+        analysis_run_id: UUID,
+        *,
+        attempt: int = 1,
+        actor_user_id: UUID | None = None,
+    ) -> str:
+        """Promote a DEFERRED run to QUEUED when no executable active run exists.
+
+        Lock order: person FOR UPDATE, then the DEFERRED run (avoids deadlock
+        with create/delete which lock person first).
+
+        Returns a status string: QUEUED / DEFERRED / FAILED / SKIPPED / …
+        """
+        from app.tasks.analysis_tasks import (
+            AUTO_ANALYSIS_DEFER_COUNTDOWN_SECONDS,
+            AUTO_ANALYSIS_DEFER_MAX_ATTEMPTS,
+            enqueue_deferred_auto_profile_analysis,
+            enqueue_profile_analysis,
+        )
+
+        peek = self.repo.get_run(analysis_run_id)
+        if peek is None:
+            return "NOT_FOUND"
+        if peek.status != "DEFERRED":
+            # CANCELLED / QUEUED / FAILED / … — do not resume.
+            return peek.status
+
+        person = self.repo.get_person(peek.person_id, for_update=True)
+        if person is None or person.deleted_at is not None or person.status == "DELETED":
+            self.db.rollback()
+            return "SKIPPED"
+
+        run = self.repo.get_run(analysis_run_id, for_update=True)
+        if run is None:
+            self.db.rollback()
+            return "NOT_FOUND"
+        if run.status != "DEFERRED":
+            status = run.status
+            self.db.rollback()
+            return status
+
+        # Only QUEUED/PROCESSING block promotion; other DEFERRED runs do not.
+        active = self.repo.get_active_run_for_person(run.person_id)
+        if active is not None and active.id != run.id:
+            if int(attempt) >= AUTO_ANALYSIS_DEFER_MAX_ATTEMPTS:
+                message = (
+                    "자동분석 대기 재시도 한도를 초과했습니다. "
+                    "분석 상세에서 재시도할 수 있습니다."
+                )
+                self.repo.mark_failed(run, message)
+                self.repo.add_audit(
+                    action_type="ANALYSIS_FAILED",
+                    actor_user_id=actor_user_id,
+                    target_id=run.id,
+                    after={"status": "FAILED", "error": message},
+                    metadata={
+                        "reason": "DEFER_EXHAUSTED",
+                        "attempt": int(attempt),
+                    },
+                )
+                self.db.commit()
+                return "FAILED"
+
+            self.db.commit()
+            try:
+                enqueue_deferred_auto_profile_analysis(
+                    run.id,
+                    attempt=int(attempt) + 1,
+                )
+            except Exception:
+                logger.exception(
+                    "deferred re-schedule failed analysis_run_id=%s attempt=%s",
+                    run.id,
+                    attempt,
+                )
+            logger.info(
+                "deferred analysis still blocked analysis_run_id=%s attempt=%s "
+                "countdown=%s",
+                run.id,
+                attempt,
+                AUTO_ANALYSIS_DEFER_COUNTDOWN_SECONDS,
+            )
+            return "DEFERRED"
+
+        before = {"status": run.status}
+        self.repo.mark_queued(run)
+        self.repo.add_audit(
+            action_type="ANALYSIS_CREATE",
+            actor_user_id=actor_user_id,
+            target_id=run.id,
+            before=before,
+            after={"status": "QUEUED"},
+            metadata={"reason": "DEFERRED_PROMOTED", "attempt": int(attempt)},
+        )
+        self.db.commit()
+
+        try:
+            enqueue_profile_analysis(run.id, actor_user_id)
+        except Exception:
+            logger.exception(
+                "deferred promote enqueue failed analysis_run_id=%s", run.id
+            )
+            run = self.repo.get_run(run.id, for_update=True)
+            if run is not None and run.status == "QUEUED":
+                self.repo.mark_failed(run, "AI queue unavailable")
+                self.repo.add_audit(
+                    action_type="ANALYSIS_ENQUEUE_FAILED",
+                    actor_user_id=actor_user_id,
+                    target_id=run.id,
+                    after={"status": "FAILED"},
+                )
+                self.db.commit()
+            return "FAILED"
+
+        logger.info(
+            "deferred analysis promoted analysis_run_id=%s attempt=%s",
+            run.id,
+            attempt,
+        )
+        return "QUEUED"
 
     def create_analysis_for_ready_document(
         self, document_id: UUID
