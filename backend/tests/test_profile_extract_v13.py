@@ -392,11 +392,14 @@ def test_profile_extract_registry_current_is_v13() -> None:
     assert cur.clear_catalog_code_customer is True
     assert cur.promote_exact_catalog_codes is True
     assert cur.backfill_exact_core_evidence is True
+    assert cur.backfill_exact_project_evidence is True
     assert cur.core_system_prompt == v13.CORE_SYSTEM_PROMPT
     assert v13.BACKFILL_EXACT_CORE_EVIDENCE is True
+    assert v13.BACKFILL_EXACT_PROJECT_EVIDENCE is True
 
     v12_spec = resolve_profile_prompt("profile-extract-v12")
     assert v12_spec.backfill_exact_core_evidence is False
+    assert v12_spec.backfill_exact_project_evidence is False
     assert v12_spec.promote_exact_catalog_codes is True
     assert v12_spec.core_system_prompt == v12.CORE_SYSTEM_PROMPT
 

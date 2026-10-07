@@ -899,6 +899,78 @@ def promote_exact_root_catalog_codes(
     )
 
 
+def backfill_exact_project_evidence(
+    candidate: ProfileCandidateDocument,
+    *,
+    page_texts: dict[tuple[str, int], str] | None,
+) -> tuple[ProfileCandidateDocument, int]:
+    """v13: repair quote-less project ROOT refs via exact same-page scalars.
+
+    When normalize clears ``quote_text`` but the ref still has a valid
+    document_id/page_no, try exact substring matches on THAT page only, in
+    priority order: project_name, customer_name, responsibilities,
+    project_summary.
+
+    - Project ``source_refs`` only; j/t/x relation refs are never modified.
+    - Existing non-empty quotes always win.
+    - No cross-document/page search, fuzzy match, or invented text.
+    - Dates alone are never used as evidence anchors.
+
+    Returns ``(candidate, root_refs_repaired)``.
+    """
+    if not page_texts or not candidate.projects:
+        return candidate, 0
+
+    repaired = 0
+    projects: list[ProjectCandidate] = []
+    for project in candidate.projects:
+        refs = list(project.source_refs or [])
+        if not refs:
+            projects.append(project)
+            continue
+        anchors = (
+            project.project_name,
+            project.customer_name,
+            project.responsibilities,
+            project.project_summary,
+        )
+        new_refs: list[SourceRef] = []
+        changed = False
+        for ref in refs:
+            if _source_ref_has_quote(ref):
+                new_refs.append(ref)
+                continue
+            doc_id = ref.document_id
+            page_no = ref.page_no
+            if not doc_id or page_no is None:
+                new_refs.append(ref)
+                continue
+            page_text = page_texts.get((doc_id, page_no)) or ""
+            if not page_text:
+                new_refs.append(ref)
+                continue
+            quote: str | None = None
+            for scalar in anchors:
+                text = (scalar or "").strip() if isinstance(scalar, str) else ""
+                if text and text in page_text:
+                    quote = text
+                    break
+            if quote is None:
+                new_refs.append(ref)
+                continue
+            new_refs.append(ref.model_copy(update={"quote_text": quote}))
+            repaired += 1
+            changed = True
+        if changed:
+            projects.append(project.model_copy(update={"source_refs": new_refs}))
+        else:
+            projects.append(project)
+
+    if repaired == 0:
+        return candidate, 0
+    return candidate.model_copy(update={"projects": projects}), repaired
+
+
 def apply_normalized_quote_evidence(
     candidate: ProfileCandidateDocument,
 ) -> ProfileCandidateDocument:

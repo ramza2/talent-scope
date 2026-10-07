@@ -49,6 +49,7 @@ class ProfilePromptSpec:
     clear_catalog_code_customer: bool = False
     promote_exact_catalog_codes: bool = False
     backfill_exact_core_evidence: bool = False
+    backfill_exact_project_evidence: bool = False
 
 
 def _spec_from_module(module) -> ProfilePromptSpec:
@@ -87,6 +88,9 @@ def _spec_from_staged_module(module) -> ProfilePromptSpec:
         ),
         backfill_exact_core_evidence=bool(
             getattr(module, "BACKFILL_EXACT_CORE_EVIDENCE", False)
+        ),
+        backfill_exact_project_evidence=bool(
+            getattr(module, "BACKFILL_EXACT_PROJECT_EVIDENCE", False)
         ),
     )
 
