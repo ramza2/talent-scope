@@ -47,6 +47,7 @@ from app.modules.analysis.code_catalog import (
 from app.modules.analysis.compact_v8 import (
     apply_normalized_quote_evidence,
     backfill_exact_core_evidence,
+    backfill_exact_project_evidence,
     build_document_alias_view,
     expand_compact_core,
     expand_compact_projects,
@@ -1061,10 +1062,38 @@ class AnalysisService:
                 settings=self.settings,
                 page_texts=page_texts,
             )
+            projects_in = len(doc.projects)
+            root_refs_repaired = 0
+            # v13: repair quote-less project root refs via exact same-page scalars
+            # before the fail-closed quote filter.
+            if prompt.backfill_exact_project_evidence:
+                doc, root_refs_repaired = backfill_exact_project_evidence(
+                    doc,
+                    page_texts=page_texts,
+                )
+            projects_with_quote = sum(
+                1
+                for project in doc.projects
+                if any(
+                    (ref.quote_text or "").strip()
+                    for ref in (project.source_refs or [])
+                )
+            )
             # v10+: after normalize may clear quotes / drop invalid refs, re-check
             # that projects and j/t/x still have non-empty quote_text evidence.
             if prompt.strict_relation_evidence:
                 doc = apply_normalized_quote_evidence(doc)
+            if prompt.backfill_exact_project_evidence or prompt.strict_relation_evidence:
+                logger.info(
+                    "analysis project root evidence analysis_run_id=%s "
+                    "projects_in=%s root_refs_repaired=%s projects_with_quote=%s "
+                    "projects_after_filter=%s",
+                    base_log.get("analysis_run_id"),
+                    projects_in,
+                    root_refs_repaired,
+                    projects_with_quote,
+                    len(doc.projects),
+                )
             return doc
 
         def _core_needs_retry(candidate: ProfileCandidateDocument) -> bool:
