@@ -154,7 +154,11 @@ class AnalysisRepository:
         page: int,
         page_size: int,
     ) -> tuple[list[AnalysisRun], int]:
-        filters = []
+        # Default list excludes soft-deleted persons; restore to ACTIVE resurfaces runs.
+        filters = [
+            Person.status != "DELETED",
+            Person.deleted_at.is_(None),
+        ]
         if status:
             filters.append(AnalysisRun.status == status)
         if person_id is not None:
@@ -164,6 +168,7 @@ class AnalysisRepository:
             self.db.execute(
                 select(func.count())
                 .select_from(AnalysisRun)
+                .join(Person, Person.id == AnalysisRun.person_id)
                 .where(*filters)
             ).scalar_one()
         )
@@ -179,6 +184,7 @@ class AnalysisRepository:
         rows = list(
             self.db.execute(
                 select(AnalysisRun)
+                .join(Person, Person.id == AnalysisRun.person_id)
                 .where(*filters)
                 .order_by(order)
                 .offset((page - 1) * page_size)
@@ -188,6 +194,24 @@ class AnalysisRepository:
             .all()
         )
         return rows, total
+
+    def list_active_runs_for_person_for_update(
+        self, person_id: UUID
+    ) -> list[AnalysisRun]:
+        """QUEUED/PROCESSING runs for a person, locked for update."""
+        return list(
+            self.db.execute(
+                select(AnalysisRun)
+                .where(
+                    AnalysisRun.person_id == person_id,
+                    AnalysisRun.status.in_(("QUEUED", "PROCESSING")),
+                )
+                .order_by(AnalysisRun.created_at.asc(), AnalysisRun.id.asc())
+                .with_for_update()
+            )
+            .scalars()
+            .all()
+        )
 
     def replace_diffs(
         self, run_id: UUID, specs: list[dict[str, Any]]
