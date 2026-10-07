@@ -92,6 +92,47 @@ def _optional_int(value: Any) -> int | None:
     return None
 
 
+# Anchored birth-year date forms that start with YYYY (no mid-string inference).
+_BIRTH_YEAR_DATE_RE = re.compile(
+    r"^(\d{4})"
+    r"(?:"
+    r"년(?:\s*\d{1,2}월(?:\s*\d{1,2}일)?)?"
+    r"|"
+    r"[.\-/]\d{1,2}(?:[.\-/]\d{1,2})?"
+    r")$"
+)
+
+
+def _optional_birth_year(value: Any) -> int | None:
+    """Fail-soft birth_year for compact profile ``by``.
+
+    Accepts:
+    - ``int`` (not bool)
+    - plain 4-digit numeric string (``\"1976\"``)
+    - anchored full/partial date strings beginning with a 4-digit year
+      (``\"1976년 04월 05일\"``, ``\"1976-04-05\"``, ``\"1976.04.05\"``,
+      ``\"1976/04/05\"``, ``\"1976년\"``)
+
+    Rejects floats, bools, containers, short years, trailing junk, and years
+    that appear later in arbitrary text (e.g. ``\"생년 1976\"``).
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if text.isdigit() and len(text) == 4:
+        return int(text)
+    match = _BIRTH_YEAR_DATE_RE.fullmatch(text)
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
 _YM_RE = re.compile(r"^(\d{4})[.\-](\d{2})$")
 _STRICT_RELATION_KEYS = frozenset({"j", "t", "x"})
 _CUSTOMER_CODE_TYPES = frozenset({"BIZ", "CUSTOMER_TYPE"})
@@ -219,7 +260,9 @@ def _expand_profile(
         if value is None:
             continue
         if field == "birth_year":
-            profile[field] = value
+            year = _optional_birth_year(value)
+            if year is not None:
+                profile[field] = year
             continue
         if field in _PROFILE_TEXT_FIELDS:
             text = _optional_text(value)
