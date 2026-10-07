@@ -171,29 +171,44 @@ export function resolveUploadSession(
   })
 }
 
-/** Existing-person attach: session → upload → type → LINK_EXISTING / NEW_GROUP. */
+export type PromoteExistingPersonDocumentItem = {
+  file: File
+  documentTypeCode: string
+  title?: string
+}
+
+/** Existing-person attach: one session → one upload → per-file type → one resolve. */
 export async function promoteExistingPersonDocuments(opts: {
   personId: string
-  files: File[]
-  documentTypeCode: string
+  items: PromoteExistingPersonDocumentItem[]
   mode?: 'NEW_GROUP'
-  title?: string
 }) {
   const session = await createUploadSession(opts.personId)
   const sessionId = session.data.id
   try {
-    const uploaded = await uploadSessionFiles(sessionId, opts.files)
-    for (const file of uploaded.data) {
-      await patchTempFile(sessionId, file.temp_file_id, opts.documentTypeCode)
+    const files = opts.items.map((item) => item.file)
+    const uploaded = await uploadSessionFiles(sessionId, files)
+    if (uploaded.data.length !== opts.items.length) {
+      throw new Error(
+        '업로드된 파일 수가 선택한 파일 수와 일치하지 않습니다.',
+      )
+    }
+    // Index/order mapping only — never match by filename.
+    for (let i = 0; i < uploaded.data.length; i += 1) {
+      await patchTempFile(
+        sessionId,
+        uploaded.data[i].temp_file_id,
+        opts.items[i].documentTypeCode,
+      )
     }
     return resolveUploadSession(sessionId, {
       mode: 'LINK_EXISTING',
       person_id: opts.personId,
-      document_resolution: uploaded.data.map((file) => ({
+      document_resolution: uploaded.data.map((file, i) => ({
         temp_file_id: file.temp_file_id,
         mode: opts.mode ?? 'NEW_GROUP',
-        document_type_code: opts.documentTypeCode,
-        title: opts.title ?? file.original_filename,
+        document_type_code: opts.items[i].documentTypeCode,
+        title: opts.items[i].title ?? file.original_filename,
       })),
     })
   } catch (error) {
