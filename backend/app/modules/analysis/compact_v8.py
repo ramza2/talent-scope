@@ -899,22 +899,62 @@ def promote_exact_root_catalog_codes(
     )
 
 
+def _project_evidence_anchors(project: ProjectCandidate) -> tuple[str, ...]:
+    """Scalar anchors for project root evidence, in priority order."""
+    out: list[str] = []
+    for scalar in (
+        project.project_name,
+        project.customer_name,
+        project.responsibilities,
+        project.project_summary,
+    ):
+        if isinstance(scalar, str):
+            text = scalar.strip()
+            if text:
+                out.append(text)
+    return tuple(out)
+
+
+def _unique_exact_page_ref(
+    quote: str,
+    *,
+    page_texts: dict[tuple[str, int], str],
+) -> SourceRef | None:
+    """Return a root ref only when ``quote`` matches exactly one page.
+
+    Ambiguous multi-page hits are rejected (no arbitrary first-page pick).
+    """
+    text = (quote or "").strip()
+    if not text:
+        return None
+    hits: list[tuple[str, int]] = []
+    for doc_id, page_no in sorted(page_texts.keys()):
+        page_text = page_texts.get((doc_id, page_no)) or ""
+        if text in page_text:
+            hits.append((doc_id, page_no))
+    if len(hits) != 1:
+        return None
+    doc_id, page_no = hits[0]
+    return SourceRef(document_id=doc_id, page_no=page_no, quote_text=text)
+
+
 def backfill_exact_project_evidence(
     candidate: ProfileCandidateDocument,
     *,
     page_texts: dict[tuple[str, int], str] | None,
 ) -> tuple[ProfileCandidateDocument, int]:
-    """v13: repair quote-less project ROOT refs via exact same-page scalars.
+    """v13: repair quote-less / empty project ROOT refs via exact page scalars.
 
-    When normalize clears ``quote_text`` but the ref still has a valid
-    document_id/page_no, try exact substring matches on THAT page only, in
-    priority order: project_name, customer_name, responsibilities,
-    project_summary.
+    1. Existing non-empty quotes always win.
+    2. Quote-less refs with valid document_id/page_no: try exact anchors on
+       THAT page only (project_name → customer_name → responsibilities →
+       project_summary).
+    3. Empty ``source_refs``: search allowed ``page_texts`` for an exact
+       unique page match of those anchors; create one root ref from the
+       matched page. Ambiguous multi-page hits are not repaired.
 
     - Project ``source_refs`` only; j/t/x relation refs are never modified.
-    - Existing non-empty quotes always win.
-    - No cross-document/page search, fuzzy match, or invented text.
-    - Dates alone are never used as evidence anchors.
+    - No fuzzy match or invented text. Dates alone are never anchors.
 
     Returns ``(candidate, root_refs_repaired)``.
     """
@@ -925,15 +965,24 @@ def backfill_exact_project_evidence(
     projects: list[ProjectCandidate] = []
     for project in candidate.projects:
         refs = list(project.source_refs or [])
+        anchors = _project_evidence_anchors(project)
+
+        # Empty refs (discarded/missing r): unique exact page search.
         if not refs:
-            projects.append(project)
+            created: SourceRef | None = None
+            for text in anchors:
+                created = _unique_exact_page_ref(text, page_texts=page_texts)
+                if created is not None:
+                    break
+            if created is not None:
+                projects.append(
+                    project.model_copy(update={"source_refs": [created]})
+                )
+                repaired += 1
+            else:
+                projects.append(project)
             continue
-        anchors = (
-            project.project_name,
-            project.customer_name,
-            project.responsibilities,
-            project.project_summary,
-        )
+
         new_refs: list[SourceRef] = []
         changed = False
         for ref in refs:
@@ -950,9 +999,8 @@ def backfill_exact_project_evidence(
                 new_refs.append(ref)
                 continue
             quote: str | None = None
-            for scalar in anchors:
-                text = (scalar or "").strip() if isinstance(scalar, str) else ""
-                if text and text in page_text:
+            for text in anchors:
+                if text in page_text:
                     quote = text
                     break
             if quote is None:
