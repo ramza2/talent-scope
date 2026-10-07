@@ -7,6 +7,7 @@ import math
 import re
 from dataclasses import dataclass
 from decimal import Decimal
+from collections.abc import Sequence
 from typing import Any
 from uuid import UUID
 
@@ -270,6 +271,14 @@ class AnalysisService:
         if person is None or person.deleted_at is not None or person.status == "DELETED":
             raise NotFoundError("인력을 찾을 수 없습니다.")
 
+        # Active-run guard must run after person FOR UPDATE so concurrent creates
+        # serialize on the person row and at most one QUEUED/PROCESSING run exists.
+        active = self.repo.get_active_run_for_person(payload.person_id)
+        if active is not None:
+            raise AnalysisStateConflictError(
+                "이미 진행 중인 AI 분석이 있습니다. 완료 후 다시 시도해 주세요."
+            )
+
         profile = self.repo.get_profile(payload.person_id, for_update=True)
         if profile is None:
             raise NotFoundError("인력 프로필을 찾을 수 없습니다.")
@@ -333,59 +342,103 @@ class AnalysisService:
 
         return CreateAnalysisResponseData(analysis_id=run.id, status="QUEUED")
 
-    def create_analysis_for_ready_document(
-        self, document_id: UUID
+    def create_analysis_for_ready_documents(
+        self,
+        batch_document_ids: Sequence[UUID],
+        *,
+        new_document_ids: Sequence[UUID] | None = None,
     ) -> CreateAnalysisResponseData | None:
-        """Auto-start PROFILE analysis for a newly READY document.
+        """Auto-start one PROFILE analysis when an upload batch is fully READY.
 
-        Idempotent: skips when any AnalysisRun already references the document.
-        Returns None when skipped; raises only on unexpected create/enqueue errors
-        (caller should not mark the Document FAILED).
+        - Requires every batch document to exist, share one person, and be READY.
+        - Skips when ``new_document_ids`` is provided and empty / disjoint (all-reused).
+        - After person FOR UPDATE, skips when any historical run already covers
+          the full batch (status-independent, including FAILED).
+        - Propagates ``AnalysisStateConflictError`` when another QUEUED/PROCESSING
+          run blocks create so callers can schedule a bounded delayed retry.
+        - Returns None when skipped for non-conflict reasons.
         """
-        docs = self.repo.list_documents_by_ids([document_id])
-        if not docs:
+        batch = list(dict.fromkeys(batch_document_ids))
+        if not batch:
+            return None
+
+        if new_document_ids is not None:
+            new_set = set(new_document_ids)
+            if not new_set.intersection(batch):
+                logger.info(
+                    "auto analysis skipped batch=%s reason=no_new_documents",
+                    [str(i) for i in batch],
+                )
+                return None
+
+        docs = self.repo.list_documents_by_ids(batch)
+        if len(docs) != len(batch):
             logger.info(
-                "auto analysis skipped document_id=%s reason=document_unavailable",
-                document_id,
+                "auto analysis skipped batch=%s reason=document_unavailable",
+                [str(i) for i in batch],
             )
             return None
 
-        document, group, _name = docs[0]
-        if document.processing_status != "READY":
+        person_ids = {group.person_id for _document, group, _name in docs}
+        if len(person_ids) != 1:
             logger.info(
-                "auto analysis skipped document_id=%s reason=not_ready status=%s",
-                document_id,
-                document.processing_status,
+                "auto analysis skipped batch=%s reason=person_mismatch",
+                [str(i) for i in batch],
             )
             return None
+        person_id = next(iter(person_ids))
 
-        person = self.repo.get_person(group.person_id, for_update=True)
+        for document, _group, _name in docs:
+            if document.processing_status != "READY":
+                logger.info(
+                    "auto analysis skipped batch=%s reason=not_all_ready "
+                    "document_id=%s status=%s",
+                    [str(i) for i in batch],
+                    document.id,
+                    document.processing_status,
+                )
+                return None
+
+        person = self.repo.get_person(person_id, for_update=True)
         if person is None or person.deleted_at is not None or person.status == "DELETED":
             logger.info(
-                "auto analysis skipped document_id=%s reason=person_unavailable",
-                document_id,
+                "auto analysis skipped batch=%s reason=person_unavailable",
+                [str(i) for i in batch],
             )
             return None
 
-        if self.repo.has_any_run_for_document(document_id):
+        # Historical idempotency under person lock (covers FAILED/REVIEWING/…).
+        if self.repo.has_run_covering_document_batch(person_id, batch):
             logger.info(
-                "auto analysis skipped document_id=%s reason=analysis_run_exists",
-                document_id,
+                "auto analysis skipped batch=%s reason=batch_run_exists",
+                [str(i) for i in batch],
             )
             return None
 
+        actor_user_id = docs[0][0].uploaded_by
         payload = CreateAnalysisRequest(
-            person_id=group.person_id,
-            document_ids=[document_id],
+            person_id=person_id,
+            document_ids=batch,
             analysis_type="PROFILE",
         )
-        result = self.create_analysis(payload, document.uploaded_by)
+        # Active-run conflicts propagate for deferred retry by the caller.
+        result = self.create_analysis(payload, actor_user_id)
+
         logger.info(
-            "auto analysis started document_id=%s analysis_run_id=%s",
-            document_id,
+            "auto analysis started batch=%s analysis_run_id=%s",
+            [str(i) for i in batch],
             result.analysis_id,
         )
         return result
+
+    def create_analysis_for_ready_document(
+        self, document_id: UUID
+    ) -> CreateAnalysisResponseData | None:
+        """Compatibility wrapper: single-document auto batch."""
+        return self.create_analysis_for_ready_documents(
+            [document_id],
+            new_document_ids=[document_id],
+        )
 
     # -------------------------------------------------------------------- run
 

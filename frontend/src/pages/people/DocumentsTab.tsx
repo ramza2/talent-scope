@@ -19,7 +19,7 @@ import type { UploadFile } from 'antd/es/upload/interface'
 import { useNavigate } from 'react-router-dom'
 
 import { apiErrorMessage } from '@/api/errors'
-import { createAnalysis } from '@/api/analyses'
+import { createAnalysis, listAnalyses } from '@/api/analyses'
 import { listCodes } from '@/api/codes'
 import {
   deleteDocument,
@@ -130,6 +130,30 @@ export function DocumentsTab({ personId, isAdmin, onChanged }: Props) {
       return pending ? 3000 : false
     },
   })
+
+  const analysesQuery = useQuery({
+    queryKey: ['analyses', { person_id: personId }],
+    queryFn: () =>
+      listAnalyses({
+        person_id: personId,
+        page: 1,
+        page_size: 20,
+        sort: 'created_desc',
+      }),
+    enabled: isAdmin,
+    refetchInterval: (query) => {
+      const items = query.state.data?.data ?? []
+      const active = items.some(
+        (a) => a.status === 'QUEUED' || a.status === 'PROCESSING',
+      )
+      return active ? 3000 : false
+    },
+  })
+
+  const hasActiveAnalysis = useMemo(() => {
+    const items = analysesQuery.data?.data ?? []
+    return items.some((a) => a.status === 'QUEUED' || a.status === 'PROCESSING')
+  }, [analysesQuery.data])
 
   const docTypesQuery = useQuery({
     queryKey: ['codes', 'DOC_TYPE', 'active'],
@@ -242,6 +266,9 @@ export function DocumentsTab({ personId, isAdmin, onChanged }: Props) {
       setSelectedKeys([])
       await invalidateLocal()
       await queryClient.invalidateQueries({ queryKey: ['analyses'] })
+      await queryClient.invalidateQueries({
+        queryKey: ['analyses', { person_id: personId }],
+      })
       navigate(`/analyses/${res.data.analysis_id}`)
     },
     onError: (error) =>
@@ -435,13 +462,21 @@ export function DocumentsTab({ personId, isAdmin, onChanged }: Props) {
             </Space>
           ) : null}
           {isAdmin ? (
-            <Button
-              disabled={selectedKeys.length === 0}
-              loading={analysisMutation.isPending}
-              onClick={startAnalysis}
+            <Tooltip
+              title={
+                hasActiveAnalysis ? 'AI 분석이 진행 중입니다.' : undefined
+              }
             >
-              AI 상세 분석
-            </Button>
+              <span>
+                <Button
+                  disabled={selectedKeys.length === 0 || hasActiveAnalysis}
+                  loading={analysisMutation.isPending}
+                  onClick={startAnalysis}
+                >
+                  AI 상세 분석
+                </Button>
+              </span>
+            </Tooltip>
           ) : null}
           {isAdmin ? (
             <Button type="primary" onClick={() => setUploadOpen(true)}>

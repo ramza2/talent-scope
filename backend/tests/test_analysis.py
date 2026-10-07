@@ -5549,7 +5549,7 @@ def test_auto_analysis_skips_failed_deleted_and_keeps_document_ready_on_enqueue_
     assert len(runs) == 1
     assert runs[0].status == "FAILED"
 
-    # Existing run (FAILED) still blocks auto re-create.
+    # Same-batch historical idempotency: FAILED still blocks auto re-create.
     monkeypatch.setattr(
         "app.tasks.analysis_tasks.enqueue_profile_analysis",
         lambda *_a, **_k: None,
@@ -5584,7 +5584,7 @@ def test_process_document_task_auto_analysis_only_on_ready(
         lambda self, document_id: "READY",
     )
 
-    def _auto_ready(db, document_id):
+    def _auto_ready(db, document_id, **_kwargs):
         ready_calls.append(document_id)
 
     monkeypatch.setattr(
@@ -5599,7 +5599,7 @@ def test_process_document_task_auto_analysis_only_on_ready(
         lambda self, document_id: "FAILED",
     )
 
-    def _auto_failed(db, document_id):
+    def _auto_failed(db, document_id, **_kwargs):
         failed_calls.append(document_id)
 
     monkeypatch.setattr(

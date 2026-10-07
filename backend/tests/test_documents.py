@@ -1189,11 +1189,11 @@ def test_same_person_ready_sha_reuses_document(
 
     monkeypatch.setattr(
         "app.tasks.document_tasks.enqueue_document_processing",
-        lambda doc_id: enqueue_calls.append(doc_id),
+        lambda doc_id, **_k: enqueue_calls.append(doc_id),
     )
     monkeypatch.setattr(
-        "app.modules.analysis.service.AnalysisService.create_analysis_for_ready_document",
-        lambda self, document_id: auto_calls.append(document_id) or None,
+        "app.modules.analysis.service.AnalysisService.create_analysis_for_ready_documents",
+        lambda self, batch, **_k: auto_calls.extend(batch) or None,
     )
 
     orig_init = DocumentService.__init__
@@ -1301,7 +1301,8 @@ def test_same_person_ready_sha_reuses_document(
         assert docs_after == docs_before
         assert enqueue_calls == []
         assert copy_calls == []
-        assert auto_calls == [uuid.UUID(doc_id)]
+        # All-reused resolve must not force a new auto analysis.
+        assert auto_calls == []
 
         reuse_audits = list(
             db_session.execute(
@@ -1324,8 +1325,10 @@ def test_same_person_ready_sha_reuses_document(
 def test_reuse_skips_auto_analysis_when_run_exists(
     client: TestClient, db_session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """All-reused resolve must not force auto analysis even if a prior run exists."""
     from app.db.models.analysis import AnalysisRun, AnalysisRunDocument
-    from app.ai.prompts.profile_extract import CURRENT_PROFILE_PROMPT_VERSION, current_profile_prompt
+    from app.ai.prompts.profile_extract import current_profile_prompt
+    from app.modules.analysis.service import AnalysisService
 
     suffix = uuid.uuid4().hex[:8]
     codes = [f"DOC-RESUME-{suffix}"]
@@ -1338,24 +1341,21 @@ def test_reuse_skips_auto_analysis_when_run_exists(
 
     monkeypatch.setattr(
         "app.tasks.document_tasks.enqueue_document_processing",
-        lambda doc_id: enqueue_calls.append(doc_id),
+        lambda doc_id, **_k: enqueue_calls.append(doc_id),
     )
     monkeypatch.setattr(
         "app.tasks.analysis_tasks.enqueue_profile_analysis",
         lambda *_a, **_k: None,
     )
 
-    # Let real create_analysis_for_ready_document run (idempotent skip).
-    from app.modules.analysis.service import AnalysisService
+    orig = AnalysisService.create_analysis_for_ready_documents
 
-    orig = AnalysisService.create_analysis_for_ready_document
-
-    def _wrap(self, document_id):
-        result = orig(self, document_id)
-        real_auto_calls.append((document_id, result))
+    def _wrap(self, batch, **kwargs):
+        result = orig(self, batch, **kwargs)
+        real_auto_calls.append((list(batch), result))
         return result
 
-    monkeypatch.setattr(AnalysisService, "create_analysis_for_ready_document", _wrap)
+    monkeypatch.setattr(AnalysisService, "create_analysis_for_ready_documents", _wrap)
 
     try:
         csrf = _login(client, admin.login_id)
@@ -1446,9 +1446,7 @@ def test_reuse_skips_auto_analysis_when_run_exists(
         assert res2.status_code == 201, res2.text
         assert res2.json()["data"]["reused_document_ids"] == [str(doc_id)]
         assert enqueue_calls == []
-        assert len(real_auto_calls) == 1
-        assert real_auto_calls[0][0] == doc_id
-        assert real_auto_calls[0][1] is None  # skipped — run exists
+        assert real_auto_calls == []
         runs = list(
             db_session.execute(
                 select(AnalysisRun).where(AnalysisRun.person_id == uuid.UUID(person_id))
@@ -1794,11 +1792,11 @@ def test_new_version_reuses_same_group_sha_only(
     enqueue_calls: list = []
     monkeypatch.setattr(
         "app.tasks.document_tasks.enqueue_document_processing",
-        lambda doc_id: enqueue_calls.append(doc_id),
+        lambda doc_id, **_k: enqueue_calls.append(doc_id),
     )
     monkeypatch.setattr(
-        "app.modules.analysis.service.AnalysisService.create_analysis_for_ready_document",
-        lambda self, document_id: None,
+        "app.modules.analysis.service.AnalysisService.create_analysis_for_ready_documents",
+        lambda self, batch, **_k: None,
     )
     try:
         csrf = _login(client, admin.login_id)
