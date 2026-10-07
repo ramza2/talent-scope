@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import {
   Button,
   Modal,
@@ -51,10 +51,15 @@ function previewUnavailableTooltip(row: DocumentListItem): string {
   return '미리보기를 사용할 수 없습니다. 원본 파일을 다운로드해 확인해 주세요.'
 }
 
-type DocTypeSource = 'manual' | null
+type FileDocTypeSource = 'manual' | 'suggested'
+
+type FileDocTypeState = {
+  documentTypeCode?: string
+  source: FileDocTypeSource | null
+}
 
 /** High-confidence filename rules aligned with backend `_suggest_doc_type` (no DOC-OTHER fallback). */
-function suggestDocTypeFromFilename(filename: string): string | undefined {
+export function suggestDocTypeFromFilename(filename: string): string | undefined {
   const lower = filename.toLowerCase()
   const mapping: Array<[readonly string[], string]> = [
     [['이력서', 'resume', 'cv'], 'DOC-RESUME'],
@@ -73,24 +78,28 @@ function suggestDocTypeFromFilename(filename: string): string | undefined {
   return undefined
 }
 
-/** All files must resolve to the same active DOC_TYPE; otherwise no auto-selection. */
-function consensusDocType(
+/** Merge per-file DOC_TYPE state keyed by UploadFile.uid; never overwrite manual picks. */
+export function mergeFileDocTypeState(
   files: UploadFile[],
+  prev: Record<string, FileDocTypeState>,
   activeCodes: ReadonlySet<string>,
-): string | undefined {
-  if (files.length === 0) return undefined
-  let agreed: string | undefined
+): Record<string, FileDocTypeState> {
+  const next: Record<string, FileDocTypeState> = {}
   for (const file of files) {
+    const existing = prev[file.uid]
+    if (existing?.source === 'manual') {
+      next[file.uid] = existing
+      continue
+    }
     const name = file.name || file.originFileObj?.name || ''
-    const code = suggestDocTypeFromFilename(name)
-    if (!code || !activeCodes.has(code)) return undefined
-    if (agreed === undefined) {
-      agreed = code
-    } else if (agreed !== code) {
-      return undefined
+    const suggested = suggestDocTypeFromFilename(name)
+    if (suggested && activeCodes.has(suggested)) {
+      next[file.uid] = { documentTypeCode: suggested, source: 'suggested' }
+    } else {
+      next[file.uid] = { documentTypeCode: undefined, source: null }
     }
   }
-  return agreed
+  return next
 }
 
 function statusTag(status: string) {
@@ -109,9 +118,10 @@ export function DocumentsTab({ personId, isAdmin, onChanged }: Props) {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const [uploadOpen, setUploadOpen] = useState(false)
-  const [docType, setDocType] = useState<string | undefined>()
-  const [docTypeSource, setDocTypeSource] = useState<DocTypeSource>(null)
   const [fileList, setFileList] = useState<UploadFile[]>([])
+  const [fileDocTypes, setFileDocTypes] = useState<Record<string, FileDocTypeState>>(
+    {},
+  )
   const [showDeleted, setShowDeleted] = useState(false)
   const [selectedKeys, setSelectedKeys] = useState<Key[]>([])
 
@@ -178,24 +188,34 @@ export function DocumentsTab({ personId, isAdmin, onChanged }: Props) {
     [docTypesQuery.data],
   )
 
-  const suggestedDocType = useMemo(() => {
-    if (!uploadOpen) return undefined
-    if (fileList.length === 0) return undefined
-    if (docTypesQuery.isLoading) return undefined
-    const activeCodes = new Set(docTypeOptions.map((o) => o.value))
-    return consensusDocType(fileList, activeCodes)
-  }, [uploadOpen, fileList, docTypeOptions, docTypesQuery.isLoading])
+  const activeDocTypeCodes = useMemo(
+    () => new Set(docTypeOptions.map((o) => o.value)),
+    [docTypeOptions],
+  )
 
-  const effectiveDocType =
-    docTypeSource === 'manual' ? docType : (suggestedDocType ?? undefined)
-  const isSuggestedSelection =
-    docTypeSource !== 'manual' && Boolean(suggestedDocType)
+  useEffect(() => {
+    if (!uploadOpen) return
+    if (docTypesQuery.isLoading) return
+    setFileDocTypes((prev) =>
+      mergeFileDocTypeState(fileList, prev, activeDocTypeCodes),
+    )
+  }, [uploadOpen, fileList, activeDocTypeCodes, docTypesQuery.isLoading])
+
+  const filesMissingDocType = useMemo(
+    () =>
+      fileList.filter((file) => !fileDocTypes[file.uid]?.documentTypeCode),
+    [fileList, fileDocTypes],
+  )
+
+  const canUpload =
+    fileList.length > 0 &&
+    filesMissingDocType.length === 0 &&
+    !docTypesQuery.isLoading
 
   const resetUploadModal = () => {
     setUploadOpen(false)
     setFileList([])
-    setDocType(undefined)
-    setDocTypeSource(null)
+    setFileDocTypes({})
   }
 
   const invalidateLocal = async () => {
@@ -205,18 +225,30 @@ export function DocumentsTab({ personId, isAdmin, onChanged }: Props) {
 
   const uploadMutation = useMutation({
     mutationFn: async () => {
-      if (!effectiveDocType) throw new Error('문서 종류를 선택하세요.')
-      const files: File[] = []
-      for (const item of fileList) {
-        if (item.originFileObj) {
-          files.push(item.originFileObj as File)
-        }
+      if (fileList.length === 0) throw new Error('업로드할 파일을 선택하세요.')
+      if (filesMissingDocType.length > 0) {
+        const names = filesMissingDocType
+          .map((f) => f.name || f.originFileObj?.name || f.uid)
+          .join(', ')
+        throw new Error(`문서 종류를 선택하세요: ${names}`)
       }
-      if (files.length === 0) throw new Error('업로드할 파일을 선택하세요.')
+      const items = []
+      for (const item of fileList) {
+        if (!item.originFileObj) continue
+        const code = fileDocTypes[item.uid]?.documentTypeCode
+        if (!code) continue
+        items.push({
+          file: item.originFileObj as File,
+          documentTypeCode: code,
+        })
+      }
+      if (items.length === 0) throw new Error('업로드할 파일을 선택하세요.')
+      if (items.length !== fileList.length) {
+        throw new Error('선택한 파일 정보를 확인할 수 없습니다.')
+      }
       return promoteExistingPersonDocuments({
         personId,
-        files,
-        documentTypeCode: effectiveDocType,
+        items,
         mode: 'NEW_GROUP',
       })
     },
@@ -537,42 +569,91 @@ export function DocumentsTab({ personId, isAdmin, onChanged }: Props) {
         onOk={() => uploadMutation.mutate()}
         confirmLoading={uploadMutation.isPending}
         okText="업로드"
+        okButtonProps={{ disabled: !canUpload }}
         destroyOnClose
+        width={640}
       >
         <Typography.Paragraph type="secondary">
           각 파일은 새 문서 그룹(version 1)으로 승격됩니다. 버전 추가는 API의 NEW_VERSION으로
-          처리합니다.
+          처리합니다. 파일마다 문서 종류를 지정한 뒤 한 번에 등록합니다.
         </Typography.Paragraph>
-        <div style={{ marginBottom: 12 }}>
-          <Typography.Text>문서 종류</Typography.Text>
-          <Select
-            style={{ width: '100%', marginTop: 6 }}
-            placeholder="DOC_TYPE 선택"
-            options={docTypeOptions}
-            value={effectiveDocType}
-            allowClear
-            onChange={(value) => {
-              setDocType(value)
-              setDocTypeSource('manual')
-            }}
-            loading={docTypesQuery.isLoading}
-            showSearch
-            optionFilterProp="label"
-          />
-          {isSuggestedSelection ? (
-            <Typography.Text type="secondary" style={{ display: 'block', marginTop: 6 }}>
-              파일명 기준으로 문서 종류를 자동 선택했습니다.
-            </Typography.Text>
-          ) : null}
-        </div>
         <Upload
           multiple
           beforeUpload={() => false}
           fileList={fileList}
+          showUploadList={false}
           onChange={({ fileList: next }) => setFileList(next)}
         >
-          <Button>파일 선택</Button>
+          <Button style={{ marginBottom: 12 }}>파일 선택</Button>
         </Upload>
+        {fileList.length > 0 ? (
+          <Table
+            size="small"
+            pagination={false}
+            rowKey={(row) => row.uid}
+            dataSource={fileList}
+            columns={[
+              {
+                title: '파일명',
+                key: 'name',
+                ellipsis: true,
+                render: (_, file) =>
+                  file.name || file.originFileObj?.name || file.uid,
+              },
+              {
+                title: '문서 종류',
+                key: 'docType',
+                width: 260,
+                render: (_, file) => (
+                  <Select
+                    style={{ width: '100%' }}
+                    placeholder="DOC_TYPE 선택"
+                    options={docTypeOptions}
+                    value={fileDocTypes[file.uid]?.documentTypeCode}
+                    allowClear
+                    loading={docTypesQuery.isLoading}
+                    showSearch
+                    optionFilterProp="label"
+                    onChange={(value) => {
+                      setFileDocTypes((prev) => ({
+                        ...prev,
+                        [file.uid]: {
+                          documentTypeCode: value,
+                          source: 'manual',
+                        },
+                      }))
+                    }}
+                  />
+                ),
+              },
+              {
+                title: '',
+                key: 'remove',
+                width: 64,
+                render: (_, file) => (
+                  <Button
+                    type="link"
+                    danger
+                    size="small"
+                    onClick={() => {
+                      setFileList((prev) => prev.filter((f) => f.uid !== file.uid))
+                    }}
+                  >
+                    삭제
+                  </Button>
+                ),
+              },
+            ]}
+          />
+        ) : null}
+        {filesMissingDocType.length > 0 ? (
+          <Typography.Text type="danger" style={{ display: 'block', marginTop: 8 }}>
+            문서 종류를 선택하세요:{' '}
+            {filesMissingDocType
+              .map((f) => f.name || f.originFileObj?.name || f.uid)
+              .join(', ')}
+          </Typography.Text>
+        ) : null}
       </Modal>
     </div>
   )
