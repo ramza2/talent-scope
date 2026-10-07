@@ -46,6 +46,7 @@ from app.modules.analysis.code_catalog import (
 )
 from app.modules.analysis.compact_v8 import (
     apply_normalized_quote_evidence,
+    backfill_exact_core_evidence,
     build_document_alias_view,
     expand_compact_core,
     expand_compact_projects,
@@ -1029,6 +1030,13 @@ class AnalysisService:
             # v11: promote raw_value that exactly equals an active typed catalog code.
             if prompt.promote_exact_catalog_codes:
                 doc = promote_exact_root_catalog_codes(doc, catalog=catalog_map)
+            # v13: exact substring provenance for CORE entities missing refs.
+            if prompt.backfill_exact_core_evidence:
+                doc = backfill_exact_core_evidence(
+                    doc,
+                    page_texts=page_texts,
+                    allowed_documents=allowed_documents,
+                )
             return doc
 
         def _normalize_projects(raw: dict[str, Any]) -> ProfileCandidateDocument:
