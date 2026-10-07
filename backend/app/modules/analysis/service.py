@@ -635,17 +635,40 @@ class AnalysisService:
                 return "FAILED"
 
             self.db.commit()
+            run_id = run.id
+            next_attempt = int(attempt) + 1
             try:
                 enqueue_deferred_auto_profile_analysis(
-                    run.id,
-                    attempt=int(attempt) + 1,
+                    run_id,
+                    attempt=next_attempt,
                 )
             except Exception:
                 logger.exception(
                     "deferred re-schedule failed analysis_run_id=%s attempt=%s",
-                    run.id,
+                    run_id,
                     attempt,
                 )
+                # Session uses expire_on_commit=False; force a fresh read so a
+                # concurrent CANCELLED/QUEUED transition is not overwritten.
+                self.db.expire_all()
+                run = self.repo.get_run(run_id, for_update=True)
+                if run is not None and run.status == "DEFERRED":
+                    self.repo.mark_failed(run, "AI queue unavailable")
+                    self.repo.add_audit(
+                        action_type="ANALYSIS_ENQUEUE_FAILED",
+                        actor_user_id=actor_user_id,
+                        target_id=run.id,
+                        after={"status": "FAILED"},
+                        metadata={
+                            "reason": "DEFERRED_RESCHEDULE_UNAVAILABLE",
+                            "attempt": int(attempt),
+                        },
+                    )
+                    self.db.commit()
+                    return "FAILED"
+                if run is not None:
+                    return run.status
+                return "NOT_FOUND"
             logger.info(
                 "deferred analysis still blocked analysis_run_id=%s attempt=%s "
                 "countdown=%s",
@@ -1954,12 +1977,34 @@ class AnalysisService:
     def retry_analysis(
         self, analysis_id: UUID, actor_user_id: UUID
     ) -> CreateAnalysisResponseData:
+        # Lock order: peek run → person FOR UPDATE → run FOR UPDATE
+        # (same as create / promote; avoids bypassing single-active invariant).
+        peek = self.repo.get_run(analysis_id)
+        if peek is None:
+            raise NotFoundError("분석을 찾을 수 없습니다.")
+        if peek.status != "FAILED":
+            raise AnalysisStateConflictError(
+                "FAILED 상태의 분석만 재시도할 수 있습니다."
+            )
+
+        person = self.repo.get_person(peek.person_id, for_update=True)
+        if person is None or person.deleted_at is not None or person.status == "DELETED":
+            raise NotFoundError("인력을 찾을 수 없습니다.")
+
         run = self.repo.get_run(analysis_id, for_update=True)
         if run is None:
             raise NotFoundError("분석을 찾을 수 없습니다.")
         if run.status != "FAILED":
             raise AnalysisStateConflictError(
                 "FAILED 상태의 분석만 재시도할 수 있습니다."
+            )
+
+        # Self is FAILED so not a blocker; DEFERRED/QUEUED/PROCESSING block retry.
+        blocking = self.repo.get_manual_create_blocking_run(run.person_id)
+        if blocking is not None:
+            raise AnalysisStateConflictError(
+                "이미 진행 중이거나 대기 중인 AI 분석이 있습니다. "
+                "완료 후 다시 시도해 주세요."
             )
 
         self.repo.clear_candidate_and_diffs(run)

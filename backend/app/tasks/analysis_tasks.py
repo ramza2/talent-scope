@@ -135,8 +135,54 @@ def retry_deferred_auto_profile_analysis(
         db.close()
 
 
-# Backward-compatible alias for imports/tests that still reference the old name.
-retry_auto_profile_analysis_batch = retry_deferred_auto_profile_analysis
+@celery_app.task(
+    name="app.tasks.analysis_tasks.retry_auto_profile_analysis_batch",
+    bind=True,
+    max_retries=0,
+)
+def retry_auto_profile_analysis_batch(
+    self,
+    batch_document_ids: list[str],
+    new_document_ids: list[str],
+    attempt: int = 1,
+) -> dict[str, str]:
+    """Compatibility task for pre-DEFERRED ETA messages still in Redis.
+
+    Old workers scheduled this name with batch document ids. New workers must
+    keep the Celery registry entry so those messages are not dropped as
+    unregistered. Execution delegates to ``create_analysis_for_ready_documents``
+    which persists DEFERRED (and schedules promote by run id) or creates QUEUED.
+    """
+    db = SessionLocal()
+    try:
+        batch = [UUID(str(i)) for i in batch_document_ids]
+        new_ids = [UUID(str(i)) for i in new_document_ids]
+        service = AnalysisService(db, storage=get_object_storage())
+        result = service.create_analysis_for_ready_documents(
+            batch,
+            new_document_ids=new_ids,
+        )
+        if result is None:
+            logger.info(
+                "compat auto analysis batch skipped batch=%s attempt=%s",
+                batch_document_ids,
+                attempt,
+            )
+            return {"status": "SKIPPED", "attempt": str(attempt)}
+        return {
+            "status": result.status,
+            "analysis_run_id": str(result.analysis_id),
+            "attempt": str(attempt),
+        }
+    except Exception:
+        logger.exception(
+            "retry_auto_profile_analysis_batch failed batch=%s attempt=%s",
+            batch_document_ids,
+            attempt,
+        )
+        raise
+    finally:
+        db.close()
 
 
 def enqueue_deferred_auto_profile_analysis(
