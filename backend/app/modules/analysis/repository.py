@@ -106,6 +106,18 @@ class AnalysisRepository:
         ).scalar_one_or_none()
         return row is not None
 
+    def get_active_run_for_person(self, person_id: UUID) -> AnalysisRun | None:
+        """Return a QUEUED/PROCESSING run for the person, if any."""
+        return self.db.execute(
+            select(AnalysisRun)
+            .where(
+                AnalysisRun.person_id == person_id,
+                AnalysisRun.status.in_(("QUEUED", "PROCESSING")),
+            )
+            .order_by(AnalysisRun.created_at.asc())
+            .limit(1)
+        ).scalar_one_or_none()
+
     def list_runs(
         self,
         *,

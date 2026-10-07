@@ -635,8 +635,14 @@ class DocumentService:
                     exc_info=True,
                 )
 
-        self._enqueue_processing(new_document_ids)
-        self._maybe_auto_analyze_reused(reused_document_ids)
+        # New docs carry the full resolve batch so auto-analysis waits until all
+        # batch members are READY. All-reused resolutions enqueue nothing and
+        # do not force a new analysis.
+        self._enqueue_processing(
+            new_document_ids,
+            batch_document_ids=document_ids,
+            new_document_ids=new_document_ids,
+        )
 
         return {
             "person_id": person.id,
@@ -761,7 +767,11 @@ class DocumentService:
                     exc_info=True,
                 )
 
-        self._enqueue_processing(document_ids)
+        self._enqueue_processing(
+            document_ids,
+            batch_document_ids=document_ids,
+            new_document_ids=document_ids,
+        )
 
         assert person_id is not None
         return {
@@ -851,32 +861,20 @@ class DocumentService:
         )
         return existing.id, temp_key
 
-    def _enqueue_processing(self, document_ids: list[UUID]) -> None:
+    def _enqueue_processing(
+        self,
+        document_ids: list[UUID],
+        *,
+        batch_document_ids: list[UUID],
+        new_document_ids: list[UUID],
+    ) -> None:
         from app.tasks.document_tasks import enqueue_document_processing
 
         for doc_id in document_ids:
-            enqueue_document_processing(doc_id)
-
-    def _maybe_auto_analyze_reused(self, document_ids: list[UUID]) -> None:
-        """Best-effort PROFILE analysis for reused READY docs (never fails resolve)."""
-        if not document_ids:
-            return
-        try:
-            from app.modules.analysis.service import AnalysisService
-
-            service = AnalysisService(self.db, storage=self.storage)
-            for doc_id in document_ids:
-                try:
-                    service.create_analysis_for_ready_document(doc_id)
-                except Exception:
-                    logger.exception(
-                        "auto analysis after reuse failed document_id=%s",
-                        doc_id,
-                    )
-        except Exception:
-            logger.exception(
-                "auto analysis after reuse setup failed document_ids=%s",
-                [str(i) for i in document_ids],
+            enqueue_document_processing(
+                doc_id,
+                batch_document_ids=batch_document_ids,
+                new_document_ids=new_document_ids,
             )
 
     def _promote_temp_file(
