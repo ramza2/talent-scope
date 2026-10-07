@@ -441,30 +441,27 @@ def _normalize_projects(compact: dict, *, catalog: dict | None = None, page_text
 # ---------------------------------------------------------------------------
 
 
-def test_profile_extract_registry_current_is_v12() -> None:
+def test_profile_extract_registry_v12_remains_staged_compact_historical() -> None:
+    """v12 stays resolvable as historical staged+compact; current may advance."""
     from app.ai.prompts import profile_extract_v11 as v11
     from app.ai.prompts import profile_extract_v12 as v12
-    from app.ai.prompts.profile_extract import (
-        CURRENT_PROFILE_PROMPT_VERSION,
-        current_profile_prompt,
-        resolve_profile_prompt,
-    )
+    from app.ai.prompts.profile_extract import resolve_profile_prompt
 
-    assert CURRENT_PROFILE_PROMPT_VERSION == "profile-extract-v12"
-    cur = current_profile_prompt()
-    assert cur.prompt_version == "profile-extract-v12"
-    assert cur.extraction_mode == "staged"
-    assert cur.compact_protocol is True
-    assert cur.strict_relation_evidence is True
-    assert cur.derive_project_duration is True
-    assert cur.clear_catalog_code_customer is True
-    assert cur.promote_exact_catalog_codes is True
-    assert cur.core_system_prompt == v12.CORE_SYSTEM_PROMPT
+    v12_spec = resolve_profile_prompt("profile-extract-v12")
+    assert v12_spec.extraction_mode == "staged"
+    assert v12_spec.compact_protocol is True
+    assert v12_spec.strict_relation_evidence is True
+    assert v12_spec.derive_project_duration is True
+    assert v12_spec.clear_catalog_code_customer is True
+    assert v12_spec.promote_exact_catalog_codes is True
+    assert v12_spec.backfill_exact_core_evidence is False
+    assert v12_spec.core_system_prompt == v12.CORE_SYSTEM_PROMPT
     assert v12.PROMOTE_EXACT_CATALOG_CODES is True
 
     v11_spec = resolve_profile_prompt("profile-extract-v11")
     assert v11_spec.promote_exact_catalog_codes is True
     assert v11_spec.strict_relation_evidence is True
+    assert v11_spec.backfill_exact_core_evidence is False
     assert v11_spec.core_system_prompt == v11.CORE_SYSTEM_PROMPT
 
 
@@ -704,7 +701,6 @@ def test_v12_same_project_multi_doc_evidence_and_isolation() -> None:
 
 
 def test_v12_happy_path_two_calls(db_session):
-    from app.ai.prompts.profile_extract import CURRENT_PROFILE_PROMPT_VERSION
     from app.modules.analysis.service import AnalysisService
     from app.storage.s3 import get_object_storage
     from tests.test_analysis import (
@@ -715,7 +711,6 @@ def test_v12_happy_path_two_calls(db_session):
         _seed_person_doc,
     )
 
-    assert CURRENT_PROFILE_PROMPT_VERSION == "profile-extract-v12"
     admin = _create_user(
         db_session, login_id=f"v12_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
     )
@@ -740,7 +735,12 @@ def test_v12_happy_path_two_calls(db_session):
         doc_type_name="이력서",
         page_text=_v12_mixed_source_page(),
     )
-    run = _queue_run(db_session, person.id, document.id)
+    run = _queue_run(
+        db_session,
+        person.id,
+        document.id,
+        prompt_version="profile-extract-v12",
+    )
     assert run.prompt_version == "profile-extract-v12"
 
     llm = _StagedSequenceLLM([_v12_core(), _v12_projects(multi_doc=False)])

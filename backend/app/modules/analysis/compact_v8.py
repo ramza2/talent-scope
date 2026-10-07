@@ -650,6 +650,151 @@ def _relation_has_quote_evidence(rel: CodeRefCandidate) -> bool:
     return any(_source_ref_has_quote(ref) for ref in (rel.source_refs or []))
 
 
+_CORE_PROFILE_BACKFILL_FIELDS = (
+    "name",
+    "phone",
+    "email",
+    "address_region",
+    "current_title",
+    "career_document_value",
+)
+
+
+def _exact_page_match(
+    value: str | None,
+    *,
+    page_texts: dict[tuple[str, int], str],
+    allowed_documents: dict[str, set[int]],
+) -> SourceRef | None:
+    """First deterministic exact substring match in stable (doc, page) order."""
+    text = (value or "").strip()
+    if not text:
+        return None
+    for doc_id, page_no in sorted(page_texts.keys()):
+        if doc_id not in allowed_documents:
+            continue
+        pages = allowed_documents[doc_id]
+        if pages and page_no not in pages:
+            continue
+        page_text = page_texts.get((doc_id, page_no)) or ""
+        if text in page_text:
+            return SourceRef(document_id=doc_id, page_no=page_no, quote_text=text)
+    return None
+
+
+def _refs_nonempty(refs: list[SourceRef] | None) -> bool:
+    return any((ref.quote_text or "").strip() for ref in (refs or []))
+
+
+def backfill_exact_core_evidence(
+    candidate: ProfileCandidateDocument,
+    *,
+    page_texts: dict[tuple[str, int], str] | None,
+    allowed_documents: dict[str, set[int]],
+) -> ProfileCandidateDocument:
+    """v13: backfill empty CORE source_refs via exact page-text substring match.
+
+    - CORE entities only; projects untouched.
+    - Existing non-empty refs always win.
+    - Exact literal match only; no fuzzy/alias/inference.
+    - affiliation_company is never backfilled.
+    """
+    if not page_texts:
+        return candidate
+
+    def _one(value: str | None, refs: list[SourceRef]) -> list[SourceRef]:
+        if _refs_nonempty(refs):
+            return list(refs)
+        match = _exact_page_match(
+            value,
+            page_texts=page_texts,
+            allowed_documents=allowed_documents,
+        )
+        return [match] if match is not None else list(refs)
+
+    profile_refs = dict(candidate.profile.source_refs or {})
+    profile_changed = False
+    for field in _CORE_PROFILE_BACKFILL_FIELDS:
+        existing = profile_refs.get(field) or []
+        if _refs_nonempty(existing):
+            continue
+        scalar = getattr(candidate.profile, field, None)
+        if not isinstance(scalar, str):
+            continue
+        match = _exact_page_match(
+            scalar,
+            page_texts=page_texts,
+            allowed_documents=allowed_documents,
+        )
+        if match is None:
+            continue
+        profile_refs[field] = [match]
+        profile_changed = True
+
+    profile = (
+        candidate.profile.model_copy(update={"source_refs": profile_refs})
+        if profile_changed
+        else candidate.profile
+    )
+
+    jobs = [
+        job.model_copy(update={"source_refs": _one(job.raw_value, job.source_refs)})
+        for job in candidate.jobs
+    ]
+    skills = [
+        skill.model_copy(
+            update={"source_refs": _one(skill.raw_value, skill.source_refs)}
+        )
+        for skill in candidate.skills
+    ]
+    expertise = [
+        exp.model_copy(update={"source_refs": _one(exp.raw_value, exp.source_refs)})
+        for exp in candidate.expertise
+    ]
+    employment = [
+        row.model_copy(
+            update={"source_refs": _one(row.company_name, row.source_refs)}
+        )
+        for row in candidate.employment_history
+    ]
+    education = [
+        row.model_copy(
+            update={"source_refs": _one(row.school_name, row.source_refs)}
+        )
+        for row in candidate.education
+    ]
+    certifications = [
+        row.model_copy(
+            update={
+                "source_refs": _one(row.certification_name, row.source_refs)
+            }
+        )
+        for row in candidate.certifications
+    ]
+
+    if (
+        profile is candidate.profile
+        and jobs == list(candidate.jobs)
+        and skills == list(candidate.skills)
+        and expertise == list(candidate.expertise)
+        and employment == list(candidate.employment_history)
+        and education == list(candidate.education)
+        and certifications == list(candidate.certifications)
+    ):
+        return candidate
+    return candidate.model_copy(
+        update={
+            "profile": profile,
+            "jobs": jobs,
+            "skills": skills,
+            "expertise": expertise,
+            "employment_history": employment,
+            "education": education,
+            "certifications": certifications,
+        }
+    )
+
+
 def promote_exact_root_catalog_codes(
     candidate: ProfileCandidateDocument,
     *,
