@@ -217,6 +217,127 @@ def test_existing_valid_quote_unchanged() -> None:
     assert len(filtered.projects) == 1
 
 
+def test_empty_refs_unique_project_name_exact_match_repaired() -> None:
+    from app.ai.schemas.profile_candidate import (
+        ProfileCandidateDocument,
+        ProjectCandidate,
+    )
+    from app.modules.analysis.compact_v8 import (
+        apply_normalized_quote_evidence,
+        backfill_exact_project_evidence,
+    )
+
+    doc = ProfileCandidateDocument(
+        schema_version="profile-candidate-v1",
+        projects=[
+            ProjectCandidate(
+                project_name="고객보안운영프로젝트",
+                customer_name="고객기관",
+                source_refs=[],
+            )
+        ],
+    )
+    texts = {
+        (_DOC1, 1): "머리말",
+        (_DOC1, 2): "고객보안운영프로젝트 PL 운영",
+    }
+    out, repaired = backfill_exact_project_evidence(doc, page_texts=texts)
+    assert repaired == 1
+    ref = out.projects[0].source_refs[0]
+    assert ref.quote_text == "고객보안운영프로젝트"
+    assert ref.document_id == _DOC1
+    assert ref.page_no == 2
+    filtered = apply_normalized_quote_evidence(out)
+    assert len(filtered.projects) == 1
+
+
+def test_empty_refs_customer_name_fallback_exact_match_repaired() -> None:
+    from app.ai.schemas.profile_candidate import (
+        ProfileCandidateDocument,
+        ProjectCandidate,
+    )
+    from app.modules.analysis.compact_v8 import backfill_exact_project_evidence
+
+    doc = ProfileCandidateDocument(
+        schema_version="profile-candidate-v1",
+        projects=[
+            ProjectCandidate(
+                project_name="페이지에없는프로젝트명",
+                customer_name="고객기관보안",
+                responsibilities="운영",
+                source_refs=[],
+            )
+        ],
+    )
+    out, repaired = backfill_exact_project_evidence(
+        doc,
+        page_texts={(_DOC1, 1): "발주 고객기관보안 관련 문서"},
+    )
+    assert repaired == 1
+    assert out.projects[0].source_refs[0].quote_text == "고객기관보안"
+    assert out.projects[0].source_refs[0].document_id == _DOC1
+    assert out.projects[0].source_refs[0].page_no == 1
+
+
+def test_empty_refs_ambiguous_duplicate_match_not_repaired() -> None:
+    from app.ai.schemas.profile_candidate import (
+        ProfileCandidateDocument,
+        ProjectCandidate,
+    )
+    from app.modules.analysis.compact_v8 import (
+        apply_normalized_quote_evidence,
+        backfill_exact_project_evidence,
+    )
+
+    doc = ProfileCandidateDocument(
+        schema_version="profile-candidate-v1",
+        projects=[
+            ProjectCandidate(
+                project_name="공통프로젝트명",
+                source_refs=[],
+            )
+        ],
+    )
+    texts = {
+        (_DOC1, 1): "공통프로젝트명 첫번째",
+        (_DOC1, 2): "공통프로젝트명 두번째",
+    }
+    out, repaired = backfill_exact_project_evidence(doc, page_texts=texts)
+    assert repaired == 0
+    assert out.projects[0].source_refs == []
+    assert apply_normalized_quote_evidence(out).projects == []
+
+
+def test_empty_refs_no_exact_scalar_not_repaired() -> None:
+    from app.ai.schemas.profile_candidate import (
+        ProfileCandidateDocument,
+        ProjectCandidate,
+    )
+    from app.modules.analysis.compact_v8 import (
+        apply_normalized_quote_evidence,
+        backfill_exact_project_evidence,
+    )
+
+    doc = ProfileCandidateDocument(
+        schema_version="profile-candidate-v1",
+        projects=[
+            ProjectCandidate(
+                project_name="없는이름",
+                customer_name="없는고객",
+                responsibilities="없는업무",
+                source_refs=[],
+            )
+        ],
+    )
+    out, repaired = backfill_exact_project_evidence(
+        doc,
+        page_texts={(_DOC1, 1): "관련 없는 페이지 텍스트"},
+    )
+    assert repaired == 0
+    assert out.projects[0].source_refs == []
+    assert apply_normalized_quote_evidence(out).projects == []
+
+
 def test_wrong_page_or_no_anchor_remains_fail_closed() -> None:
     texts = {
         (_DOC1, 1): "다른내용만 있음",
