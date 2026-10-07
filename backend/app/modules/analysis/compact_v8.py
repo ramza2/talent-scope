@@ -228,10 +228,13 @@ def _expand_ref(item: Any, alias_to_id: dict[str, str]) -> dict[str, Any] | None
         doc_id = _optional_text(doc_id)
     if doc_id is None:
         return None
-    page_no = item.get("p", item.get("page_no"))
+    # Fail-soft: keep ref when page_no is malformed; omit only the field.
+    # Accept positive ints / numeric strings via p or canonical page_no.
+    raw_page = item.get("p", item.get("page_no"))
+    page_no = _optional_int(raw_page)
     quote = _optional_text(item.get("q", item.get("quote_text")))
     out: dict[str, Any] = {"document_id": doc_id}
-    if page_no is not None:
+    if page_no is not None and page_no > 0:
         out["page_no"] = page_no
     if quote is not None:
         out["quote_text"] = quote
