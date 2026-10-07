@@ -118,6 +118,33 @@ class AnalysisRepository:
             .limit(1)
         ).scalar_one_or_none()
 
+    def has_run_covering_document_batch(
+        self, person_id: UUID, document_ids: list[UUID]
+    ) -> bool:
+        """True when any AnalysisRun for the person links all batch documents.
+
+        Status-independent (includes FAILED/REVIEWING/…). Used for auto-analysis
+        historical idempotency so the same upload batch is not re-created.
+        """
+        batch = list(dict.fromkeys(document_ids))
+        if not batch:
+            return False
+        covering_run_id = self.db.execute(
+            select(AnalysisRunDocument.analysis_run_id)
+            .join(AnalysisRun, AnalysisRun.id == AnalysisRunDocument.analysis_run_id)
+            .where(
+                AnalysisRun.person_id == person_id,
+                AnalysisRunDocument.document_id.in_(batch),
+            )
+            .group_by(AnalysisRunDocument.analysis_run_id)
+            .having(
+                func.count(func.distinct(AnalysisRunDocument.document_id))
+                == len(batch)
+            )
+            .limit(1)
+        ).scalar_one_or_none()
+        return covering_run_id is not None
+
     def list_runs(
         self,
         *,

@@ -58,7 +58,7 @@ def _seed_second_ready_doc(db_session, person, user_id, *, status: str = "READY"
         mime_type="application/pdf",
         file_size=100,
         storage_key=f"test/{uuid.uuid4()}.pdf",
-        sha256="b" * 64,
+        sha256=(uuid.uuid4().hex + uuid.uuid4().hex),
         processing_status=status,
         uploaded_by=user_id,
     )
@@ -281,6 +281,19 @@ def test_active_guard_evaluated_after_person_for_update_contract() -> None:
     assert person_idx < active_idx
 
 
+def test_auto_batch_historical_check_after_person_for_update_contract() -> None:
+    from app.modules.analysis import service as analysis_service_mod
+
+    source = inspect.getsource(
+        analysis_service_mod.AnalysisService.create_analysis_for_ready_documents
+    )
+    person_idx = source.find("get_person(person_id, for_update=True)")
+    hist_idx = source.find("has_run_covering_document_batch(person_id, batch)")
+    assert person_idx != -1
+    assert hist_idx != -1
+    assert person_idx < hist_idx
+
+
 def test_mixed_new_reused_batch_includes_both(
     db_session, monkeypatch: pytest.MonkeyPatch
 ):
@@ -400,3 +413,290 @@ def test_resolve_enqueue_passes_batch_ids(monkeypatch: pytest.MonkeyPatch):
     assert calls[0][1] == [d1, d2, d3]
     assert calls[0][2] == [d1, d2]
     assert calls[1][0] == d2
+
+
+def test_unrelated_active_run_defers_auto_batch(
+    db_session, monkeypatch: pytest.MonkeyPatch
+):
+    from app.core.exceptions import AnalysisStateConflictError
+    from app.modules.analysis.schemas import CreateAnalysisRequest
+    from app.modules.analysis.service import AnalysisService
+    from app.storage.s3 import get_object_storage
+    from app.tasks import document_tasks
+
+    monkeypatch.setattr(
+        "app.tasks.analysis_tasks.enqueue_profile_analysis", lambda *_a, **_k: None
+    )
+    defer_calls: list[dict] = []
+
+    def _capture_defer(batch, new_ids, *, attempt=1):
+        defer_calls.append(
+            {
+                "batch": list(batch),
+                "new": list(new_ids),
+                "attempt": attempt,
+            }
+        )
+
+    monkeypatch.setattr(
+        "app.tasks.analysis_tasks.enqueue_deferred_auto_profile_analysis",
+        _capture_defer,
+    )
+
+    admin = _create_user(
+        db_session, login_id=f"df_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    person, unrelated = _seed_person_with_ready_doc(db_session, admin.id)
+    doc_a = _seed_second_ready_doc(db_session, person, admin.id, status="READY")
+    doc_b = _seed_second_ready_doc(db_session, person, admin.id, status="READY")
+    service = AnalysisService(db_session, storage=get_object_storage())
+    service.create_analysis(
+        CreateAnalysisRequest(
+            person_id=person.id,
+            document_ids=[unrelated.id],
+            analysis_type="PROFILE",
+        ),
+        admin.id,
+    )
+    assert len(_count_person_runs(db_session, person.id)) == 1
+
+    batch = [doc_a.id, doc_b.id]
+    with pytest.raises(AnalysisStateConflictError):
+        service.create_analysis_for_ready_documents(
+            batch, new_document_ids=batch
+        )
+    db_session.rollback()
+    assert len(_count_person_runs(db_session, person.id)) == 1
+
+    document_tasks._maybe_start_auto_profile_analysis(
+        db_session,
+        doc_a.id,
+        batch_document_ids=batch,
+        new_document_ids=batch,
+    )
+    assert len(defer_calls) == 1
+    assert set(defer_calls[0]["batch"]) == set(batch)
+    assert defer_calls[0]["attempt"] == 1
+    assert len(_count_person_runs(db_session, person.id)) == 1
+    _cleanup_person(db_session, person.id, admin.id)
+
+
+def test_deferred_retry_reschedules_while_active(
+    db_session, monkeypatch: pytest.MonkeyPatch
+):
+    from app.modules.analysis.schemas import CreateAnalysisRequest
+    from app.modules.analysis.service import AnalysisService
+    from app.storage.s3 import get_object_storage
+    from app.tasks import analysis_tasks
+
+    monkeypatch.setattr(
+        "app.tasks.analysis_tasks.enqueue_profile_analysis", lambda *_a, **_k: None
+    )
+    scheduled: list[dict] = []
+
+    def _capture_apply_async(*_a, **kwargs):
+        scheduled.append(kwargs)
+
+    monkeypatch.setattr(
+        analysis_tasks.retry_auto_profile_analysis_batch,
+        "apply_async",
+        _capture_apply_async,
+    )
+
+    admin = _create_user(
+        db_session, login_id=f"dr_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    person, unrelated = _seed_person_with_ready_doc(db_session, admin.id)
+    doc_a = _seed_second_ready_doc(db_session, person, admin.id, status="READY")
+    service = AnalysisService(db_session, storage=get_object_storage())
+    service.create_analysis(
+        CreateAnalysisRequest(
+            person_id=person.id,
+            document_ids=[unrelated.id],
+            analysis_type="PROFILE",
+        ),
+        admin.id,
+    )
+
+    result = analysis_tasks.retry_auto_profile_analysis_batch.run(
+        batch_document_ids=[str(doc_a.id)],
+        new_document_ids=[str(doc_a.id)],
+        attempt=1,
+    )
+    assert result["status"] == "DEFERRED"
+    assert len(scheduled) == 1
+    assert scheduled[0]["countdown"] == analysis_tasks.AUTO_ANALYSIS_DEFER_COUNTDOWN_SECONDS
+    assert scheduled[0]["kwargs"]["attempt"] == 2
+    assert len(_count_person_runs(db_session, person.id)) == 1
+    _cleanup_person(db_session, person.id, admin.id)
+
+
+def test_deferred_retry_creates_batch_after_active_clears(
+    db_session, monkeypatch: pytest.MonkeyPatch
+):
+    from app.db.models.analysis import AnalysisRun, AnalysisRunDocument
+    from app.modules.analysis.schemas import CreateAnalysisRequest
+    from app.modules.analysis.service import AnalysisService
+    from app.storage.s3 import get_object_storage
+    from app.tasks import analysis_tasks
+
+    monkeypatch.setattr(
+        "app.tasks.analysis_tasks.enqueue_profile_analysis", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(
+        analysis_tasks.retry_auto_profile_analysis_batch,
+        "apply_async",
+        lambda *_a, **_k: None,
+    )
+
+    admin = _create_user(
+        db_session, login_id=f"dc_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    person, unrelated = _seed_person_with_ready_doc(db_session, admin.id)
+    doc_a = _seed_second_ready_doc(db_session, person, admin.id, status="READY")
+    doc_b = _seed_second_ready_doc(db_session, person, admin.id, status="READY")
+    service = AnalysisService(db_session, storage=get_object_storage())
+    active = service.create_analysis(
+        CreateAnalysisRequest(
+            person_id=person.id,
+            document_ids=[unrelated.id],
+            analysis_type="PROFILE",
+        ),
+        admin.id,
+    )
+    run = db_session.get(AnalysisRun, active.analysis_id)
+    assert run is not None
+    run.status = "REVIEWING"
+    db_session.commit()
+
+    batch = [doc_a.id, doc_b.id]
+    result = analysis_tasks.retry_auto_profile_analysis_batch.run(
+        batch_document_ids=[str(i) for i in batch],
+        new_document_ids=[str(i) for i in batch],
+        attempt=3,
+    )
+    assert result["status"] == "QUEUED"
+    runs = _count_person_runs(db_session, person.id)
+    assert len(runs) == 2
+    new_run_id = uuid.UUID(result["analysis_run_id"])
+    linked = set(
+        db_session.execute(
+            select(AnalysisRunDocument.document_id).where(
+                AnalysisRunDocument.analysis_run_id == new_run_id
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert linked == set(batch)
+    _cleanup_person(db_session, person.id, admin.id)
+
+
+def test_duplicate_deferred_retry_keeps_single_run(
+    db_session, monkeypatch: pytest.MonkeyPatch
+):
+    from app.modules.analysis.service import AnalysisService
+    from app.storage.s3 import get_object_storage
+    from app.tasks import analysis_tasks
+
+    monkeypatch.setattr(
+        "app.tasks.analysis_tasks.enqueue_profile_analysis", lambda *_a, **_k: None
+    )
+    admin = _create_user(
+        db_session, login_id=f"dd_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    person, doc_a = _seed_person_with_ready_doc(db_session, admin.id)
+    doc_b = _seed_second_ready_doc(db_session, person, admin.id, status="READY")
+    batch = [doc_a.id, doc_b.id]
+    first = analysis_tasks.retry_auto_profile_analysis_batch.run(
+        batch_document_ids=[str(i) for i in batch],
+        new_document_ids=[str(i) for i in batch],
+        attempt=1,
+    )
+    assert first["status"] == "QUEUED"
+    second = analysis_tasks.retry_auto_profile_analysis_batch.run(
+        batch_document_ids=[str(i) for i in batch],
+        new_document_ids=[str(i) for i in batch],
+        attempt=2,
+    )
+    assert second["status"] == "SKIPPED"
+    assert len(_count_person_runs(db_session, person.id)) == 1
+    _cleanup_person(db_session, person.id, admin.id)
+
+
+def test_same_batch_failed_blocks_auto_but_manual_retry_works(
+    db_session, monkeypatch: pytest.MonkeyPatch
+):
+    from app.db.models.analysis import AnalysisRun
+    from app.modules.analysis.service import AnalysisService
+    from app.storage.s3 import get_object_storage
+
+    monkeypatch.setattr(
+        "app.tasks.analysis_tasks.enqueue_profile_analysis", lambda *_a, **_k: None
+    )
+    admin = _create_user(
+        db_session, login_id=f"ff_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    person, doc = _seed_person_with_ready_doc(db_session, admin.id)
+    service = AnalysisService(db_session, storage=get_object_storage())
+    created = service.create_analysis_for_ready_document(doc.id)
+    assert created is not None
+    run = db_session.get(AnalysisRun, created.analysis_id)
+    assert run is not None
+    run.status = "FAILED"
+    db_session.commit()
+
+    assert service.create_analysis_for_ready_document(doc.id) is None
+    assert len(_count_person_runs(db_session, person.id)) == 1
+
+    retried = service.retry_analysis(created.analysis_id, admin.id)
+    assert retried.status == "QUEUED"
+    assert retried.analysis_id == created.analysis_id
+    db_session.refresh(run)
+    assert run.status == "QUEUED"
+    assert len(_count_person_runs(db_session, person.id)) == 1
+    _cleanup_person(db_session, person.id, admin.id)
+
+
+def test_defer_max_attempt_does_not_reschedule(
+    db_session, monkeypatch: pytest.MonkeyPatch
+):
+    from app.modules.analysis.schemas import CreateAnalysisRequest
+    from app.modules.analysis.service import AnalysisService
+    from app.storage.s3 import get_object_storage
+    from app.tasks import analysis_tasks
+
+    monkeypatch.setattr(
+        "app.tasks.analysis_tasks.enqueue_profile_analysis", lambda *_a, **_k: None
+    )
+    scheduled: list[dict] = []
+    monkeypatch.setattr(
+        analysis_tasks.retry_auto_profile_analysis_batch,
+        "apply_async",
+        lambda *_a, **kwargs: scheduled.append(kwargs),
+    )
+
+    admin = _create_user(
+        db_session, login_id=f"mxa_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    person, unrelated = _seed_person_with_ready_doc(db_session, admin.id)
+    doc_a = _seed_second_ready_doc(db_session, person, admin.id, status="READY")
+    service = AnalysisService(db_session, storage=get_object_storage())
+    service.create_analysis(
+        CreateAnalysisRequest(
+            person_id=person.id,
+            document_ids=[unrelated.id],
+            analysis_type="PROFILE",
+        ),
+        admin.id,
+    )
+
+    result = analysis_tasks.retry_auto_profile_analysis_batch.run(
+        batch_document_ids=[str(doc_a.id)],
+        new_document_ids=[str(doc_a.id)],
+        attempt=analysis_tasks.AUTO_ANALYSIS_DEFER_MAX_ATTEMPTS,
+    )
+    assert result["status"] == "DEFER_EXHAUSTED"
+    assert scheduled == []
+    assert len(_count_person_runs(db_session, person.id)) == 1
+    _cleanup_person(db_session, person.id, admin.id)

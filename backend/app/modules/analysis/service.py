@@ -352,9 +352,11 @@ class AnalysisService:
 
         - Requires every batch document to exist, share one person, and be READY.
         - Skips when ``new_document_ids`` is provided and empty / disjoint (all-reused).
-        - Uses ``create_analysis`` active-run guard (person FOR UPDATE) for races.
-        - Returns None when skipped; raises only on unexpected create/enqueue errors
-          (caller should not mark the Document FAILED).
+        - After person FOR UPDATE, skips when any historical run already covers
+          the full batch (status-independent, including FAILED).
+        - Propagates ``AnalysisStateConflictError`` when another QUEUED/PROCESSING
+          run blocks create so callers can schedule a bounded delayed retry.
+        - Returns None when skipped for non-conflict reasons.
         """
         batch = list(dict.fromkeys(batch_document_ids))
         if not batch:
@@ -405,20 +407,22 @@ class AnalysisService:
             )
             return None
 
+        # Historical idempotency under person lock (covers FAILED/REVIEWING/…).
+        if self.repo.has_run_covering_document_batch(person_id, batch):
+            logger.info(
+                "auto analysis skipped batch=%s reason=batch_run_exists",
+                [str(i) for i in batch],
+            )
+            return None
+
         actor_user_id = docs[0][0].uploaded_by
         payload = CreateAnalysisRequest(
             person_id=person_id,
             document_ids=batch,
             analysis_type="PROFILE",
         )
-        try:
-            result = self.create_analysis(payload, actor_user_id)
-        except AnalysisStateConflictError:
-            logger.info(
-                "auto analysis skipped batch=%s reason=active_run",
-                [str(i) for i in batch],
-            )
-            return None
+        # Active-run conflicts propagate for deferred retry by the caller.
+        result = self.create_analysis(payload, actor_user_id)
 
         logger.info(
             "auto analysis started batch=%s analysis_run_id=%s",

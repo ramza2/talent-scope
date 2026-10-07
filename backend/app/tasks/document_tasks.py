@@ -8,6 +8,7 @@ from uuid import UUID
 
 from sqlalchemy.orm import Session
 
+from app.core.exceptions import AnalysisStateConflictError
 from app.db.session import SessionLocal
 from app.modules.document_processing.service import DocumentProcessingService
 from app.storage.s3 import get_object_storage
@@ -30,26 +31,47 @@ def _maybe_start_auto_profile_analysis(
     new_document_ids: Sequence[UUID] | None = None,
 ) -> None:
     """Best-effort PROFILE analysis after READY. Never fails document processing."""
+    batch = list(batch_document_ids) if batch_document_ids is not None else [document_id]
+    new_ids = (
+        list(new_document_ids) if new_document_ids is not None else [document_id]
+    )
     try:
         from app.modules.analysis.service import AnalysisService
 
-        batch = list(batch_document_ids) if batch_document_ids is not None else [document_id]
-        new_ids = (
-            list(new_document_ids)
-            if new_document_ids is not None
-            else [document_id]
-        )
         AnalysisService(
             db, storage=get_object_storage()
         ).create_analysis_for_ready_documents(
             batch,
             new_document_ids=new_ids,
         )
+    except AnalysisStateConflictError:
+        # Unrelated active run: release person lock, then schedule bounded retry.
+        try:
+            db.rollback()
+            from app.tasks.analysis_tasks import enqueue_deferred_auto_profile_analysis
+
+            enqueue_deferred_auto_profile_analysis(
+                batch,
+                new_ids,
+                attempt=1,
+            )
+            logger.info(
+                "auto analysis deferred after active conflict document_id=%s "
+                "batch=%s",
+                document_id,
+                [str(i) for i in batch],
+            )
+        except Exception:
+            logger.exception(
+                "auto analysis defer enqueue failed document_id=%s batch=%s",
+                document_id,
+                [str(i) for i in batch],
+            )
     except Exception:
         logger.exception(
             "auto analysis failed document_id=%s batch=%s",
             document_id,
-            [str(i) for i in (batch_document_ids or [document_id])],
+            [str(i) for i in batch],
         )
 
 

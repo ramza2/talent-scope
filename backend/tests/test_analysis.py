@@ -5549,14 +5549,12 @@ def test_auto_analysis_skips_failed_deleted_and_keeps_document_ready_on_enqueue_
     assert len(runs) == 1
     assert runs[0].status == "FAILED"
 
-    # FAILED is not an active guard; a later auto-start may create another run.
+    # Same-batch historical idempotency: FAILED still blocks auto re-create.
     monkeypatch.setattr(
         "app.tasks.analysis_tasks.enqueue_profile_analysis",
         lambda *_a, **_k: None,
     )
-    recreated = service.create_analysis_for_ready_document(document.id)
-    assert recreated is not None
-    assert recreated.status == "QUEUED"
+    assert service.create_analysis_for_ready_document(document.id) is None
     assert (
         len(
             list(
@@ -5567,7 +5565,7 @@ def test_auto_analysis_skips_failed_deleted_and_keeps_document_ready_on_enqueue_
                 .all()
             )
         )
-        == 2
+        == 1
     )
 
     _cleanup_person(db_session, person.id, admin.id)
