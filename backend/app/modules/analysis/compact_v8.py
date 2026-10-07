@@ -92,6 +92,17 @@ def _optional_int(value: Any) -> int | None:
     return None
 
 
+def _optional_bool(value: Any) -> bool | None:
+    """Fail-soft optional boolean for compact skill ``rep``.
+
+    Accepts only real ``bool`` (``True`` / ``False``).
+    Rejects str/int/float/list/dict/None and other non-bool values.
+    """
+    if isinstance(value, bool):
+        return value
+    return None
+
+
 # Anchored birth-year date forms that start with YYYY (no mid-string inference).
 _BIRTH_YEAR_DATE_RE = re.compile(
     r"^(\d{4})"
@@ -311,8 +322,10 @@ def _expand_skill(item: Any, alias_to_id: dict[str, str]) -> dict[str, Any] | No
     months = _optional_int(item.get("m"))
     if months is not None:
         out["experience_months"] = months
-    if item.get("rep") is not None:
-        out["is_representative"] = item["rep"]
+    # Fail-soft: omit malformed rep (e.g. free-text) rather than failing validation.
+    rep = _optional_bool(item.get("rep"))
+    if rep is not None:
+        out["is_representative"] = rep
     if item.get("f") is not None:
         out["confidence"] = item["f"]
     refs = expand_compact_refs(item.get("r"), alias_to_id)
