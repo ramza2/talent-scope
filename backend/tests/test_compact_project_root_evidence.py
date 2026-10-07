@@ -116,12 +116,8 @@ def _pipeline(
 
 
 def test_registry_v13_enables_project_root_backfill_only() -> None:
-    from app.ai.prompts.profile_extract import (
-        CURRENT_PROFILE_PROMPT_VERSION,
-        resolve_profile_prompt,
-    )
+    from app.ai.prompts.profile_extract import resolve_profile_prompt
 
-    assert CURRENT_PROFILE_PROMPT_VERSION == "profile-extract-v13"
     v13 = resolve_profile_prompt("profile-extract-v13")
     assert v13.backfill_exact_project_evidence is True
     assert v13.backfill_exact_core_evidence is True

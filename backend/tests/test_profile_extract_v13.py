@@ -373,27 +373,22 @@ def _normalize_projects(compact: dict, *, page_texts=None):
 # ---------------------------------------------------------------------------
 
 
-def test_profile_extract_registry_current_is_v13() -> None:
+def test_profile_extract_registry_v13_remains_staged_compact_historical() -> None:
+    """v13 stays resolvable as historical staged+compact; current may advance."""
     from app.ai.prompts import profile_extract_v12 as v12
     from app.ai.prompts import profile_extract_v13 as v13
-    from app.ai.prompts.profile_extract import (
-        CURRENT_PROFILE_PROMPT_VERSION,
-        current_profile_prompt,
-        resolve_profile_prompt,
-    )
+    from app.ai.prompts.profile_extract import resolve_profile_prompt
 
-    assert CURRENT_PROFILE_PROMPT_VERSION == "profile-extract-v13"
-    cur = current_profile_prompt()
-    assert cur.prompt_version == "profile-extract-v13"
-    assert cur.extraction_mode == "staged"
-    assert cur.compact_protocol is True
-    assert cur.strict_relation_evidence is True
-    assert cur.derive_project_duration is True
-    assert cur.clear_catalog_code_customer is True
-    assert cur.promote_exact_catalog_codes is True
-    assert cur.backfill_exact_core_evidence is True
-    assert cur.backfill_exact_project_evidence is True
-    assert cur.core_system_prompt == v13.CORE_SYSTEM_PROMPT
+    v13_spec = resolve_profile_prompt("profile-extract-v13")
+    assert v13_spec.extraction_mode == "staged"
+    assert v13_spec.compact_protocol is True
+    assert v13_spec.strict_relation_evidence is True
+    assert v13_spec.derive_project_duration is True
+    assert v13_spec.clear_catalog_code_customer is True
+    assert v13_spec.promote_exact_catalog_codes is True
+    assert v13_spec.backfill_exact_core_evidence is True
+    assert v13_spec.backfill_exact_project_evidence is True
+    assert v13_spec.core_system_prompt == v13.CORE_SYSTEM_PROMPT
     assert v13.BACKFILL_EXACT_CORE_EVIDENCE is True
     assert v13.BACKFILL_EXACT_PROJECT_EVIDENCE is True
 
@@ -675,7 +670,6 @@ def test_v13_projects_system_ops_and_same_engagement_tech() -> None:
 
 
 def test_v13_happy_path_two_calls(db_session):
-    from app.ai.prompts.profile_extract import CURRENT_PROFILE_PROMPT_VERSION
     from app.modules.analysis.service import AnalysisService
     from app.storage.s3 import get_object_storage
     from tests.test_analysis import (
@@ -686,7 +680,6 @@ def test_v13_happy_path_two_calls(db_session):
         _seed_person_doc,
     )
 
-    assert CURRENT_PROFILE_PROMPT_VERSION == "profile-extract-v13"
     admin = _create_user(
         db_session, login_id=f"v13_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
     )
@@ -711,7 +704,12 @@ def test_v13_happy_path_two_calls(db_session):
         doc_type_name="이력서",
         page_text=_v13_page(),
     )
-    run = _queue_run(db_session, person.id, document.id)
+    run = _queue_run(
+        db_session,
+        person.id,
+        document.id,
+        prompt_version="profile-extract-v13",
+    )
     assert run.prompt_version == "profile-extract-v13"
 
     llm = _StagedSequenceLLM(
