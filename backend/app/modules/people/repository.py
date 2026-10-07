@@ -508,7 +508,9 @@ class PeopleRepository:
             select(AnalysisRun)
             .where(
                 AnalysisRun.person_id == person_id,
-                AnalysisRun.status.in_(("QUEUED", "PROCESSING", "REVIEWING")),
+                AnalysisRun.status.in_(
+                    ("DEFERRED", "QUEUED", "PROCESSING", "REVIEWING")
+                ),
             )
             .order_by(AnalysisRun.created_at.desc())
             .limit(1)

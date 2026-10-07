@@ -28,7 +28,7 @@ class AnalysisRun(Base):
     __tablename__ = "analysis_run"
     __table_args__ = (
         CheckConstraint(
-            "status IN ('QUEUED', 'PROCESSING', 'REVIEWING', 'CONFIRMED', 'FAILED', 'CANCELLED')",
+            "status IN ('DEFERRED', 'QUEUED', 'PROCESSING', 'REVIEWING', 'CONFIRMED', 'FAILED', 'CANCELLED')",
             name="analysis_run_status_check",
         ),
         CheckConstraint(

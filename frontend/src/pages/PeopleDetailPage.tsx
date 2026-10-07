@@ -385,10 +385,16 @@ export function PeopleDetailPage() {
               {PROFILE_FRESHNESS_LABELS[profileFreshness]}
             </Tag>
             {person.pending_analysis &&
-            ['QUEUED', 'PROCESSING', 'REVIEWING'].includes(person.pending_analysis.status) ? (
+            ['DEFERRED', 'QUEUED', 'PROCESSING', 'REVIEWING'].includes(
+              person.pending_analysis.status,
+            ) ? (
               <Tag
                 color={
-                  person.pending_analysis.status === 'REVIEWING' ? 'processing' : 'blue'
+                  person.pending_analysis.status === 'REVIEWING'
+                    ? 'processing'
+                    : person.pending_analysis.status === 'DEFERRED'
+                      ? 'gold'
+                      : 'blue'
                 }
                 style={{ cursor: 'pointer', marginLeft: 4 }}
                 onClick={() => navigate(`/analyses/${person.pending_analysis!.id}`)}
@@ -443,7 +449,9 @@ export function PeopleDetailPage() {
             />
           ) : null}
           {person.pending_analysis &&
-          ['QUEUED', 'PROCESSING', 'REVIEWING'].includes(person.pending_analysis.status) ? (
+          ['DEFERRED', 'QUEUED', 'PROCESSING', 'REVIEWING'].includes(
+            person.pending_analysis.status,
+          ) ? (
             <Alert
               style={{ marginTop: 12, maxWidth: 560 }}
               type={person.pending_analysis.status === 'REVIEWING' ? 'warning' : 'info'}
@@ -451,7 +459,9 @@ export function PeopleDetailPage() {
               message={
                 person.pending_analysis.status === 'REVIEWING'
                   ? 'AI 분석 검토 대기 중입니다.'
-                  : `AI 분석이 ${person.pending_analysis.status} 상태입니다.`
+                  : person.pending_analysis.status === 'DEFERRED'
+                    ? '앞선 AI 분석 완료를 기다리고 있습니다.'
+                    : `AI 분석이 ${person.pending_analysis.status} 상태입니다.`
               }
               action={
                 <Button

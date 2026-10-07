@@ -1,6 +1,7 @@
 import { apiFetch } from '@/api/client'
 
 export type AnalysisStatus =
+  | 'DEFERRED'
   | 'QUEUED'
   | 'PROCESSING'
   | 'REVIEWING'
@@ -353,7 +354,10 @@ export function canConfirmAnalysis(input: {
 }
 
 export function isActiveAnalysisStatus(status: AnalysisStatus): boolean {
-  return status === 'QUEUED' || status === 'PROCESSING'
+  // DEFERRED waits for another run; keep polling so UI updates on promote.
+  return (
+    status === 'DEFERRED' || status === 'QUEUED' || status === 'PROCESSING'
+  )
 }
 
 export {

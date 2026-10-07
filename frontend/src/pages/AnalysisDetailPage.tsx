@@ -86,9 +86,11 @@ function statusTag(status: AnalysisStatus) {
           ? 'warning'
           : status === 'REVIEWING'
             ? 'processing'
-            : status === 'PROCESSING' || status === 'QUEUED'
-              ? 'blue'
-              : 'default'
+            : status === 'DEFERRED'
+              ? 'gold'
+              : status === 'PROCESSING' || status === 'QUEUED'
+                ? 'blue'
+                : 'default'
   return <Tag color={color}>{status}</Tag>
 }
 
@@ -617,7 +619,15 @@ export function AnalysisDetailPage() {
         </Space>
       </Space>
 
-      {isActiveAnalysisStatus(analysis.status) ? (
+      {analysis.status === 'DEFERRED' ? (
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginBottom: 16 }}
+          message="앞선 AI 분석 완료를 기다리고 있습니다."
+          description="대기 중에는 Diff 검토와 확정을 할 수 없습니다. 상태가 바뀌면 자동으로 갱신됩니다."
+        />
+      ) : isActiveAnalysisStatus(analysis.status) ? (
         <Alert
           type="info"
           showIcon

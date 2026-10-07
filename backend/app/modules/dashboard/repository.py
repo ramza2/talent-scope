@@ -12,7 +12,13 @@ from app.db.models.document import Document, DocumentGroup
 from app.db.models.person import Person, PersonProfile
 
 _VISIBLE_STATUSES = ("ACTIVE", "INACTIVE", "ARCHIVED")
-_OPS_ANALYSIS_STATUSES = ("QUEUED", "PROCESSING", "REVIEWING", "FAILED")
+_OPS_ANALYSIS_STATUSES = (
+    "DEFERRED",
+    "QUEUED",
+    "PROCESSING",
+    "REVIEWING",
+    "FAILED",
+)
 _ACTIONABLE_CHANGE_TYPES = ("NEW", "UPDATE", "CONFLICT", "REVIEW")
 
 

@@ -43,6 +43,7 @@ const PERSON_STATUS_LABELS: Record<string, string> = {
 }
 
 const ANALYSIS_STATUS_LABELS: Record<string, { label: string; color: string }> = {
+  DEFERRED: { label: '선행 대기', color: 'gold' },
   QUEUED: { label: '대기', color: 'default' },
   PROCESSING: { label: '분석 중', color: 'processing' },
   REVIEWING: { label: '검토 대기', color: 'warning' },

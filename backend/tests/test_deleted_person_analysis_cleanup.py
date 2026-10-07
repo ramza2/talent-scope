@@ -139,6 +139,8 @@ def test_person_delete_cancels_only_active_runs(db_session) -> None:
         db_session, login_id=f"pc_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
     )
     person, document = _seed_person_with_ready_doc(db_session, admin.id)
+    deferred = _queue_run(db_session, person.id, document.id)
+    deferred.status = "DEFERRED"
     queued = _queue_run(db_session, person.id, document.id)
     processing = _queue_run(db_session, person.id, document.id)
     processing.status = "PROCESSING"
@@ -156,11 +158,13 @@ def test_person_delete_cancels_only_active_runs(db_session) -> None:
         admin.id,
     )
 
+    db_session.refresh(deferred)
     db_session.refresh(queued)
     db_session.refresh(processing)
     db_session.refresh(reviewing)
     db_session.refresh(failed)
     db_session.refresh(confirmed)
+    assert deferred.status == "CANCELLED"
     assert queued.status == "CANCELLED"
     assert processing.status == "CANCELLED"
     assert reviewing.status == "REVIEWING"
@@ -171,13 +175,13 @@ def test_person_delete_cancels_only_active_runs(db_session) -> None:
         db_session.execute(
             select(AuditLog).where(
                 AuditLog.action_type == "ANALYSIS_CANCEL",
-                AuditLog.target_id.in_([queued.id, processing.id]),
+                AuditLog.target_id.in_([deferred.id, queued.id, processing.id]),
             )
         )
         .scalars()
         .all()
     )
-    assert len(audits) == 2
+    assert len(audits) == 3
     for audit in audits:
         meta = audit.metadata_json or {}
         assert meta.get("reason") == "PERSON_DELETED"

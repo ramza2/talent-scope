@@ -387,11 +387,12 @@ class PeopleService:
     def _cancel_active_analyses_for_deleted_person(
         self, person_id: UUID, *, actor_user_id: UUID
     ) -> None:
-        """Cancel QUEUED/PROCESSING runs when a person is soft-deleted.
+        """Cancel DEFERRED/QUEUED/PROCESSING runs when a person is soft-deleted.
 
         Does not change REVIEWING/FAILED/CONFIRMED/CANCELLED history.
         Does not revoke workers; PROCESSING→CANCELLED is honored by
-        ``_persist_reviewing`` status re-check.
+        ``_persist_reviewing`` status re-check. Later deferred retry tasks
+        skip non-DEFERRED (including CANCELLED) runs.
         """
         from app.modules.analysis.repository import AnalysisRepository
 
