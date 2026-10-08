@@ -87,6 +87,7 @@ TalentScope는 사내에서 보유한 이력서, 경력기술서, 인력 프로�
 - [15. Backend REST API Specification](docs/15_backend_api.md)
 - [16. Search Performance / EXPLAIN ANALYZE](docs/16_search_performance.md)
 - [17. Server Deployment / Migration / Pytest / PERF Runbook](docs/17_server_deployment.md)
+- [18. AI Analysis Quality Evaluation](docs/18_analysis_quality_evaluation.md)
 
 실행 가능한 1차 MVP 기준 PostgreSQL Schema 초안은 [`db/schema.sql`](db/schema.sql)에 정리합니다. 구현 착수 이후 Schema 변경은 SQLAlchemy + Alembic Migration으로 관리합니다.
 
