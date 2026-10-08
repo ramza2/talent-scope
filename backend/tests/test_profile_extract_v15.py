@@ -185,30 +185,28 @@ def _rich_page_text(count: int = 5) -> str:
 # ---------------------------------------------------------------------------
 
 
-def test_profile_extract_registry_current_is_v15() -> None:
+def test_profile_extract_registry_v15_remains_resolvable() -> None:
+    """v15 stays resolvable unchanged; current may advance (v16+)."""
     from app.ai.prompts import profile_extract_v14 as v14
     from app.ai.prompts import profile_extract_v15 as v15
-    from app.ai.prompts.profile_extract import (
-        CURRENT_PROFILE_PROMPT_VERSION,
-        current_profile_prompt,
-        resolve_profile_prompt,
-    )
+    from app.ai.prompts.profile_extract import resolve_profile_prompt
 
-    assert CURRENT_PROFILE_PROMPT_VERSION == "profile-extract-v15"
-    cur = current_profile_prompt()
-    assert cur.prompt_version == "profile-extract-v15"
-    assert cur.extraction_mode == "staged"
-    assert cur.compact_protocol is True
-    assert cur.strict_relation_evidence is True
-    assert cur.derive_project_duration is True
-    assert cur.clear_catalog_code_customer is True
-    assert cur.promote_exact_catalog_codes is True
-    assert cur.backfill_exact_core_evidence is True
-    assert cur.backfill_exact_project_evidence is True
-    assert cur.validate_projects_recovery_root is True
-    assert cur.core_system_prompt == v15.CORE_SYSTEM_PROMPT
-    assert cur.projects_system_prompt == v15.PROJECTS_SYSTEM_PROMPT
+    v15_spec = resolve_profile_prompt("profile-extract-v15")
+    assert v15_spec.prompt_version == "profile-extract-v15"
+    assert v15_spec.extraction_mode == "staged"
+    assert v15_spec.compact_protocol is True
+    assert v15_spec.strict_relation_evidence is True
+    assert v15_spec.derive_project_duration is True
+    assert v15_spec.clear_catalog_code_customer is True
+    assert v15_spec.promote_exact_catalog_codes is True
+    assert v15_spec.backfill_exact_core_evidence is True
+    assert v15_spec.backfill_exact_project_evidence is True
+    assert v15_spec.validate_projects_recovery_root is True
+    assert v15_spec.validate_core_structured_completeness is False
+    assert v15_spec.core_system_prompt == v15.CORE_SYSTEM_PROMPT
+    assert v15_spec.projects_system_prompt == v15.PROJECTS_SYSTEM_PROMPT
     assert v15.VALIDATE_PROJECTS_RECOVERY_ROOT is True
+    assert not hasattr(v15, "VALIDATE_CORE_STRUCTURED_COMPLETENESS")
 
     v14_spec = resolve_profile_prompt("profile-extract-v14")
     assert v14_spec.prompt_version == "profile-extract-v14"
@@ -216,6 +214,7 @@ def test_profile_extract_registry_current_is_v15() -> None:
     assert v14_spec.projects_system_prompt == v14.PROJECTS_SYSTEM_PROMPT
     assert v14_spec.backfill_exact_project_evidence is True
     assert v14_spec.validate_projects_recovery_root is False
+    assert v14_spec.validate_core_structured_completeness is False
     assert not hasattr(v14, "VALIDATE_PROJECTS_RECOVERY_ROOT")
 
 

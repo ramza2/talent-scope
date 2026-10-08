@@ -160,6 +160,18 @@ def candidate_quality_score(candidate: ProfileCandidateDocument) -> int:
     return score
 
 
+def core_structured_entity_count(candidate: ProfileCandidateDocument) -> int:
+    """Count CORE list entities only (excludes profile scalars/summary/projects)."""
+    return (
+        len(candidate.jobs)
+        + len(candidate.skills)
+        + len(candidate.expertise)
+        + len(candidate.employment_history)
+        + len(candidate.education)
+        + len(candidate.certifications)
+    )
+
+
 def candidate_is_empty(candidate: ProfileCandidateDocument) -> bool:
     return candidate_quality_score(candidate) == 0
 
@@ -1457,11 +1469,19 @@ class AnalysisService:
             raise InsufficientCandidateError()
 
         def _core_needs_retry(candidate: ProfileCandidateDocument) -> bool:
-            return candidate_needs_llm_retry(
+            if candidate_needs_llm_retry(
                 candidate,
                 documents=documents,
                 source_char_count=source_char_count,
-            )
+            ):
+                return True
+            if not prompt.validate_core_structured_completeness:
+                return False
+            if source_char_count < _SPARSE_MIN_SOURCE_CHARS:
+                return False
+            if not _documents_are_rich_profile_type(documents):
+                return False
+            return core_structured_entity_count(candidate) <= 1
 
         def _projects_needs_retry(candidate: ProfileCandidateDocument) -> bool:
             if len(candidate.projects) > 0:
