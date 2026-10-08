@@ -700,22 +700,123 @@ def _count_compact_relation_codes(codes: Any) -> int:
     return count
 
 
-def count_raw_compact_project_relations(raw: dict[str, Any] | None) -> dict[str, int]:
-    """Privacy-safe raw PROJECTS relation counts (keys/counts only)."""
-    empty = {"projects": 0, "j": 0, "t": 0, "x": 0, "b": 0, "ct": 0}
+def _compact_projects_list(raw: dict[str, Any] | None) -> list[Any]:
     if not isinstance(raw, dict):
-        return empty
+        return []
     projects_raw = raw.get("pr")
     if projects_raw is None:
         projects_raw = raw.get("projects")
     if not isinstance(projects_raw, list):
-        return empty
+        return []
+    return projects_raw
+
+
+def count_raw_compact_project_relations(raw: dict[str, Any] | None) -> dict[str, int]:
+    """Privacy-safe raw PROJECTS relation counts (keys/counts only)."""
+    projects_raw = _compact_projects_list(raw)
     counts = {"projects": len(projects_raw), "j": 0, "t": 0, "x": 0, "b": 0, "ct": 0}
     for item in projects_raw:
         if not isinstance(item, dict):
             continue
         for key in ("j", "t", "x", "b", "ct"):
             counts[key] += _count_compact_relation_codes(item.get(key))
+    return counts
+
+
+def _count_rm_ref_entries(bucket: Any) -> int:
+    """Count rm ref-shaped entries only (no values)."""
+    if isinstance(bucket, list):
+        count = 0
+        for item in bucket:
+            if isinstance(item, dict):
+                count += 1
+            elif isinstance(item, str) and item.strip():
+                count += 1
+        return count
+    if isinstance(bucket, dict):
+        total = 0
+        for value in bucket.values():
+            if isinstance(value, list):
+                total += _count_rm_ref_entries(value)
+            elif isinstance(value, dict):
+                total += 1
+        return total
+    return 0
+
+
+def _rm_bucket_usable(bucket: Any) -> bool:
+    return _count_rm_ref_entries(bucket) > 0
+
+
+def count_raw_compact_project_rm(raw: dict[str, Any] | None) -> dict[str, int]:
+    """Privacy-safe raw rm presence/ref counts for j/t/x (no values)."""
+    projects_raw = _compact_projects_list(raw)
+    counts = {
+        "rm_j_projects": 0,
+        "rm_t_projects": 0,
+        "rm_x_projects": 0,
+        "rm_j_refs": 0,
+        "rm_t_refs": 0,
+        "rm_x_refs": 0,
+    }
+    for item in projects_raw:
+        if not isinstance(item, dict):
+            continue
+        relation_map = item.get("rm")
+        if not isinstance(relation_map, dict):
+            continue
+        for key, proj_key, refs_key in (
+            ("j", "rm_j_projects", "rm_j_refs"),
+            ("t", "rm_t_projects", "rm_t_refs"),
+            ("x", "rm_x_projects", "rm_x_refs"),
+        ):
+            bucket = relation_map.get(key)
+            refs = _count_rm_ref_entries(bucket)
+            counts[refs_key] += refs
+            if refs > 0 or _rm_bucket_usable(bucket):
+                counts[proj_key] += 1
+    return counts
+
+
+def count_expanded_project_relations(
+    expanded: dict[str, Any] | None,
+) -> dict[str, int]:
+    """Privacy-safe expanded-before-normalize project relation counts."""
+    empty = {
+        "projects": 0,
+        "jobs": 0,
+        "skills": 0,
+        "expertise": 0,
+        "business_domains": 0,
+        "customer_types": 0,
+    }
+    if not isinstance(expanded, dict):
+        return empty
+    projects = expanded.get("projects")
+    if not isinstance(projects, list):
+        return empty
+    counts = dict(empty)
+    counts["projects"] = len(projects)
+    for project in projects:
+        if not isinstance(project, dict):
+            continue
+        counts["jobs"] += len(project["jobs"]) if isinstance(project.get("jobs"), list) else 0
+        counts["skills"] += (
+            len(project["skills"]) if isinstance(project.get("skills"), list) else 0
+        )
+        counts["expertise"] += (
+            len(project["expertise"]) if isinstance(project.get("expertise"), list) else 0
+        )
+        counts["business_domains"] += (
+            len(project["business_domains"])
+            if isinstance(project.get("business_domains"), list)
+            else 0
+        )
+        counts["customer_types"] += (
+            len(project["customer_types"])
+            if isinstance(project.get("customer_types"), list)
+            else 0
+        )
     return counts
 
 
@@ -739,10 +840,33 @@ def project_relation_diagnostic_counts(
     *,
     raw: dict[str, Any] | None,
     candidate: ProfileCandidateDocument,
+    expanded: dict[str, Any] | None = None,
+    pre_strict: ProfileCandidateDocument | None = None,
 ) -> dict[str, int]:
-    """Compare raw compact vs normalized relation counts (counts only)."""
+    """Stage-aware PROJECTS relation counts (counts only; no values/quotes).
+
+    Stages:
+    - raw compact j/t/x/b/ct + rm presence/refs for j/t/x
+    - expanded (after compact expand, before normalize)
+    - pre_strict (after normalize/backfill, before strict quote filter)
+    - candidate final (after strict quote filter when applied)
+    """
     raw_counts = count_raw_compact_project_relations(raw)
-    norm = count_normalized_project_relations(candidate)
+    rm_counts = count_raw_compact_project_rm(raw)
+    final = count_normalized_project_relations(candidate)
+    if expanded is None and pre_strict is None:
+        # Legacy caller without stage snapshots: do not invent stage drops.
+        expanded_counts = dict(final)
+        pre = dict(final)
+    else:
+        expanded_counts = count_expanded_project_relations(expanded)
+        pre = (
+            count_normalized_project_relations(pre_strict)
+            if pre_strict is not None
+            else dict(expanded_counts)
+        )
+        if expanded is None:
+            expanded_counts = dict(pre)
     return {
         "projects_raw": raw_counts["projects"],
         "raw_j": raw_counts["j"],
@@ -750,17 +874,52 @@ def project_relation_diagnostic_counts(
         "raw_x": raw_counts["x"],
         "raw_b": raw_counts["b"],
         "raw_ct": raw_counts["ct"],
-        "norm_projects": norm["projects"],
-        "norm_jobs": norm["jobs"],
-        "norm_skills": norm["skills"],
-        "norm_expertise": norm["expertise"],
-        "norm_business_domains": norm["business_domains"],
-        "norm_customer_types": norm["customer_types"],
-        "dropped_j": max(0, raw_counts["j"] - norm["jobs"]),
-        "dropped_t": max(0, raw_counts["t"] - norm["skills"]),
-        "dropped_x": max(0, raw_counts["x"] - norm["expertise"]),
-        "dropped_b": max(0, raw_counts["b"] - norm["business_domains"]),
-        "dropped_ct": max(0, raw_counts["ct"] - norm["customer_types"]),
+        "raw_rm_j_projects": rm_counts["rm_j_projects"],
+        "raw_rm_t_projects": rm_counts["rm_t_projects"],
+        "raw_rm_x_projects": rm_counts["rm_x_projects"],
+        "raw_rm_j_refs": rm_counts["rm_j_refs"],
+        "raw_rm_t_refs": rm_counts["rm_t_refs"],
+        "raw_rm_x_refs": rm_counts["rm_x_refs"],
+        "expanded_projects": expanded_counts["projects"],
+        "expanded_jobs": expanded_counts["jobs"],
+        "expanded_skills": expanded_counts["skills"],
+        "expanded_expertise": expanded_counts["expertise"],
+        "expanded_business_domains": expanded_counts["business_domains"],
+        "expanded_customer_types": expanded_counts["customer_types"],
+        "pre_strict_projects": pre["projects"],
+        "pre_strict_jobs": pre["jobs"],
+        "pre_strict_skills": pre["skills"],
+        "pre_strict_expertise": pre["expertise"],
+        "pre_strict_business_domains": pre["business_domains"],
+        "pre_strict_customer_types": pre["customer_types"],
+        "norm_projects": final["projects"],
+        "norm_jobs": final["jobs"],
+        "norm_skills": final["skills"],
+        "norm_expertise": final["expertise"],
+        "norm_business_domains": final["business_domains"],
+        "norm_customer_types": final["customer_types"],
+        "dropped_j": max(0, raw_counts["j"] - final["jobs"]),
+        "dropped_t": max(0, raw_counts["t"] - final["skills"]),
+        "dropped_x": max(0, raw_counts["x"] - final["expertise"]),
+        "dropped_b": max(0, raw_counts["b"] - final["business_domains"]),
+        "dropped_ct": max(0, raw_counts["ct"] - final["customer_types"]),
+        "dropped_during_expand_j": max(0, raw_counts["j"] - expanded_counts["jobs"]),
+        "dropped_during_expand_t": max(0, raw_counts["t"] - expanded_counts["skills"]),
+        "dropped_during_expand_x": max(0, raw_counts["x"] - expanded_counts["expertise"]),
+        "dropped_during_normalize_j": max(
+            0, expanded_counts["jobs"] - pre["jobs"]
+        ),
+        "dropped_during_normalize_t": max(
+            0, expanded_counts["skills"] - pre["skills"]
+        ),
+        "dropped_during_normalize_x": max(
+            0, expanded_counts["expertise"] - pre["expertise"]
+        ),
+        "dropped_during_strict_filter_j": max(0, pre["jobs"] - final["jobs"]),
+        "dropped_during_strict_filter_t": max(0, pre["skills"] - final["skills"]),
+        "dropped_during_strict_filter_x": max(
+            0, pre["expertise"] - final["expertise"]
+        ),
     }
 
 
