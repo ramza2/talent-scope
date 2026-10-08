@@ -60,15 +60,29 @@ python scripts/analysis_quality_report.py --latest 10 --format json --output /tm
 python scripts/analysis_quality_report.py --latest 10 --format csv --output /tmp/aqr.csv
 ```
 
-서버 compose (repo bind-mount tools runner; UUID는 hard-code하지 말 것):
+서버 compose (UUID는 hard-code하지 말 것):
+
+`api` service의 production `DATABASE_URL`로 실제 `AnalysisRun`을 조회한다.  
+CLI 자체는 DB write/commit을 하지 않는 read-only 도구다.  
+`test` service는 `POSTGRES_TEST_DB`용이며 tools-db-init가 test DB를 재생성하므로  
+production quality report에 사용하지 않는다.
 
 ```bash
-docker compose --env-file .env.server -f docker-compose.server.yml --profile tools \
-  run --rm --entrypoint python test \
-  /workspace/backend/scripts/analysis_quality_report.py --latest 5
+docker compose \
+  --env-file .env.server \
+  -f docker-compose.server.yml \
+  run --rm --no-deps \
+  -v "$PWD/backend:/workspace/backend:ro" \
+  --entrypoint python api \
+  /workspace/backend/scripts/analysis_quality_report.py \
+  --latest 5
 
-docker compose --env-file .env.server -f docker-compose.server.yml --profile tools \
-  run --rm --entrypoint python test \
+docker compose \
+  --env-file .env.server \
+  -f docker-compose.server.yml \
+  run --rm --no-deps \
+  -v "$PWD/backend:/workspace/backend:ro" \
+  --entrypoint python api \
   /workspace/backend/scripts/analysis_quality_report.py \
   --analysis-run-id <uuid> --format json
 ```

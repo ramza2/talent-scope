@@ -11,10 +11,29 @@ Usage (local Cloud Agent / host with DATABASE_URL):
   python scripts/analysis_quality_report.py --person-id <uuid> --latest 3
   python scripts/analysis_quality_report.py --latest 10 --format json --output /tmp/report.json
 
-Server compose (repo bind-mounted tools runner):
-  docker compose --env-file .env.server -f docker-compose.server.yml --profile tools \\
-    run --rm --entrypoint python test \\
-    /workspace/backend/scripts/analysis_quality_report.py --latest 5
+Server compose (production DATABASE_URL via api service; script bind-mounted RO):
+  docker compose \\
+    --env-file .env.server \\
+    -f docker-compose.server.yml \\
+    run --rm --no-deps \\
+    -v "$PWD/backend:/workspace/backend:ro" \\
+    --entrypoint python api \\
+    /workspace/backend/scripts/analysis_quality_report.py \\
+    --latest 5
+
+  docker compose \\
+    --env-file .env.server \\
+    -f docker-compose.server.yml \\
+    run --rm --no-deps \\
+    -v "$PWD/backend:/workspace/backend:ro" \\
+    --entrypoint python api \\
+    /workspace/backend/scripts/analysis_quality_report.py \\
+    --analysis-run-id <uuid> --format json
+
+Notes:
+  - Uses the api service production DATABASE_URL to read real AnalysisRun rows.
+  - CLI itself is read-only (no DB write/commit).
+  - Do not use the test service (POSTGRES_TEST_DB / recreated test DB).
 """
 
 from __future__ import annotations
