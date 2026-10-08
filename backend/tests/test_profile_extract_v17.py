@@ -290,8 +290,11 @@ def test_v17_biz_defense_media_and_no_customer_type_seed() -> None:
 
 def test_project_relation_diagnostic_counts_only() -> None:
     from app.modules.analysis.compact_v8 import (
+        apply_normalized_quote_evidence,
+        expand_compact_projects,
         project_relation_diagnostic_counts,
     )
+    from app.modules.analysis.normalize import normalize_candidate
 
     raw = {
         "pr": [
@@ -312,8 +315,28 @@ def test_project_relation_diagnostic_counts_only() -> None:
         ]
     }
     page = "비밀프로젝트명 비밀고객 TA 사업관리 AD"
-    doc = _normalize_projects(raw, page_texts={(_DOC1, 1): page})
-    counts = project_relation_diagnostic_counts(raw=raw, candidate=doc)
+    page_texts = {(_DOC1, 1): page}
+    expanded = expand_compact_projects(
+        raw,
+        alias_to_id=_ALIAS,
+        strict_relation_evidence=True,
+        derive_duration=True,
+        clear_catalog_code_customer=True,
+        catalog=_CATALOG,
+    )
+    pre_strict = normalize_candidate(
+        expanded,
+        catalog=_CATALOG,
+        allowed_documents={_DOC1: {1}},
+        page_texts=page_texts,
+    )
+    doc = apply_normalized_quote_evidence(pre_strict)
+    counts = project_relation_diagnostic_counts(
+        raw=raw,
+        expanded=expanded,
+        pre_strict=pre_strict,
+        candidate=doc,
+    )
 
     assert counts["projects_raw"] == 1
     assert counts["raw_j"] == 2
@@ -321,8 +344,13 @@ def test_project_relation_diagnostic_counts_only() -> None:
     assert counts["raw_x"] == 1
     assert counts["raw_b"] == 1
     assert counts["raw_ct"] == 1
+    assert counts["raw_rm_j_projects"] == 1
+    assert counts["raw_rm_t_projects"] == 0
+    assert counts["expanded_jobs"] == 2
+    assert counts["expanded_skills"] == 0  # no rm.t => expand drop
+    assert counts["dropped_during_expand_t"] == 1
     assert counts["norm_jobs"] == 2
-    assert counts["norm_skills"] == 0  # no rm.t => dropped
+    assert counts["norm_skills"] == 0
     assert counts["norm_expertise"] == 1
     assert counts["norm_business_domains"] == 1
     assert counts["dropped_t"] == 1
@@ -341,9 +369,27 @@ def test_project_relation_diagnostic_counts_only() -> None:
             }
         ]
     }
-    doc_no_ct = _normalize_projects(raw_no_ct, page_texts={(_DOC1, 1): page})
+    expanded_no_ct = expand_compact_projects(
+        raw_no_ct,
+        alias_to_id=_ALIAS,
+        strict_relation_evidence=True,
+        derive_duration=True,
+        catalog=_CATALOG,
+    )
+    pre_no_ct = normalize_candidate(
+        expanded_no_ct,
+        catalog=_CATALOG,
+        allowed_documents={_DOC1: {1}},
+        page_texts=page_texts,
+    )
+    doc_no_ct = apply_normalized_quote_evidence(pre_no_ct)
     assert doc_no_ct.projects[0].customer_types == []
-    no_ct_counts = project_relation_diagnostic_counts(raw=raw_no_ct, candidate=doc_no_ct)
+    no_ct_counts = project_relation_diagnostic_counts(
+        raw=raw_no_ct,
+        expanded=expanded_no_ct,
+        pre_strict=pre_no_ct,
+        candidate=doc_no_ct,
+    )
     assert no_ct_counts["raw_ct"] == 0
     assert no_ct_counts["norm_customer_types"] == 0
 
@@ -354,22 +400,5 @@ def test_project_relation_diagnostic_counts_only() -> None:
     assert "SHOULD-NOT-EXIST" not in serialized
     assert "TA" not in serialized
     assert "사업관리" not in serialized
-    assert set(counts.keys()) == {
-        "projects_raw",
-        "raw_j",
-        "raw_t",
-        "raw_x",
-        "raw_b",
-        "raw_ct",
-        "norm_projects",
-        "norm_jobs",
-        "norm_skills",
-        "norm_expertise",
-        "norm_business_domains",
-        "norm_customer_types",
-        "dropped_j",
-        "dropped_t",
-        "dropped_x",
-        "dropped_b",
-        "dropped_ct",
-    }
+    assert counts["dropped_during_expand_j"] == 0
+    assert "dropped_during_strict_filter_j" in counts

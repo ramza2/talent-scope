@@ -1437,6 +1437,8 @@ class AnalysisService:
                     for ref in (project.source_refs or [])
                 )
             )
+            # Snapshot after normalize/backfill, before strict quote filter.
+            pre_strict = doc
             # v10+: after normalize may clear quotes / drop invalid refs, re-check
             # that projects and j/t/x still have non-empty quote_text evidence.
             if prompt.strict_relation_evidence:
@@ -1453,14 +1455,31 @@ class AnalysisService:
                     len(doc.projects),
                 )
             # Counts-only relation diagnostics (no values/quotes/names).
-            rel = project_relation_diagnostic_counts(raw=raw, candidate=doc)
+            rel = project_relation_diagnostic_counts(
+                raw=raw,
+                expanded=expanded,
+                pre_strict=pre_strict,
+                candidate=doc,
+            )
             logger.info(
                 "analysis project relations analysis_run_id=%s "
                 "projects_raw=%s raw_j=%s raw_t=%s raw_x=%s raw_b=%s raw_ct=%s "
+                "raw_rm_j_projects=%s raw_rm_t_projects=%s raw_rm_x_projects=%s "
+                "raw_rm_j_refs=%s raw_rm_t_refs=%s raw_rm_x_refs=%s "
+                "expanded_jobs=%s expanded_skills=%s expanded_expertise=%s "
+                "expanded_business_domains=%s expanded_customer_types=%s "
+                "pre_strict_jobs=%s pre_strict_skills=%s pre_strict_expertise=%s "
                 "norm_jobs=%s norm_skills=%s norm_expertise=%s "
                 "norm_business_domains=%s norm_customer_types=%s "
                 "dropped_j=%s dropped_t=%s dropped_x=%s dropped_b=%s "
-                "dropped_ct=%s",
+                "dropped_ct=%s "
+                "dropped_during_expand_j=%s dropped_during_expand_t=%s "
+                "dropped_during_expand_x=%s "
+                "dropped_during_normalize_j=%s dropped_during_normalize_t=%s "
+                "dropped_during_normalize_x=%s "
+                "dropped_during_strict_filter_j=%s "
+                "dropped_during_strict_filter_t=%s "
+                "dropped_during_strict_filter_x=%s",
                 base_log.get("analysis_run_id"),
                 rel["projects_raw"],
                 rel["raw_j"],
@@ -1468,6 +1487,20 @@ class AnalysisService:
                 rel["raw_x"],
                 rel["raw_b"],
                 rel["raw_ct"],
+                rel["raw_rm_j_projects"],
+                rel["raw_rm_t_projects"],
+                rel["raw_rm_x_projects"],
+                rel["raw_rm_j_refs"],
+                rel["raw_rm_t_refs"],
+                rel["raw_rm_x_refs"],
+                rel["expanded_jobs"],
+                rel["expanded_skills"],
+                rel["expanded_expertise"],
+                rel["expanded_business_domains"],
+                rel["expanded_customer_types"],
+                rel["pre_strict_jobs"],
+                rel["pre_strict_skills"],
+                rel["pre_strict_expertise"],
                 rel["norm_jobs"],
                 rel["norm_skills"],
                 rel["norm_expertise"],
@@ -1478,6 +1511,15 @@ class AnalysisService:
                 rel["dropped_x"],
                 rel["dropped_b"],
                 rel["dropped_ct"],
+                rel["dropped_during_expand_j"],
+                rel["dropped_during_expand_t"],
+                rel["dropped_during_expand_x"],
+                rel["dropped_during_normalize_j"],
+                rel["dropped_during_normalize_t"],
+                rel["dropped_during_normalize_x"],
+                rel["dropped_during_strict_filter_j"],
+                rel["dropped_during_strict_filter_t"],
+                rel["dropped_during_strict_filter_x"],
             )
             return doc
 
