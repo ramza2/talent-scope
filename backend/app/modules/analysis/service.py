@@ -1510,7 +1510,11 @@ class AnalysisService:
             normalize_raw=_normalize_projects,
             needs_retry=_projects_needs_retry,
             fail_closed_if_bad=False,
-            validate_recovery_raw=_validate_projects_recovery_raw,
+            validate_recovery_raw=(
+                _validate_projects_recovery_raw
+                if prompt.validate_projects_recovery_root
+                else None
+            ),
         )
         logger.info(
             "analysis candidate quality run_id=%s phase=projects "

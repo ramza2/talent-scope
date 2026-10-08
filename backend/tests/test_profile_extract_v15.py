@@ -23,6 +23,7 @@ os.environ.setdefault("APP_SECRET_KEY", "test-secret")
 os.environ["APP_ENV"] = "test"
 
 _HEAD_SHA = "6973c29d4ba4d9bde1f1af19e5c7e08f6cf0154d"
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 _DOC1 = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 _ALIAS = {"D1": _DOC1}
 
@@ -204,22 +205,26 @@ def test_profile_extract_registry_current_is_v15() -> None:
     assert cur.promote_exact_catalog_codes is True
     assert cur.backfill_exact_core_evidence is True
     assert cur.backfill_exact_project_evidence is True
+    assert cur.validate_projects_recovery_root is True
     assert cur.core_system_prompt == v15.CORE_SYSTEM_PROMPT
     assert cur.projects_system_prompt == v15.PROJECTS_SYSTEM_PROMPT
+    assert v15.VALIDATE_PROJECTS_RECOVERY_ROOT is True
 
     v14_spec = resolve_profile_prompt("profile-extract-v14")
     assert v14_spec.prompt_version == "profile-extract-v14"
     assert v14_spec.core_system_prompt == v14.CORE_SYSTEM_PROMPT
     assert v14_spec.projects_system_prompt == v14.PROJECTS_SYSTEM_PROMPT
     assert v14_spec.backfill_exact_project_evidence is True
+    assert v14_spec.validate_projects_recovery_root is False
+    assert not hasattr(v14, "VALIDATE_PROJECTS_RECOVERY_ROOT")
 
 
 def test_v14_prompt_file_byte_identical_to_head() -> None:
     path = "backend/app/ai/prompts/profile_extract_v14.py"
-    current = Path("/workspace") / path
+    current = _REPO_ROOT / path
     base = subprocess.check_output(
         ["git", "show", f"{_HEAD_SHA}:{path}"],
-        cwd="/workspace",
+        cwd=_REPO_ROOT,
     )
     assert hashlib.sha256(current.read_bytes()).digest() == hashlib.sha256(base).digest()
 
@@ -352,6 +357,61 @@ def test_v15_malformed_projects_recovery_fails_closed(db_session, caplog):
     assert any("raw_top_level_keys=" in r.message for r in caplog.records)
     # Must not silently REVIEWING with projects=0
     assert run.candidate_json is None or run.status == "FAILED"
+    _cleanup_person(db_session, person.id, admin.id)
+
+
+def test_v14_bare_projects_recovery_keeps_legacy_runtime(db_session, caplog):
+    """v14 must not apply the v15 malformed-root fail-closed guard."""
+    from app.modules.analysis.service import AnalysisService
+    from app.storage.s3 import get_object_storage
+    from tests.test_analysis import (
+        _cleanup_person,
+        _create_user,
+        _ensure_analysis_code,
+        _queue_run,
+        _seed_person_doc,
+    )
+
+    admin = _create_user(
+        db_session, login_id=f"v14m_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    _ensure_analysis_code(db_session, "JOB-MGT-PL", "JOB", "PL")
+    _ensure_analysis_code(db_session, "TECH-SEC-AD", "TECH", "AD")
+    _ensure_analysis_code(db_session, "EXP-MGT", "EXP", "Management")
+    person, document = _seed_person_doc(
+        db_session,
+        admin.id,
+        doc_type_code="DOC-RESUME",
+        doc_type_name="이력서",
+        page_text=_rich_page_text(5),
+    )
+    run = _queue_run(
+        db_session,
+        person.id,
+        document.id,
+        prompt_version="profile-extract-v14",
+    )
+
+    llm = _StagedSequenceLLM(
+        [
+            _v15_core(),
+            _projects_without_evidence(5),
+            _bare_project_root(),
+        ]
+    )
+    service = AnalysisService(db_session, storage=get_object_storage(), llm=llm)
+    with caplog.at_level(logging.INFO):
+        status = service.run_analysis(run.id)
+    assert status == "REVIEWING"
+    db_session.refresh(run)
+    assert run.status == "REVIEWING"
+    assert run.candidate_json["projects"] == []
+    assert llm.calls == 3
+    assert llm.phases == ["core", "projects", "projects"]
+    assert llm.log_contexts[2].get("recovery_retry") is True
+    assert not any(
+        "analysis projects malformed root" in r.message for r in caplog.records
+    )
     _cleanup_person(db_session, person.id, admin.id)
 
 
