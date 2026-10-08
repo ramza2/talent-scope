@@ -179,8 +179,22 @@ def test_v17_relations_with_rm_survive_and_without_rm_drop() -> None:
                 "b": ["BIZ-PUBLIC"],
                 "r": [{"d": "D1", "p": 1, "q": "공공기관 시스템구축 및 운영"}],
                 "rm": {
-                    "j": [{"d": "D1", "p": 1, "q": "TA 사업관리"}],
-                    "x": [{"d": "D1", "p": 1, "q": "사업관리"}],
+                    # Shared rm quote must verbatim-support every j/x using it:
+                    # TA, 사업관리, 시스템구축 및 운영 / IT시스템기술지원.
+                    "j": [
+                        {
+                            "d": "D1",
+                            "p": 1,
+                            "q": "시스템구축 및 운영 > IT시스템기술지원 TA 사업관리",
+                        }
+                    ],
+                    "x": [
+                        {
+                            "d": "D1",
+                            "p": 1,
+                            "q": "시스템구축 및 운영 > IT시스템기술지원 TA 사업관리",
+                        }
+                    ],
                 },
             }
         ]
