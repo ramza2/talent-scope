@@ -668,6 +668,21 @@ def _expand_project(
     return out if out else None
 
 
+def is_valid_compact_projects_root(raw: dict[str, Any] | None) -> bool:
+    """True when root has ``pr`` or legacy ``projects`` as a list (incl. empty).
+
+    Bare project objects (e.g. keys n/cust/r at root) are malformed.
+    Does not wrap or coerce bare roots into ``{"pr":[raw]}``.
+    """
+    if not isinstance(raw, dict):
+        return False
+    if isinstance(raw.get("pr"), list):
+        return True
+    if isinstance(raw.get("projects"), list):
+        return True
+    return False
+
+
 def expand_compact_projects(
     raw: dict[str, Any],
     *,
