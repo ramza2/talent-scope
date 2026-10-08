@@ -683,6 +683,87 @@ def is_valid_compact_projects_root(raw: dict[str, Any] | None) -> bool:
     return False
 
 
+def _count_compact_relation_codes(codes: Any) -> int:
+    """Count usable compact relation codes only (no values logged)."""
+    if not isinstance(codes, list):
+        return 0
+    count = 0
+    for item in codes:
+        if isinstance(item, str):
+            if item.strip():
+                count += 1
+            continue
+        if isinstance(item, dict):
+            code = item.get("c") if item.get("c") is not None else item.get("code")
+            if isinstance(code, str) and code.strip():
+                count += 1
+    return count
+
+
+def count_raw_compact_project_relations(raw: dict[str, Any] | None) -> dict[str, int]:
+    """Privacy-safe raw PROJECTS relation counts (keys/counts only)."""
+    empty = {"projects": 0, "j": 0, "t": 0, "x": 0, "b": 0, "ct": 0}
+    if not isinstance(raw, dict):
+        return empty
+    projects_raw = raw.get("pr")
+    if projects_raw is None:
+        projects_raw = raw.get("projects")
+    if not isinstance(projects_raw, list):
+        return empty
+    counts = {"projects": len(projects_raw), "j": 0, "t": 0, "x": 0, "b": 0, "ct": 0}
+    for item in projects_raw:
+        if not isinstance(item, dict):
+            continue
+        for key in ("j", "t", "x", "b", "ct"):
+            counts[key] += _count_compact_relation_codes(item.get(key))
+    return counts
+
+
+def count_normalized_project_relations(
+    candidate: ProfileCandidateDocument,
+) -> dict[str, int]:
+    """Privacy-safe normalized project relation counts (no values)."""
+    return {
+        "projects": len(candidate.projects),
+        "jobs": sum(len(p.jobs) for p in candidate.projects),
+        "skills": sum(len(p.skills) for p in candidate.projects),
+        "expertise": sum(len(p.expertise) for p in candidate.projects),
+        "business_domains": sum(
+            len(p.business_domains) for p in candidate.projects
+        ),
+        "customer_types": sum(len(p.customer_types) for p in candidate.projects),
+    }
+
+
+def project_relation_diagnostic_counts(
+    *,
+    raw: dict[str, Any] | None,
+    candidate: ProfileCandidateDocument,
+) -> dict[str, int]:
+    """Compare raw compact vs normalized relation counts (counts only)."""
+    raw_counts = count_raw_compact_project_relations(raw)
+    norm = count_normalized_project_relations(candidate)
+    return {
+        "projects_raw": raw_counts["projects"],
+        "raw_j": raw_counts["j"],
+        "raw_t": raw_counts["t"],
+        "raw_x": raw_counts["x"],
+        "raw_b": raw_counts["b"],
+        "raw_ct": raw_counts["ct"],
+        "norm_projects": norm["projects"],
+        "norm_jobs": norm["jobs"],
+        "norm_skills": norm["skills"],
+        "norm_expertise": norm["expertise"],
+        "norm_business_domains": norm["business_domains"],
+        "norm_customer_types": norm["customer_types"],
+        "dropped_j": max(0, raw_counts["j"] - norm["jobs"]),
+        "dropped_t": max(0, raw_counts["t"] - norm["skills"]),
+        "dropped_x": max(0, raw_counts["x"] - norm["expertise"]),
+        "dropped_b": max(0, raw_counts["b"] - norm["business_domains"]),
+        "dropped_ct": max(0, raw_counts["ct"] - norm["customer_types"]),
+    }
+
+
 def expand_compact_projects(
     raw: dict[str, Any],
     *,

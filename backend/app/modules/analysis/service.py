@@ -53,6 +53,7 @@ from app.modules.analysis.compact_v8 import (
     expand_compact_core,
     expand_compact_projects,
     is_valid_compact_projects_root,
+    project_relation_diagnostic_counts,
     promote_exact_root_catalog_codes,
 )
 from app.modules.analysis.diff_engine import DiffSpec, build_diffs
@@ -1451,6 +1452,33 @@ class AnalysisService:
                     projects_with_quote,
                     len(doc.projects),
                 )
+            # Counts-only relation diagnostics (no values/quotes/names).
+            rel = project_relation_diagnostic_counts(raw=raw, candidate=doc)
+            logger.info(
+                "analysis project relations analysis_run_id=%s "
+                "projects_raw=%s raw_j=%s raw_t=%s raw_x=%s raw_b=%s raw_ct=%s "
+                "norm_jobs=%s norm_skills=%s norm_expertise=%s "
+                "norm_business_domains=%s norm_customer_types=%s "
+                "dropped_j=%s dropped_t=%s dropped_x=%s dropped_b=%s "
+                "dropped_ct=%s",
+                base_log.get("analysis_run_id"),
+                rel["projects_raw"],
+                rel["raw_j"],
+                rel["raw_t"],
+                rel["raw_x"],
+                rel["raw_b"],
+                rel["raw_ct"],
+                rel["norm_jobs"],
+                rel["norm_skills"],
+                rel["norm_expertise"],
+                rel["norm_business_domains"],
+                rel["norm_customer_types"],
+                rel["dropped_j"],
+                rel["dropped_t"],
+                rel["dropped_x"],
+                rel["dropped_b"],
+                rel["dropped_ct"],
+            )
             return doc
 
         def _validate_projects_recovery_raw(raw: dict[str, Any]) -> None:
