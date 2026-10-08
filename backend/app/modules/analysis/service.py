@@ -52,6 +52,7 @@ from app.modules.analysis.compact_v8 import (
     build_document_alias_view,
     expand_compact_core,
     expand_compact_projects,
+    is_valid_compact_projects_root,
     promote_exact_root_catalog_codes,
 )
 from app.modules.analysis.diff_engine import DiffSpec, build_diffs
@@ -1301,8 +1302,15 @@ class AnalysisService:
             normalize_raw: Any,
             needs_retry: Any,
             fail_closed_if_bad: bool,
+            validate_recovery_raw: Any | None = None,
         ) -> ProfileCandidateDocument:
             nonlocal recovery_budget
+
+            def _apply_recovery_raw(raw: dict[str, Any]) -> ProfileCandidateDocument:
+                if validate_recovery_raw is not None:
+                    validate_recovery_raw(raw)
+                return normalize_raw(raw)
+
             try:
                 raw = _phase_call(
                     phase=phase,
@@ -1333,7 +1341,7 @@ class AnalysisService:
                         code_catalog_text=code_catalog_text,
                         recovery_retry=True,
                     )
-                    candidate = normalize_raw(raw)
+                    candidate = _apply_recovery_raw(raw)
                 except AIResponseTruncatedError:
                     raise InsufficientCandidateError() from trunc_exc
             else:
@@ -1347,7 +1355,7 @@ class AnalysisService:
                             code_catalog_text=code_catalog_text,
                             recovery_retry=True,
                         )
-                        candidate = normalize_raw(raw)
+                        candidate = _apply_recovery_raw(raw)
                     except AIResponseTruncatedError:
                         raise InsufficientCandidateError()
 
@@ -1433,6 +1441,21 @@ class AnalysisService:
                 )
             return doc
 
+        def _validate_projects_recovery_raw(raw: dict[str, Any]) -> None:
+            """Fail closed when recovery returns bare/malformed PROJECTS root."""
+            if is_valid_compact_projects_root(raw):
+                return
+            top_keys = raw_candidate_top_level_keys(raw)
+            logger.info(
+                "analysis projects malformed root analysis_run_id=%s attempt=%s "
+                "recovery_retry=%s raw_top_level_keys=%s",
+                base_log.get("analysis_run_id"),
+                call_count,
+                True,
+                top_keys,
+            )
+            raise InsufficientCandidateError()
+
         def _core_needs_retry(candidate: ProfileCandidateDocument) -> bool:
             return candidate_needs_llm_retry(
                 candidate,
@@ -1487,6 +1510,11 @@ class AnalysisService:
             normalize_raw=_normalize_projects,
             needs_retry=_projects_needs_retry,
             fail_closed_if_bad=False,
+            validate_recovery_raw=(
+                _validate_projects_recovery_raw
+                if prompt.validate_projects_recovery_root
+                else None
+            ),
         )
         logger.info(
             "analysis candidate quality run_id=%s phase=projects "

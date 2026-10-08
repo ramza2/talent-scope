@@ -21,10 +21,11 @@ from app.ai.prompts import (
     profile_extract_v12,
     profile_extract_v13,
     profile_extract_v14,
+    profile_extract_v15,
 )
 from app.ai.providers.errors import AIProviderError
 
-CURRENT_PROFILE_PROMPT_VERSION = "profile-extract-v14"
+CURRENT_PROFILE_PROMPT_VERSION = "profile-extract-v15"
 
 ExtractionMode = Literal["single", "staged"]
 
@@ -51,6 +52,7 @@ class ProfilePromptSpec:
     promote_exact_catalog_codes: bool = False
     backfill_exact_core_evidence: bool = False
     backfill_exact_project_evidence: bool = False
+    validate_projects_recovery_root: bool = False
 
 
 def _spec_from_module(module) -> ProfilePromptSpec:
@@ -93,6 +95,9 @@ def _spec_from_staged_module(module) -> ProfilePromptSpec:
         backfill_exact_project_evidence=bool(
             getattr(module, "BACKFILL_EXACT_PROJECT_EVIDENCE", False)
         ),
+        validate_projects_recovery_root=bool(
+            getattr(module, "VALIDATE_PROJECTS_RECOVERY_ROOT", False)
+        ),
     )
 
 
@@ -111,6 +116,7 @@ _REGISTRY: dict[str, ProfilePromptSpec] = {
     profile_extract_v12.PROMPT_VERSION: _spec_from_staged_module(profile_extract_v12),
     profile_extract_v13.PROMPT_VERSION: _spec_from_staged_module(profile_extract_v13),
     profile_extract_v14.PROMPT_VERSION: _spec_from_staged_module(profile_extract_v14),
+    profile_extract_v15.PROMPT_VERSION: _spec_from_staged_module(profile_extract_v15),
 }
 
 
