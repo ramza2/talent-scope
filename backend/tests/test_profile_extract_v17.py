@@ -72,29 +72,26 @@ def _normalize_projects(
 # ---------------------------------------------------------------------------
 
 
-def test_profile_extract_registry_current_is_v17() -> None:
+def test_profile_extract_registry_v17_remains_resolvable() -> None:
+    """v17 stays resolvable unchanged; current may advance (v18+)."""
     from app.ai.prompts import profile_extract_v16 as v16
     from app.ai.prompts import profile_extract_v17 as v17
-    from app.ai.prompts.profile_extract import (
-        CURRENT_PROFILE_PROMPT_VERSION,
-        current_profile_prompt,
-        resolve_profile_prompt,
-    )
+    from app.ai.prompts.profile_extract import resolve_profile_prompt
 
-    assert CURRENT_PROFILE_PROMPT_VERSION == "profile-extract-v17"
-    cur = current_profile_prompt()
-    assert cur.prompt_version == "profile-extract-v17"
-    assert cur.extraction_mode == "staged"
-    assert cur.compact_protocol is True
-    assert cur.strict_relation_evidence is True
-    assert cur.derive_project_duration is True
-    assert cur.clear_catalog_code_customer is True
-    assert cur.promote_exact_catalog_codes is True
-    assert cur.backfill_exact_core_evidence is True
-    assert cur.backfill_exact_project_evidence is True
-    assert cur.validate_projects_recovery_root is True
-    assert cur.validate_core_structured_completeness is True
-    assert cur.projects_system_prompt == v17.PROJECTS_SYSTEM_PROMPT
+    v17_spec = resolve_profile_prompt("profile-extract-v17")
+    assert v17_spec.prompt_version == "profile-extract-v17"
+    assert v17_spec.extraction_mode == "staged"
+    assert v17_spec.compact_protocol is True
+    assert v17_spec.strict_relation_evidence is True
+    assert v17_spec.derive_project_duration is True
+    assert v17_spec.clear_catalog_code_customer is True
+    assert v17_spec.promote_exact_catalog_codes is True
+    assert v17_spec.backfill_exact_core_evidence is True
+    assert v17_spec.backfill_exact_project_evidence is True
+    assert v17_spec.validate_projects_recovery_root is True
+    assert v17_spec.validate_core_structured_completeness is True
+    assert v17_spec.projects_system_prompt == v17.PROJECTS_SYSTEM_PROMPT
+    assert v17_spec.core_system_prompt == v17.CORE_SYSTEM_PROMPT
 
     v16_spec = resolve_profile_prompt("profile-extract-v16")
     assert v16_spec.prompt_version == "profile-extract-v16"
