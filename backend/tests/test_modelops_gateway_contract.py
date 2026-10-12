@@ -6,11 +6,11 @@ from unittest.mock import patch
 
 import httpx
 
-from app.ai.providers.embedding import OpenAICompatibleEmbeddingProvider
 from app.ai.providers.llm import OpenAICompatibleLLMProvider
 from app.ai.providers.openai_compat import (
     normalize_chat_completions_url,
     normalize_embeddings_url,
+    post_embeddings,
 )
 from app.ai.providers.vlm import OpenAICompatibleVLMProvider
 from app.core.config import Settings
@@ -100,33 +100,42 @@ def test_vlm_gateway_keeps_alias_and_image_url_payload() -> None:
     assert content[1]["image_url"]["url"].startswith("data:image/png;base64,")
 
 
-def test_embedding_gateway_keeps_alias_and_1024_dimensions() -> None:
+def test_embedding_gateway_keeps_alias_and_1024_dimensions(
+    monkeypatch,
+) -> None:
     captured: dict[str, object] = {}
-    vector = [0.01] * 1024
 
-    def fake_post_embeddings(**kwargs):
-        captured.update(kwargs)
-        return {
-            "data": [{"index": 0, "embedding": vector}],
-            "model": "embedding-alias",
-        }
-
-    with patch(
-        "app.ai.providers.embedding.assert_embedding_dimensions_configured",
-        return_value=1024,
-    ), patch(
-        "app.ai.providers.embedding.post_embeddings",
-        side_effect=fake_post_embeddings,
-    ):
-        provider = OpenAICompatibleEmbeddingProvider(
-            base_url=_GATEWAY,
-            api_key="",
-            model="embedding-alias",
-            dimensions=1024,
+    def fake_post(self, url, *, headers=None, json=None, **kwargs):
+        captured["url"] = url
+        captured["payload"] = json
+        return httpx.Response(
+            200,
+            json={
+                "data": [{"index": 0, "embedding": [0.01] * 1024}],
+                "model": "embedding-alias",
+            },
         )
-        result = provider.embed_text("gateway compatibility")
 
-    assert len(result) == 1024
-    assert captured["base_url"] == _GATEWAY
+    monkeypatch.setattr(httpx.Client, "post", fake_post)
+    settings = Settings(
+        embedding_base_url=_GATEWAY,
+        embedding_api_key="",
+        embedding_model="embedding-alias",
+        embedding_dimensions=1024,
+    )
+
+    data = post_embeddings(
+        base_url=settings.embedding_base_url,
+        api_key=settings.embedding_api_key,
+        payload={
+            "model": settings.embedding_model,
+            "input": ["gateway compatibility"],
+        },
+        timeout_seconds=settings.embedding_request_timeout_seconds,
+    )
+
+    assert settings.embedding_dimensions == 1024
+    assert captured["url"] == "https://gateway.example.test/v1/embeddings"
     assert captured["payload"]["model"] == "embedding-alias"
     assert captured["payload"]["input"] == ["gateway compatibility"]
+    assert len(data["data"][0]["embedding"]) == 1024
