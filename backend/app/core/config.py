@@ -35,13 +35,13 @@ class Settings(BaseSettings):
     libreoffice_bin: str = "soffice"
     libreoffice_timeout_seconds: int = 120
 
-    llm_base_url: str = "https://alzi-llm.openlink.kr"
+    llm_base_url: str = "https://gateway.example.test"
     llm_api_key: str = "change-me"
-    llm_model: str = "Qwen3-14B"
+    llm_model: str = "llm-model-alias"
 
-    vlm_base_url: str = "https://alzi-vlm.openlink.kr"
+    vlm_base_url: str = "https://gateway.example.test"
     vlm_api_key: str = "change-me"
-    vlm_model: str = "Qwen2.5-VL-7B-Instruct"
+    vlm_model: str = "vlm-model-alias"
 
     # Upload identify / AI runtime limits
     ai_request_timeout_seconds: float = 60.0
@@ -62,9 +62,9 @@ class Settings(BaseSettings):
     analysis_max_quote_chars: int = 400
     analysis_max_source_refs: int = 5
 
-    embedding_base_url: str = "change-me"
+    embedding_base_url: str = "https://gateway.example.test"
     embedding_api_key: str = "change-me"
-    embedding_model: str = "bge-m3"
+    embedding_model: str = "embedding-model-alias"
 
     talentscope_host: str = "localhost"
 
