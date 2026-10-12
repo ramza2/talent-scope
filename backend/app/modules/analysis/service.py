@@ -55,6 +55,7 @@ from app.modules.analysis.compact_v8 import (
     is_valid_compact_projects_root,
     project_relation_diagnostic_counts,
     promote_exact_root_catalog_codes,
+    repair_whitespace_project_evidence,
 )
 from app.modules.analysis.diff_engine import DiffSpec, build_diffs
 from app.modules.analysis.normalize import normalize_candidate
@@ -1407,6 +1408,19 @@ class AnalysisService:
                 clear_catalog_code_customer=prompt.clear_catalog_code_customer,
                 catalog=catalog_map,
             )
+            ws_repair_counts = {
+                "whitespace_repaired_root_refs": 0,
+                "whitespace_repaired_j_refs": 0,
+                "whitespace_repaired_t_refs": 0,
+                "whitespace_repaired_x_refs": 0,
+            }
+            # v19: repair whitespace-only quote mismatches before normalize
+            # clears non-exact quotes.
+            if prompt.repair_whitespace_project_evidence:
+                expanded, ws_repair_counts = repair_whitespace_project_evidence(
+                    expanded,
+                    page_texts=page_texts,
+                )
             projects_raw = {
                 "schema_version": CANDIDATE_SCHEMA_VERSION,
                 "projects": expanded.get("projects")
@@ -1461,6 +1475,18 @@ class AnalysisService:
                 pre_strict=pre_strict,
                 candidate=doc,
             )
+            if prompt.repair_whitespace_project_evidence:
+                logger.info(
+                    "analysis project whitespace evidence "
+                    "analysis_run_id=%s whitespace_repaired_root_refs=%s "
+                    "whitespace_repaired_j_refs=%s whitespace_repaired_t_refs=%s "
+                    "whitespace_repaired_x_refs=%s",
+                    base_log.get("analysis_run_id"),
+                    ws_repair_counts["whitespace_repaired_root_refs"],
+                    ws_repair_counts["whitespace_repaired_j_refs"],
+                    ws_repair_counts["whitespace_repaired_t_refs"],
+                    ws_repair_counts["whitespace_repaired_x_refs"],
+                )
             logger.info(
                 "analysis project relations analysis_run_id=%s "
                 "projects_raw=%s raw_j=%s raw_t=%s raw_x=%s raw_b=%s raw_ct=%s "

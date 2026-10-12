@@ -70,31 +70,30 @@ def _normalize_projects(
 # ---------------------------------------------------------------------------
 
 
-def test_profile_extract_registry_current_is_v18() -> None:
+def test_profile_extract_registry_v18_remains_resolvable() -> None:
+    """v18 stays resolvable unchanged; current may advance (v19+)."""
     from app.ai.prompts import profile_extract_v17 as v17
     from app.ai.prompts import profile_extract_v18 as v18
-    from app.ai.prompts.profile_extract import (
-        CURRENT_PROFILE_PROMPT_VERSION,
-        current_profile_prompt,
-        resolve_profile_prompt,
-    )
+    from app.ai.prompts.profile_extract import resolve_profile_prompt
 
-    assert CURRENT_PROFILE_PROMPT_VERSION == "profile-extract-v18"
-    cur = current_profile_prompt()
-    assert cur.prompt_version == "profile-extract-v18"
-    assert cur.extraction_mode == "staged"
-    assert cur.compact_protocol is True
-    assert cur.strict_relation_evidence is True
-    assert cur.validate_projects_recovery_root is True
-    assert cur.validate_core_structured_completeness is True
-    assert cur.projects_system_prompt == v18.PROJECTS_SYSTEM_PROMPT
-    assert cur.core_system_prompt == v18.CORE_SYSTEM_PROMPT
+    v18_spec = resolve_profile_prompt("profile-extract-v18")
+    assert v18_spec.prompt_version == "profile-extract-v18"
+    assert v18_spec.extraction_mode == "staged"
+    assert v18_spec.compact_protocol is True
+    assert v18_spec.strict_relation_evidence is True
+    assert v18_spec.validate_projects_recovery_root is True
+    assert v18_spec.validate_core_structured_completeness is True
+    assert v18_spec.repair_whitespace_project_evidence is False
+    assert not hasattr(v18, "REPAIR_WHITESPACE_PROJECT_EVIDENCE")
+    assert v18_spec.projects_system_prompt == v18.PROJECTS_SYSTEM_PROMPT
+    assert v18_spec.core_system_prompt == v18.CORE_SYSTEM_PROMPT
 
     v17_spec = resolve_profile_prompt("profile-extract-v17")
     assert v17_spec.prompt_version == "profile-extract-v17"
     assert v17_spec.projects_system_prompt == v17.PROJECTS_SYSTEM_PROMPT
     assert v17_spec.core_system_prompt == v17.CORE_SYSTEM_PROMPT
     assert v17_spec.strict_relation_evidence is True
+    assert v17_spec.repair_whitespace_project_evidence is False
 
 
 def test_v17_prompt_file_byte_identical_to_base() -> None:

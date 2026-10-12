@@ -1290,6 +1290,189 @@ def backfill_exact_project_evidence(
     return candidate.model_copy(update={"projects": projects}), repaired
 
 
+def _whitespace_folded(text: str) -> str:
+    """Remove Unicode whitespace only (``str.isspace()``); no case/char folding."""
+    return "".join(ch for ch in text if not ch.isspace())
+
+
+def find_unique_whitespace_insensitive_span(
+    page_text: str, quote: str
+) -> str | None:
+    """Return the unique original page span matching quote ignoring whitespace.
+
+    Fail-closed: zero or multiple matches → ``None``. Exact substring matches
+    are handled by the caller (left unchanged).
+    """
+    needle = _whitespace_folded(quote)
+    if not needle:
+        return None
+    matches: list[str] = []
+    n = len(page_text)
+    needle_len = len(needle)
+    i = 0
+    while i < n:
+        if page_text[i].isspace():
+            i += 1
+            continue
+        folded: list[str] = []
+        j = i
+        while j < n and len(folded) < needle_len:
+            ch = page_text[j]
+            if not ch.isspace():
+                folded.append(ch)
+            j += 1
+        if len(folded) == needle_len and "".join(folded) == needle:
+            matches.append(page_text[i:j])
+            if len(matches) > 1:
+                return None
+        i += 1
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def _repair_ref_quote_whitespace(
+    ref: dict[str, Any],
+    *,
+    page_texts: dict[tuple[str, int], str],
+) -> tuple[dict[str, Any], bool]:
+    """Repair one expanded source_ref quote in place semantics; return (ref, changed)."""
+    quote = ref.get("quote_text")
+    if not isinstance(quote, str):
+        return ref, False
+    quote = quote.strip()
+    if not quote:
+        return ref, False
+    doc_id = ref.get("document_id")
+    page_no = ref.get("page_no")
+    if not isinstance(doc_id, str) or not doc_id.strip():
+        return ref, False
+    if not isinstance(page_no, int):
+        return ref, False
+    page_text = page_texts.get((doc_id, page_no))
+    if not isinstance(page_text, str) or not page_text:
+        return ref, False
+    if quote in page_text:
+        return ref, False
+    span = find_unique_whitespace_insensitive_span(page_text, quote)
+    if span is None:
+        return ref, False
+    if span == quote:
+        return ref, False
+    repaired = dict(ref)
+    repaired["quote_text"] = span
+    return repaired, True
+
+
+def repair_whitespace_project_evidence(
+    expanded: dict[str, Any],
+    *,
+    page_texts: dict[tuple[str, int], str] | None,
+) -> tuple[dict[str, Any], dict[str, int]]:
+    """v19: repair PROJECTS quotes that differ only by Unicode whitespace.
+
+    Runs on expanded compact PROJECTS (before ``normalize_candidate``).
+    Only existing non-empty quotes on project root / jobs / skills / expertise
+    refs are considered. Fail-closed unique match on the referenced page only.
+    Never copies root evidence into j/t/x or invents text.
+
+    Returns ``(expanded, counts)`` with counts-only diagnostics.
+    """
+    counts = {
+        "whitespace_repaired_root_refs": 0,
+        "whitespace_repaired_j_refs": 0,
+        "whitespace_repaired_t_refs": 0,
+        "whitespace_repaired_x_refs": 0,
+    }
+    if not page_texts or not isinstance(expanded, dict):
+        return expanded, counts
+    projects = expanded.get("projects")
+    if not isinstance(projects, list) or not projects:
+        return expanded, counts
+
+    new_projects: list[Any] = []
+    changed_any = False
+    for project in projects:
+        if not isinstance(project, dict):
+            new_projects.append(project)
+            continue
+        proj = dict(project)
+        proj_changed = False
+
+        root_refs = proj.get("source_refs")
+        if isinstance(root_refs, list):
+            repaired_refs: list[Any] = []
+            root_changed = False
+            for ref in root_refs:
+                if not isinstance(ref, dict):
+                    repaired_refs.append(ref)
+                    continue
+                new_ref, changed = _repair_ref_quote_whitespace(
+                    ref, page_texts=page_texts
+                )
+                repaired_refs.append(new_ref)
+                if changed:
+                    counts["whitespace_repaired_root_refs"] += 1
+                    root_changed = True
+            if root_changed:
+                proj["source_refs"] = repaired_refs
+                proj_changed = True
+
+        for field, count_key in (
+            ("jobs", "whitespace_repaired_j_refs"),
+            ("skills", "whitespace_repaired_t_refs"),
+            ("expertise", "whitespace_repaired_x_refs"),
+        ):
+            relations = proj.get(field)
+            if not isinstance(relations, list):
+                continue
+            new_relations: list[Any] = []
+            field_changed = False
+            for rel in relations:
+                if not isinstance(rel, dict):
+                    new_relations.append(rel)
+                    continue
+                rel_refs = rel.get("source_refs")
+                if not isinstance(rel_refs, list):
+                    new_relations.append(rel)
+                    continue
+                new_rel_refs: list[Any] = []
+                rel_changed = False
+                for ref in rel_refs:
+                    if not isinstance(ref, dict):
+                        new_rel_refs.append(ref)
+                        continue
+                    new_ref, changed = _repair_ref_quote_whitespace(
+                        ref, page_texts=page_texts
+                    )
+                    new_rel_refs.append(new_ref)
+                    if changed:
+                        counts[count_key] += 1
+                        rel_changed = True
+                if rel_changed:
+                    new_rel = dict(rel)
+                    new_rel["source_refs"] = new_rel_refs
+                    new_relations.append(new_rel)
+                    field_changed = True
+                else:
+                    new_relations.append(rel)
+            if field_changed:
+                proj[field] = new_relations
+                proj_changed = True
+
+        if proj_changed:
+            changed_any = True
+            new_projects.append(proj)
+        else:
+            new_projects.append(project)
+
+    if not changed_any:
+        return expanded, counts
+    out = dict(expanded)
+    out["projects"] = new_projects
+    return out, counts
+
+
 def apply_normalized_quote_evidence(
     candidate: ProfileCandidateDocument,
 ) -> ProfileCandidateDocument:
