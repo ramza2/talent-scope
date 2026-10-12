@@ -62,7 +62,7 @@ class Settings(BaseSettings):
     analysis_max_quote_chars: int = 400
     analysis_max_source_refs: int = 5
 
-    embedding_base_url: str = "change-me"
+    embedding_base_url: str = "https://gateway.example.test"
     embedding_api_key: str = "change-me"
     embedding_model: str = "embedding-model-alias"
 
