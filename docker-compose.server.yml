@@ -1,10 +1,11 @@
-# TalentScope server stack for the existing shared Traefik instance.
+# TalentScope server stack for internal-network direct access.
 #
 # Required invocation pattern:
 #   docker compose --env-file .env.server -f docker-compose.server.yml ...
 #
-# Only frontend/api join the external Traefik network. PostgreSQL, Redis,
-# MinIO, worker, beat and one-shot tool containers stay on the private network.
+# Only frontend publishes a host port. Backend, PostgreSQL, Redis, MinIO,
+# worker, beat and one-shot tool containers stay on the private network.
+# Frontend nginx continues to proxy /api/ to http://api:8000/api/.
 
 services:
   postgres:
@@ -105,19 +106,8 @@ services:
       timeout: 5s
       retries: 12
       start_period: 20s
-    labels:
-      - traefik.enable=true
-      - traefik.docker.network=${TRAEFIK_NETWORK:-traefik_proxy}
-      - traefik.http.routers.talentscope-api.rule=Host(`${TALENTSCOPE_HOST}`) && PathPrefix(`/api`)
-      - traefik.http.routers.talentscope-api.entrypoints=${TRAEFIK_ENTRYPOINT:-websecure}
-      - traefik.http.routers.talentscope-api.priority=100
-      - traefik.http.routers.talentscope-api.tls=true
-      - traefik.http.routers.talentscope-api.tls.certresolver=${TRAEFIK_CERTRESOLVER:-letsencrypt}
-      - traefik.http.routers.talentscope-api.service=talentscope-api
-      - traefik.http.services.talentscope-api.loadbalancer.server.port=8000
     networks:
       - internal
-      - proxy
 
   worker:
     build:
@@ -151,7 +141,6 @@ services:
       ]
     networks:
       - internal
-      - proxy
 
   beat:
     build:
@@ -182,21 +171,12 @@ services:
     depends_on:
       api:
         condition: service_healthy
-    labels:
-      - traefik.enable=true
-      - traefik.docker.network=${TRAEFIK_NETWORK:-traefik_proxy}
-      - traefik.http.routers.talentscope-web.rule=Host(`${TALENTSCOPE_HOST}`)
-      - traefik.http.routers.talentscope-web.entrypoints=${TRAEFIK_ENTRYPOINT:-websecure}
-      - traefik.http.routers.talentscope-web.priority=10
-      - traefik.http.routers.talentscope-web.tls=true
-      - traefik.http.routers.talentscope-web.tls.certresolver=${TRAEFIK_CERTRESOLVER:-letsencrypt}
-      - traefik.http.routers.talentscope-web.service=talentscope-web
-      - traefik.http.services.talentscope-web.loadbalancer.server.port=80
+    ports:
+      - "${TALENTSCOPE_BIND_IP}:${TALENTSCOPE_PORT}:80"
     networks:
-      - proxy
+      - internal
 
-  # One-shot production migration runner. It is internal-only so Traefik never
-  # routes requests to a container whose only job is `alembic upgrade head`.
+  # One-shot production migration runner. Internal-only; never publish a port.
   migrate:
     profiles: ["tools"]
     build:
@@ -324,9 +304,6 @@ services:
 networks:
   internal:
     driver: bridge
-  proxy:
-    external: true
-    name: ${TRAEFIK_NETWORK:-traefik_proxy}
 
 volumes:
   postgres_data:
