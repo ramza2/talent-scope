@@ -82,6 +82,9 @@ class Settings(BaseSettings):
     session_ttl_seconds: int = 28800
     csrf_cookie_name: str = "ts_csrf"
     redis_key_prefix: str = "talentscope"
+    # Optional explicit Secure cookie override (SESSION_COOKIE_SECURE).
+    # When unset, production remains Secure=True and development Secure=False.
+    session_cookie_secure: bool | None = None
 
     @property
     def is_development(self) -> bool:
@@ -89,7 +92,13 @@ class Settings(BaseSettings):
 
     @property
     def cookie_secure(self) -> bool:
-        """Secure cookies in non-dev environments (HTTPS)."""
+        """Secure cookies in non-dev environments (HTTPS).
+
+        ``SESSION_COOKIE_SECURE`` may force True/False for HTTP internal access.
+        When unset, behavior matches the historical production/dev default.
+        """
+        if self.session_cookie_secure is not None:
+            return self.session_cookie_secure
         return not self.is_development
 
 
