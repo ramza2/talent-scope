@@ -434,6 +434,16 @@ export function AnalysisDetailPage() {
                   <Button type="link" size="small" onClick={() => void openEvidence(ev)}>
                     근거 보기
                   </Button>
+                ) : ev.document_id ? (
+                  <Button
+                    type="link"
+                    size="small"
+                    href={documentPreviewUrl(ev.document_id)}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    {ev.page_no != null ? `문서 보기 p.${ev.page_no}` : '문서 보기'}
+                  </Button>
                 ) : null}
               </div>
             ))}
