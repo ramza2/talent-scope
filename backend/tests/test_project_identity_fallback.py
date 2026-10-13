@@ -225,3 +225,160 @@ def test_name_alone_without_date_anchor_does_not_identity_match() -> None:
     assert any(
         s.entity_type == "PROJECT" and s.change_type == "NEW" for s in specs
     )
+
+
+def test_customer_whitespace_only_links_same_without_conflict() -> None:
+    from app.modules.analysis.diff_engine import build_diffs
+
+    candidate = _doc(
+        [
+            {
+                "project_name": "2011년 HW자원통합구축 사업2-1(대전)",
+                "customer_name": "정부통합 전산센터",
+                "start_date": "2011-06-10",
+                "end_date": "2011-11-15",
+            }
+        ]
+    )
+    base = {
+        "profile": {"name": "홍길동"},
+        "projects": [
+            {
+                "id": _PROJ_A,
+                "project_name": "2011년 HW자원통합구축 사업2-1(대전)",
+                "customer_name": "정부통합전산센터",
+                "start_date": "2011-06-10",
+                "end_date": "2011-11-15",
+            }
+        ],
+    }
+    specs = build_diffs(candidate, base)
+    project_specs = [s for s in specs if s.entity_type == "PROJECT"]
+    assert any(
+        s.change_type == "SAME" and s.existing_target_id == UUID(_PROJ_A)
+        for s in project_specs
+    )
+    assert not any(s.change_type == "NEW" for s in project_specs)
+    assert not any(
+        s.field_name == "customer_name" and s.change_type == "CONFLICT"
+        for s in project_specs
+    )
+
+
+def test_different_customer_same_name_dates_unique_review_with_target() -> None:
+    from app.modules.analysis.diff_engine import build_diffs
+
+    candidate = _doc(
+        [
+            {
+                "project_name": "2013년 차기 복권통합구축사업",
+                "customer_name": "복권위원회",
+                "start_date": "2013-09-16",
+                "end_date": "2013-12-31",
+            }
+        ]
+    )
+    base = {
+        "profile": {"name": "홍길동"},
+        "projects": [
+            {
+                "id": _PROJ_A,
+                "project_name": "2013년 차기 복권통합구축사업",
+                "customer_name": "기획재정부",
+                "start_date": "2013-09-16",
+                "end_date": "2013-12-31",
+            }
+        ],
+    }
+    specs = build_diffs(candidate, base)
+    reviews = [
+        s
+        for s in specs
+        if s.entity_type == "PROJECT"
+        and s.change_type == "REVIEW"
+        and s.candidate_path == "projects[0]"
+    ]
+    assert len(reviews) == 1
+    assert reviews[0].existing_target_id == UUID(_PROJ_A)
+    assert not any(
+        s.entity_type == "PROJECT" and s.change_type == "NEW" for s in specs
+    )
+
+
+def test_different_customer_same_name_dates_multiple_review_without_target() -> None:
+    from app.modules.analysis.diff_engine import build_diffs
+
+    candidate = _doc(
+        [
+            {
+                "project_name": "2013년 차기 복권통합구축사업",
+                "customer_name": "복권위원회",
+                "start_date": "2013-09-16",
+                "end_date": "2013-12-31",
+            }
+        ]
+    )
+    base = {
+        "profile": {"name": "홍길동"},
+        "projects": [
+            {
+                "id": _PROJ_A,
+                "project_name": "2013년 차기 복권통합구축사업",
+                "customer_name": "기획재정부",
+                "start_date": "2013-09-16",
+                "end_date": "2013-12-31",
+            },
+            {
+                "id": _PROJ_B,
+                "project_name": "2013년 차기 복권통합구축사업",
+                "customer_name": "동행복권",
+                "start_date": "2013-09-16",
+                "end_date": "2013-12-31",
+            },
+        ],
+    }
+    specs = build_diffs(candidate, base)
+    reviews = [
+        s
+        for s in specs
+        if s.entity_type == "PROJECT"
+        and s.change_type == "REVIEW"
+        and s.candidate_path == "projects[0]"
+    ]
+    assert len(reviews) == 1
+    assert reviews[0].existing_target_id is None
+
+
+def test_true_new_2011_nov_dec_dates_still_new() -> None:
+    from app.modules.analysis.diff_engine import build_diffs
+
+    candidate = _doc(
+        [
+            {
+                "project_name": "2011년 HW자원통합구축 추가사업",
+                "customer_name": "정부통합전산센터",
+                "start_date": "2011-11-16",
+                "end_date": "2011-12-24",
+            }
+        ]
+    )
+    base = {
+        "profile": {"name": "홍길동"},
+        "projects": [
+            {
+                "id": _PROJ_A,
+                "project_name": "2011년 HW자원통합구축 사업2-1(대전)",
+                "customer_name": "정부통합전산센터",
+                "start_date": "2011-06-10",
+                "end_date": "2011-11-15",
+            }
+        ],
+    }
+    specs = build_diffs(candidate, base)
+    assert any(
+        s.entity_type == "PROJECT"
+        and s.change_type == "NEW"
+        and isinstance(s.new_value, dict)
+        and s.new_value.get("start_date") == "2011-11-16"
+        for s in specs
+    )
