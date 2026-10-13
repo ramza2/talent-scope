@@ -764,19 +764,51 @@ def _compare_fields(
     return out
 
 
+def _project_date_key(value: Any) -> str | None:
+    """Canonical project date key so YYYY-MM-DD and YYYY.MM.DD match.
+
+    Diff-only normalization: does not change Confirm storage or other entities.
+    Unparseable values fall back to the trimmed original string.
+    """
+    text = _norm_str(value)
+    if not text:
+        return None
+    folded = text.split("T", 1)[0] if "T" in text else text
+    folded = folded.replace(".", "-").replace("/", "-")
+    parts = parse_date_parts(folded)
+    if parts is None:
+        return text
+    year, month, day = parts
+    if month is None:
+        return f"{year:04d}"
+    if day is None:
+        return f"{year:04d}-{month:02d}"
+    return f"{year:04d}-{month:02d}-{day:02d}"
+
+
+def _project_dates_equal(a: Any, b: Any) -> bool:
+    if _eq(a, b):
+        return True
+    ka = _project_date_key(a)
+    kb = _project_date_key(b)
+    if ka is None or kb is None:
+        return False
+    return ka == kb
+
+
 def _project_match_key(row: Any) -> tuple[str | None, str | None, str | None, str | None]:
     if isinstance(row, dict):
         return (
             _norm_str(row.get("project_name")),
             _norm_str(row.get("customer_name")),
-            _norm_str(row.get("start_date")),
-            _norm_str(row.get("end_date")),
+            _project_date_key(row.get("start_date")),
+            _project_date_key(row.get("end_date")),
         )
     return (
         _norm_str(row.project_name),
         _norm_str(row.customer_name),
-        _norm_str(row.start_date),
-        _norm_str(row.end_date),
+        _project_date_key(row.start_date),
+        _project_date_key(row.end_date),
     )
 
 
@@ -855,10 +887,16 @@ def _diff_projects(
                 )
             ]
             if similar:
+                # Unique similar project → surface existing id for review UX.
+                # Multiple similar candidates stay target-less (ambiguous).
+                target_id = (
+                    _as_uuid(similar[0].get("id")) if len(similar) == 1 else None
+                )
                 specs.append(
                     DiffSpec(
                         entity_type="PROJECT",
                         candidate_path=path,
+                        existing_target_id=target_id,
                         change_type="REVIEW",
                         old_value=similar if len(similar) > 1 else similar[0],
                         new_value=dump,
@@ -892,7 +930,14 @@ def _diff_projects(
 
         old = matches[0]
         target_id = _as_uuid(old.get("id"))
-        field_changes = _compare_fields(old, dump, PROJECT_COMPARE_FIELDS)
+        field_changes = [
+            (field_name, change, old_v, new_v)
+            for field_name, change, old_v, new_v in _compare_fields(
+                old, dump, PROJECT_COMPARE_FIELDS
+            )
+            if field_name not in {"start_date", "end_date"}
+            or not _project_dates_equal(old_v, new_v)
+        ]
         relation_specs = _diff_project_relations(
             path=path,
             old_project=old,
