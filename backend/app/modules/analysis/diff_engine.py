@@ -681,13 +681,51 @@ def _diff_keyed_records(
                     )
                 )
             elif len(similar) == 1:
+                old = similar[0]
+                target_id = _as_uuid(old.get("id"))
+                # EDUCATION only: unique similar with no conflicting new facts is
+                # not a review item. Sparse candidates (e.g. dates omitted) that
+                # only repeat school/degree become SAME; null-fills stay UPDATE.
+                # EMPLOYMENT / CERTIFICATION keep root REVIEW for unique similar.
+                if entity_type == "EDUCATION":
+                    field_changes = _compare_fields(old, dump, fields)
+                    if not field_changes:
+                        specs.append(
+                            DiffSpec(
+                                entity_type=entity_type,
+                                candidate_path=path,
+                                existing_target_id=target_id,
+                                change_type="SAME",
+                                old_value=old,
+                                new_value=dump,
+                                confidence=getattr(cand, "confidence", None),
+                                source_refs=refs,
+                            )
+                        )
+                        continue
+                    if all(change == "UPDATE" for _, change, _, _ in field_changes):
+                        for field_name, change, old_v, new_v in field_changes:
+                            specs.append(
+                                DiffSpec(
+                                    entity_type=entity_type,
+                                    candidate_path=f"{path}.{field_name}",
+                                    existing_target_id=target_id,
+                                    field_name=field_name,
+                                    change_type=change,
+                                    old_value=old_v,
+                                    new_value=new_v,
+                                    confidence=getattr(cand, "confidence", None),
+                                    source_refs=refs,
+                                )
+                            )
+                        continue
                 specs.append(
                     DiffSpec(
                         entity_type=entity_type,
                         candidate_path=path,
-                        existing_target_id=_as_uuid(similar[0].get("id")),
+                        existing_target_id=target_id,
                         change_type="REVIEW",
-                        old_value=similar[0],
+                        old_value=old,
                         new_value=dump,
                         confidence=getattr(cand, "confidence", None),
                         source_refs=refs,
