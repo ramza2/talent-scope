@@ -850,6 +850,85 @@ def _project_match_key(row: Any) -> tuple[str | None, str | None, str | None, st
     )
 
 
+def _fold_project_name(value: str) -> str:
+    """Collapse Unicode whitespace for project-name identity checks."""
+    return "".join(ch for ch in value if not ch.isspace())
+
+
+def _project_names_identity_compatible(a: str | None, b: str | None) -> bool:
+    """Conservative name check for date-anchored project identity fallback.
+
+    Not a general similarity score. After whitespace folding, names match when
+    equal, one is a contiguous substring of the other (with length ratio), or
+    the longer differs by exactly one contiguous insertion (e.g. optional
+    ``범정부`` token) while still covering most of the shorter name.
+    """
+    if not a or not b:
+        return False
+    fa = _fold_project_name(a)
+    fb = _fold_project_name(b)
+    if not fa or not fb:
+        return False
+    if fa == fb:
+        return True
+    short, long = (fa, fb) if len(fa) <= len(fb) else (fb, fa)
+    # Reject loose containment where only a small fragment is shared.
+    if len(short) * 10 < len(long) * 8:
+        return False
+    if short in long:
+        return True
+    gap = len(long) - len(short)
+    if gap <= 0:
+        return False
+    for i in range(len(short) + 1):
+        if long[:i] == short[:i] and long[i + gap :] == short[i:]:
+            return True
+    return False
+
+
+def _project_customer_identity_compatible(
+    cand_customer: str | None, row_customer: str | None
+) -> bool:
+    if cand_customer is None or row_customer is None:
+        return True
+    return cand_customer == row_customer
+
+
+def _project_identity_fallback_matches(
+    project: Any,
+    existing: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Date-anchored identity fallback when exact natural-key match fails.
+
+    Requires both start and end dates on each side, exact normalized equality,
+    customer compatibility (equal or one empty), and conservative name
+    compatibility. Never matches on name alone.
+    """
+    cand_name = _norm_str(_field(project, "project_name"))
+    cand_customer = _norm_str(_field(project, "customer_name"))
+    cand_start = _project_date_key(_field(project, "start_date"))
+    cand_end = _project_date_key(_field(project, "end_date"))
+    if not cand_name or not cand_start or not cand_end:
+        return []
+    out: list[dict[str, Any]] = []
+    for row in existing:
+        row_name = _norm_str(row.get("project_name"))
+        row_start = _project_date_key(row.get("start_date"))
+        row_end = _project_date_key(row.get("end_date"))
+        if not row_name or not row_start or not row_end:
+            continue
+        if row_start != cand_start or row_end != cand_end:
+            continue
+        if not _project_customer_identity_compatible(
+            cand_customer, _norm_str(row.get("customer_name"))
+        ):
+            continue
+        if not _project_names_identity_compatible(cand_name, row_name):
+            continue
+        out.append(row)
+    return out
+
+
 PROJECT_RELATION_FIELDS: tuple[str, ...] = (
     "jobs",
     "skills",
@@ -942,6 +1021,26 @@ def _diff_projects(
                         source_refs=refs,
                     )
                 )
+                continue
+
+            # Exact key missed (often limited name variants). Date-anchored
+            # identity fallback connects only when unique.
+            identity = _project_identity_fallback_matches(project, existing)
+            if len(identity) > 1:
+                specs.append(
+                    DiffSpec(
+                        entity_type="PROJECT",
+                        candidate_path=path,
+                        change_type="REVIEW",
+                        old_value=identity,
+                        new_value=dump,
+                        confidence=project.confidence,
+                        source_refs=refs,
+                    )
+                )
+                continue
+            if len(identity) == 1:
+                matches = identity
             else:
                 specs.append(
                     DiffSpec(
@@ -964,7 +1063,7 @@ def _diff_projects(
                         additions_only_unmapped=True,
                     )
                 )
-            continue
+                continue
 
         old = matches[0]
         target_id = _as_uuid(old.get("id"))
