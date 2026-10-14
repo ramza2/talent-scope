@@ -834,6 +834,49 @@ def _project_dates_equal(a: Any, b: Any) -> bool:
     return ka == kb
 
 
+def _project_date_parts(value: Any) -> tuple[int, int | None, int | None] | None:
+    """Parse project dates after folding ``.`` / ``/`` separators (PROJECT-only)."""
+    text = _norm_str(value)
+    if not text:
+        return None
+    folded = text.split("T", 1)[0] if "T" in text else text
+    folded = folded.replace(".", "-").replace("/", "-")
+    return parse_date_parts(folded)
+
+
+def _project_date_precision_compatible(*, candidate: Any, existing: Any) -> bool:
+    """Directional PROJECT-only date compatibility for identity/field diff.
+
+    Rules (no year-only, no fuzzy / ±1 month):
+    - Same canonical key (format fold of equal precision) → compatible.
+    - candidate ``YYYY.MM`` vs existing ``YYYY-MM-DD``: same year/month → compatible.
+    - candidate ``YYYY.MM`` vs existing ``YYYY.MM``: exact year/month → compatible.
+    - candidate ``YYYY-MM-DD`` vs existing ``YYYY-MM-DD``: exact day only.
+    - candidate day precision vs existing month precision → not compatible
+      (never shrink candidate day down to month).
+    """
+    if _project_dates_equal(candidate, existing):
+        return True
+    pc = _project_date_parts(candidate)
+    pe = _project_date_parts(existing)
+    if pc is None or pe is None:
+        return False
+    yc, mc, dc = pc
+    ye, me, de = pe
+    # Both sides need at least month precision; year-only is never enough.
+    if mc is None or me is None:
+        return False
+    if yc != ye or mc != me:
+        return False
+    if dc is None:
+        # Candidate month precision: existing month or any day in that month.
+        return True
+    if de is None:
+        # Candidate has a day; existing is month-only — do not shrink.
+        return False
+    return dc == de
+
+
 def _project_match_key(row: Any) -> tuple[str | None, str | None, str | None, str | None]:
     if isinstance(row, dict):
         return (
@@ -911,24 +954,39 @@ def _project_identity_fallback_matches(
 ) -> list[dict[str, Any]]:
     """Date-anchored identity fallback when exact natural-key match fails.
 
-    Requires both start and end dates on each side, exact normalized equality,
-    customer compatibility (equal ignoring whitespace, or one empty), and
-    conservative name compatibility. Never matches on name alone.
+    Requires both start and end dates on each side, precision-compatible dates
+    (directional month↔day rules), customer compatibility (equal ignoring
+    whitespace, or one empty), and conservative name compatibility. Never
+    matches on name alone.
     """
     cand_name = _norm_str(_field(project, "project_name"))
     cand_customer = _norm_str(_field(project, "customer_name"))
-    cand_start = _project_date_key(_field(project, "start_date"))
-    cand_end = _project_date_key(_field(project, "end_date"))
-    if not cand_name or not cand_start or not cand_end:
+    cand_start = _field(project, "start_date")
+    cand_end = _field(project, "end_date")
+    if (
+        not cand_name
+        or not _project_date_key(cand_start)
+        or not _project_date_key(cand_end)
+    ):
         return []
     out: list[dict[str, Any]] = []
     for row in existing:
         row_name = _norm_str(row.get("project_name"))
-        row_start = _project_date_key(row.get("start_date"))
-        row_end = _project_date_key(row.get("end_date"))
-        if not row_name or not row_start or not row_end:
+        row_start = row.get("start_date")
+        row_end = row.get("end_date")
+        if (
+            not row_name
+            or not _project_date_key(row_start)
+            or not _project_date_key(row_end)
+        ):
             continue
-        if row_start != cand_start or row_end != cand_end:
+        if not _project_date_precision_compatible(
+            candidate=cand_start, existing=row_start
+        ):
+            continue
+        if not _project_date_precision_compatible(
+            candidate=cand_end, existing=row_end
+        ):
             continue
         if not _project_customer_identity_compatible(
             cand_customer, _norm_str(row.get("customer_name"))
@@ -1027,39 +1085,9 @@ def _diff_projects(
             )
             continue
         if not matches:
-            # Same name (+ optional customer) but different dates → ambiguous REVIEW.
-            similar = [
-                row
-                for row in existing
-                if _norm_str(row.get("project_name")) == key[0]
-                and (
-                    key[1] is None
-                    or _norm_str(row.get("customer_name")) is None
-                    or _norm_str(row.get("customer_name")) == key[1]
-                )
-            ]
-            if similar:
-                # Unique similar project → surface existing id for review UX.
-                # Multiple similar candidates stay target-less (ambiguous).
-                target_id = (
-                    _as_uuid(similar[0].get("id")) if len(similar) == 1 else None
-                )
-                specs.append(
-                    DiffSpec(
-                        entity_type="PROJECT",
-                        candidate_path=path,
-                        existing_target_id=target_id,
-                        change_type="REVIEW",
-                        old_value=similar if len(similar) > 1 else similar[0],
-                        new_value=dump,
-                        confidence=project.confidence,
-                        source_refs=refs,
-                    )
-                )
-                continue
-
-            # Exact key missed (often limited name variants). Date-anchored
-            # identity fallback connects only when unique.
+            # Exact key missed. Prefer precision-compatible identity fallback
+            # before same-name/date-different REVIEW so month↔day same-month
+            # pairs (e.g. 2018.06 vs 2018-06-11) link instead of false REVIEW.
             identity = _project_identity_fallback_matches(project, existing)
             if len(identity) > 1:
                 specs.append(
@@ -1077,6 +1105,36 @@ def _diff_projects(
             if len(identity) == 1:
                 matches = identity
             else:
+                # Same name (+ optional customer) but incompatible dates → REVIEW.
+                similar = [
+                    row
+                    for row in existing
+                    if _norm_str(row.get("project_name")) == key[0]
+                    and (
+                        key[1] is None
+                        or _norm_str(row.get("customer_name")) is None
+                        or _norm_str(row.get("customer_name")) == key[1]
+                    )
+                ]
+                if similar:
+                    # Unique similar project → surface existing id for review UX.
+                    # Multiple similar candidates stay target-less (ambiguous).
+                    target_id = (
+                        _as_uuid(similar[0].get("id")) if len(similar) == 1 else None
+                    )
+                    specs.append(
+                        DiffSpec(
+                            entity_type="PROJECT",
+                            candidate_path=path,
+                            existing_target_id=target_id,
+                            change_type="REVIEW",
+                            old_value=similar if len(similar) > 1 else similar[0],
+                            new_value=dump,
+                            confidence=project.confidence,
+                            source_refs=refs,
+                        )
+                    )
+                    continue
                 # Same exact name + dates but incompatible customer (e.g. different
                 # non-empty orgs): do not auto-link; unique hit → targeted REVIEW.
                 name_date = _project_name_date_review_matches(project, existing)
@@ -1134,7 +1192,9 @@ def _diff_projects(
             if not (
                 (
                     field_name in {"start_date", "end_date"}
-                    and _project_dates_equal(old_v, new_v)
+                    and _project_date_precision_compatible(
+                        candidate=new_v, existing=old_v
+                    )
                 )
                 or (
                     field_name == "customer_name"
