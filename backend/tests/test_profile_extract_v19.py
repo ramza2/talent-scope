@@ -87,13 +87,16 @@ def test_profile_extract_registry_v19_remains_resolvable() -> None:
     assert v19_spec.repair_whitespace_project_evidence is True
     assert v19.REPAIR_WHITESPACE_PROJECT_EVIDENCE is True
     assert v19_spec.drop_generic_activity_core_tech is False
+    assert v19_spec.require_core_tech_quote_evidence is False
     assert not hasattr(v19, "DROP_GENERIC_ACTIVITY_CORE_TECH")
+    assert not hasattr(v19, "REQUIRE_CORE_TECH_QUOTE_EVIDENCE")
     assert v19_spec.strict_relation_evidence is True
     assert v19_spec.projects_system_prompt == v19.PROJECTS_SYSTEM_PROMPT
 
     v18_spec = resolve_profile_prompt("profile-extract-v18")
     assert v18_spec.repair_whitespace_project_evidence is False
     assert v18_spec.drop_generic_activity_core_tech is False
+    assert v18_spec.require_core_tech_quote_evidence is False
     assert v18_spec.projects_system_prompt == v18.PROJECTS_SYSTEM_PROMPT
     assert not hasattr(v18, "REPAIR_WHITESPACE_PROJECT_EVIDENCE")
 

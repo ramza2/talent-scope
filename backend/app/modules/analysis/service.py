@@ -50,6 +50,7 @@ from app.modules.analysis.compact_v8 import (
     backfill_exact_core_evidence,
     backfill_exact_project_evidence,
     build_document_alias_view,
+    drop_core_skills_without_quote_evidence,
     drop_generic_activity_core_skills,
     expand_compact_core,
     expand_compact_projects,
@@ -1398,9 +1399,12 @@ class AnalysisService:
                     page_texts=page_texts,
                     allowed_documents=allowed_documents,
                 )
-            # v20: drop root TECH skills whose raw_value is activity-only.
+            # v20: drop root TECH skills whose raw_value is activity-only, then
+            # drop skills that still lack quote evidence after exact backfill.
             if prompt.drop_generic_activity_core_tech:
                 doc = drop_generic_activity_core_skills(doc)
+            if prompt.require_core_tech_quote_evidence:
+                doc = drop_core_skills_without_quote_evidence(doc)
             return doc
 
         def _normalize_projects(raw: dict[str, Any]) -> ProfileCandidateDocument:

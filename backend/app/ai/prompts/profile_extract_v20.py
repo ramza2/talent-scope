@@ -1,8 +1,9 @@
 """Compact staged profile extraction — version profile-extract-v20.
 
-v19 contract plus clearer CORE TECH activity wording and runtime guard:
+v19 contract plus clearer CORE TECH activity wording and runtime guards:
 - Feature flag DROP_GENERIC_ACTIVITY_CORE_TECH
-- Deterministic drop of root s[] values that are work/activity phrases only
+- Feature flag REQUIRE_CORE_TECH_QUOTE_EVIDENCE
+- Deterministic drop of root s[] activity-only phrases and quote-less TECH
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ VALIDATE_PROJECTS_RECOVERY_ROOT = True
 VALIDATE_CORE_STRUCTURED_COMPLETENESS = True
 REPAIR_WHITESPACE_PROJECT_EVIDENCE = True
 DROP_GENERIC_ACTIVITY_CORE_TECH = True
+REQUIRE_CORE_TECH_QUOTE_EVIDENCE = True
 
 CORE_SCHEMA_GUIDE = """
 Compact CORE root (omit null/empty):

@@ -61,6 +61,7 @@ class ProfilePromptSpec:
     validate_core_structured_completeness: bool = False
     repair_whitespace_project_evidence: bool = False
     drop_generic_activity_core_tech: bool = False
+    require_core_tech_quote_evidence: bool = False
 
 
 def _spec_from_module(module) -> ProfilePromptSpec:
@@ -114,6 +115,9 @@ def _spec_from_staged_module(module) -> ProfilePromptSpec:
         ),
         drop_generic_activity_core_tech=bool(
             getattr(module, "DROP_GENERIC_ACTIVITY_CORE_TECH", False)
+        ),
+        require_core_tech_quote_evidence=bool(
+            getattr(module, "REQUIRE_CORE_TECH_QUOTE_EVIDENCE", False)
         ),
     )
 

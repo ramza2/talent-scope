@@ -1231,6 +1231,24 @@ def drop_generic_activity_core_skills(
     return candidate.model_copy(update={"skills": kept})
 
 
+def drop_core_skills_without_quote_evidence(
+    candidate: ProfileCandidateDocument,
+) -> ProfileCandidateDocument:
+    """v20: drop root skills that still lack non-empty quote evidence.
+
+    Intended after ``backfill_exact_core_evidence``. Valid TECH codes without
+    any quoted source_ref are removed. Project relation t[] / JOB / EXP stay.
+    """
+    kept = [
+        skill
+        for skill in candidate.skills
+        if _refs_nonempty(skill.source_refs)
+    ]
+    if len(kept) == len(candidate.skills):
+        return candidate
+    return candidate.model_copy(update={"skills": kept})
+
+
 def _project_evidence_anchors(project: ProjectCandidate) -> tuple[str, ...]:
     """Scalar anchors for project root evidence, in priority order."""
     out: list[str] = []
