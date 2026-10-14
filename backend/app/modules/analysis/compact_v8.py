@@ -1722,6 +1722,30 @@ def _project_job_has_literal_pm_pl_evidence(rel: CodeRefCandidate) -> bool:
     return False
 
 
+def normalize_career_document_value(
+    candidate: ProfileCandidateDocument,
+) -> ProfileCandidateDocument:
+    """v20: rewrite parseable profile.career_document_value to duration-only text.
+
+    Leaves technical_grade, source_refs, and all other fields unchanged.
+    """
+    from app.modules.analysis.career_document_months import (
+        normalize_career_document_value_text,
+    )
+
+    raw = candidate.profile.career_document_value
+    normalized = normalize_career_document_value_text(raw)
+    if normalized == raw:
+        return candidate
+    return candidate.model_copy(
+        update={
+            "profile": candidate.profile.model_copy(
+                update={"career_document_value": normalized}
+            )
+        }
+    )
+
+
 def drop_project_jobs_without_literal_pm_pl_evidence(
     candidate: ProfileCandidateDocument,
 ) -> ProfileCandidateDocument:

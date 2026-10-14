@@ -4,8 +4,10 @@ v19 contract plus clearer CORE TECH activity wording and runtime guards:
 - Feature flag DROP_GENERIC_ACTIVITY_CORE_TECH
 - Feature flag REQUIRE_CORE_TECH_QUOTE_EVIDENCE
 - Feature flag REQUIRE_LITERAL_PM_PL_PROJECT_JOB_EVIDENCE
+- Feature flag NORMALIZE_CAREER_DOCUMENT_VALUE
 - Deterministic drop of root s[] activity-only phrases and quote-less TECH
 - Deterministic drop of PROJECT JOB-MGT-PM/PL without literal PM/PL quote tokens
+- Deterministic career_document_value → duration-only text
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ DROP_GENERIC_ACTIVITY_CORE_TECH = True
 REQUIRE_CORE_TECH_QUOTE_EVIDENCE = True
 BACKFILL_PROJECT_DATES_FROM_ROOT_EVIDENCE = True
 REQUIRE_LITERAL_PM_PL_PROJECT_JOB_EVIDENCE = True
+NORMALIZE_CAREER_DOCUMENT_VALUE = True
 
 CORE_SCHEMA_GUIDE = """
 Compact CORE root (omit null/empty):

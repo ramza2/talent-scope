@@ -64,6 +64,7 @@ class ProfilePromptSpec:
     require_core_tech_quote_evidence: bool = False
     backfill_project_dates_from_root_evidence: bool = False
     require_literal_pm_pl_project_job_evidence: bool = False
+    normalize_career_document_value: bool = False
 
 
 def _spec_from_module(module) -> ProfilePromptSpec:
@@ -126,6 +127,9 @@ def _spec_from_staged_module(module) -> ProfilePromptSpec:
         ),
         require_literal_pm_pl_project_job_evidence=bool(
             getattr(module, "REQUIRE_LITERAL_PM_PL_PROJECT_JOB_EVIDENCE", False)
+        ),
+        normalize_career_document_value=bool(
+            getattr(module, "NORMALIZE_CAREER_DOCUMENT_VALUE", False)
         ),
     )
 

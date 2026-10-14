@@ -54,6 +54,7 @@ from app.modules.analysis.compact_v8 import (
     drop_core_skills_without_quote_evidence,
     drop_generic_activity_core_skills,
     drop_project_jobs_without_literal_pm_pl_evidence,
+    normalize_career_document_value,
     expand_compact_core,
     expand_compact_projects,
     is_valid_compact_projects_root,
@@ -1407,6 +1408,10 @@ class AnalysisService:
                 doc = drop_generic_activity_core_skills(doc)
             if prompt.require_core_tech_quote_evidence:
                 doc = drop_core_skills_without_quote_evidence(doc)
+            # v20: keep only parseable total-career duration in p.cdv
+            # (strip grade/prefix noise; leave approx/range untouched).
+            if prompt.normalize_career_document_value:
+                doc = normalize_career_document_value(doc)
             return doc
 
         def _normalize_projects(raw: dict[str, Any]) -> ProfileCandidateDocument:
