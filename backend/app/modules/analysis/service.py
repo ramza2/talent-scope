@@ -51,6 +51,7 @@ from app.modules.analysis.compact_v8 import (
     backfill_exact_project_evidence,
     backfill_project_dates_from_root_evidence,
     build_document_alias_view,
+    clear_education_status_without_literal_evidence,
     drop_core_skills_without_quote_evidence,
     drop_generic_activity_core_skills,
     drop_project_jobs_without_literal_pm_pl_evidence,
@@ -1412,6 +1413,9 @@ class AnalysisService:
             # (strip grade/prefix noise; leave approx/range untouched).
             if prompt.normalize_career_document_value:
                 doc = normalize_career_document_value(doc)
+            # v20: education st needs literal status words in quote evidence.
+            if prompt.require_literal_education_status_evidence:
+                doc = clear_education_status_without_literal_evidence(doc)
             return doc
 
         def _normalize_projects(raw: dict[str, Any]) -> ProfileCandidateDocument:

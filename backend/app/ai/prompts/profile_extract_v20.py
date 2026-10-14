@@ -5,9 +5,11 @@ v19 contract plus clearer CORE TECH activity wording and runtime guards:
 - Feature flag REQUIRE_CORE_TECH_QUOTE_EVIDENCE
 - Feature flag REQUIRE_LITERAL_PM_PL_PROJECT_JOB_EVIDENCE
 - Feature flag NORMALIZE_CAREER_DOCUMENT_VALUE
+- Feature flag REQUIRE_LITERAL_EDUCATION_STATUS_EVIDENCE
 - Deterministic drop of root s[] activity-only phrases and quote-less TECH
 - Deterministic drop of PROJECT JOB-MGT-PM/PL without literal PM/PL quote tokens
 - Deterministic career_document_value → duration-only text
+- Deterministic education status drop without literal status words in quotes
 """
 
 from __future__ import annotations
@@ -30,6 +32,7 @@ REQUIRE_CORE_TECH_QUOTE_EVIDENCE = True
 BACKFILL_PROJECT_DATES_FROM_ROOT_EVIDENCE = True
 REQUIRE_LITERAL_PM_PL_PROJECT_JOB_EVIDENCE = True
 NORMALIZE_CAREER_DOCUMENT_VALUE = True
+REQUIRE_LITERAL_EDUCATION_STATUS_EVIDENCE = True
 
 CORE_SCHEMA_GUIDE = """
 Compact CORE root (omit null/empty):
@@ -48,6 +51,8 @@ e[]:{sc,mj,dg,s,e,st,f,r?}
   Table cols: 구분|재학기간|학교명|전공명|졸업여부…
   sc=institution name (○○고/대/대학원); NEVER 고교/전문학사/학사/석사/박사.
   If school unknown, omit sc. dg=고졸/전문학사/학사/석사. st=status only.
+  st only with explicit status words (졸업/재학/졸예) in that item's r.q;
+  never infer GRADUATED/졸업 from degree alone (학사/석사/박사/전문학사).
   Never invent e for 재학중/졸예. Ignore blank doctorate.
 c[]:{n,is,acq,exp,f,r?}  acq=acquired; keep issuer; no invented expiry.
 sum:string | conf:0..1

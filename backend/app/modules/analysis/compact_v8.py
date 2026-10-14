@@ -10,6 +10,7 @@ from app.ai.schemas.profile_candidate import (
     PROFILE_SCALAR_FIELD_NAMES,
     SCHEMA_VERSION,
     CodeRefCandidate,
+    EducationCandidate,
     ExpertiseCandidate,
     JobCandidate,
     ProfileCandidateDocument,
@@ -1720,6 +1721,64 @@ def _project_job_has_literal_pm_pl_evidence(rel: CodeRefCandidate) -> bool:
         if quote and pattern.search(quote):
             return True
     return False
+
+
+# Education status is free-form in schema; repo prompts/tests use Korean
+# 졸업/재학중/졸예. LLM may also emit GRADUATED/ENROLLED. Unknown → drop.
+_EDUCATION_STATUS_LITERALS: dict[str, tuple[str, ...]] = {
+    "GRADUATED": ("졸업",),
+    "졸업": ("졸업",),
+    "ENROLLED": ("재학",),
+    "재학": ("재학",),
+    "재학중": ("재학",),
+    "졸예": ("졸업예정", "졸예"),
+    "졸업예정": ("졸업예정", "졸예"),
+}
+
+
+def _education_status_literals(status: str) -> tuple[str, ...] | None:
+    key = status.strip()
+    if not key:
+        return None
+    if key in _EDUCATION_STATUS_LITERALS:
+        return _EDUCATION_STATUS_LITERALS[key]
+    return _EDUCATION_STATUS_LITERALS.get(key.upper())
+
+
+def _education_status_has_literal_evidence(row: EducationCandidate) -> bool:
+    status = (row.status or "").strip()
+    if not status:
+        return True
+    literals = _education_status_literals(status)
+    if literals is None:
+        return False
+    for ref in row.source_refs or []:
+        quote = ref.quote_text or ""
+        if any(lit in quote for lit in literals):
+            return True
+    return False
+
+
+def clear_education_status_without_literal_evidence(
+    candidate: ProfileCandidateDocument,
+) -> ProfileCandidateDocument:
+    """v20: clear EducationCandidate.status lacking literal status-word quotes.
+
+    Keeps the education row and school/major/degree/dates/source_refs.
+    Degree words alone (학사/석사/…) are not status evidence. Unknown status
+    values are fail-closed cleared.
+    """
+    changed = False
+    new_rows: list[EducationCandidate] = []
+    for row in candidate.education:
+        if _education_status_has_literal_evidence(row):
+            new_rows.append(row)
+            continue
+        changed = True
+        new_rows.append(row.model_copy(update={"status": None}))
+    if not changed:
+        return candidate
+    return candidate.model_copy(update={"education": new_rows})
 
 
 def normalize_career_document_value(
