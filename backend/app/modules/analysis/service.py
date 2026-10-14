@@ -51,6 +51,7 @@ from app.modules.analysis.compact_v8 import (
     backfill_exact_project_evidence,
     backfill_project_dates_from_root_evidence,
     build_document_alias_view,
+    backfill_semantic_core_expertise_evidence,
     clear_education_status_without_literal_evidence,
     drop_core_skills_without_quote_evidence,
     drop_generic_activity_core_skills,
@@ -1416,6 +1417,14 @@ class AnalysisService:
             # v20: education st needs literal status words in quote evidence.
             if prompt.require_literal_education_status_evidence:
                 doc = clear_education_status_without_literal_evidence(doc)
+            # v20: known root EXP codes get semantic phrase provenance when
+            # exact raw_value backfill left source_refs empty.
+            if prompt.backfill_semantic_core_exp_evidence:
+                doc = backfill_semantic_core_expertise_evidence(
+                    doc,
+                    page_texts=page_texts,
+                    allowed_documents=allowed_documents,
+                )
             return doc
 
         def _normalize_projects(raw: dict[str, Any]) -> ProfileCandidateDocument:

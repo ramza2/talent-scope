@@ -1150,6 +1150,91 @@ def _refs_nonempty(refs: list[SourceRef] | None) -> bool:
     return any((ref.quote_text or "").strip() for ref in (refs or []))
 
 
+# v20 semantic EXP backfill: prompt-contract phrases only (not raw code text).
+# Higher strength wins; ties break by sorted (document_id, page_no).
+_EXP_SEMANTIC_PATTERNS: dict[str, tuple[tuple[int, str, tuple[str, ...]], ...]] = {
+    "EXP-INFRA": (
+        # quote, optional same-page companions
+        (3, "시스템구축 및 운영", ("IT시스템기술지원", "IT시스템관리")),
+        (2, "정보시스템 운영", ()),
+        (1, "시스템 운영", ()),
+    ),
+    "EXP-MGT": ((1, "사업관리", ()),),
+    "EXP-SEC-OPS": ((1, "보안 운영", ()),),
+    "EXP-SEC-BUILD": ((1, "보안 구축", ()),),
+}
+
+
+def _semantic_exp_page_match(
+    code: str,
+    *,
+    page_texts: dict[tuple[str, int], str],
+    allowed_documents: dict[str, set[int]],
+) -> SourceRef | None:
+    """Strongest prompt-contract phrase match for a known EXP code."""
+    patterns = _EXP_SEMANTIC_PATTERNS.get(code)
+    if not patterns:
+        return None
+    best: tuple[int, str, int, str] | None = None
+    for doc_id, page_no in sorted(page_texts.keys()):
+        if doc_id not in allowed_documents:
+            continue
+        pages = allowed_documents[doc_id]
+        if pages and page_no not in pages:
+            continue
+        page_text = page_texts.get((doc_id, page_no)) or ""
+        if not page_text:
+            continue
+        for strength, quote, companions in patterns:
+            if quote not in page_text:
+                continue
+            if companions and not any(req in page_text for req in companions):
+                continue
+            # Sort key: higher strength first, then earlier doc/page.
+            key = (-strength, doc_id, page_no, quote)
+            if best is None or key < best:
+                best = key
+    if best is None:
+        return None
+    _, doc_id, page_no, quote = best
+    return SourceRef(document_id=doc_id, page_no=page_no, quote_text=quote)
+
+
+def backfill_semantic_core_expertise_evidence(
+    candidate: ProfileCandidateDocument,
+    *,
+    page_texts: dict[tuple[str, int], str] | None,
+    allowed_documents: dict[str, set[int]],
+) -> ProfileCandidateDocument:
+    """v20: fill empty root expertise source_refs via prompt-contract phrases.
+
+    Only known EXP codes (INFRA/MGT/SEC-OPS/SEC-BUILD). Never overwrites
+    existing refs. Does not change raw_value/code/evidence_type/confidence.
+    """
+    if not page_texts:
+        return candidate
+    changed = False
+    new_expertise: list[ExpertiseCandidate] = []
+    for exp in candidate.expertise:
+        if _refs_nonempty(exp.source_refs):
+            new_expertise.append(exp)
+            continue
+        code = (exp.code or "").strip()
+        match = _semantic_exp_page_match(
+            code,
+            page_texts=page_texts,
+            allowed_documents=allowed_documents,
+        )
+        if match is None:
+            new_expertise.append(exp)
+            continue
+        changed = True
+        new_expertise.append(exp.model_copy(update={"source_refs": [match]}))
+    if not changed:
+        return candidate
+    return candidate.model_copy(update={"expertise": new_expertise})
+
+
 def backfill_exact_core_evidence(
     candidate: ProfileCandidateDocument,
     *,

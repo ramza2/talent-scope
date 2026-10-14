@@ -43,6 +43,8 @@ def test_profile_extract_registry_current_is_v20() -> None:
     assert v20.NORMALIZE_CAREER_DOCUMENT_VALUE is True
     assert cur.require_literal_education_status_evidence is True
     assert v20.REQUIRE_LITERAL_EDUCATION_STATUS_EVIDENCE is True
+    assert cur.backfill_semantic_core_exp_evidence is True
+    assert v20.BACKFILL_SEMANTIC_CORE_EXP_EVIDENCE is True
     assert cur.repair_whitespace_project_evidence is True
     assert cur.strict_relation_evidence is True
 
@@ -53,12 +55,14 @@ def test_profile_extract_registry_current_is_v20() -> None:
     assert v19_spec.require_literal_pm_pl_project_job_evidence is False
     assert v19_spec.normalize_career_document_value is False
     assert v19_spec.require_literal_education_status_evidence is False
+    assert v19_spec.backfill_semantic_core_exp_evidence is False
     assert not hasattr(v19, "DROP_GENERIC_ACTIVITY_CORE_TECH")
     assert not hasattr(v19, "REQUIRE_CORE_TECH_QUOTE_EVIDENCE")
     assert not hasattr(v19, "BACKFILL_PROJECT_DATES_FROM_ROOT_EVIDENCE")
     assert not hasattr(v19, "REQUIRE_LITERAL_PM_PL_PROJECT_JOB_EVIDENCE")
     assert not hasattr(v19, "NORMALIZE_CAREER_DOCUMENT_VALUE")
     assert not hasattr(v19, "REQUIRE_LITERAL_EDUCATION_STATUS_EVIDENCE")
+    assert not hasattr(v19, "BACKFILL_SEMANTIC_CORE_EXP_EVIDENCE")
     assert v19_spec.projects_system_prompt == v19.PROJECTS_SYSTEM_PROMPT
 
 
