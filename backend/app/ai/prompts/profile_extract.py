@@ -26,10 +26,11 @@ from app.ai.prompts import (
     profile_extract_v17,
     profile_extract_v18,
     profile_extract_v19,
+    profile_extract_v20,
 )
 from app.ai.providers.errors import AIProviderError
 
-CURRENT_PROFILE_PROMPT_VERSION = "profile-extract-v19"
+CURRENT_PROFILE_PROMPT_VERSION = "profile-extract-v20"
 
 ExtractionMode = Literal["single", "staged"]
 
@@ -59,6 +60,7 @@ class ProfilePromptSpec:
     validate_projects_recovery_root: bool = False
     validate_core_structured_completeness: bool = False
     repair_whitespace_project_evidence: bool = False
+    drop_generic_activity_core_tech: bool = False
 
 
 def _spec_from_module(module) -> ProfilePromptSpec:
@@ -110,6 +112,9 @@ def _spec_from_staged_module(module) -> ProfilePromptSpec:
         repair_whitespace_project_evidence=bool(
             getattr(module, "REPAIR_WHITESPACE_PROJECT_EVIDENCE", False)
         ),
+        drop_generic_activity_core_tech=bool(
+            getattr(module, "DROP_GENERIC_ACTIVITY_CORE_TECH", False)
+        ),
     )
 
 
@@ -133,6 +138,7 @@ _REGISTRY: dict[str, ProfilePromptSpec] = {
     profile_extract_v17.PROMPT_VERSION: _spec_from_staged_module(profile_extract_v17),
     profile_extract_v18.PROMPT_VERSION: _spec_from_staged_module(profile_extract_v18),
     profile_extract_v19.PROMPT_VERSION: _spec_from_staged_module(profile_extract_v19),
+    profile_extract_v20.PROMPT_VERSION: _spec_from_staged_module(profile_extract_v20),
 }
 
 

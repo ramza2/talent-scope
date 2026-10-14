@@ -50,6 +50,7 @@ from app.modules.analysis.compact_v8 import (
     backfill_exact_core_evidence,
     backfill_exact_project_evidence,
     build_document_alias_view,
+    drop_generic_activity_core_skills,
     expand_compact_core,
     expand_compact_projects,
     is_valid_compact_projects_root,
@@ -1397,6 +1398,9 @@ class AnalysisService:
                     page_texts=page_texts,
                     allowed_documents=allowed_documents,
                 )
+            # v20: drop root TECH skills whose raw_value is activity-only.
+            if prompt.drop_generic_activity_core_tech:
+                doc = drop_generic_activity_core_skills(doc)
             return doc
 
         def _normalize_projects(raw: dict[str, Any]) -> ProfileCandidateDocument:

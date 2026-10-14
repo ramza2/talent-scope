@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Any
 
 from app.ai.schemas.profile_candidate import (
@@ -1168,6 +1169,66 @@ def promote_exact_root_catalog_codes(
     return candidate.model_copy(
         update={"jobs": jobs, "skills": skills, "expertise": expertise}
     )
+
+
+# Folded exact phrases that are work/activity-only (never TECH by themselves).
+_GENERIC_ACTIVITY_CORE_TECH_FOLDED: frozenset[str] = frozenset(
+    {
+        "운영",
+        "구축",
+        "유지보수",
+        "기술지원",
+        "백업",
+        "이관",
+        "사업관리",
+        "정보자원통합구축",
+        "정보시스템운영",
+        "시스템운영",
+        "시스템구축",
+        "시스템구축및운영",
+    }
+)
+
+
+def fold_generic_activity_tech_text(value: str) -> str:
+    """Normalize for generic-activity TECH matching (whitespace/punct only)."""
+    text = unicodedata.normalize("NFKC", value).casefold()
+    out: list[str] = []
+    for ch in text:
+        if ch.isspace():
+            continue
+        if unicodedata.category(ch).startswith("P"):
+            continue
+        out.append(ch)
+    return "".join(out)
+
+
+def is_generic_activity_core_tech_raw(raw_value: str | None) -> bool:
+    """True when raw_value is only a known work/activity phrase (fail-closed)."""
+    if not isinstance(raw_value, str):
+        return False
+    folded = fold_generic_activity_tech_text(raw_value)
+    if not folded:
+        return False
+    return folded in _GENERIC_ACTIVITY_CORE_TECH_FOLDED
+
+
+def drop_generic_activity_core_skills(
+    candidate: ProfileCandidateDocument,
+) -> ProfileCandidateDocument:
+    """v20: remove root skills whose raw_value is an activity-only phrase.
+
+    Project relation skills are untouched. JOB/EXP and non-matching TECH stay.
+    Drops even when ``code`` is set if raw_value itself is generic activity.
+    """
+    kept = [
+        skill
+        for skill in candidate.skills
+        if not is_generic_activity_core_tech_raw(skill.raw_value)
+    ]
+    if len(kept) == len(candidate.skills):
+        return candidate
+    return candidate.model_copy(update={"skills": kept})
 
 
 def _project_evidence_anchors(project: ProjectCandidate) -> tuple[str, ...]:

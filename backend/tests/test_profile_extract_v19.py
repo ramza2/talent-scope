@@ -76,25 +76,24 @@ def _pipeline(
 # ---------------------------------------------------------------------------
 
 
-def test_profile_extract_registry_current_is_v19() -> None:
+def test_profile_extract_registry_v19_remains_resolvable() -> None:
+    """v19 stays resolvable unchanged; current may advance (v20+)."""
     from app.ai.prompts import profile_extract_v18 as v18
     from app.ai.prompts import profile_extract_v19 as v19
-    from app.ai.prompts.profile_extract import (
-        CURRENT_PROFILE_PROMPT_VERSION,
-        current_profile_prompt,
-        resolve_profile_prompt,
-    )
+    from app.ai.prompts.profile_extract import resolve_profile_prompt
 
-    assert CURRENT_PROFILE_PROMPT_VERSION == "profile-extract-v19"
-    cur = current_profile_prompt()
-    assert cur.prompt_version == "profile-extract-v19"
-    assert cur.repair_whitespace_project_evidence is True
+    v19_spec = resolve_profile_prompt("profile-extract-v19")
+    assert v19_spec.prompt_version == "profile-extract-v19"
+    assert v19_spec.repair_whitespace_project_evidence is True
     assert v19.REPAIR_WHITESPACE_PROJECT_EVIDENCE is True
-    assert cur.strict_relation_evidence is True
-    assert cur.projects_system_prompt == v19.PROJECTS_SYSTEM_PROMPT
+    assert v19_spec.drop_generic_activity_core_tech is False
+    assert not hasattr(v19, "DROP_GENERIC_ACTIVITY_CORE_TECH")
+    assert v19_spec.strict_relation_evidence is True
+    assert v19_spec.projects_system_prompt == v19.PROJECTS_SYSTEM_PROMPT
 
     v18_spec = resolve_profile_prompt("profile-extract-v18")
     assert v18_spec.repair_whitespace_project_evidence is False
+    assert v18_spec.drop_generic_activity_core_tech is False
     assert v18_spec.projects_system_prompt == v18.PROJECTS_SYSTEM_PROMPT
     assert not hasattr(v18, "REPAIR_WHITESPACE_PROJECT_EVIDENCE")
 
