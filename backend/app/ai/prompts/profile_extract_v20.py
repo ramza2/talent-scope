@@ -23,6 +23,7 @@ VALIDATE_CORE_STRUCTURED_COMPLETENESS = True
 REPAIR_WHITESPACE_PROJECT_EVIDENCE = True
 DROP_GENERIC_ACTIVITY_CORE_TECH = True
 REQUIRE_CORE_TECH_QUOTE_EVIDENCE = True
+BACKFILL_PROJECT_DATES_FROM_ROOT_EVIDENCE = True
 
 CORE_SCHEMA_GUIDE = """
 Compact CORE root (omit null/empty):
@@ -53,6 +54,7 @@ pr[] (omit empty):
   n, cust(literal customer text), s, e, resp, sum?,
   j/t/x inline relation objects, b/ct code arrays, f,
   r:[ref] REQUIRED ≥1 from THIS project.
+  s/e=project period when the row shows dates (YYYY.MM; no guessing).
   Do NOT emit separate rm.
 
 j/t/x[]:{"c":"CATALOG-CODE","r":[ref,...]}  REQUIRED shape.
@@ -189,6 +191,9 @@ Projects:
   combine evidence only after identity match (≤2 refs).
 - Distinct rows stay distinct. Every project needs r from THAT row with
   non-empty verbatim q (no paraphrase).
+- When the project row shows an explicit period, always emit s/e
+  (do not omit). Month-level source text → YYYY.MM precision. Never invent
+  or guess dates; only return periods present in that row.
 - Per project: recall ALL supported j/x/b from THAT row (TA, 사업관리,
   OPS+INFRA, BIZ-PUBLIC/DEFENSE/MEDIA) when explicitly evidenced.
 - j/t/x MUST be objects {{"c":CODE,"r":[ref…]}} with ≥1 same-project verbatim q;

@@ -49,6 +49,7 @@ from app.modules.analysis.compact_v8 import (
     apply_normalized_quote_evidence,
     backfill_exact_core_evidence,
     backfill_exact_project_evidence,
+    backfill_project_dates_from_root_evidence,
     build_document_alias_view,
     drop_core_skills_without_quote_evidence,
     drop_generic_activity_core_skills,
@@ -1451,6 +1452,9 @@ class AnalysisService:
                     doc,
                     page_texts=page_texts,
                 )
+            # v20: fill missing project s/e from unique root-quote date ranges.
+            if prompt.backfill_project_dates_from_root_evidence:
+                doc = backfill_project_dates_from_root_evidence(doc)
             projects_with_quote = sum(
                 1
                 for project in doc.projects

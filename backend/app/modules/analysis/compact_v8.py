@@ -183,6 +183,154 @@ def derive_duration_months(start: Any, end: Any) -> int | None:
     return delta
 
 
+_PROJECT_DATE_RANGE_RE = re.compile(
+    r"(?P<sy>\d{2}|\d{4})[.\-](?P<sm>\d{2})\s*[~～]\s*"
+    r"(?P<ey>\d{2}|\d{4})[.\-](?P<em>\d{2})"
+)
+_FOUR_DIGIT_YEAR_RE = re.compile(r"(?<!\d)((?:19|20)\d{2})(?!\d)")
+
+
+def _collect_year_anchors(*texts: str | None) -> list[int]:
+    anchors: list[int] = []
+    for text in texts:
+        if not isinstance(text, str) or not text:
+            continue
+        for match in _FOUR_DIGIT_YEAR_RE.finditer(text):
+            year = int(match.group(1))
+            if 1900 <= year <= 2100:
+                anchors.append(year)
+    return anchors
+
+
+def _expand_year_token(
+    token: str,
+    *,
+    anchors: list[int],
+) -> int | None:
+    if len(token) == 4:
+        year = int(token)
+        return year if 1900 <= year <= 2100 else None
+    if len(token) != 2:
+        return None
+    yy = int(token)
+    matched = sorted({year for year in anchors if year % 100 == yy})
+    if len(matched) == 1:
+        return matched[0]
+    if len(matched) > 1:
+        return None
+    return 2000 + yy if yy <= 49 else 1900 + yy
+
+
+def _format_year_month(year: int, month: int) -> str:
+    return f"{year:04d}.{month:02d}"
+
+
+def parse_project_date_range_from_texts(
+    texts: list[str],
+    *,
+    project_name: str | None = None,
+) -> tuple[str, str] | None:
+    """Parse a unique YYYY.MM~YYYY.MM range from texts; else None (fail-closed)."""
+    if not texts:
+        return None
+    anchors = _collect_year_anchors(project_name, *texts)
+    parsed: set[tuple[str, str]] = set()
+    for text in texts:
+        for match in _PROJECT_DATE_RANGE_RE.finditer(text):
+            sm = int(match.group("sm"))
+            em = int(match.group("em"))
+            if sm < 1 or sm > 12 or em < 1 or em > 12:
+                return None
+            sy_tok = match.group("sy")
+            ey_tok = match.group("ey")
+            start_year = _expand_year_token(sy_tok, anchors=anchors)
+            end_year = _expand_year_token(ey_tok, anchors=anchors)
+            if start_year is None or end_year is None:
+                return None
+            # Classic two-digit wrap: 99.12 ~ 00.02 under pivot already yields
+            # 1999/2000. If end < start, try one century bump on YY end only.
+            if (end_year, em) < (start_year, sm):
+                if len(ey_tok) == 2:
+                    bumped = end_year + 100
+                    if bumped <= 2100 and (bumped, em) >= (start_year, sm):
+                        end_year = bumped
+                    else:
+                        return None
+                else:
+                    return None
+            parsed.add(
+                (
+                    _format_year_month(start_year, sm),
+                    _format_year_month(end_year, em),
+                )
+            )
+            if len(parsed) > 1:
+                return None
+    if len(parsed) != 1:
+        return None
+    return next(iter(parsed))
+
+
+def backfill_project_dates_from_root_evidence(
+    candidate: ProfileCandidateDocument,
+) -> ProfileCandidateDocument:
+    """v20: fill missing project start/end from unique root-quote date ranges.
+
+    Uses only project root ``source_refs[].quote_text``. Never reads relation
+    j/t/x refs or page text. Existing start/end values are never overwritten.
+    Recalculates ``duration_months`` via ``derive_duration_months`` when both
+    ends are present after fill.
+    """
+    if not candidate.projects:
+        return candidate
+    projects: list[ProjectCandidate] = []
+    changed_any = False
+    for project in candidate.projects:
+        need_start = not (project.start_date or "").strip()
+        need_end = not (project.end_date or "").strip()
+        if not need_start and not need_end:
+            projects.append(project)
+            continue
+        quotes = [
+            (ref.quote_text or "").strip()
+            for ref in (project.source_refs or [])
+            if (ref.quote_text or "").strip()
+        ]
+        if not quotes:
+            projects.append(project)
+            continue
+        parsed = parse_project_date_range_from_texts(
+            quotes, project_name=project.project_name
+        )
+        if parsed is None:
+            projects.append(project)
+            continue
+        start_s, end_s = parsed
+        updates: dict[str, Any] = {}
+        if need_start and need_end:
+            updates["start_date"] = start_s
+            updates["end_date"] = end_s
+        elif need_start:
+            if parse_year_month(project.end_date) == parse_year_month(end_s):
+                updates["start_date"] = start_s
+        elif need_end:
+            if parse_year_month(project.start_date) == parse_year_month(start_s):
+                updates["end_date"] = end_s
+        if not updates:
+            projects.append(project)
+            continue
+        new_start = updates.get("start_date", project.start_date)
+        new_end = updates.get("end_date", project.end_date)
+        duration = derive_duration_months(new_start, new_end)
+        if duration is not None:
+            updates["duration_months"] = duration
+        projects.append(project.model_copy(update=updates))
+        changed_any = True
+    if not changed_any:
+        return candidate
+    return candidate.model_copy(update={"projects": projects})
+
+
 def build_document_alias_view(document_blocks: str) -> tuple[str, dict[str, str]]:
     """Replace UUID document headers with D1/D2… aliases for the LLM prompt.
 

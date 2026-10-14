@@ -35,14 +35,18 @@ def test_profile_extract_registry_current_is_v20() -> None:
     assert v20.DROP_GENERIC_ACTIVITY_CORE_TECH is True
     assert cur.require_core_tech_quote_evidence is True
     assert v20.REQUIRE_CORE_TECH_QUOTE_EVIDENCE is True
+    assert cur.backfill_project_dates_from_root_evidence is True
+    assert v20.BACKFILL_PROJECT_DATES_FROM_ROOT_EVIDENCE is True
     assert cur.repair_whitespace_project_evidence is True
     assert cur.strict_relation_evidence is True
 
     v19_spec = resolve_profile_prompt("profile-extract-v19")
     assert v19_spec.drop_generic_activity_core_tech is False
     assert v19_spec.require_core_tech_quote_evidence is False
+    assert v19_spec.backfill_project_dates_from_root_evidence is False
     assert not hasattr(v19, "DROP_GENERIC_ACTIVITY_CORE_TECH")
     assert not hasattr(v19, "REQUIRE_CORE_TECH_QUOTE_EVIDENCE")
+    assert not hasattr(v19, "BACKFILL_PROJECT_DATES_FROM_ROOT_EVIDENCE")
     assert v19_spec.projects_system_prompt == v19.PROJECTS_SYSTEM_PROMPT
 
 
@@ -57,16 +61,17 @@ def test_v19_prompt_file_byte_identical_to_base() -> None:
 
 
 def test_v20_inherits_v19_flags_and_projects_contract() -> None:
-    from app.ai.prompts import profile_extract_v19 as v19
     from app.ai.prompts import profile_extract_v20 as v20
 
     assert v20.REPAIR_WHITESPACE_PROJECT_EVIDENCE is True
     assert v20.STRICT_RELATION_EVIDENCE is True
-    assert v20.PROJECTS_SCHEMA_GUIDE == v19.PROJECTS_SCHEMA_GUIDE
+    assert v20.BACKFILL_PROJECT_DATES_FROM_ROOT_EVIDENCE is True
     assert "정보자원 통합구축" in v20.CORE_SYSTEM_PROMPT
     assert "s[].v must be the technology/product/tool phrase itself" in (
         v20.CORE_SYSTEM_PROMPT
     )
+    assert "YYYY.MM" in v20.PROJECTS_SYSTEM_PROMPT
+    assert "s/e=project period" in v20.PROJECTS_SCHEMA_GUIDE
 
 
 def _core_doc(*, skills, jobs=None, expertise=None, projects=None):
