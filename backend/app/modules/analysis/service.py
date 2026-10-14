@@ -53,6 +53,7 @@ from app.modules.analysis.compact_v8 import (
     build_document_alias_view,
     drop_core_skills_without_quote_evidence,
     drop_generic_activity_core_skills,
+    drop_project_jobs_without_literal_pm_pl_evidence,
     expand_compact_core,
     expand_compact_projects,
     is_valid_compact_projects_root,
@@ -1469,6 +1470,10 @@ class AnalysisService:
             # that projects and j/t/x still have non-empty quote_text evidence.
             if prompt.strict_relation_evidence:
                 doc = apply_normalized_quote_evidence(doc)
+            # v20: JOB-MGT-PM/PL need literal PM/PL tokens in quote_text, not
+            # merely any non-empty quote (e.g. "부장" / "사업관리" alone).
+            if prompt.require_literal_pm_pl_project_job_evidence:
+                doc = drop_project_jobs_without_literal_pm_pl_evidence(doc)
             if prompt.backfill_exact_project_evidence or prompt.strict_relation_evidence:
                 logger.info(
                     "analysis project root evidence analysis_run_id=%s "

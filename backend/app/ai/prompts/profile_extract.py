@@ -63,6 +63,7 @@ class ProfilePromptSpec:
     drop_generic_activity_core_tech: bool = False
     require_core_tech_quote_evidence: bool = False
     backfill_project_dates_from_root_evidence: bool = False
+    require_literal_pm_pl_project_job_evidence: bool = False
 
 
 def _spec_from_module(module) -> ProfilePromptSpec:
@@ -122,6 +123,9 @@ def _spec_from_staged_module(module) -> ProfilePromptSpec:
         ),
         backfill_project_dates_from_root_evidence=bool(
             getattr(module, "BACKFILL_PROJECT_DATES_FROM_ROOT_EVIDENCE", False)
+        ),
+        require_literal_pm_pl_project_job_evidence=bool(
+            getattr(module, "REQUIRE_LITERAL_PM_PL_PROJECT_JOB_EVIDENCE", False)
         ),
     )
 

@@ -1700,6 +1700,54 @@ def repair_whitespace_project_evidence(
     return out, counts
 
 
+# PROJECT JOB-MGT-PM / JOB-MGT-PL require a literal PM/PL token in some quote.
+# ASCII alnum boundaries: allow "PM", "[PM]", "PM 사업관리", "PM/PL"; reject "PMO".
+_PM_LITERAL_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9])PM(?![A-Za-z0-9])", re.IGNORECASE)
+_PL_LITERAL_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9])PL(?![A-Za-z0-9])", re.IGNORECASE)
+_PM_PL_LITERAL_JOB_PATTERNS: dict[str, re.Pattern[str]] = {
+    "JOB-MGT-PM": _PM_LITERAL_TOKEN_RE,
+    "JOB-MGT-PL": _PL_LITERAL_TOKEN_RE,
+}
+
+
+def _project_job_has_literal_pm_pl_evidence(rel: CodeRefCandidate) -> bool:
+    """True when job is not PM/PL, or at least one quote has the required token."""
+    pattern = _PM_PL_LITERAL_JOB_PATTERNS.get((rel.code or "").strip())
+    if pattern is None:
+        return True
+    for ref in rel.source_refs or []:
+        quote = (ref.quote_text or "").strip()
+        if quote and pattern.search(quote):
+            return True
+    return False
+
+
+def drop_project_jobs_without_literal_pm_pl_evidence(
+    candidate: ProfileCandidateDocument,
+) -> ProfileCandidateDocument:
+    """v20: drop PROJECT JOB-MGT-PM/PL lacking literal PM/PL quote tokens.
+
+    Only project ``jobs`` relations are filtered. Root jobs, other JOB codes
+    (e.g. JOB-ARC-TA), skills/expertise/domains, and the project itself stay.
+    """
+    changed = False
+    new_projects: list[ProjectCandidate] = []
+    for project in candidate.projects:
+        kept_jobs = [
+            job
+            for job in project.jobs
+            if _project_job_has_literal_pm_pl_evidence(job)
+        ]
+        if len(kept_jobs) != len(project.jobs):
+            changed = True
+            new_projects.append(project.model_copy(update={"jobs": kept_jobs}))
+        else:
+            new_projects.append(project)
+    if not changed:
+        return candidate
+    return candidate.model_copy(update={"projects": new_projects})
+
+
 def apply_normalized_quote_evidence(
     candidate: ProfileCandidateDocument,
 ) -> ProfileCandidateDocument:
