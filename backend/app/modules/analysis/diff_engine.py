@@ -1200,6 +1200,14 @@ def _diff_projects(
                     field_name == "customer_name"
                     and _project_customers_ws_equal(old_v, new_v)
                 )
+                or (
+                    # Identity-compatible spelling variants already accepted for
+                    # match must not surface as project_name CONFLICT.
+                    field_name == "project_name"
+                    and _project_names_identity_compatible(
+                        _norm_str(old_v), _norm_str(new_v)
+                    )
+                )
             )
         ]
         relation_specs = _diff_project_relations(
