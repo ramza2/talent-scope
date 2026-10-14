@@ -55,6 +55,7 @@ from app.modules.analysis.compact_v8 import (
     clear_education_status_without_literal_evidence,
     drop_core_skills_without_quote_evidence,
     drop_generic_activity_core_skills,
+    drop_project_expertise_without_semantic_evidence,
     drop_project_jobs_without_literal_pm_pl_evidence,
     normalize_career_document_value,
     expand_compact_core,
@@ -1488,6 +1489,10 @@ class AnalysisService:
             # that projects and j/t/x still have non-empty quote_text evidence.
             if prompt.strict_relation_evidence:
                 doc = apply_normalized_quote_evidence(doc)
+            # v20: known PROJECT EXP codes need quote phrases that actually
+            # support the EXP (e.g. 업무분석 ≠ EXP-INFRA).
+            if prompt.require_semantic_project_exp_evidence:
+                doc = drop_project_expertise_without_semantic_evidence(doc)
             # v20: JOB-MGT-PM/PL need literal PM/PL tokens in quote_text, not
             # merely any non-empty quote (e.g. "부장" / "사업관리" alone).
             if prompt.require_literal_pm_pl_project_job_evidence:

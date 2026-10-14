@@ -1150,11 +1150,11 @@ def _refs_nonempty(refs: list[SourceRef] | None) -> bool:
     return any((ref.quote_text or "").strip() for ref in (refs or []))
 
 
-# v20 semantic EXP backfill: prompt-contract phrases only (not raw code text).
-# Higher strength wins; ties break by sorted (document_id, page_no).
+# v20 semantic EXP phrases (CORE backfill + PROJECT relation guard).
+# Higher strength wins for backfill; ties break by sorted (document_id, page_no).
 _EXP_SEMANTIC_PATTERNS: dict[str, tuple[tuple[int, str, tuple[str, ...]], ...]] = {
     "EXP-INFRA": (
-        # quote, optional same-page companions
+        # quote phrase, optional same-text companions
         (3, "시스템구축 및 운영", ("IT시스템기술지원", "IT시스템관리")),
         (2, "정보시스템 운영", ()),
         (1, "시스템 운영", ()),
@@ -1163,6 +1163,23 @@ _EXP_SEMANTIC_PATTERNS: dict[str, tuple[tuple[int, str, tuple[str, ...]], ...]] 
     "EXP-SEC-OPS": ((1, "보안 운영", ()),),
     "EXP-SEC-BUILD": ((1, "보안 구축", ()),),
 }
+
+
+def _quote_supports_semantic_exp(code: str, quote: str) -> bool:
+    """True when quote text itself supports a known EXP prompt-contract phrase."""
+    patterns = _EXP_SEMANTIC_PATTERNS.get(code)
+    if not patterns:
+        return False
+    text = (quote or "").strip()
+    if not text:
+        return False
+    for _strength, phrase, companions in patterns:
+        if phrase not in text:
+            continue
+        if companions and not any(req in text for req in companions):
+            continue
+        return True
+    return False
 
 
 def _semantic_exp_page_match(
@@ -1888,6 +1905,42 @@ def normalize_career_document_value(
             )
         }
     )
+
+
+def drop_project_expertise_without_semantic_evidence(
+    candidate: ProfileCandidateDocument,
+) -> ProfileCandidateDocument:
+    """v20: drop PROJECT expertise whose quotes do not support known EXP codes.
+
+    Only ``project.expertise`` for EXP-INFRA/MGT/SEC-OPS/SEC-BUILD. Unknown EXP
+    codes, root expertise, jobs/skills/domains, and the project row stay.
+    Any one supporting quote keeps the relation.
+    """
+    changed = False
+    new_projects: list[ProjectCandidate] = []
+    for project in candidate.projects:
+        kept_exp: list[CodeRefCandidate] = []
+        dropped = False
+        for rel in project.expertise:
+            code = (rel.code or "").strip()
+            if code not in _EXP_SEMANTIC_PATTERNS:
+                kept_exp.append(rel)
+                continue
+            if any(
+                _quote_supports_semantic_exp(code, ref.quote_text or "")
+                for ref in (rel.source_refs or [])
+            ):
+                kept_exp.append(rel)
+                continue
+            dropped = True
+        if dropped:
+            changed = True
+            new_projects.append(project.model_copy(update={"expertise": kept_exp}))
+        else:
+            new_projects.append(project)
+    if not changed:
+        return candidate
+    return candidate.model_copy(update={"projects": new_projects})
 
 
 def drop_project_jobs_without_literal_pm_pl_evidence(

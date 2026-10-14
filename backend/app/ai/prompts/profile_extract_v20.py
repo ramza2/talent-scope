@@ -7,11 +7,13 @@ v19 contract plus clearer CORE TECH activity wording and runtime guards:
 - Feature flag NORMALIZE_CAREER_DOCUMENT_VALUE
 - Feature flag REQUIRE_LITERAL_EDUCATION_STATUS_EVIDENCE
 - Feature flag BACKFILL_SEMANTIC_CORE_EXP_EVIDENCE
+- Feature flag REQUIRE_SEMANTIC_PROJECT_EXP_EVIDENCE
 - Deterministic drop of root s[] activity-only phrases and quote-less TECH
 - Deterministic drop of PROJECT JOB-MGT-PM/PL without literal PM/PL quote tokens
 - Deterministic career_document_value → duration-only text
 - Deterministic education status drop without literal status words in quotes
 - Deterministic semantic evidence backfill for known root EXP codes
+- Deterministic drop of PROJECT EXP lacking supporting semantic quotes
 """
 
 from __future__ import annotations
@@ -36,6 +38,7 @@ REQUIRE_LITERAL_PM_PL_PROJECT_JOB_EVIDENCE = True
 NORMALIZE_CAREER_DOCUMENT_VALUE = True
 REQUIRE_LITERAL_EDUCATION_STATUS_EVIDENCE = True
 BACKFILL_SEMANTIC_CORE_EXP_EVIDENCE = True
+REQUIRE_SEMANTIC_PROJECT_EXP_EVIDENCE = True
 
 CORE_SCHEMA_GUIDE = """
 Compact CORE root (omit null/empty):
@@ -214,6 +217,8 @@ Projects:
   never bare string codes; never neighbor quotes.
   Prefer shortest same-row quote containing the supporting phrase.
 - PM/PL needs literal PM/PL in that item's r.q.
+- 업무분석/유지보수/운영 alone (or "시스템구축 및 운영" without IT시스템기술지원/관리)
+  is not EXP-INFRA evidence.
 - Never omit a supported relation because another EXP exists.
 - cust=literal customer text only. Concise resp. b/ct stay code arrays.
 

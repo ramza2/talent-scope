@@ -67,6 +67,7 @@ class ProfilePromptSpec:
     normalize_career_document_value: bool = False
     require_literal_education_status_evidence: bool = False
     backfill_semantic_core_exp_evidence: bool = False
+    require_semantic_project_exp_evidence: bool = False
 
 
 def _spec_from_module(module) -> ProfilePromptSpec:
@@ -138,6 +139,9 @@ def _spec_from_staged_module(module) -> ProfilePromptSpec:
         ),
         backfill_semantic_core_exp_evidence=bool(
             getattr(module, "BACKFILL_SEMANTIC_CORE_EXP_EVIDENCE", False)
+        ),
+        require_semantic_project_exp_evidence=bool(
+            getattr(module, "REQUIRE_SEMANTIC_PROJECT_EXP_EVIDENCE", False)
         ),
     )
 
