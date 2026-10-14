@@ -1036,6 +1036,44 @@ def _project_name_date_review_matches(
     return out
 
 
+def _project_customer_date_review_matches(
+    project: Any,
+    existing: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Same customer + precision-compatible dates; name ignored (REVIEW-only).
+
+    Both sides must have a non-empty customer that is equal ignoring whitespace.
+    Never used for auto-link / SAME / UPDATE.
+    """
+    cand_customer = _norm_str(_field(project, "customer_name"))
+    cand_start = _field(project, "start_date")
+    cand_end = _field(project, "end_date")
+    if (
+        not cand_customer
+        or not _project_date_key(cand_start)
+        or not _project_date_key(cand_end)
+    ):
+        return []
+    out: list[dict[str, Any]] = []
+    for row in existing:
+        if not _project_customers_ws_equal(cand_customer, row.get("customer_name")):
+            continue
+        row_start = row.get("start_date")
+        row_end = row.get("end_date")
+        if not _project_date_key(row_start) or not _project_date_key(row_end):
+            continue
+        if not _project_date_precision_compatible(
+            candidate=cand_start, existing=row_start
+        ):
+            continue
+        if not _project_date_precision_compatible(
+            candidate=cand_end, existing=row_end
+        ):
+            continue
+        out.append(row)
+    return out
+
+
 PROJECT_RELATION_FIELDS: tuple[str, ...] = (
     "jobs",
     "skills",
@@ -1166,6 +1204,35 @@ def _diff_projects(
                             change_type="REVIEW",
                             old_value=(
                                 name_date if len(name_date) > 1 else name_date[0]
+                            ),
+                            new_value=dump,
+                            confidence=project.confidence,
+                            source_refs=refs,
+                        )
+                    )
+                    continue
+                # Same customer + precision-compatible dates, names not
+                # identity-compatible: potential match → REVIEW only (never
+                # auto-link / SAME / UPDATE).
+                customer_date = _project_customer_date_review_matches(
+                    project, existing
+                )
+                if customer_date:
+                    target_id = (
+                        _as_uuid(customer_date[0].get("id"))
+                        if len(customer_date) == 1
+                        else None
+                    )
+                    specs.append(
+                        DiffSpec(
+                            entity_type="PROJECT",
+                            candidate_path=path,
+                            existing_target_id=target_id,
+                            change_type="REVIEW",
+                            old_value=(
+                                customer_date
+                                if len(customer_date) > 1
+                                else customer_date[0]
                             ),
                             new_value=dump,
                             confidence=project.confidence,
