@@ -61,6 +61,9 @@ class Settings(BaseSettings):
     analysis_code_context_max_chars: int = 12000
     analysis_max_quote_chars: int = 400
     analysis_max_source_refs: int = 5
+    # Optional Qwen3 thinking toggle for profile analysis complete_json only.
+    # None keeps historical Chat Completions payloads unchanged.
+    analysis_llm_enable_thinking: bool | None = None
 
     embedding_base_url: str = "https://gateway.example.test"
     embedding_api_key: str = "change-me"

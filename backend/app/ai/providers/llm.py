@@ -70,6 +70,7 @@ class OpenAICompatibleLLMProvider:
             user_prompt,
             log_context,
             timeout_seconds=float(self.settings.analysis_ai_request_timeout_seconds),
+            enable_thinking=self.settings.analysis_llm_enable_thinking,
         )
         return _parse_json_dict(content, allow_repair=True)
 
@@ -80,8 +81,9 @@ class OpenAICompatibleLLMProvider:
         log_context: dict | None,
         *,
         timeout_seconds: float,
+        enable_thinking: bool | None = None,
     ) -> str:
-        payload = {
+        payload: dict = {
             "model": self.settings.llm_model,
             "temperature": 0,
             "messages": [
@@ -89,6 +91,9 @@ class OpenAICompatibleLLMProvider:
                 {"role": "user", "content": user_prompt},
             ],
         }
+        # Profile-analysis toggle only: omit key entirely when unset.
+        if enable_thinking is not None:
+            payload["chat_template_kwargs"] = {"enable_thinking": enable_thinking}
         ctx = {
             **(log_context or {}),
             "provider": "llm",
