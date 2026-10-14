@@ -1002,21 +1002,35 @@ def _project_name_date_review_matches(
     project: Any,
     existing: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Exact project_name + equal normalized dates (customer may differ)."""
+    """Exact project_name + precision-compatible dates (customer may differ).
+
+    Used when identity fallback rejects a customer mismatch. Does not expand
+    name matching beyond exact ``project_name`` equality.
+    """
     cand_name = _norm_str(_field(project, "project_name"))
-    cand_start = _project_date_key(_field(project, "start_date"))
-    cand_end = _project_date_key(_field(project, "end_date"))
-    if not cand_name or not cand_start or not cand_end:
+    cand_start = _field(project, "start_date")
+    cand_end = _field(project, "end_date")
+    if (
+        not cand_name
+        or not _project_date_key(cand_start)
+        or not _project_date_key(cand_end)
+    ):
         return []
     out: list[dict[str, Any]] = []
     for row in existing:
         if _norm_str(row.get("project_name")) != cand_name:
             continue
-        row_start = _project_date_key(row.get("start_date"))
-        row_end = _project_date_key(row.get("end_date"))
-        if not row_start or not row_end:
+        row_start = row.get("start_date")
+        row_end = row.get("end_date")
+        if not _project_date_key(row_start) or not _project_date_key(row_end):
             continue
-        if row_start != cand_start or row_end != cand_end:
+        if not _project_date_precision_compatible(
+            candidate=cand_start, existing=row_start
+        ):
+            continue
+        if not _project_date_precision_compatible(
+            candidate=cand_end, existing=row_end
+        ):
             continue
         out.append(row)
     return out
