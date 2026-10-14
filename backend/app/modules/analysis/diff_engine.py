@@ -12,7 +12,10 @@ from app.ai.schemas.profile_candidate import (
     ProfileCandidateDocument,
 )
 from app.core.person_name import person_name_match_key
-from app.modules.analysis.career_document_months import parse_career_document_months
+from app.modules.analysis.career_document_months import (
+    normalize_career_document_value_text,
+    parse_career_document_months,
+)
 
 EMPLOYMENT_FIELDS: tuple[str, ...] = (
     "company_name",
@@ -216,6 +219,30 @@ def _dump_model(row: Any) -> dict[str, Any]:
     return dict(row)
 
 
+def _career_document_value_change(old_val: Any, new_val: Any) -> str:
+    """career_document_value-only: semantic-equivalent cleanup → UPDATE.
+
+    When both sides parse to the same months and ``new_val`` is already
+    canonical duration text, emit UPDATE so a reviewer can replace a noisy
+    confirmed string with the cleaned candidate. Otherwise CONFLICT.
+    """
+    old_months = parse_career_document_months(
+        old_val if isinstance(old_val, str) else None
+    )
+    new_months = parse_career_document_months(
+        new_val if isinstance(new_val, str) else None
+    )
+    if old_months is None or new_months is None:
+        return "CONFLICT"
+    if old_months != new_months:
+        return "CONFLICT"
+    if not isinstance(new_val, str):
+        return "CONFLICT"
+    if normalize_career_document_value_text(new_val) != new_val:
+        return "CONFLICT"
+    return "UPDATE"
+
+
 def _diff_profile_scalars(
     candidate: ProfileCandidateDocument, profile_snap: dict[str, Any]
 ) -> list[DiffSpec]:
@@ -245,8 +272,10 @@ def _diff_profile_scalars(
             change = "SAME"
         elif old_val is None or old_val == "":
             change = "NEW"
+        elif field_name == "career_document_value":
+            change = _career_document_value_change(old_val, new_val)
         else:
-            # Never auto-UPDATE scalars when both sides are non-null.
+            # Never auto-UPDATE other scalars when both sides are non-null.
             change = "CONFLICT"
         specs.append(
             DiffSpec(
