@@ -58,6 +58,8 @@ from app.modules.analysis.compact_v8 import (
     backfill_project_biz_evidence,
     backfill_semantic_project_expertise_evidence,
     backfill_semantic_project_job_evidence,
+    count_project_job_code_distribution,
+    count_project_jobs_with_quote_evidence,
     drop_project_expertise_without_semantic_evidence,
     drop_project_jobs_without_literal_pm_pl_evidence,
     normalize_career_document_value,
@@ -1506,12 +1508,21 @@ class AnalysisService:
                 )
             # v20: repair known PROJECT JOB refs from unique semantic
             # project-row spans before strict quote filter.
+            jobs_with_quote_before_job_backfill = (
+                count_project_jobs_with_quote_evidence(doc)
+            )
             if prompt.backfill_semantic_project_job_evidence:
                 doc = backfill_semantic_project_job_evidence(
                     doc,
                     page_texts=page_texts,
                     allowed_documents=allowed_documents,
                 )
+            job_semantic_backfilled_refs = max(
+                0,
+                count_project_jobs_with_quote_evidence(doc)
+                - jobs_with_quote_before_job_backfill,
+            )
+            pre_strict_job_codes = count_project_job_code_distribution(doc)
             # v10+: after normalize may clear quotes / drop invalid refs, re-check
             # that projects and j/t/x still have non-empty quote_text evidence.
             if prompt.strict_relation_evidence:
@@ -1613,6 +1624,15 @@ class AnalysisService:
                 rel["dropped_during_strict_filter_j"],
                 rel["dropped_during_strict_filter_t"],
                 rel["dropped_during_strict_filter_x"],
+            )
+            # Codes/counts only: pre-strict PROJECT job code distribution and
+            # how many JOB relations gained quote_text via semantic backfill.
+            logger.info(
+                "analysis project job codes analysis_run_id=%s "
+                "pre_strict_job_codes=%s job_semantic_backfilled_refs=%s",
+                base_log.get("analysis_run_id"),
+                pre_strict_job_codes,
+                job_semantic_backfilled_refs,
             )
             return doc
 

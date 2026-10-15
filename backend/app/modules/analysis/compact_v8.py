@@ -986,6 +986,34 @@ def count_normalized_project_relations(
     }
 
 
+def count_project_job_code_distribution(
+    candidate: ProfileCandidateDocument | None,
+) -> dict[str, int]:
+    """PROJECT job code histogram (codes/counts only; no names/quotes)."""
+    counts: dict[str, int] = {}
+    if candidate is None:
+        return counts
+    for project in candidate.projects:
+        for job in project.jobs:
+            code = (job.code or "").strip() or "?"
+            counts[code] = counts.get(code, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def count_project_jobs_with_quote_evidence(
+    candidate: ProfileCandidateDocument | None,
+) -> int:
+    """Count PROJECT job relations that already have non-empty quote_text."""
+    if candidate is None:
+        return 0
+    return sum(
+        1
+        for project in candidate.projects
+        for job in project.jobs
+        if _relation_has_quote_evidence(job)
+    )
+
+
 def project_relation_diagnostic_counts(
     *,
     raw: dict[str, Any] | None,
