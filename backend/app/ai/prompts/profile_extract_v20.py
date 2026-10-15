@@ -10,6 +10,7 @@ v19 contract plus clearer CORE TECH activity wording and runtime guards:
 - Feature flag REQUIRE_SEMANTIC_PROJECT_EXP_EVIDENCE
 - Feature flag BACKFILL_SEMANTIC_PROJECT_EXP_EVIDENCE
 - Feature flag BACKFILL_PROJECT_BIZ_EVIDENCE
+- Feature flag BACKFILL_SEMANTIC_PROJECT_JOB_EVIDENCE
 - Deterministic drop of root s[] activity-only phrases and quote-less TECH
 - Deterministic drop of PROJECT JOB-MGT-PM/PL without literal PM/PL quote tokens
 - Deterministic career_document_value → duration-only text
@@ -18,6 +19,7 @@ v19 contract plus clearer CORE TECH activity wording and runtime guards:
 - Deterministic drop of PROJECT EXP lacking supporting semantic quotes
 - Deterministic project-row semantic quote backfill for known PROJECT EXP
 - Deterministic project-row evidence backfill for PROJECT business_domains
+- Deterministic project-row semantic quote backfill for known PROJECT JOB
 """
 
 from __future__ import annotations
@@ -45,6 +47,7 @@ BACKFILL_SEMANTIC_CORE_EXP_EVIDENCE = True
 REQUIRE_SEMANTIC_PROJECT_EXP_EVIDENCE = True
 BACKFILL_SEMANTIC_PROJECT_EXP_EVIDENCE = True
 BACKFILL_PROJECT_BIZ_EVIDENCE = True
+BACKFILL_SEMANTIC_PROJECT_JOB_EVIDENCE = True
 
 CORE_SCHEMA_GUIDE = """
 Compact CORE root (omit null/empty):

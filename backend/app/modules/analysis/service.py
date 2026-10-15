@@ -57,6 +57,7 @@ from app.modules.analysis.compact_v8 import (
     drop_generic_activity_core_skills,
     backfill_project_biz_evidence,
     backfill_semantic_project_expertise_evidence,
+    backfill_semantic_project_job_evidence,
     drop_project_expertise_without_semantic_evidence,
     drop_project_jobs_without_literal_pm_pl_evidence,
     normalize_career_document_value,
@@ -1499,6 +1500,14 @@ class AnalysisService:
             # source rows (codes unchanged; no reclassification).
             if prompt.backfill_project_biz_evidence:
                 doc = backfill_project_biz_evidence(
+                    doc,
+                    page_texts=page_texts,
+                    allowed_documents=allowed_documents,
+                )
+            # v20: repair known PROJECT JOB refs from unique semantic
+            # project-row spans before strict quote filter.
+            if prompt.backfill_semantic_project_job_evidence:
+                doc = backfill_semantic_project_job_evidence(
                     doc,
                     page_texts=page_texts,
                     allowed_documents=allowed_documents,

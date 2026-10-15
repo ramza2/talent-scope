@@ -1807,10 +1807,25 @@ def repair_whitespace_project_evidence(
 # ASCII alnum boundaries: allow "PM", "[PM]", "PM 사업관리", "PM/PL"; reject "PMO".
 _PM_LITERAL_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9])PM(?![A-Za-z0-9])", re.IGNORECASE)
 _PL_LITERAL_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9])PL(?![A-Za-z0-9])", re.IGNORECASE)
+_TA_LITERAL_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9])TA(?![A-Za-z0-9])", re.IGNORECASE)
 _PM_PL_LITERAL_JOB_PATTERNS: dict[str, re.Pattern[str]] = {
     "JOB-MGT-PM": _PM_LITERAL_TOKEN_RE,
     "JOB-MGT-PL": _PL_LITERAL_TOKEN_RE,
 }
+# JOB codes eligible for v20 semantic project-row evidence backfill.
+# OPS-SYS/MGT reuse EXP-INFRA/EXP-MGT phrase rules; TA/PM/PL use literals.
+_JOB_SEMANTIC_EXP_ALIAS: dict[str, str] = {
+    "JOB-OPS-SYS": "EXP-INFRA",
+    "JOB-MGT": "EXP-MGT",
+}
+_JOB_LITERAL_TOKEN_PATTERNS: dict[str, re.Pattern[str]] = {
+    "JOB-ARC-TA": _TA_LITERAL_TOKEN_RE,
+    "JOB-MGT-PM": _PM_LITERAL_TOKEN_RE,
+    "JOB-MGT-PL": _PL_LITERAL_TOKEN_RE,
+}
+_JOB_SEMANTIC_BACKFILL_CODES = frozenset(_JOB_SEMANTIC_EXP_ALIAS) | frozenset(
+    _JOB_LITERAL_TOKEN_PATTERNS
+)
 
 
 def _project_job_has_literal_pm_pl_evidence(rel: CodeRefCandidate) -> bool:
@@ -2122,6 +2137,59 @@ def _find_unique_semantic_project_exp_ref(
     return SourceRef(document_id=doc_id, page_no=page_no, quote_text=quote)
 
 
+def _quote_supports_semantic_project_job(code: str, quote: str) -> bool:
+    """True when quote supports a known PROJECT JOB semantic/literal rule."""
+    text = (quote or "").strip()
+    if not text:
+        return False
+    exp_alias = _JOB_SEMANTIC_EXP_ALIAS.get(code)
+    if exp_alias is not None:
+        return _quote_supports_semantic_exp(exp_alias, text)
+    pattern = _JOB_LITERAL_TOKEN_PATTERNS.get(code)
+    if pattern is None:
+        return False
+    return pattern.search(text) is not None
+
+
+def _extract_semantic_project_job_quote(code: str, text: str) -> str | None:
+    """Minimal actual substring in ``text`` that supports the JOB code."""
+    exp_alias = _JOB_SEMANTIC_EXP_ALIAS.get(code)
+    if exp_alias is not None:
+        return _extract_semantic_exp_quote(exp_alias, text)
+    pattern = _JOB_LITERAL_TOKEN_PATTERNS.get(code)
+    if pattern is None:
+        return None
+    match = pattern.search(text)
+    if match is None:
+        return None
+    return text[match.start() : match.end()]
+
+
+def _find_unique_semantic_project_job_ref(
+    project: ProjectCandidate,
+    code: str,
+    *,
+    page_texts: dict[tuple[str, int], str],
+    allowed_documents: dict[str, set[int]],
+) -> SourceRef | None:
+    """Fail-closed unique project-row match for semantic JOB quote backfill."""
+    row = _find_unique_project_source_row(
+        project,
+        page_texts=page_texts,
+        allowed_documents=allowed_documents,
+        line_predicate=lambda line: _quote_supports_semantic_project_job(
+            code, line
+        ),
+    )
+    if row is None:
+        return None
+    doc_id, page_no, line = row
+    quote = _extract_semantic_project_job_quote(code, line)
+    if not quote:
+        return None
+    return SourceRef(document_id=doc_id, page_no=page_no, quote_text=quote)
+
+
 def _biz_ref_is_same_project_row(
     project: ProjectCandidate, ref: SourceRef
 ) -> bool:
@@ -2216,6 +2284,57 @@ def backfill_project_biz_evidence(
             new_projects.append(
                 project.model_copy(update={"business_domains": new_biz})
             )
+        else:
+            new_projects.append(project)
+    if not changed:
+        return candidate
+    return candidate.model_copy(update={"projects": new_projects})
+
+
+def backfill_semantic_project_job_evidence(
+    candidate: ProfileCandidateDocument,
+    *,
+    page_texts: dict[tuple[str, int], str] | None,
+    allowed_documents: dict[str, set[int]],
+) -> ProfileCandidateDocument:
+    """v20: repair PROJECT JOB refs from a unique semantic project source row.
+
+    Only existing ``project.jobs`` for known JOB semantic codes (OPS-SYS, MGT,
+    TA, PM, PL). Does not create/reclassify JOB codes. Leaves already-supporting
+    refs unchanged. Never modifies root jobs, EXP/TECH/BIZ, or project scalars.
+    """
+    if not page_texts or not candidate.projects:
+        return candidate
+    changed = False
+    new_projects: list[ProjectCandidate] = []
+    for project in candidate.projects:
+        new_jobs: list[CodeRefCandidate] = []
+        project_changed = False
+        for rel in project.jobs:
+            code = (rel.code or "").strip()
+            if code not in _JOB_SEMANTIC_BACKFILL_CODES:
+                new_jobs.append(rel)
+                continue
+            if any(
+                _quote_supports_semantic_project_job(code, ref.quote_text or "")
+                for ref in (rel.source_refs or [])
+            ):
+                new_jobs.append(rel)
+                continue
+            match = _find_unique_semantic_project_job_ref(
+                project,
+                code,
+                page_texts=page_texts,
+                allowed_documents=allowed_documents,
+            )
+            if match is None:
+                new_jobs.append(rel)
+                continue
+            project_changed = True
+            new_jobs.append(rel.model_copy(update={"source_refs": [match]}))
+        if project_changed:
+            changed = True
+            new_projects.append(project.model_copy(update={"jobs": new_jobs}))
         else:
             new_projects.append(project)
     if not changed:
