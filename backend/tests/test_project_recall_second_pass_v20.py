@@ -181,6 +181,74 @@ def test_same_7_twice_union_7() -> None:
     assert len(out.projects) == 7
 
 
+def test_second_internal_duplicate_supplements_once() -> None:
+    """Same project returned twice in second pass → append only once."""
+    from app.modules.analysis.compact_v8 import supplement_projects_from_second_pass
+
+    first = _doc(_seven_final_projects())
+    dup = _missing_two()[0]
+    second = _doc(
+        [
+            dup,
+            _project(
+                name="2011년 제2차 자원통합 구축 HW1사업(대전)",
+                customer="정부통합전산센터",
+                start="2011.06",
+                end="2011.12",
+                root_quote="11.06 ~ 12.01 업무이관",
+            ),
+        ]
+    )
+    out, n = supplement_projects_from_second_pass(first, second)
+    assert n == 1
+    assert len(out.projects) == 8
+    assert (
+        sum(
+            1
+            for p in out.projects
+            if "2011년 제2차 자원통합" in (p.project_name or "")
+        )
+        == 1
+    )
+
+
+def test_second_two_distinct_projects_both_supplemented() -> None:
+    from app.modules.analysis.compact_v8 import supplement_projects_from_second_pass
+
+    first = _doc(_seven_final_projects())
+    second = _doc(_missing_two())
+    out, n = supplement_projects_from_second_pass(first, second)
+    assert n == 2
+    assert len(out.projects) == 9
+
+
+def test_second_ambiguous_customer_date_internal_dup_fail_closed() -> None:
+    """Two second projects share customer+dates → only first extras wins."""
+    from app.modules.analysis.compact_v8 import supplement_projects_from_second_pass
+
+    first = _doc(_seven_final_projects()[:1])
+    second = _doc(
+        [
+            _project(
+                name="2011년 A사업",
+                customer="정부통합전산센터",
+                start="2011.06",
+                end="2011.12",
+            ),
+            _project(
+                name="2011년 B사업",
+                customer="정부통합전산센터",
+                start="2011.06",
+                end="2011.12",
+            ),
+        ]
+    )
+    out, n = supplement_projects_from_second_pass(first, second)
+    assert n == 1
+    assert len(out.projects) == 2
+    assert out.projects[1].project_name == "2011년 A사업"
+
+
 def test_same_name_ws_fold_compatible_dates_no_duplicate() -> None:
     from app.modules.analysis.compact_v8 import supplement_projects_from_second_pass
 

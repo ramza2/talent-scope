@@ -2810,7 +2810,9 @@ def supplement_projects_from_second_pass(
     first_projects = list(first.projects)
     extras: list[ProjectCandidate] = []
     for cand in second.projects:
-        if _second_project_matches_first(first_projects, cand):
+        # Compare against first + already-accepted extras so second-pass
+        # internal duplicates are not appended twice.
+        if _second_project_matches_first(first_projects + extras, cand):
             continue
         extras.append(cand)
     if not extras:
