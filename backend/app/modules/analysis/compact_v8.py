@@ -1968,6 +1968,25 @@ def _line_has_year_month(line: str, year: int, month: int) -> bool:
     return False
 
 
+def _quote_matches_project_start_month(
+    project: ProjectCandidate, quote: str
+) -> bool:
+    """True when quote start month equals candidate start (YYYY.MM or YY.MM)."""
+    start_ym = _project_start_year_month(project)
+    if start_ym is None:
+        return False
+    year, month = start_ym
+    if _line_has_year_month(quote, year, month):
+        return True
+    # PPTX root evidence often uses multi-line YY.MM ~ YY.MM spans.
+    parsed = parse_project_date_range_from_texts(
+        [quote], project_name=project.project_name
+    )
+    if parsed is None:
+        return False
+    return parse_year_month(parsed[0]) == start_ym
+
+
 def _line_has_ws_folded_phrase(line: str, phrase: str) -> bool:
     needle = _fold_ws_text(phrase.strip())
     if not needle:
@@ -2106,14 +2125,20 @@ def _find_unique_semantic_project_exp_ref(
 def _biz_ref_is_same_project_row(
     project: ProjectCandidate, ref: SourceRef
 ) -> bool:
-    """True when an existing BIZ quote already looks like this project row."""
+    """True when a quote is fail-closed same-project evidence for BIZ.
+
+    Allows multi-line PPTX root spans (YY.MM ranges). Requires start-month
+    match plus project_name or customer ws-fold match. Rejects employment-
+    history section text. Does not accept same-page/same-year alone.
+    """
     quote = (ref.quote_text or "").strip()
     if not quote:
         return False
     if not _PROJECT_ROW_RANGE_MARK_RE.search(quote):
         return False
-    start_ym = _project_start_year_month(project)
-    if start_ym is None or not _line_has_year_month(quote, *start_ym):
+    if _EMPLOYMENT_SECTION_RE.search(quote):
+        return False
+    if not _quote_matches_project_start_month(project, quote):
         return False
     name = (project.project_name or "").strip()
     customer = (project.customer_name or "").strip()
@@ -2121,11 +2146,17 @@ def _biz_ref_is_same_project_row(
         name in quote or _line_has_ws_folded_phrase(quote, name)
     )
     cust_ok = bool(customer) and _line_has_ws_folded_phrase(quote, customer)
-    if not name_ok and not cust_ok:
-        return False
-    if _line_is_employment_history_row(quote, name_matched=name_ok):
-        return False
-    return True
+    return name_ok or cust_ok
+
+
+def _find_reusable_project_root_ref_for_biz(
+    project: ProjectCandidate,
+) -> SourceRef | None:
+    """First project.root source_ref that is fail-closed same-project evidence."""
+    for ref in project.source_refs or []:
+        if _biz_ref_is_same_project_row(project, ref):
+            return ref
+    return None
 
 
 def backfill_project_biz_evidence(
@@ -2137,21 +2168,33 @@ def backfill_project_biz_evidence(
     """v20: repair PROJECT business_domains refs from unique project source rows.
 
     Keeps existing BIZ codes/counts; only fills/replaces ``source_refs`` when
-    a fail-closed unique project row is found. Does not create/drop/reclassify
-    BIZ codes. Leaves already-appropriate same-project-row refs unchanged.
+    fail-closed same-project evidence is found. Order:
+    1) preserve existing valid BIZ refs
+    2) reuse project.source_refs (multi-line PPTX roots allowed)
+    3) unique page_texts line-level project row
     """
-    if not page_texts or not candidate.projects:
+    if not candidate.projects:
         return candidate
     changed = False
     new_projects: list[ProjectCandidate] = []
     for project in candidate.projects:
         new_biz: list[CodeRefCandidate] = []
         project_changed = False
+        root_reuse = _find_reusable_project_root_ref_for_biz(project)
         for rel in project.business_domains:
             if any(
                 _biz_ref_is_same_project_row(project, ref)
                 for ref in (rel.source_refs or [])
             ):
+                new_biz.append(rel)
+                continue
+            if root_reuse is not None:
+                project_changed = True
+                new_biz.append(
+                    rel.model_copy(update={"source_refs": [root_reuse]})
+                )
+                continue
+            if not page_texts:
                 new_biz.append(rel)
                 continue
             row = _find_unique_project_source_row(
