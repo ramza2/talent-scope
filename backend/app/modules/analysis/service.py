@@ -62,6 +62,7 @@ from app.modules.analysis.compact_v8 import (
     count_project_jobs_with_quote_evidence,
     drop_project_expertise_without_semantic_evidence,
     drop_project_jobs_without_literal_pm_pl_evidence,
+    repair_project_pm_pl_to_ops_sys,
     normalize_career_document_value,
     expand_compact_core,
     expand_compact_projects,
@@ -1506,6 +1507,17 @@ class AnalysisService:
                     page_texts=page_texts,
                     allowed_documents=allowed_documents,
                 )
+            # v20: reclassify unsupported PROJECT PM/PL → JOB-OPS-SYS when a
+            # unique same-project row has strong OPS semantic evidence.
+            project_job_pm_pl_to_ops_repaired = 0
+            if prompt.repair_project_pm_pl_to_ops_sys:
+                doc, project_job_pm_pl_to_ops_repaired = (
+                    repair_project_pm_pl_to_ops_sys(
+                        doc,
+                        page_texts=page_texts,
+                        allowed_documents=allowed_documents,
+                    )
+                )
             # v20: repair known PROJECT JOB refs from unique semantic
             # project-row spans before strict quote filter.
             jobs_with_quote_before_job_backfill = (
@@ -1629,10 +1641,12 @@ class AnalysisService:
             # how many JOB relations gained quote_text via semantic backfill.
             logger.info(
                 "analysis project job codes analysis_run_id=%s "
-                "pre_strict_job_codes=%s job_semantic_backfilled_refs=%s",
+                "pre_strict_job_codes=%s job_semantic_backfilled_refs=%s "
+                "project_job_pm_pl_to_ops_repaired=%s",
                 base_log.get("analysis_run_id"),
                 pre_strict_job_codes,
                 job_semantic_backfilled_refs,
+                project_job_pm_pl_to_ops_repaired,
             )
             return doc
 

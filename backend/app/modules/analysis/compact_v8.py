@@ -2319,6 +2319,66 @@ def backfill_project_biz_evidence(
     return candidate.model_copy(update={"projects": new_projects})
 
 
+_PM_PL_TO_OPS_REPAIR_CODES = frozenset({"JOB-MGT-PM", "JOB-MGT-PL"})
+
+
+def repair_project_pm_pl_to_ops_sys(
+    candidate: ProfileCandidateDocument,
+    *,
+    page_texts: dict[tuple[str, int], str] | None,
+    allowed_documents: dict[str, set[int]],
+) -> tuple[ProfileCandidateDocument, int]:
+    """v20: reclassify unsupported PROJECT PM/PL → JOB-OPS-SYS when OPS evidence exists.
+
+    Applies only to existing ``project.jobs`` with code JOB-MGT-PM / JOB-MGT-PL
+    that lack literal PM/PL tokens in ``source_refs``, when a fail-closed unique
+    same-project source row strongly supports JOB-OPS-SYS. Sets
+    ``code=JOB-OPS-SYS`` and ``source_refs=[semantic span]``. Does not create
+    relations, increase relation count, or touch root jobs / EXP / TECH / BIZ /
+    scalars. Literal PM/PL (boundary-safe; PMO ≠ PM) never repairs.
+    """
+    if not page_texts or not candidate.projects:
+        return candidate, 0
+    repaired = 0
+    changed = False
+    new_projects: list[ProjectCandidate] = []
+    for project in candidate.projects:
+        new_jobs: list[CodeRefCandidate] = []
+        project_changed = False
+        for rel in project.jobs:
+            code = (rel.code or "").strip()
+            if code not in _PM_PL_TO_OPS_REPAIR_CODES:
+                new_jobs.append(rel)
+                continue
+            if _project_job_has_literal_pm_pl_evidence(rel):
+                new_jobs.append(rel)
+                continue
+            match = _find_unique_semantic_project_job_ref(
+                project,
+                "JOB-OPS-SYS",
+                page_texts=page_texts,
+                allowed_documents=allowed_documents,
+            )
+            if match is None:
+                new_jobs.append(rel)
+                continue
+            project_changed = True
+            repaired += 1
+            new_jobs.append(
+                rel.model_copy(
+                    update={"code": "JOB-OPS-SYS", "source_refs": [match]}
+                )
+            )
+        if project_changed:
+            changed = True
+            new_projects.append(project.model_copy(update={"jobs": new_jobs}))
+        else:
+            new_projects.append(project)
+    if not changed:
+        return candidate, 0
+    return candidate.model_copy(update={"projects": new_projects}), repaired
+
+
 def backfill_semantic_project_job_evidence(
     candidate: ProfileCandidateDocument,
     *,

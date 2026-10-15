@@ -11,6 +11,7 @@ v19 contract plus clearer CORE TECH activity wording and runtime guards:
 - Feature flag BACKFILL_SEMANTIC_PROJECT_EXP_EVIDENCE
 - Feature flag BACKFILL_PROJECT_BIZ_EVIDENCE
 - Feature flag BACKFILL_SEMANTIC_PROJECT_JOB_EVIDENCE
+- Feature flag REPAIR_PROJECT_PM_PL_TO_OPS_SYS
 - Deterministic drop of root s[] activity-only phrases and quote-less TECH
 - Deterministic drop of PROJECT JOB-MGT-PM/PL without literal PM/PL quote tokens
 - Deterministic career_document_value → duration-only text
@@ -20,6 +21,7 @@ v19 contract plus clearer CORE TECH activity wording and runtime guards:
 - Deterministic project-row semantic quote backfill for known PROJECT EXP
 - Deterministic project-row evidence backfill for PROJECT business_domains
 - Deterministic project-row semantic quote backfill for known PROJECT JOB
+- Deterministic PROJECT PM/PL→JOB-OPS-SYS repair when unsupported PM/PL has strong OPS row evidence
 """
 
 from __future__ import annotations
@@ -48,6 +50,7 @@ REQUIRE_SEMANTIC_PROJECT_EXP_EVIDENCE = True
 BACKFILL_SEMANTIC_PROJECT_EXP_EVIDENCE = True
 BACKFILL_PROJECT_BIZ_EVIDENCE = True
 BACKFILL_SEMANTIC_PROJECT_JOB_EVIDENCE = True
+REPAIR_PROJECT_PM_PL_TO_OPS_SYS = True
 
 CORE_SCHEMA_GUIDE = """
 Compact CORE root (omit null/empty):
@@ -159,10 +162,14 @@ Emit j/t/x as {"c":CODE,"r":[{"d":"D1","p":N,"q":"verbatim"}]} — no rm.
 Supported when explicitly evidenced (catalog code must exist):
 - literal "TA" => j:{"c":"JOB-ARC-TA","r":[{"d":"D1","p":N,"q":"TA"}]}
 - literal PM => JOB-MGT-PM; literal PL => JOB-MGT-PL (inline r with PM/PL)
+- No literal PM in that item's r.q => do NOT emit JOB-MGT-PM.
+- No literal PL in that item's r.q => do NOT emit JOB-MGT-PL.
+- 직급/직책 부장/차장/팀장 alone is NOT PM evidence (do not emit JOB-MGT-PM).
 - generic "사업관리" (no PM/PL) => JOB-MGT + EXP-MGT; q includes "사업관리"
   Do NOT promote to PM/PL without literal PM/PL.
-- "정보시스템 운영"/"시스템 운영"/("시스템구축 및 운영"+IT시스템기술지원)
+- "정보시스템 운영"/"시스템 운영"/("시스템구축 및 운영"+IT시스템기술지원/관리)
   => JOB-OPS-SYS + EXP-INFRA; inline q with same phrase. Plain "운영" ≠ SYS.
+  Do NOT substitute JOB-MGT-PM for that OPS evidence.
 - clear public/gov => b:BIZ-PUBLIC; defense => BIZ-DEFENSE; movie/film => BIZ-MEDIA
 - A) "PM 사업관리" => j JOB-MGT-PM + x EXP-MGT; each with inline r.
 - B) Doc1 PL + Doc2 same engagement AD/SEP/NAC => matching-row inline r only.
@@ -225,7 +232,9 @@ Projects:
 - j/t/x MUST be objects {{"c":CODE,"r":[ref…]}} with ≥1 same-project verbatim q;
   never bare string codes; never neighbor quotes.
   Prefer shortest same-row quote containing the supporting phrase.
-- PM/PL needs literal PM/PL in that item's r.q.
+- PM/PL needs literal PM/PL in that item's r.q; 부장/차장/팀장 ≠ PM.
+- No literal PM → do not emit JOB-MGT-PM; no literal PL → do not emit JOB-MGT-PL.
+- 시스템구축 및 운영 + IT시스템기술지원/관리 → JOB-OPS-SYS (not PM).
 - 업무분석/유지보수/운영 alone (or "시스템구축 및 운영" without IT시스템기술지원/관리)
   is not EXP-INFRA evidence.
 - Never omit a supported relation because another EXP exists.
