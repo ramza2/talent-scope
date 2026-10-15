@@ -55,6 +55,7 @@ from app.modules.analysis.compact_v8 import (
     clear_education_status_without_literal_evidence,
     drop_core_skills_without_quote_evidence,
     drop_generic_activity_core_skills,
+    backfill_semantic_project_expertise_evidence,
     drop_project_expertise_without_semantic_evidence,
     drop_project_jobs_without_literal_pm_pl_evidence,
     normalize_career_document_value,
@@ -1485,6 +1486,14 @@ class AnalysisService:
             )
             # Snapshot after normalize/backfill, before strict quote filter.
             pre_strict = doc
+            # v20: repair known PROJECT EXP refs from a unique semantic
+            # project-row span before strict/semantic drop filters.
+            if prompt.backfill_semantic_project_exp_evidence:
+                doc = backfill_semantic_project_expertise_evidence(
+                    doc,
+                    page_texts=page_texts,
+                    allowed_documents=allowed_documents,
+                )
             # v10+: after normalize may clear quotes / drop invalid refs, re-check
             # that projects and j/t/x still have non-empty quote_text evidence.
             if prompt.strict_relation_evidence:

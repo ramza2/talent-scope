@@ -1907,6 +1907,197 @@ def normalize_career_document_value(
     )
 
 
+_LINE_DATE_YM_RE = re.compile(
+    r"(?<!\d)(\d{4})[./\-](\d{1,2})(?:[./\-]\d{1,2})?(?!\d)"
+)
+_PROJECT_ROW_RANGE_MARK_RE = re.compile(r"[~～]")
+
+
+def _fold_ws_text(value: str) -> str:
+    return "".join(ch for ch in value if not ch.isspace())
+
+
+def _project_start_year_month(project: ProjectCandidate) -> tuple[int, int] | None:
+    """Candidate start as (year, month); accepts YYYY.MM or YYYY.MM.DD forms."""
+    ym = parse_year_month(project.start_date)
+    if ym is not None:
+        return ym
+    text = _optional_text(project.start_date)
+    if text is None:
+        return None
+    match = _LINE_DATE_YM_RE.search(text)
+    if match is None:
+        return None
+    year = int(match.group(1))
+    month = int(match.group(2))
+    if month < 1 or month > 12:
+        return None
+    return year, month
+
+
+def _line_has_year_month(line: str, year: int, month: int) -> bool:
+    for match in _LINE_DATE_YM_RE.finditer(line):
+        if int(match.group(1)) == year and int(match.group(2)) == month:
+            return True
+    return False
+
+
+def _line_has_ws_folded_phrase(line: str, phrase: str) -> bool:
+    needle = _fold_ws_text(phrase.strip())
+    if not needle:
+        return False
+    return needle in _fold_ws_text(line)
+
+
+def _extract_semantic_exp_quote(code: str, text: str) -> str | None:
+    """Shortest actual substring in ``text`` that supports the EXP code."""
+    patterns = _EXP_SEMANTIC_PATTERNS.get(code)
+    if not patterns:
+        return None
+    for _strength, phrase, companions in patterns:
+        if phrase not in text:
+            continue
+        if not companions:
+            return phrase
+        for req in companions:
+            if req not in text:
+                continue
+            i_phrase = text.find(phrase)
+            i_req = text.find(req)
+            start = min(i_phrase, i_req)
+            end = max(i_phrase + len(phrase), i_req + len(req))
+            span = text[start:end].strip()
+            if span and _quote_supports_semantic_exp(code, span):
+                return span
+    return None
+
+
+def _iter_allowed_page_lines(
+    page_texts: dict[tuple[str, int], str],
+    allowed_documents: dict[str, set[int]],
+):
+    for doc_id, page_no in sorted(page_texts.keys()):
+        if doc_id not in allowed_documents:
+            continue
+        pages = allowed_documents[doc_id]
+        if pages and page_no not in pages:
+            continue
+        page_text = page_texts.get((doc_id, page_no)) or ""
+        for raw_line in page_text.splitlines():
+            line = raw_line.strip()
+            if line:
+                yield doc_id, page_no, line
+
+
+def _find_unique_semantic_project_exp_ref(
+    project: ProjectCandidate,
+    code: str,
+    *,
+    page_texts: dict[tuple[str, int], str],
+    allowed_documents: dict[str, set[int]],
+) -> SourceRef | None:
+    """Fail-closed unique project-row match for semantic EXP quote backfill."""
+    start_ym = _project_start_year_month(project)
+    if start_ym is None:
+        return None
+    year, month = start_ym
+    name = (project.project_name or "").strip() or None
+    customer = (project.customer_name or "").strip() or None
+    if name is None and customer is None:
+        return None
+
+    # Rows must carry semantic phrase + start month + a date-range marker so
+    # employment/title lines and page-level generic phrases are not reused.
+    named_hits: list[tuple[str, int, str]] = []
+    customer_hits: list[tuple[str, int, str]] = []
+    for doc_id, page_no, line in _iter_allowed_page_lines(
+        page_texts, allowed_documents
+    ):
+        if not _PROJECT_ROW_RANGE_MARK_RE.search(line):
+            continue
+        if not _line_has_year_month(line, year, month):
+            continue
+        if not _quote_supports_semantic_exp(code, line):
+            continue
+        quote = _extract_semantic_exp_quote(code, line)
+        if not quote:
+            continue
+        hit = (doc_id, page_no, quote)
+        if name is not None and (
+            name in line or _line_has_ws_folded_phrase(line, name)
+        ):
+            named_hits.append(hit)
+        if customer is not None and _line_has_ws_folded_phrase(line, customer):
+            customer_hits.append(hit)
+
+    def _unique(hits: list[tuple[str, int, str]]) -> SourceRef | None:
+        uniq = list(dict.fromkeys(hits))
+        if len(uniq) != 1:
+            return None
+        doc_id, page_no, quote = uniq[0]
+        return SourceRef(document_id=doc_id, page_no=page_no, quote_text=quote)
+
+    # Prefer exact/ws-fold project_name association when unique.
+    if named_hits:
+        return _unique(named_hits)
+    # Name differs or absent: only when customer+start month uniquely picks
+    # one semantic source row.
+    if customer_hits:
+        return _unique(customer_hits)
+    return None
+
+
+def backfill_semantic_project_expertise_evidence(
+    candidate: ProfileCandidateDocument,
+    *,
+    page_texts: dict[tuple[str, int], str] | None,
+    allowed_documents: dict[str, set[int]],
+) -> ProfileCandidateDocument:
+    """v20: repair PROJECT EXP refs from a unique semantic project source row.
+
+    Only existing ``project.expertise`` relations for known EXP codes. Does not
+    create new EXP codes. Leaves already-supporting refs unchanged. Never
+    modifies jobs/skills/domains/root expertise or project scalars.
+    """
+    if not page_texts or not candidate.projects:
+        return candidate
+    changed = False
+    new_projects: list[ProjectCandidate] = []
+    for project in candidate.projects:
+        new_exp: list[CodeRefCandidate] = []
+        project_changed = False
+        for rel in project.expertise:
+            code = (rel.code or "").strip()
+            if code not in _EXP_SEMANTIC_PATTERNS:
+                new_exp.append(rel)
+                continue
+            if any(
+                _quote_supports_semantic_exp(code, ref.quote_text or "")
+                for ref in (rel.source_refs or [])
+            ):
+                new_exp.append(rel)
+                continue
+            match = _find_unique_semantic_project_exp_ref(
+                project,
+                code,
+                page_texts=page_texts,
+                allowed_documents=allowed_documents,
+            )
+            if match is None:
+                new_exp.append(rel)
+                continue
+            project_changed = True
+            new_exp.append(rel.model_copy(update={"source_refs": [match]}))
+        if project_changed:
+            changed = True
+            new_projects.append(project.model_copy(update={"expertise": new_exp}))
+        else:
+            new_projects.append(project)
+    if not changed:
+        return candidate
+    return candidate.model_copy(update={"projects": new_projects})
+
+
 def drop_project_expertise_without_semantic_evidence(
     candidate: ProfileCandidateDocument,
 ) -> ProfileCandidateDocument:

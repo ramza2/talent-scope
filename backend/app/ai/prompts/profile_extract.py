@@ -68,6 +68,7 @@ class ProfilePromptSpec:
     require_literal_education_status_evidence: bool = False
     backfill_semantic_core_exp_evidence: bool = False
     require_semantic_project_exp_evidence: bool = False
+    backfill_semantic_project_exp_evidence: bool = False
 
 
 def _spec_from_module(module) -> ProfilePromptSpec:
@@ -142,6 +143,9 @@ def _spec_from_staged_module(module) -> ProfilePromptSpec:
         ),
         require_semantic_project_exp_evidence=bool(
             getattr(module, "REQUIRE_SEMANTIC_PROJECT_EXP_EVIDENCE", False)
+        ),
+        backfill_semantic_project_exp_evidence=bool(
+            getattr(module, "BACKFILL_SEMANTIC_PROJECT_EXP_EVIDENCE", False)
         ),
     )
 
