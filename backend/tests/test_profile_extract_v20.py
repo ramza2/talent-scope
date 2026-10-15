@@ -55,6 +55,10 @@ def test_profile_extract_registry_current_is_v20() -> None:
     assert v20.BACKFILL_SEMANTIC_PROJECT_JOB_EVIDENCE is True
     assert cur.repair_project_pm_pl_to_ops_sys is True
     assert v20.REPAIR_PROJECT_PM_PL_TO_OPS_SYS is True
+    assert cur.repair_project_mgt_to_ops_sys is True
+    assert v20.REPAIR_PROJECT_MGT_TO_OPS_SYS is True
+    assert cur.require_semantic_project_job_evidence is True
+    assert v20.REQUIRE_SEMANTIC_PROJECT_JOB_EVIDENCE is True
     assert cur.repair_whitespace_project_evidence is True
     assert cur.strict_relation_evidence is True
 
@@ -71,6 +75,8 @@ def test_profile_extract_registry_current_is_v20() -> None:
     assert v19_spec.backfill_project_biz_evidence is False
     assert v19_spec.backfill_semantic_project_job_evidence is False
     assert v19_spec.repair_project_pm_pl_to_ops_sys is False
+    assert v19_spec.repair_project_mgt_to_ops_sys is False
+    assert v19_spec.require_semantic_project_job_evidence is False
     assert not hasattr(v19, "DROP_GENERIC_ACTIVITY_CORE_TECH")
     assert not hasattr(v19, "REQUIRE_CORE_TECH_QUOTE_EVIDENCE")
     assert not hasattr(v19, "BACKFILL_PROJECT_DATES_FROM_ROOT_EVIDENCE")
@@ -83,6 +89,8 @@ def test_profile_extract_registry_current_is_v20() -> None:
     assert not hasattr(v19, "BACKFILL_PROJECT_BIZ_EVIDENCE")
     assert not hasattr(v19, "BACKFILL_SEMANTIC_PROJECT_JOB_EVIDENCE")
     assert not hasattr(v19, "REPAIR_PROJECT_PM_PL_TO_OPS_SYS")
+    assert not hasattr(v19, "REPAIR_PROJECT_MGT_TO_OPS_SYS")
+    assert not hasattr(v19, "REQUIRE_SEMANTIC_PROJECT_JOB_EVIDENCE")
     assert v19_spec.projects_system_prompt == v19.PROJECTS_SYSTEM_PROMPT
 
 

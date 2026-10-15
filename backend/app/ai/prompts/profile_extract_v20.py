@@ -12,6 +12,8 @@ v19 contract plus clearer CORE TECH activity wording and runtime guards:
 - Feature flag BACKFILL_PROJECT_BIZ_EVIDENCE
 - Feature flag BACKFILL_SEMANTIC_PROJECT_JOB_EVIDENCE
 - Feature flag REPAIR_PROJECT_PM_PL_TO_OPS_SYS
+- Feature flag REPAIR_PROJECT_MGT_TO_OPS_SYS
+- Feature flag REQUIRE_SEMANTIC_PROJECT_JOB_EVIDENCE
 - Deterministic drop of root s[] activity-only phrases and quote-less TECH
 - Deterministic drop of PROJECT JOB-MGT-PM/PL without literal PM/PL quote tokens
 - Deterministic career_document_value → duration-only text
@@ -22,6 +24,8 @@ v19 contract plus clearer CORE TECH activity wording and runtime guards:
 - Deterministic project-row evidence backfill for PROJECT business_domains
 - Deterministic project-row semantic quote backfill for known PROJECT JOB
 - Deterministic PROJECT PM/PL→JOB-OPS-SYS repair when unsupported PM/PL has strong OPS row evidence
+- Deterministic PROJECT JOB-MGT→JOB-OPS-SYS repair when unsupported MGT has strong OPS row evidence
+- Deterministic drop of PROJECT JOB-MGT/OPS-SYS/TA lacking semantic/literal quote evidence
 """
 
 from __future__ import annotations
@@ -51,6 +55,8 @@ BACKFILL_SEMANTIC_PROJECT_EXP_EVIDENCE = True
 BACKFILL_PROJECT_BIZ_EVIDENCE = True
 BACKFILL_SEMANTIC_PROJECT_JOB_EVIDENCE = True
 REPAIR_PROJECT_PM_PL_TO_OPS_SYS = True
+REPAIR_PROJECT_MGT_TO_OPS_SYS = True
+REQUIRE_SEMANTIC_PROJECT_JOB_EVIDENCE = True
 
 CORE_SCHEMA_GUIDE = """
 Compact CORE root (omit null/empty):

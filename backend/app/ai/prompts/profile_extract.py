@@ -72,6 +72,8 @@ class ProfilePromptSpec:
     backfill_project_biz_evidence: bool = False
     backfill_semantic_project_job_evidence: bool = False
     repair_project_pm_pl_to_ops_sys: bool = False
+    repair_project_mgt_to_ops_sys: bool = False
+    require_semantic_project_job_evidence: bool = False
 
 
 def _spec_from_module(module) -> ProfilePromptSpec:
@@ -158,6 +160,12 @@ def _spec_from_staged_module(module) -> ProfilePromptSpec:
         ),
         repair_project_pm_pl_to_ops_sys=bool(
             getattr(module, "REPAIR_PROJECT_PM_PL_TO_OPS_SYS", False)
+        ),
+        repair_project_mgt_to_ops_sys=bool(
+            getattr(module, "REPAIR_PROJECT_MGT_TO_OPS_SYS", False)
+        ),
+        require_semantic_project_job_evidence=bool(
+            getattr(module, "REQUIRE_SEMANTIC_PROJECT_JOB_EVIDENCE", False)
         ),
     )
 

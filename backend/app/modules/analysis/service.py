@@ -62,6 +62,8 @@ from app.modules.analysis.compact_v8 import (
     count_project_jobs_with_quote_evidence,
     drop_project_expertise_without_semantic_evidence,
     drop_project_jobs_without_literal_pm_pl_evidence,
+    drop_project_jobs_without_semantic_evidence,
+    repair_project_mgt_to_ops_sys,
     repair_project_pm_pl_to_ops_sys,
     normalize_career_document_value,
     expand_compact_core,
@@ -1518,6 +1520,17 @@ class AnalysisService:
                         allowed_documents=allowed_documents,
                     )
                 )
+            # v20: reclassify unsupported PROJECT JOB-MGT → JOB-OPS-SYS when a
+            # unique same-project row has strong OPS semantic evidence.
+            project_job_mgt_to_ops_repaired = 0
+            if prompt.repair_project_mgt_to_ops_sys:
+                doc, project_job_mgt_to_ops_repaired = (
+                    repair_project_mgt_to_ops_sys(
+                        doc,
+                        page_texts=page_texts,
+                        allowed_documents=allowed_documents,
+                    )
+                )
             # v20: repair known PROJECT JOB refs from unique semantic
             # project-row spans before strict quote filter.
             jobs_with_quote_before_job_backfill = (
@@ -1539,6 +1552,9 @@ class AnalysisService:
             # that projects and j/t/x still have non-empty quote_text evidence.
             if prompt.strict_relation_evidence:
                 doc = apply_normalized_quote_evidence(doc)
+            # v20: JOB-MGT / OPS-SYS / TA need supporting semantic/literal quotes.
+            if prompt.require_semantic_project_job_evidence:
+                doc = drop_project_jobs_without_semantic_evidence(doc)
             # v20: known PROJECT EXP codes need quote phrases that actually
             # support the EXP (e.g. 업무분석 ≠ EXP-INFRA).
             if prompt.require_semantic_project_exp_evidence:
@@ -1642,11 +1658,13 @@ class AnalysisService:
             logger.info(
                 "analysis project job codes analysis_run_id=%s "
                 "pre_strict_job_codes=%s job_semantic_backfilled_refs=%s "
-                "project_job_pm_pl_to_ops_repaired=%s",
+                "project_job_pm_pl_to_ops_repaired=%s "
+                "project_job_mgt_to_ops_repaired=%s",
                 base_log.get("analysis_run_id"),
                 pre_strict_job_codes,
                 job_semantic_backfilled_refs,
                 project_job_pm_pl_to_ops_repaired,
+                project_job_mgt_to_ops_repaired,
             )
             return doc
 

@@ -2320,6 +2320,8 @@ def backfill_project_biz_evidence(
 
 
 _PM_PL_TO_OPS_REPAIR_CODES = frozenset({"JOB-MGT-PM", "JOB-MGT-PL"})
+# JOB codes checked by v20 PROJECT JOB semantic guard (PM/PL keep separate guard).
+_JOB_SEMANTIC_GUARD_CODES = frozenset({"JOB-MGT", "JOB-OPS-SYS", "JOB-ARC-TA"})
 
 
 def repair_project_pm_pl_to_ops_sys(
@@ -2377,6 +2379,109 @@ def repair_project_pm_pl_to_ops_sys(
     if not changed:
         return candidate, 0
     return candidate.model_copy(update={"projects": new_projects}), repaired
+
+
+def _project_job_has_literal_mgt_evidence(rel: CodeRefCandidate) -> bool:
+    """True when any JOB-MGT quote contains literal 사업관리."""
+    return any(
+        _quote_supports_semantic_project_job("JOB-MGT", ref.quote_text or "")
+        for ref in (rel.source_refs or [])
+    )
+
+
+def repair_project_mgt_to_ops_sys(
+    candidate: ProfileCandidateDocument,
+    *,
+    page_texts: dict[tuple[str, int], str] | None,
+    allowed_documents: dict[str, set[int]],
+) -> tuple[ProfileCandidateDocument, int]:
+    """v20: reclassify unsupported PROJECT JOB-MGT → JOB-OPS-SYS when OPS exists.
+
+    Applies only to existing ``project.jobs`` with code JOB-MGT that lack
+    literal ``사업관리`` in ``source_refs``, when a fail-closed unique
+    same-project source row strongly supports JOB-OPS-SYS. Sets
+    ``code=JOB-OPS-SYS`` and ``source_refs=[semantic span]``. Does not create
+    relations or touch root jobs / EXP / TECH / BIZ / scalars. Literal
+    사업관리 never repairs (preserve JOB-MGT).
+    """
+    if not page_texts or not candidate.projects:
+        return candidate, 0
+    repaired = 0
+    changed = False
+    new_projects: list[ProjectCandidate] = []
+    for project in candidate.projects:
+        new_jobs: list[CodeRefCandidate] = []
+        project_changed = False
+        for rel in project.jobs:
+            code = (rel.code or "").strip()
+            if code != "JOB-MGT":
+                new_jobs.append(rel)
+                continue
+            if _project_job_has_literal_mgt_evidence(rel):
+                new_jobs.append(rel)
+                continue
+            match = _find_unique_semantic_project_job_ref(
+                project,
+                "JOB-OPS-SYS",
+                page_texts=page_texts,
+                allowed_documents=allowed_documents,
+            )
+            if match is None:
+                new_jobs.append(rel)
+                continue
+            project_changed = True
+            repaired += 1
+            new_jobs.append(
+                rel.model_copy(
+                    update={"code": "JOB-OPS-SYS", "source_refs": [match]}
+                )
+            )
+        if project_changed:
+            changed = True
+            new_projects.append(project.model_copy(update={"jobs": new_jobs}))
+        else:
+            new_projects.append(project)
+    if not changed:
+        return candidate, 0
+    return candidate.model_copy(update={"projects": new_projects}), repaired
+
+
+def _project_job_has_semantic_guard_evidence(rel: CodeRefCandidate) -> bool:
+    """True when job is out of guard scope or has supporting semantic/literal quote."""
+    code = (rel.code or "").strip()
+    if code not in _JOB_SEMANTIC_GUARD_CODES:
+        return True
+    return any(
+        _quote_supports_semantic_project_job(code, ref.quote_text or "")
+        for ref in (rel.source_refs or [])
+    )
+
+
+def drop_project_jobs_without_semantic_evidence(
+    candidate: ProfileCandidateDocument,
+) -> ProfileCandidateDocument:
+    """v20: drop PROJECT JOB-MGT/OPS-SYS/TA lacking semantic/literal quotes.
+
+    JOB-MGT needs literal 사업관리; JOB-OPS-SYS needs strong OPS phrases;
+    JOB-ARC-TA needs boundary-safe TA. JOB-MGT-PM/PL and other JOB codes are
+    left for their dedicated guards / unchanged. Root jobs stay.
+    """
+    changed = False
+    new_projects: list[ProjectCandidate] = []
+    for project in candidate.projects:
+        kept_jobs = [
+            job
+            for job in project.jobs
+            if _project_job_has_semantic_guard_evidence(job)
+        ]
+        if len(kept_jobs) != len(project.jobs):
+            changed = True
+            new_projects.append(project.model_copy(update={"jobs": kept_jobs}))
+        else:
+            new_projects.append(project)
+    if not changed:
+        return candidate
+    return candidate.model_copy(update={"projects": new_projects})
 
 
 def backfill_semantic_project_job_evidence(
