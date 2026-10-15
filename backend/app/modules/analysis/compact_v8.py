@@ -2692,3 +2692,130 @@ def apply_normalized_quote_evidence(
     ):
         return candidate
     return candidate.model_copy(update={"projects": kept})
+
+
+def _project_names_identity_match(a: ProjectCandidate, b: ProjectCandidate) -> bool:
+    na = (a.project_name or "").strip()
+    nb = (b.project_name or "").strip()
+    if not na or not nb:
+        return False
+    return na == nb or _fold_ws_text(na) == _fold_ws_text(nb)
+
+
+def _project_customers_identity_match(a: ProjectCandidate, b: ProjectCandidate) -> bool:
+    ca = (a.customer_name or "").strip()
+    cb = (b.customer_name or "").strip()
+    if not ca or not cb:
+        return False
+    return _fold_ws_text(ca) == _fold_ws_text(cb)
+
+
+def _project_date_parts_local(
+    value: Any,
+) -> tuple[int, int | None, int | None] | None:
+    """Parse PROJECT dates (YYYY.MM / YYYY-MM / YYYY.MM.DD / YYYY-MM-DD).
+
+    Local minimal helper — does not import diff_engine private parsers.
+    Year-only is rejected for identity (month precision required later).
+    """
+    text = _optional_text(value)
+    if text is None:
+        return None
+    folded = text.split("T", 1)[0] if "T" in text else text
+    folded = folded.replace(".", "-").replace("/", "-").strip()
+    parts = folded.split("-")
+    if not parts or not parts[0].isdigit() or len(parts[0]) != 4:
+        return None
+    year = int(parts[0])
+    if year < 1900 or year > 2100:
+        return None
+    month: int | None = None
+    day: int | None = None
+    if len(parts) >= 2 and parts[1].isdigit():
+        month = int(parts[1])
+        if month < 1 or month > 12:
+            return None
+    if len(parts) >= 3 and parts[2].isdigit():
+        day = int(parts[2])
+        if day < 1 or day > 31:
+            return None
+    if day is not None and month is None:
+        return None
+    return year, month, day
+
+
+def _project_dates_prefix_compatible(a: Any, b: Any) -> bool:
+    """Symmetric PROJECT date compatibility (no ±1 month, no year-only).
+
+    Month precision vs day-in-same-month is compatible in either direction.
+    Both sides need at least year+month.
+    """
+    if _optional_text(a) is None or _optional_text(b) is None:
+        return False
+    pa = _project_date_parts_local(a)
+    pb = _project_date_parts_local(b)
+    if pa is None or pb is None:
+        return False
+    ya, ma, da = pa
+    yb, mb, db = pb
+    if ma is None or mb is None:
+        return False
+    if ya != yb or ma != mb:
+        return False
+    if da is not None and db is not None and da != db:
+        return False
+    return True
+
+
+def _project_period_compatible(a: ProjectCandidate, b: ProjectCandidate) -> bool:
+    """Reuse PROJECT date precision policy (prefix-compatible; no ±1 month)."""
+    return _project_dates_prefix_compatible(
+        a.start_date, b.start_date
+    ) and _project_dates_prefix_compatible(a.end_date, b.end_date)
+
+
+def _second_project_matches_first(
+    first_projects: list[ProjectCandidate], second: ProjectCandidate
+) -> bool:
+    """True when second should not be appended (same identity or ambiguous).
+
+    Fail-closed: name+compatible dates match, or unique customer+compatible
+    dates match, or ambiguous multi customer+date hits → treat as covered /
+    non-supplement (never invent a duplicate).
+    """
+    for first in first_projects:
+        if _project_names_identity_match(first, second) and _project_period_compatible(
+            first, second
+        ):
+            return True
+    customer_hits = [
+        first
+        for first in first_projects
+        if _project_customers_identity_match(first, second)
+        and _project_period_compatible(first, second)
+    ]
+    # Unique customer hit → same project. Ambiguous (>1) → do not supplement.
+    return len(customer_hits) >= 1
+
+
+def supplement_projects_from_second_pass(
+    first: ProfileCandidateDocument,
+    second: ProfileCandidateDocument,
+) -> tuple[ProfileCandidateDocument, int]:
+    """Append unmatched second-pass projects; first projects/relations win.
+
+    Does not create source-only projects, does not merge scalars/relations for
+    matched identities, and never removes/overwrites first projects.
+    """
+    first_projects = list(first.projects)
+    extras: list[ProjectCandidate] = []
+    for cand in second.projects:
+        if _second_project_matches_first(first_projects, cand):
+            continue
+        extras.append(cand)
+    if not extras:
+        return first, 0
+    return (
+        first.model_copy(update={"projects": first_projects + extras}),
+        len(extras),
+    )

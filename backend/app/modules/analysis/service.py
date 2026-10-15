@@ -72,6 +72,7 @@ from app.modules.analysis.compact_v8 import (
     project_relation_diagnostic_counts,
     promote_exact_root_catalog_codes,
     repair_whitespace_project_evidence,
+    supplement_projects_from_second_pass,
 )
 from app.modules.analysis.diff_engine import DiffSpec, build_diffs
 from app.modules.analysis.normalize import normalize_candidate
@@ -1759,6 +1760,60 @@ class AnalysisService:
             base_log.get("document_count"),
             vlm_pages,
             len(projects_doc.projects),
+        )
+
+        # v20: bounded PROJECT recall second-pass. Keep first normalized
+        # projects; append only unmatched second-pass survivors. Uses the
+        # shared recovery budget (max 1) and overall LLM call cap (max 3).
+        project_recall_second_pass = 0
+        project_first_count = len(projects_doc.projects)
+        project_second_count = 0
+        project_supplemented = 0
+        if (
+            prompt.recover_project_recall_second_pass
+            and recovery_budget > 0
+            and call_count < 3
+            and source_char_count >= _SPARSE_MIN_SOURCE_CHARS
+            and _documents_are_rich_profile_type(documents)
+        ):
+            recovery_budget -= 1
+            project_recall_second_pass = 1
+            try:
+                raw_second = _phase_call(
+                    phase="projects",
+                    system_prompt=prompt.projects_system_prompt,
+                    build_user_prompt=prompt.build_projects_user_prompt,
+                    code_catalog_text=projects_catalog,
+                    recovery_retry=True,
+                )
+                if prompt.validate_projects_recovery_root:
+                    _validate_projects_recovery_raw(raw_second)
+                second_doc = _normalize_projects(raw_second)
+                project_second_count = len(second_doc.projects)
+                projects_doc, project_supplemented = (
+                    supplement_projects_from_second_pass(projects_doc, second_doc)
+                )
+            except (
+                AIResponseTruncatedError,
+                AIResponseValidationError,
+                InsufficientCandidateError,
+                AIProviderError,
+            ):
+                # Fail closed: keep first-pass projects unchanged.
+                project_second_count = 0
+                project_supplemented = 0
+        logger.info(
+            "analysis project recall second pass analysis_run_id=%s "
+            "project_recall_second_pass=%s project_first_count=%s "
+            "project_second_count=%s project_supplemented=%s "
+            "project_union_count=%s llm_calls=%s",
+            base_log.get("analysis_run_id"),
+            project_recall_second_pass,
+            project_first_count,
+            project_second_count,
+            project_supplemented,
+            len(projects_doc.projects),
+            call_count,
         )
 
         merged = core.model_copy(update={"projects": list(projects_doc.projects)})

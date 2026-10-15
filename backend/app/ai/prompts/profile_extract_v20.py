@@ -14,7 +14,10 @@ v19 contract plus clearer CORE TECH activity wording and runtime guards:
 - Feature flag REPAIR_PROJECT_PM_PL_TO_OPS_SYS
 - Feature flag REPAIR_PROJECT_MGT_TO_OPS_SYS
 - Feature flag REQUIRE_SEMANTIC_PROJECT_JOB_EVIDENCE
+- Feature flag RECOVER_PROJECT_RECALL_SECOND_PASS
 - Deterministic drop of root s[] activity-only phrases and quote-less TECH
+- Bounded PROJECT recall second-pass: keep first projects, append unmatched second only
+
 - Deterministic drop of PROJECT JOB-MGT-PM/PL without literal PM/PL quote tokens
 - Deterministic career_document_value → duration-only text
 - Deterministic education status drop without literal status words in quotes
@@ -57,6 +60,7 @@ BACKFILL_SEMANTIC_PROJECT_JOB_EVIDENCE = True
 REPAIR_PROJECT_PM_PL_TO_OPS_SYS = True
 REPAIR_PROJECT_MGT_TO_OPS_SYS = True
 REQUIRE_SEMANTIC_PROJECT_JOB_EVIDENCE = True
+RECOVER_PROJECT_RECALL_SECOND_PASS = True
 
 CORE_SCHEMA_GUIDE = """
 Compact CORE root (omit null/empty):
@@ -123,10 +127,13 @@ CORE_RECOVERY_RETRY_INSTRUCTION = (
 )
 
 PROJECTS_RECOVERY_RETRY_INSTRUCTION = (
-    "[RECOVERY] Previous PROJECTS failed shape/evidence. Return ONLY exact "
-    'root {"pr":[...]}. ALL distinct supported projects. Each project r and '
-    "every j/t/x item need inline c+r with non-empty verbatim q. "
-    "No separate rm. Never a bare project at root."
+    "[RECOVERY] Previous PROJECTS failed shape/evidence or may have missed "
+    "rows. Return ONLY exact root {\"pr\":[...]}. "
+    "Re-scan ALL distinct project/engagement period rows and return them "
+    "without omission. Include a project when row evidence exists even if "
+    "JOB/EXP/BIZ classification is uncertain. Never invent projects without "
+    "source evidence. Each project r and every j/t/x item need inline c+r "
+    "with non-empty verbatim q. No separate rm. Never a bare project at root."
 )
 
 _SHARED_SAFETY = """역할/안전:

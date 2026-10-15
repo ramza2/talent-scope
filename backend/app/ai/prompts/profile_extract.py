@@ -74,6 +74,7 @@ class ProfilePromptSpec:
     repair_project_pm_pl_to_ops_sys: bool = False
     repair_project_mgt_to_ops_sys: bool = False
     require_semantic_project_job_evidence: bool = False
+    recover_project_recall_second_pass: bool = False
 
 
 def _spec_from_module(module) -> ProfilePromptSpec:
@@ -166,6 +167,9 @@ def _spec_from_staged_module(module) -> ProfilePromptSpec:
         ),
         require_semantic_project_job_evidence=bool(
             getattr(module, "REQUIRE_SEMANTIC_PROJECT_JOB_EVIDENCE", False)
+        ),
+        recover_project_recall_second_pass=bool(
+            getattr(module, "RECOVER_PROJECT_RECALL_SECOND_PASS", False)
         ),
     )
 
