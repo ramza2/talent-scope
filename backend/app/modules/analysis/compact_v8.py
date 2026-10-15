@@ -2774,6 +2774,46 @@ def _project_period_compatible(a: ProjectCandidate, b: ProjectCandidate) -> bool
     ) and _project_dates_prefix_compatible(a.end_date, b.end_date)
 
 
+def _project_ym_ordinal(value: Any) -> int | None:
+    """Month ordinal for overlap; requires year+month precision."""
+    parts = _project_date_parts_local(value)
+    if parts is None or parts[1] is None:
+        return None
+    year, month, _day = parts
+    return year * 12 + (month - 1)
+
+
+def _project_periods_month_overlap(
+    a: ProjectCandidate, b: ProjectCandidate
+) -> bool:
+    """Inclusive month-range overlap; missing/invalid bounds → False."""
+    sa = _project_ym_ordinal(a.start_date)
+    ea = _project_ym_ordinal(a.end_date)
+    sb = _project_ym_ordinal(b.start_date)
+    eb = _project_ym_ordinal(b.end_date)
+    if sa is None or ea is None or sb is None or eb is None:
+        return False
+    if ea < sa or eb < sb:
+        return False
+    return max(sa, sb) <= min(ea, eb)
+
+
+def _project_name_customer_start_overlap_match(
+    a: ProjectCandidate, b: ProjectCandidate
+) -> bool:
+    """Fail-closed second-pass duplicate when end months disagree but periods overlap.
+
+    Requires same name (exact/ws-fold), both customers non-empty + ws-fold equal,
+    start month-precision compatible, and month-unit period overlap.
+    """
+    return (
+        _project_names_identity_match(a, b)
+        and _project_customers_identity_match(a, b)
+        and _project_dates_prefix_compatible(a.start_date, b.start_date)
+        and _project_periods_month_overlap(a, b)
+    )
+
+
 def _second_project_matches_first(
     first_projects: list[ProjectCandidate], second: ProjectCandidate
 ) -> bool:
@@ -2781,12 +2821,15 @@ def _second_project_matches_first(
 
     Fail-closed: name+compatible dates match, or unique customer+compatible
     dates match, or ambiguous multi customer+date hits → treat as covered /
-    non-supplement (never invent a duplicate).
+    non-supplement (never invent a duplicate). Also name+customer+compatible
+    start with month-period overlap (end may differ).
     """
     for first in first_projects:
         if _project_names_identity_match(first, second) and _project_period_compatible(
             first, second
         ):
+            return True
+        if _project_name_customer_start_overlap_match(first, second):
             return True
     customer_hits = [
         first

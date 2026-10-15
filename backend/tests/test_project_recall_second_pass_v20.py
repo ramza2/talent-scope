@@ -249,6 +249,122 @@ def test_second_ambiguous_customer_date_internal_dup_fail_closed() -> None:
     assert out.projects[1].project_name == "2011년 A사업"
 
 
+def test_name_customer_start_overlap_end_diff_no_duplicate() -> None:
+    """Same name/customer/start with overlapping ends 2010.04 vs 2010.05."""
+    from app.modules.analysis.compact_v8 import supplement_projects_from_second_pass
+
+    first = _doc(
+        [
+            _project(
+                name="영화진흥위원회 전산실 유지보수 사업",
+                customer="영화진흥위원회",
+                start="2008.12",
+                end="2010.04",
+            )
+        ]
+    )
+    second = _doc(
+        [
+            _project(
+                name="영화진흥위원회 전산실 유지보수 사업",
+                customer="영화진흥위원회",
+                start="2008.12",
+                end="2010.05",
+            )
+        ]
+    )
+    out, n = supplement_projects_from_second_pass(first, second)
+    assert n == 0
+    assert len(out.projects) == 1
+    assert out.projects[0].end_date == "2010.04"
+
+
+def test_name_customer_same_but_start_diff_distinct() -> None:
+    from app.modules.analysis.compact_v8 import supplement_projects_from_second_pass
+
+    first = _doc(
+        [
+            _project(
+                name="영화진흥위원회 전산실 유지보수 사업",
+                customer="영화진흥위원회",
+                start="2008.12",
+                end="2010.04",
+            )
+        ]
+    )
+    second = _doc(
+        [
+            _project(
+                name="영화진흥위원회 전산실 유지보수 사업",
+                customer="영화진흥위원회",
+                start="2011.01",
+                end="2011.06",
+            )
+        ]
+    )
+    out, n = supplement_projects_from_second_pass(first, second)
+    assert n == 1
+    assert len(out.projects) == 2
+
+
+def test_name_start_same_but_customer_diff_distinct() -> None:
+    from app.modules.analysis.compact_v8 import supplement_projects_from_second_pass
+
+    first = _doc(
+        [
+            _project(
+                name="영화진흥위원회 전산실 유지보수 사업",
+                customer="영화진흥위원회",
+                start="2008.12",
+                end="2010.04",
+            )
+        ]
+    )
+    second = _doc(
+        [
+            _project(
+                name="영화진흥위원회 전산실 유지보수 사업",
+                customer="문화체육관광부",
+                start="2008.12",
+                end="2010.05",
+            )
+        ]
+    )
+    out, n = supplement_projects_from_second_pass(first, second)
+    assert n == 1
+    assert len(out.projects) == 2
+
+
+def test_name_customer_start_same_but_non_overlap_distinct() -> None:
+    """Same name/customer/start but no provable month overlap → not this rule."""
+    from app.modules.analysis.compact_v8 import supplement_projects_from_second_pass
+
+    first = _doc(
+        [
+            _project(
+                name="영화진흥위원회 전산실 유지보수 사업",
+                customer="영화진흥위원회",
+                start="2008.12",
+                end="2010.04",
+            )
+        ]
+    )
+    # Missing end → cannot establish overlap; do not apply overlap rule.
+    second = _doc(
+        [
+            _project(
+                name="영화진흥위원회 전산실 유지보수 사업",
+                customer="영화진흥위원회",
+                start="2008.12",
+                end="",
+            )
+        ]
+    )
+    out, n = supplement_projects_from_second_pass(first, second)
+    assert n == 1
+    assert len(out.projects) == 2
+
+
 def test_same_name_ws_fold_compatible_dates_no_duplicate() -> None:
     from app.modules.analysis.compact_v8 import supplement_projects_from_second_pass
 
