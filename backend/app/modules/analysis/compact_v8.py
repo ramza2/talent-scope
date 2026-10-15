@@ -1911,10 +1911,36 @@ _LINE_DATE_YM_RE = re.compile(
     r"(?<!\d)(\d{4})[./\-](\d{1,2})(?:[./\-]\d{1,2})?(?!\d)"
 )
 _PROJECT_ROW_RANGE_MARK_RE = re.compile(r"[~～]")
+# Project-row shape markers (name/customer/period table rows). Absence plus
+# employment section/title cues means the line is not usable as project evidence.
+_PROJECT_ROW_STRUCTURE_RE = re.compile(
+    r"사업|프로젝트|구축|정보화|BIA|BCP|이전통합|업무분석|사업관리|"
+    r"시스템\s*구축|IT시스템"
+)
+_EMPLOYMENT_SECTION_RE = re.compile(r"근무경력|재직기간")
 
 
 def _fold_ws_text(value: str) -> str:
     return "".join(ch for ch in value if not ch.isspace())
+
+
+def _line_is_employment_history_row(
+    line: str, *, name_matched: bool = False
+) -> bool:
+    """True when a dated line is employment history, not a project row.
+
+    Project-name association or explicit project-structure markers keep the
+    line eligible. Employment section headers / title-only company rows are
+    rejected so they cannot backfill project BIZ/EXP evidence.
+    """
+    if name_matched:
+        return False
+    if _EMPLOYMENT_SECTION_RE.search(line):
+        return True
+    if _PROJECT_ROW_STRUCTURE_RE.search(line):
+        return False
+    # Customer/company + period + job title (or no project markers at all).
+    return True
 
 
 def _project_start_year_month(project: ProjectCandidate) -> tuple[int, int] | None:
@@ -1989,14 +2015,19 @@ def _iter_allowed_page_lines(
                 yield doc_id, page_no, line
 
 
-def _find_unique_semantic_project_exp_ref(
+def _find_unique_project_source_row(
     project: ProjectCandidate,
-    code: str,
     *,
     page_texts: dict[tuple[str, int], str],
     allowed_documents: dict[str, set[int]],
-) -> SourceRef | None:
-    """Fail-closed unique project-row match for semantic EXP quote backfill."""
+    line_predicate: Any | None = None,
+) -> tuple[str, int, str] | None:
+    """Fail-closed unique project source line for evidence backfill.
+
+    Requires start month precision, a ``~`` date-range marker, and either a
+    unique project_name (exact/ws-fold) hit or a unique customer+start hit.
+    ``line_predicate`` may further restrict candidate lines (e.g. EXP phrases).
+    """
     start_ym = _project_start_year_month(project)
     if start_ym is None:
         return None
@@ -2006,8 +2037,6 @@ def _find_unique_semantic_project_exp_ref(
     if name is None and customer is None:
         return None
 
-    # Rows must carry semantic phrase + start month + a date-range marker so
-    # employment/title lines and page-level generic phrases are not reused.
     named_hits: list[tuple[str, int, str]] = []
     customer_hits: list[tuple[str, int, str]] = []
     for doc_id, page_no, line in _iter_allowed_page_lines(
@@ -2017,34 +2046,138 @@ def _find_unique_semantic_project_exp_ref(
             continue
         if not _line_has_year_month(line, year, month):
             continue
-        if not _quote_supports_semantic_exp(code, line):
+        if line_predicate is not None and not line_predicate(line):
             continue
-        quote = _extract_semantic_exp_quote(code, line)
-        if not quote:
+        name_matched = bool(
+            name is not None
+            and (name in line or _line_has_ws_folded_phrase(line, name))
+        )
+        customer_matched = bool(
+            customer is not None and _line_has_ws_folded_phrase(line, customer)
+        )
+        if not name_matched and not customer_matched:
             continue
-        hit = (doc_id, page_no, quote)
-        if name is not None and (
-            name in line or _line_has_ws_folded_phrase(line, name)
-        ):
+        if _line_is_employment_history_row(line, name_matched=name_matched):
+            continue
+        hit = (doc_id, page_no, line)
+        if name_matched:
             named_hits.append(hit)
-        if customer is not None and _line_has_ws_folded_phrase(line, customer):
+        if customer_matched:
             customer_hits.append(hit)
 
-    def _unique(hits: list[tuple[str, int, str]]) -> SourceRef | None:
+    def _unique(
+        hits: list[tuple[str, int, str]],
+    ) -> tuple[str, int, str] | None:
         uniq = list(dict.fromkeys(hits))
         if len(uniq) != 1:
             return None
-        doc_id, page_no, quote = uniq[0]
-        return SourceRef(document_id=doc_id, page_no=page_no, quote_text=quote)
+        return uniq[0]
 
-    # Prefer exact/ws-fold project_name association when unique.
     if named_hits:
         return _unique(named_hits)
-    # Name differs or absent: only when customer+start month uniquely picks
-    # one semantic source row.
     if customer_hits:
         return _unique(customer_hits)
     return None
+
+
+def _find_unique_semantic_project_exp_ref(
+    project: ProjectCandidate,
+    code: str,
+    *,
+    page_texts: dict[tuple[str, int], str],
+    allowed_documents: dict[str, set[int]],
+) -> SourceRef | None:
+    """Fail-closed unique project-row match for semantic EXP quote backfill."""
+    row = _find_unique_project_source_row(
+        project,
+        page_texts=page_texts,
+        allowed_documents=allowed_documents,
+        line_predicate=lambda line: _quote_supports_semantic_exp(code, line),
+    )
+    if row is None:
+        return None
+    doc_id, page_no, line = row
+    quote = _extract_semantic_exp_quote(code, line)
+    if not quote:
+        return None
+    return SourceRef(document_id=doc_id, page_no=page_no, quote_text=quote)
+
+
+def _biz_ref_is_same_project_row(
+    project: ProjectCandidate, ref: SourceRef
+) -> bool:
+    """True when an existing BIZ quote already looks like this project row."""
+    quote = (ref.quote_text or "").strip()
+    if not quote:
+        return False
+    if not _PROJECT_ROW_RANGE_MARK_RE.search(quote):
+        return False
+    start_ym = _project_start_year_month(project)
+    if start_ym is None or not _line_has_year_month(quote, *start_ym):
+        return False
+    name = (project.project_name or "").strip()
+    customer = (project.customer_name or "").strip()
+    name_ok = bool(name) and (
+        name in quote or _line_has_ws_folded_phrase(quote, name)
+    )
+    cust_ok = bool(customer) and _line_has_ws_folded_phrase(quote, customer)
+    if not name_ok and not cust_ok:
+        return False
+    if _line_is_employment_history_row(quote, name_matched=name_ok):
+        return False
+    return True
+
+
+def backfill_project_biz_evidence(
+    candidate: ProfileCandidateDocument,
+    *,
+    page_texts: dict[tuple[str, int], str] | None,
+    allowed_documents: dict[str, set[int]],
+) -> ProfileCandidateDocument:
+    """v20: repair PROJECT business_domains refs from unique project source rows.
+
+    Keeps existing BIZ codes/counts; only fills/replaces ``source_refs`` when
+    a fail-closed unique project row is found. Does not create/drop/reclassify
+    BIZ codes. Leaves already-appropriate same-project-row refs unchanged.
+    """
+    if not page_texts or not candidate.projects:
+        return candidate
+    changed = False
+    new_projects: list[ProjectCandidate] = []
+    for project in candidate.projects:
+        new_biz: list[CodeRefCandidate] = []
+        project_changed = False
+        for rel in project.business_domains:
+            if any(
+                _biz_ref_is_same_project_row(project, ref)
+                for ref in (rel.source_refs or [])
+            ):
+                new_biz.append(rel)
+                continue
+            row = _find_unique_project_source_row(
+                project,
+                page_texts=page_texts,
+                allowed_documents=allowed_documents,
+            )
+            if row is None:
+                new_biz.append(rel)
+                continue
+            doc_id, page_no, line = row
+            match = SourceRef(
+                document_id=doc_id, page_no=page_no, quote_text=line
+            )
+            project_changed = True
+            new_biz.append(rel.model_copy(update={"source_refs": [match]}))
+        if project_changed:
+            changed = True
+            new_projects.append(
+                project.model_copy(update={"business_domains": new_biz})
+            )
+        else:
+            new_projects.append(project)
+    if not changed:
+        return candidate
+    return candidate.model_copy(update={"projects": new_projects})
 
 
 def backfill_semantic_project_expertise_evidence(

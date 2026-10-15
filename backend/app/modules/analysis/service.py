@@ -55,6 +55,7 @@ from app.modules.analysis.compact_v8 import (
     clear_education_status_without_literal_evidence,
     drop_core_skills_without_quote_evidence,
     drop_generic_activity_core_skills,
+    backfill_project_biz_evidence,
     backfill_semantic_project_expertise_evidence,
     drop_project_expertise_without_semantic_evidence,
     drop_project_jobs_without_literal_pm_pl_evidence,
@@ -1490,6 +1491,14 @@ class AnalysisService:
             # project-row span before strict/semantic drop filters.
             if prompt.backfill_semantic_project_exp_evidence:
                 doc = backfill_semantic_project_expertise_evidence(
+                    doc,
+                    page_texts=page_texts,
+                    allowed_documents=allowed_documents,
+                )
+            # v20: repair PROJECT BIZ relation provenance from unique project
+            # source rows (codes unchanged; no reclassification).
+            if prompt.backfill_project_biz_evidence:
+                doc = backfill_project_biz_evidence(
                     doc,
                     page_texts=page_texts,
                     allowed_documents=allowed_documents,
