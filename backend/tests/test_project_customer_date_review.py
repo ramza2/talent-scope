@@ -164,6 +164,10 @@ def test_customer_mismatch_no_customer_date_match() -> None:
 
 
 def test_end_month_mismatch_no_customer_date_match() -> None:
+    """Precision end mismatch still misses customer-date REVIEW helper.
+
+    Overlap REVIEW (separate fallback) may still surface a targeted REVIEW.
+    """
     from app.modules.analysis.diff_engine import (
         _project_customer_date_review_matches,
         build_diffs,
@@ -198,7 +202,16 @@ def test_end_month_mismatch_no_customer_date_match() -> None:
         ]
     )
     specs = build_diffs(candidate, {"profile": {"name": "홍길동"}, "projects": existing})
-    assert any(
+    reviews = [
+        s
+        for s in specs
+        if s.entity_type == "PROJECT"
+        and s.change_type == "REVIEW"
+        and s.candidate_path == "projects[0]"
+    ]
+    assert len(reviews) == 1
+    assert reviews[0].existing_target_id == UUID(_PROJ_A)
+    assert not any(
         s.entity_type == "PROJECT" and s.change_type == "NEW" for s in specs
     )
 

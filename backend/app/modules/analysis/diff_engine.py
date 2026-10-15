@@ -1103,6 +1103,83 @@ def _project_customer_date_review_matches(
     return out
 
 
+def _project_month_ordinal(value: Any) -> int | None:
+    """Year*12+month for overlap checks; requires at least month precision."""
+    parts = _project_date_parts(value)
+    if parts is None:
+        return None
+    year, month, _day = parts
+    if month is None:
+        return None
+    return year * 12 + month
+
+
+def _project_periods_overlap(
+    *,
+    cand_start: Any,
+    cand_end: Any,
+    row_start: Any,
+    row_end: Any,
+) -> bool:
+    """Inclusive month-precision interval overlap (PROJECT REVIEW helpers)."""
+    cs = _project_month_ordinal(cand_start)
+    ce = _project_month_ordinal(cand_end)
+    rs = _project_month_ordinal(row_start)
+    re = _project_month_ordinal(row_end)
+    if cs is None or ce is None or rs is None or re is None:
+        return False
+    if cs > ce or rs > re:
+        return False
+    return cs <= re and rs <= ce
+
+
+def _project_customer_overlap_review_matches(
+    project: Any,
+    existing: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Same customer + precision-compatible start + overlapping period (REVIEW).
+
+    End dates need not be precision-compatible. Name is ignored. Never used for
+    auto-link / SAME / UPDATE — REVIEW only so a human can decide.
+    """
+    cand_customer = _norm_str(_field(project, "customer_name"))
+    cand_start = _field(project, "start_date")
+    cand_end = _field(project, "end_date")
+    if (
+        not cand_customer
+        or _project_month_ordinal(cand_start) is None
+        or _project_month_ordinal(cand_end) is None
+    ):
+        return []
+    out: list[dict[str, Any]] = []
+    for row in existing:
+        row_customer = row.get("customer_name")
+        if not _norm_str(row_customer):
+            continue
+        if not _project_customers_ws_equal(cand_customer, row_customer):
+            continue
+        row_start = row.get("start_date")
+        row_end = row.get("end_date")
+        if (
+            _project_month_ordinal(row_start) is None
+            or _project_month_ordinal(row_end) is None
+        ):
+            continue
+        if not _project_date_precision_compatible(
+            candidate=cand_start, existing=row_start
+        ):
+            continue
+        if not _project_periods_overlap(
+            cand_start=cand_start,
+            cand_end=cand_end,
+            row_start=row_start,
+            row_end=row_end,
+        ):
+            continue
+        out.append(row)
+    return out
+
+
 PROJECT_RELATION_FIELDS: tuple[str, ...] = (
     "jobs",
     "skills",
@@ -1262,6 +1339,34 @@ def _diff_projects(
                                 customer_date
                                 if len(customer_date) > 1
                                 else customer_date[0]
+                            ),
+                            new_value=dump,
+                            confidence=project.confidence,
+                            source_refs=refs,
+                        )
+                    )
+                    continue
+                # Same customer + same start month + overlapping period, but
+                # end months differ: REVIEW-only (never auto-link).
+                customer_overlap = _project_customer_overlap_review_matches(
+                    project, existing
+                )
+                if customer_overlap:
+                    target_id = (
+                        _as_uuid(customer_overlap[0].get("id"))
+                        if len(customer_overlap) == 1
+                        else None
+                    )
+                    specs.append(
+                        DiffSpec(
+                            entity_type="PROJECT",
+                            candidate_path=path,
+                            existing_target_id=target_id,
+                            change_type="REVIEW",
+                            old_value=(
+                                customer_overlap
+                                if len(customer_overlap) > 1
+                                else customer_overlap[0]
                             ),
                             new_value=dump,
                             confidence=project.confidence,
