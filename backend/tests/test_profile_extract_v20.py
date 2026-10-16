@@ -61,6 +61,8 @@ def test_profile_extract_registry_current_is_v20() -> None:
     assert v20.REQUIRE_SEMANTIC_PROJECT_JOB_EVIDENCE is True
     assert cur.recover_project_recall_second_pass is True
     assert v20.RECOVER_PROJECT_RECALL_SECOND_PASS is True
+    assert cur.backfill_literal_core_tech_from_source is True
+    assert v20.BACKFILL_LITERAL_CORE_TECH_FROM_SOURCE is True
     assert cur.repair_whitespace_project_evidence is True
     assert cur.strict_relation_evidence is True
 
@@ -80,6 +82,7 @@ def test_profile_extract_registry_current_is_v20() -> None:
     assert v19_spec.repair_project_mgt_to_ops_sys is False
     assert v19_spec.require_semantic_project_job_evidence is False
     assert v19_spec.recover_project_recall_second_pass is False
+    assert v19_spec.backfill_literal_core_tech_from_source is False
     assert not hasattr(v19, "DROP_GENERIC_ACTIVITY_CORE_TECH")
     assert not hasattr(v19, "REQUIRE_CORE_TECH_QUOTE_EVIDENCE")
     assert not hasattr(v19, "BACKFILL_PROJECT_DATES_FROM_ROOT_EVIDENCE")
@@ -95,6 +98,7 @@ def test_profile_extract_registry_current_is_v20() -> None:
     assert not hasattr(v19, "REPAIR_PROJECT_MGT_TO_OPS_SYS")
     assert not hasattr(v19, "REQUIRE_SEMANTIC_PROJECT_JOB_EVIDENCE")
     assert not hasattr(v19, "RECOVER_PROJECT_RECALL_SECOND_PASS")
+    assert not hasattr(v19, "BACKFILL_LITERAL_CORE_TECH_FROM_SOURCE")
     assert v19_spec.projects_system_prompt == v19.PROJECTS_SYSTEM_PROMPT
 
 
