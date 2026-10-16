@@ -133,11 +133,130 @@ def test_existing_same_tech_skill_no_duplicate() -> None:
     ad_skills = [s for s in out.skills if s.code == "TECH-SEC-AD"]
     assert len(ad_skills) == 1
     assert ad_skills[0].raw_value == "Active Directory"
+    assert ad_skills[0].source_refs[0].quote_text == "Active Directory"
     assert {s.code for s in out.skills} == {
         "TECH-SEC-AD",
         "TECH-SEC-NAC",
         "TECH-SEC-SEP",
     }
+
+
+def test_existing_ad_empty_refs_repaired_from_literal() -> None:
+    from app.ai.schemas.profile_candidate import SkillCandidate
+
+    existing = SkillCandidate(
+        code="TECH-SEC-AD",
+        raw_value="AD",
+        last_used_year=2020,
+        experience_months=12,
+        source_refs=[],
+    )
+    page_texts = {(_DOC, 1): "보유기술: AD"}
+    out = _run(_empty_core(skills=[existing]), page_texts=page_texts)
+    assert len(out.skills) == 1
+    skill = out.skills[0]
+    assert skill.code == "TECH-SEC-AD"
+    assert skill.raw_value == "AD"
+    assert skill.last_used_year == 2020
+    assert skill.experience_months == 12
+    assert len(skill.source_refs) == 1
+    assert skill.source_refs[0].quote_text == "AD"
+    assert skill.source_refs[0].document_id == _DOC
+
+
+def test_existing_ad_nac_sep_empty_refs_repaired_no_duplicate() -> None:
+    from app.ai.schemas.profile_candidate import SkillCandidate
+
+    skills = [
+        SkillCandidate(code="TECH-SEC-AD", raw_value="AD", source_refs=[]),
+        SkillCandidate(code="TECH-SEC-NAC", raw_value="NAC", source_refs=[]),
+        SkillCandidate(code="TECH-SEC-SEP", raw_value="SEP", source_refs=[]),
+    ]
+    page_texts = {(_DOC, 1): "보유기술: AD NAC SEP"}
+    out = _run(_empty_core(skills=skills), page_texts=page_texts)
+    assert len(out.skills) == 3
+    by_code = {s.code: s for s in out.skills}
+    assert set(by_code) == {"TECH-SEC-AD", "TECH-SEC-NAC", "TECH-SEC-SEP"}
+    for code, quote in (
+        ("TECH-SEC-AD", "AD"),
+        ("TECH-SEC-NAC", "NAC"),
+        ("TECH-SEC-SEP", "SEP"),
+    ):
+        skill = by_code[code]
+        assert skill.raw_value == quote
+        assert len(skill.source_refs) == 1
+        assert skill.source_refs[0].quote_text == quote
+
+
+def test_existing_valid_ref_unchanged() -> None:
+    from app.ai.schemas.profile_candidate import SkillCandidate, SourceRef
+    from app.modules.analysis.compact_v8 import backfill_literal_core_tech_from_source
+
+    existing = SkillCandidate(
+        code="TECH-SEC-AD",
+        raw_value="Active Directory",
+        source_refs=[
+            SourceRef(
+                document_id=_DOC, page_no=1, quote_text="KEEP-EXISTING-QUOTE"
+            )
+        ],
+    )
+    page_texts = {(_DOC, 1): "KEEP-EXISTING-QUOTE AD NAC SEP"}
+    out = backfill_literal_core_tech_from_source(
+        _empty_core(skills=[existing]),
+        codes=_catalog(),
+        aliases=_aliases(),
+        page_texts=page_texts,
+        allowed_documents={_DOC: {1}},
+    )
+    ad = next(s for s in out.skills if s.code == "TECH-SEC-AD")
+    assert ad.raw_value == "Active Directory"
+    assert ad.source_refs[0].quote_text == "KEEP-EXISTING-QUOTE"
+    assert len([s for s in out.skills if s.code == "TECH-SEC-AD"]) == 1
+
+
+def test_existing_ad_empty_refs_road_not_repaired_then_dropped() -> None:
+    from app.ai.schemas.profile_candidate import SkillCandidate
+
+    existing = SkillCandidate(
+        code="TECH-SEC-AD", raw_value="AD", source_refs=[]
+    )
+    page_texts = {(_DOC, 1): "ROAD map and loading"}
+    out = _run(_empty_core(skills=[existing]), page_texts=page_texts)
+    assert out.skills == []
+
+
+def test_existing_ad_empty_refs_ambiguous_alias_not_repaired() -> None:
+    from app.ai.schemas.profile_candidate import SkillCandidate
+    from app.modules.analysis.compact_v8 import (
+        backfill_literal_core_tech_from_source,
+        drop_core_skills_without_quote_evidence,
+    )
+
+    codes = _catalog() + [
+        _code("TECH-SEC-OTHER", name="Other Sec", parent="TECH-SEC"),
+    ]
+    aliases = {
+        "TECH-SEC-AD": ["AD"],
+        "TECH-SEC-OTHER": ["AD"],
+        "TECH-SEC-NAC": ["NAC"],
+        "TECH-SEC-SEP": ["SEP"],
+    }
+    existing = SkillCandidate(
+        code="TECH-SEC-AD", raw_value="AD", source_refs=[]
+    )
+    page_texts = {(_DOC, 1): "보유기술: AD"}
+    mid = backfill_literal_core_tech_from_source(
+        _empty_core(skills=[existing]),
+        codes=codes,
+        aliases=aliases,
+        page_texts=page_texts,
+        allowed_documents={_DOC: {1}},
+    )
+    assert len(mid.skills) == 1
+    assert mid.skills[0].source_refs == []
+    out = drop_core_skills_without_quote_evidence(mid)
+    assert out.skills == []
 
 
 def test_alias_ambiguity_fail_closed_skip() -> None:

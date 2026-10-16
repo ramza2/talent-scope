@@ -1595,12 +1595,16 @@ def backfill_literal_core_tech_from_source(
     page_texts: dict[tuple[str, int], str] | None,
     allowed_documents: dict[str, set[int]],
 ) -> ProfileCandidateDocument:
-    """v20: supplement missing root TECH skills from explicit source literals.
+    """v20: repair/supplement root TECH skills from explicit source literals.
 
     Only active TECH leaf codes (``parent_code`` set) are candidates. Literals
     are CodeMaster.name and code_alias.alias. Ambiguous literals (same text →
-    multiple TECH codes) are skipped. Existing skill codes are never modified;
-    only missing codes are appended with quote evidence.
+    multiple TECH codes) are skipped.
+
+    - Existing skill with valid quote evidence → unchanged.
+    - Existing skill with empty quote evidence → ``source_refs`` only repaired
+      when a unique literal matches (raw_value/code/periods untouched).
+    - Missing skill code → append a new SkillCandidate with quote evidence.
     """
     if not page_texts or not codes:
         return candidate
@@ -1633,48 +1637,71 @@ def backfill_literal_core_tech_from_source(
             literal_to_codes.setdefault(key, set()).add(code)
         code_literals[code] = lits
 
-    existing_codes = {
-        (skill.code or "").strip()
-        for skill in candidate.skills
-        if (skill.code or "").strip()
-    }
-    extras: list[SkillCandidate] = []
-    for row in sorted(leaf_techs, key=lambda r: str(r.code)):
-        code = str(row.code).strip()
-        if code in existing_codes:
-            continue
-        # Deterministic literal order; skip ambiguous keys.
-        candidates_lits = sorted(
+    def _unique_literals_for_code(code: str) -> list[str]:
+        return sorted(
             (
                 lit
                 for lit in code_literals.get(code, [])
-                if literal_to_codes.get(_norm_tech_literal_key(lit) or "") == {code}
+                if literal_to_codes.get(_norm_tech_literal_key(lit) or "")
+                == {code}
             ),
             key=lambda s: s.casefold(),
         )
-        for lit in candidates_lits:
+
+    def _first_literal_ref(code: str) -> SourceRef | None:
+        for lit in _unique_literals_for_code(code):
             ref = _find_tech_literal_page_ref(
                 lit,
                 page_texts=page_texts,
                 allowed_documents=allowed_documents,
             )
-            if ref is None:
-                continue
-            extras.append(
-                SkillCandidate(
-                    code=code,
-                    raw_value=ref.quote_text,
-                    source_refs=[ref],
-                )
-            )
-            existing_codes.add(code)
-            break
+            if ref is not None:
+                return ref
+        return None
 
-    if not extras:
+    # Repair empty evidence on existing leaf TECH skills (no field overwrite).
+    skills_out: list[SkillCandidate] = []
+    repaired = False
+    present_codes: set[str] = set()
+    for skill in candidate.skills:
+        code = (skill.code or "").strip()
+        if code:
+            present_codes.add(code)
+        if (
+            code
+            and code in code_literals
+            and not _refs_nonempty(skill.source_refs)
+        ):
+            ref = _first_literal_ref(code)
+            if ref is not None:
+                skills_out.append(
+                    skill.model_copy(update={"source_refs": [ref]})
+                )
+                repaired = True
+                continue
+        skills_out.append(skill)
+
+    # Supplement missing leaf TECH codes (unchanged create path).
+    extras: list[SkillCandidate] = []
+    for row in sorted(leaf_techs, key=lambda r: str(r.code)):
+        code = str(row.code).strip()
+        if code in present_codes:
+            continue
+        ref = _first_literal_ref(code)
+        if ref is None:
+            continue
+        extras.append(
+            SkillCandidate(
+                code=code,
+                raw_value=ref.quote_text,
+                source_refs=[ref],
+            )
+        )
+        present_codes.add(code)
+
+    if not repaired and not extras:
         return candidate
-    return candidate.model_copy(
-        update={"skills": list(candidate.skills) + extras}
-    )
+    return candidate.model_copy(update={"skills": skills_out + extras})
 
 
 def _project_evidence_anchors(project: ProjectCandidate) -> tuple[str, ...]:
