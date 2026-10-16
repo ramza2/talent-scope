@@ -15,12 +15,13 @@ os.environ.setdefault("APP_SECRET_KEY", "test-secret")
 os.environ["APP_ENV"] = "test"
 
 _DOC = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+_DOC_B = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
 
 
-def _ref(quote: str, *, page_no: int = 1):
+def _ref(quote: str, *, page_no: int = 1, document_id: str = _DOC):
     from app.ai.schemas.profile_candidate import SourceRef
 
-    return SourceRef(document_id=_DOC, page_no=page_no, quote_text=quote)
+    return SourceRef(document_id=document_id, page_no=page_no, quote_text=quote)
 
 
 def _project(
@@ -31,6 +32,7 @@ def _project(
     end: str,
     jobs: list[tuple[str, str]] | None = None,
     root_quote: str | None = None,
+    document_id: str = _DOC,
 ):
     from app.ai.schemas.profile_candidate import CodeRefCandidate, ProjectCandidate
 
@@ -38,7 +40,7 @@ def _project(
         CodeRefCandidate(
             code=code,
             raw_value=code,
-            source_refs=[_ref(quote)],
+            source_refs=[_ref(quote, document_id=document_id)],
         )
         for code, quote in (jobs or [])
     ]
@@ -47,7 +49,7 @@ def _project(
         customer_name=customer,
         start_date=start,
         end_date=end,
-        source_refs=[_ref(root_quote or name)],
+        source_refs=[_ref(root_quote or name, document_id=document_id)],
         jobs=job_rels,
     )
 
@@ -363,6 +365,217 @@ def test_name_customer_start_same_but_non_overlap_distinct() -> None:
     out, n = supplement_projects_from_second_pass(first, second)
     assert n == 1
     assert len(out.projects) == 2
+
+
+def test_crossdoc_aggregate_span_suppresses_second() -> None:
+    """Segmented first periods covering second aggregate → no supplement."""
+    from app.modules.analysis.compact_v8 import supplement_projects_from_second_pass
+
+    customer = "국가정보자원 관리원(광주)"
+    first = _doc(
+        [
+            _project(
+                name="2018년 광주센터 정보시스템1군 운영",
+                customer=customer,
+                start="2018.01",
+                end="2018.12",
+                document_id=_DOC,
+                jobs=[("JOB-OPS-SYS", "운영")],
+            ),
+            _project(
+                name="2019년 광주센터 정보시스템1군 운영",
+                customer=customer,
+                start="2019.01",
+                end="2021.12",
+                document_id=_DOC,
+                jobs=[("JOB-OPS-SYS", "운영")],
+            ),
+            _project(
+                name="2022년 광주센터 정보시스템1군 운영",
+                customer=customer,
+                start="2022.01",
+                end="2023.01",
+                document_id=_DOC,
+                jobs=[("JOB-MGT", "사업관리")],
+            ),
+        ]
+    )
+    # Preserve first relation marker.
+    first.projects[2].jobs[0] = first.projects[2].jobs[0].model_copy(
+        update={"raw_value": "FIRST-KEEP-MGT"}
+    )
+    second = _doc(
+        [
+            _project(
+                name="광주센터 정보시스템 1군 유지보수 운영",
+                customer=customer,
+                start="2018.01",
+                end="2023.01",
+                document_id=_DOC_B,
+                jobs=[("JOB-OPS-SYS", "SECOND-OVERWRITE")],
+            )
+        ]
+    )
+    out, n = supplement_projects_from_second_pass(first, second)
+    assert n == 0
+    assert len(out.projects) == 3
+    assert out.projects[2].jobs[0].raw_value == "FIRST-KEEP-MGT"
+    assert out.projects[2].jobs[0].code == "JOB-MGT"
+
+
+def test_crossdoc_near_period_title_variant_suppresses_second() -> None:
+    from app.modules.analysis.compact_v8 import supplement_projects_from_second_pass
+
+    customer = "국가정보자원 관리원(광주)"
+    first = _doc(
+        [
+            _project(
+                name="광주통합전산센터 2015년 정보보호 강화(HW)",
+                customer=customer,
+                start="2015.07",
+                end="2015.12",
+                document_id=_DOC,
+            )
+        ]
+    )
+    second = _doc(
+        [
+            _project(
+                name="2015년 정보보호 강화사업 구축",
+                customer=customer,
+                start="2015.08",
+                end="2015.12",
+                document_id=_DOC_B,
+            )
+        ]
+    )
+    out, n = supplement_projects_from_second_pass(first, second)
+    assert n == 0
+    assert len(out.projects) == 1
+    assert out.projects[0].project_name == "광주통합전산센터 2015년 정보보호 강화(HW)"
+    assert out.projects[0].start_date == "2015.07"
+
+
+def test_crossdoc_aggregate_unrelated_name_still_supplements() -> None:
+    from app.modules.analysis.compact_v8 import supplement_projects_from_second_pass
+
+    customer = "국가정보자원 관리원(광주)"
+    first = _doc(
+        [
+            _project(
+                name="2018년 광주센터 정보시스템1군 운영",
+                customer=customer,
+                start="2018.01",
+                end="2018.12",
+                document_id=_DOC,
+            ),
+            _project(
+                name="2019년 광주센터 정보시스템1군 운영",
+                customer=customer,
+                start="2019.01",
+                end="2021.12",
+                document_id=_DOC,
+            ),
+            _project(
+                name="2022년 광주센터 정보시스템1군 운영",
+                customer=customer,
+                start="2022.01",
+                end="2023.01",
+                document_id=_DOC,
+            ),
+        ]
+    )
+    second = _doc(
+        [
+            _project(
+                name="클라우드 마이그레이션 전환 프로젝트",
+                customer=customer,
+                start="2018.01",
+                end="2023.01",
+                document_id=_DOC_B,
+            )
+        ]
+    )
+    out, n = supplement_projects_from_second_pass(first, second)
+    assert n == 1
+    assert len(out.projects) == 4
+
+
+def test_crossdoc_near_period_unrelated_name_still_supplements() -> None:
+    from app.modules.analysis.compact_v8 import supplement_projects_from_second_pass
+
+    customer = "국가정보자원 관리원(광주)"
+    first = _doc(
+        [
+            _project(
+                name="광주통합전산센터 2015년 정보보호 강화(HW)",
+                customer=customer,
+                start="2015.07",
+                end="2015.12",
+                document_id=_DOC,
+            )
+        ]
+    )
+    second = _doc(
+        [
+            _project(
+                name="네트워크 장비 교체 용역",
+                customer=customer,
+                start="2015.08",
+                end="2015.12",
+                document_id=_DOC_B,
+            )
+        ]
+    )
+    out, n = supplement_projects_from_second_pass(first, second)
+    assert n == 1
+    assert len(out.projects) == 2
+
+
+def test_same_document_skips_new_crossdoc_rules() -> None:
+    """Same root document_id → aggregate/near-period rules do not apply."""
+    from app.modules.analysis.compact_v8 import supplement_projects_from_second_pass
+
+    customer = "국가정보자원 관리원(광주)"
+    first = _doc(
+        [
+            _project(
+                name="2018년 광주센터 정보시스템1군 운영",
+                customer=customer,
+                start="2018.01",
+                end="2018.12",
+                document_id=_DOC,
+            ),
+            _project(
+                name="2019년 광주센터 정보시스템1군 운영",
+                customer=customer,
+                start="2019.01",
+                end="2021.12",
+                document_id=_DOC,
+            ),
+            _project(
+                name="2022년 광주센터 정보시스템1군 운영",
+                customer=customer,
+                start="2022.01",
+                end="2023.01",
+                document_id=_DOC,
+            ),
+        ]
+    )
+    second = _doc(
+        [
+            _project(
+                name="광주센터 정보시스템 1군 유지보수 운영",
+                customer=customer,
+                start="2018.01",
+                end="2023.01",
+                document_id=_DOC,
+            )
+        ]
+    )
+    out, n = supplement_projects_from_second_pass(first, second)
+    assert n == 1
+    assert len(out.projects) == 4
 
 
 def test_same_name_ws_fold_compatible_dates_no_duplicate() -> None:
