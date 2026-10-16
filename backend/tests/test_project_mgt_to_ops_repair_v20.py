@@ -605,9 +605,6 @@ def test_fresh_replay_0_to_8_after_full_guard() -> None:
     assert by_idx[7] == []
     assert by_idx[8] == []
 
-    open("/opt/cursor/artifacts/project-mgt-to-ops-replay.txt", "w").write(
-        "\n".join(lines) + "\n"
-    )
 
 
 def test_v19_flags_false_v20_true() -> None:
