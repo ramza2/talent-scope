@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Any
 
 from app.ai.schemas.profile_candidate import (
     PROFILE_SCALAR_FIELD_NAMES,
     SCHEMA_VERSION,
     CodeRefCandidate,
+    EducationCandidate,
     ExpertiseCandidate,
     JobCandidate,
     ProfileCandidateDocument,
@@ -180,6 +182,154 @@ def derive_duration_months(start: Any, end: Any) -> int | None:
     if delta < 0:
         return None
     return delta
+
+
+_PROJECT_DATE_RANGE_RE = re.compile(
+    r"(?P<sy>\d{2}|\d{4})[.\-](?P<sm>\d{2})\s*[~～]\s*"
+    r"(?P<ey>\d{2}|\d{4})[.\-](?P<em>\d{2})"
+)
+_FOUR_DIGIT_YEAR_RE = re.compile(r"(?<!\d)((?:19|20)\d{2})(?!\d)")
+
+
+def _collect_year_anchors(*texts: str | None) -> list[int]:
+    anchors: list[int] = []
+    for text in texts:
+        if not isinstance(text, str) or not text:
+            continue
+        for match in _FOUR_DIGIT_YEAR_RE.finditer(text):
+            year = int(match.group(1))
+            if 1900 <= year <= 2100:
+                anchors.append(year)
+    return anchors
+
+
+def _expand_year_token(
+    token: str,
+    *,
+    anchors: list[int],
+) -> int | None:
+    if len(token) == 4:
+        year = int(token)
+        return year if 1900 <= year <= 2100 else None
+    if len(token) != 2:
+        return None
+    yy = int(token)
+    matched = sorted({year for year in anchors if year % 100 == yy})
+    if len(matched) == 1:
+        return matched[0]
+    if len(matched) > 1:
+        return None
+    return 2000 + yy if yy <= 49 else 1900 + yy
+
+
+def _format_year_month(year: int, month: int) -> str:
+    return f"{year:04d}.{month:02d}"
+
+
+def parse_project_date_range_from_texts(
+    texts: list[str],
+    *,
+    project_name: str | None = None,
+) -> tuple[str, str] | None:
+    """Parse a unique YYYY.MM~YYYY.MM range from texts; else None (fail-closed)."""
+    if not texts:
+        return None
+    anchors = _collect_year_anchors(project_name, *texts)
+    parsed: set[tuple[str, str]] = set()
+    for text in texts:
+        for match in _PROJECT_DATE_RANGE_RE.finditer(text):
+            sm = int(match.group("sm"))
+            em = int(match.group("em"))
+            if sm < 1 or sm > 12 or em < 1 or em > 12:
+                return None
+            sy_tok = match.group("sy")
+            ey_tok = match.group("ey")
+            start_year = _expand_year_token(sy_tok, anchors=anchors)
+            end_year = _expand_year_token(ey_tok, anchors=anchors)
+            if start_year is None or end_year is None:
+                return None
+            # Classic two-digit wrap: 99.12 ~ 00.02 under pivot already yields
+            # 1999/2000. If end < start, try one century bump on YY end only.
+            if (end_year, em) < (start_year, sm):
+                if len(ey_tok) == 2:
+                    bumped = end_year + 100
+                    if bumped <= 2100 and (bumped, em) >= (start_year, sm):
+                        end_year = bumped
+                    else:
+                        return None
+                else:
+                    return None
+            parsed.add(
+                (
+                    _format_year_month(start_year, sm),
+                    _format_year_month(end_year, em),
+                )
+            )
+            if len(parsed) > 1:
+                return None
+    if len(parsed) != 1:
+        return None
+    return next(iter(parsed))
+
+
+def backfill_project_dates_from_root_evidence(
+    candidate: ProfileCandidateDocument,
+) -> ProfileCandidateDocument:
+    """v20: fill missing project start/end from unique root-quote date ranges.
+
+    Uses only project root ``source_refs[].quote_text``. Never reads relation
+    j/t/x refs or page text. Existing start/end values are never overwritten.
+    Recalculates ``duration_months`` via ``derive_duration_months`` when both
+    ends are present after fill.
+    """
+    if not candidate.projects:
+        return candidate
+    projects: list[ProjectCandidate] = []
+    changed_any = False
+    for project in candidate.projects:
+        need_start = not (project.start_date or "").strip()
+        need_end = not (project.end_date or "").strip()
+        if not need_start and not need_end:
+            projects.append(project)
+            continue
+        quotes = [
+            (ref.quote_text or "").strip()
+            for ref in (project.source_refs or [])
+            if (ref.quote_text or "").strip()
+        ]
+        if not quotes:
+            projects.append(project)
+            continue
+        parsed = parse_project_date_range_from_texts(
+            quotes, project_name=project.project_name
+        )
+        if parsed is None:
+            projects.append(project)
+            continue
+        start_s, end_s = parsed
+        updates: dict[str, Any] = {}
+        if need_start and need_end:
+            updates["start_date"] = start_s
+            updates["end_date"] = end_s
+        elif need_start:
+            if parse_year_month(project.end_date) == parse_year_month(end_s):
+                updates["start_date"] = start_s
+        elif need_end:
+            if parse_year_month(project.start_date) == parse_year_month(start_s):
+                updates["end_date"] = end_s
+        if not updates:
+            projects.append(project)
+            continue
+        new_start = updates.get("start_date", project.start_date)
+        new_end = updates.get("end_date", project.end_date)
+        duration = derive_duration_months(new_start, new_end)
+        if duration is not None:
+            updates["duration_months"] = duration
+        projects.append(project.model_copy(update=updates))
+        changed_any = True
+    if not changed_any:
+        return candidate
+    return candidate.model_copy(update={"projects": projects})
 
 
 def build_document_alias_view(document_blocks: str) -> tuple[str, dict[str, str]]:
@@ -836,6 +986,34 @@ def count_normalized_project_relations(
     }
 
 
+def count_project_job_code_distribution(
+    candidate: ProfileCandidateDocument | None,
+) -> dict[str, int]:
+    """PROJECT job code histogram (codes/counts only; no names/quotes)."""
+    counts: dict[str, int] = {}
+    if candidate is None:
+        return counts
+    for project in candidate.projects:
+        for job in project.jobs:
+            code = (job.code or "").strip() or "?"
+            counts[code] = counts.get(code, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def count_project_jobs_with_quote_evidence(
+    candidate: ProfileCandidateDocument | None,
+) -> int:
+    """Count PROJECT job relations that already have non-empty quote_text."""
+    if candidate is None:
+        return 0
+    return sum(
+        1
+        for project in candidate.projects
+        for job in project.jobs
+        if _relation_has_quote_evidence(job)
+    )
+
+
 def project_relation_diagnostic_counts(
     *,
     raw: dict[str, Any] | None,
@@ -998,6 +1176,108 @@ def _exact_page_match(
 
 def _refs_nonempty(refs: list[SourceRef] | None) -> bool:
     return any((ref.quote_text or "").strip() for ref in (refs or []))
+
+
+# v20 semantic EXP phrases (CORE backfill + PROJECT relation guard).
+# Higher strength wins for backfill; ties break by sorted (document_id, page_no).
+_EXP_SEMANTIC_PATTERNS: dict[str, tuple[tuple[int, str, tuple[str, ...]], ...]] = {
+    "EXP-INFRA": (
+        # quote phrase, optional same-text companions
+        (3, "시스템구축 및 운영", ("IT시스템기술지원", "IT시스템관리")),
+        (2, "정보시스템 운영", ()),
+        (1, "시스템 운영", ()),
+    ),
+    "EXP-MGT": ((1, "사업관리", ()),),
+    "EXP-SEC-OPS": ((1, "보안 운영", ()),),
+    "EXP-SEC-BUILD": ((1, "보안 구축", ()),),
+}
+
+
+def _quote_supports_semantic_exp(code: str, quote: str) -> bool:
+    """True when quote text itself supports a known EXP prompt-contract phrase."""
+    patterns = _EXP_SEMANTIC_PATTERNS.get(code)
+    if not patterns:
+        return False
+    text = (quote or "").strip()
+    if not text:
+        return False
+    for _strength, phrase, companions in patterns:
+        if phrase not in text:
+            continue
+        if companions and not any(req in text for req in companions):
+            continue
+        return True
+    return False
+
+
+def _semantic_exp_page_match(
+    code: str,
+    *,
+    page_texts: dict[tuple[str, int], str],
+    allowed_documents: dict[str, set[int]],
+) -> SourceRef | None:
+    """Strongest prompt-contract phrase match for a known EXP code."""
+    patterns = _EXP_SEMANTIC_PATTERNS.get(code)
+    if not patterns:
+        return None
+    best: tuple[int, str, int, str] | None = None
+    for doc_id, page_no in sorted(page_texts.keys()):
+        if doc_id not in allowed_documents:
+            continue
+        pages = allowed_documents[doc_id]
+        if pages and page_no not in pages:
+            continue
+        page_text = page_texts.get((doc_id, page_no)) or ""
+        if not page_text:
+            continue
+        for strength, quote, companions in patterns:
+            if quote not in page_text:
+                continue
+            if companions and not any(req in page_text for req in companions):
+                continue
+            # Sort key: higher strength first, then earlier doc/page.
+            key = (-strength, doc_id, page_no, quote)
+            if best is None or key < best:
+                best = key
+    if best is None:
+        return None
+    _, doc_id, page_no, quote = best
+    return SourceRef(document_id=doc_id, page_no=page_no, quote_text=quote)
+
+
+def backfill_semantic_core_expertise_evidence(
+    candidate: ProfileCandidateDocument,
+    *,
+    page_texts: dict[tuple[str, int], str] | None,
+    allowed_documents: dict[str, set[int]],
+) -> ProfileCandidateDocument:
+    """v20: fill empty root expertise source_refs via prompt-contract phrases.
+
+    Only known EXP codes (INFRA/MGT/SEC-OPS/SEC-BUILD). Never overwrites
+    existing refs. Does not change raw_value/code/evidence_type/confidence.
+    """
+    if not page_texts:
+        return candidate
+    changed = False
+    new_expertise: list[ExpertiseCandidate] = []
+    for exp in candidate.expertise:
+        if _refs_nonempty(exp.source_refs):
+            new_expertise.append(exp)
+            continue
+        code = (exp.code or "").strip()
+        match = _semantic_exp_page_match(
+            code,
+            page_texts=page_texts,
+            allowed_documents=allowed_documents,
+        )
+        if match is None:
+            new_expertise.append(exp)
+            continue
+        changed = True
+        new_expertise.append(exp.model_copy(update={"source_refs": [match]}))
+    if not changed:
+        return candidate
+    return candidate.model_copy(update={"expertise": new_expertise})
 
 
 def backfill_exact_core_evidence(
@@ -1168,6 +1448,84 @@ def promote_exact_root_catalog_codes(
     return candidate.model_copy(
         update={"jobs": jobs, "skills": skills, "expertise": expertise}
     )
+
+
+# Folded exact phrases that are work/activity-only (never TECH by themselves).
+_GENERIC_ACTIVITY_CORE_TECH_FOLDED: frozenset[str] = frozenset(
+    {
+        "운영",
+        "구축",
+        "유지보수",
+        "기술지원",
+        "백업",
+        "이관",
+        "사업관리",
+        "정보자원통합구축",
+        "정보시스템운영",
+        "시스템운영",
+        "시스템구축",
+        "시스템구축및운영",
+    }
+)
+
+
+def fold_generic_activity_tech_text(value: str) -> str:
+    """Normalize for generic-activity TECH matching (whitespace/punct only)."""
+    text = unicodedata.normalize("NFKC", value).casefold()
+    out: list[str] = []
+    for ch in text:
+        if ch.isspace():
+            continue
+        if unicodedata.category(ch).startswith("P"):
+            continue
+        out.append(ch)
+    return "".join(out)
+
+
+def is_generic_activity_core_tech_raw(raw_value: str | None) -> bool:
+    """True when raw_value is only a known work/activity phrase (fail-closed)."""
+    if not isinstance(raw_value, str):
+        return False
+    folded = fold_generic_activity_tech_text(raw_value)
+    if not folded:
+        return False
+    return folded in _GENERIC_ACTIVITY_CORE_TECH_FOLDED
+
+
+def drop_generic_activity_core_skills(
+    candidate: ProfileCandidateDocument,
+) -> ProfileCandidateDocument:
+    """v20: remove root skills whose raw_value is an activity-only phrase.
+
+    Project relation skills are untouched. JOB/EXP and non-matching TECH stay.
+    Drops even when ``code`` is set if raw_value itself is generic activity.
+    """
+    kept = [
+        skill
+        for skill in candidate.skills
+        if not is_generic_activity_core_tech_raw(skill.raw_value)
+    ]
+    if len(kept) == len(candidate.skills):
+        return candidate
+    return candidate.model_copy(update={"skills": kept})
+
+
+def drop_core_skills_without_quote_evidence(
+    candidate: ProfileCandidateDocument,
+) -> ProfileCandidateDocument:
+    """v20: drop root skills that still lack non-empty quote evidence.
+
+    Intended after ``backfill_exact_core_evidence``. Valid TECH codes without
+    any quoted source_ref are removed. Project relation t[] / JOB / EXP stay.
+    """
+    kept = [
+        skill
+        for skill in candidate.skills
+        if _refs_nonempty(skill.source_refs)
+    ]
+    if len(kept) == len(candidate.skills):
+        return candidate
+    return candidate.model_copy(update={"skills": kept})
 
 
 def _project_evidence_anchors(project: ProjectCandidate) -> tuple[str, ...]:
@@ -1473,6 +1831,823 @@ def repair_whitespace_project_evidence(
     return out, counts
 
 
+# PROJECT JOB-MGT-PM / JOB-MGT-PL require a literal PM/PL token in some quote.
+# ASCII alnum boundaries: allow "PM", "[PM]", "PM 사업관리", "PM/PL"; reject "PMO".
+_PM_LITERAL_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9])PM(?![A-Za-z0-9])", re.IGNORECASE)
+_PL_LITERAL_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9])PL(?![A-Za-z0-9])", re.IGNORECASE)
+_TA_LITERAL_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9])TA(?![A-Za-z0-9])", re.IGNORECASE)
+_PM_PL_LITERAL_JOB_PATTERNS: dict[str, re.Pattern[str]] = {
+    "JOB-MGT-PM": _PM_LITERAL_TOKEN_RE,
+    "JOB-MGT-PL": _PL_LITERAL_TOKEN_RE,
+}
+# JOB codes eligible for v20 semantic project-row evidence backfill.
+# OPS-SYS/MGT reuse EXP-INFRA/EXP-MGT phrase rules; TA/PM/PL use literals.
+_JOB_SEMANTIC_EXP_ALIAS: dict[str, str] = {
+    "JOB-OPS-SYS": "EXP-INFRA",
+    "JOB-MGT": "EXP-MGT",
+}
+_JOB_LITERAL_TOKEN_PATTERNS: dict[str, re.Pattern[str]] = {
+    "JOB-ARC-TA": _TA_LITERAL_TOKEN_RE,
+    "JOB-MGT-PM": _PM_LITERAL_TOKEN_RE,
+    "JOB-MGT-PL": _PL_LITERAL_TOKEN_RE,
+}
+_JOB_SEMANTIC_BACKFILL_CODES = frozenset(_JOB_SEMANTIC_EXP_ALIAS) | frozenset(
+    _JOB_LITERAL_TOKEN_PATTERNS
+)
+
+
+def _project_job_has_literal_pm_pl_evidence(rel: CodeRefCandidate) -> bool:
+    """True when job is not PM/PL, or at least one quote has the required token."""
+    pattern = _PM_PL_LITERAL_JOB_PATTERNS.get((rel.code or "").strip())
+    if pattern is None:
+        return True
+    for ref in rel.source_refs or []:
+        quote = (ref.quote_text or "").strip()
+        if quote and pattern.search(quote):
+            return True
+    return False
+
+
+# Education status is free-form in schema; repo prompts/tests use Korean
+# 졸업/재학중/졸예. LLM may also emit GRADUATED/ENROLLED. Unknown → drop.
+_EDUCATION_STATUS_LITERALS: dict[str, tuple[str, ...]] = {
+    "GRADUATED": ("졸업",),
+    "졸업": ("졸업",),
+    "ENROLLED": ("재학",),
+    "재학": ("재학",),
+    "재학중": ("재학",),
+    "졸예": ("졸업예정", "졸예"),
+    "졸업예정": ("졸업예정", "졸예"),
+}
+
+
+def _education_status_literals(status: str) -> tuple[str, ...] | None:
+    key = status.strip()
+    if not key:
+        return None
+    if key in _EDUCATION_STATUS_LITERALS:
+        return _EDUCATION_STATUS_LITERALS[key]
+    return _EDUCATION_STATUS_LITERALS.get(key.upper())
+
+
+def _education_status_has_literal_evidence(row: EducationCandidate) -> bool:
+    status = (row.status or "").strip()
+    if not status:
+        return True
+    literals = _education_status_literals(status)
+    if literals is None:
+        return False
+    for ref in row.source_refs or []:
+        quote = ref.quote_text or ""
+        if any(lit in quote for lit in literals):
+            return True
+    return False
+
+
+def clear_education_status_without_literal_evidence(
+    candidate: ProfileCandidateDocument,
+) -> ProfileCandidateDocument:
+    """v20: clear EducationCandidate.status lacking literal status-word quotes.
+
+    Keeps the education row and school/major/degree/dates/source_refs.
+    Degree words alone (학사/석사/…) are not status evidence. Unknown status
+    values are fail-closed cleared.
+    """
+    changed = False
+    new_rows: list[EducationCandidate] = []
+    for row in candidate.education:
+        if _education_status_has_literal_evidence(row):
+            new_rows.append(row)
+            continue
+        changed = True
+        new_rows.append(row.model_copy(update={"status": None}))
+    if not changed:
+        return candidate
+    return candidate.model_copy(update={"education": new_rows})
+
+
+def normalize_career_document_value(
+    candidate: ProfileCandidateDocument,
+) -> ProfileCandidateDocument:
+    """v20: rewrite parseable profile.career_document_value to duration-only text.
+
+    Leaves technical_grade, source_refs, and all other fields unchanged.
+    """
+    from app.modules.analysis.career_document_months import (
+        normalize_career_document_value_text,
+    )
+
+    raw = candidate.profile.career_document_value
+    normalized = normalize_career_document_value_text(raw)
+    if normalized == raw:
+        return candidate
+    return candidate.model_copy(
+        update={
+            "profile": candidate.profile.model_copy(
+                update={"career_document_value": normalized}
+            )
+        }
+    )
+
+
+_LINE_DATE_YM_RE = re.compile(
+    r"(?<!\d)(\d{4})[./\-](\d{1,2})(?:[./\-]\d{1,2})?(?!\d)"
+)
+_PROJECT_ROW_RANGE_MARK_RE = re.compile(r"[~～]")
+# Project-row shape markers (name/customer/period table rows). Absence plus
+# employment section/title cues means the line is not usable as project evidence.
+_PROJECT_ROW_STRUCTURE_RE = re.compile(
+    r"사업|프로젝트|구축|정보화|BIA|BCP|이전통합|업무분석|사업관리|"
+    r"시스템\s*구축|IT시스템"
+)
+_EMPLOYMENT_SECTION_RE = re.compile(r"근무경력|재직기간")
+
+
+def _fold_ws_text(value: str) -> str:
+    return "".join(ch for ch in value if not ch.isspace())
+
+
+def _line_is_employment_history_row(
+    line: str, *, name_matched: bool = False
+) -> bool:
+    """True when a dated line is employment history, not a project row.
+
+    Project-name association or explicit project-structure markers keep the
+    line eligible. Employment section headers / title-only company rows are
+    rejected so they cannot backfill project BIZ/EXP evidence.
+    """
+    if name_matched:
+        return False
+    if _EMPLOYMENT_SECTION_RE.search(line):
+        return True
+    if _PROJECT_ROW_STRUCTURE_RE.search(line):
+        return False
+    # Customer/company + period + job title (or no project markers at all).
+    return True
+
+
+def _project_start_year_month(project: ProjectCandidate) -> tuple[int, int] | None:
+    """Candidate start as (year, month); accepts YYYY.MM or YYYY.MM.DD forms."""
+    ym = parse_year_month(project.start_date)
+    if ym is not None:
+        return ym
+    text = _optional_text(project.start_date)
+    if text is None:
+        return None
+    match = _LINE_DATE_YM_RE.search(text)
+    if match is None:
+        return None
+    year = int(match.group(1))
+    month = int(match.group(2))
+    if month < 1 or month > 12:
+        return None
+    return year, month
+
+
+def _line_has_year_month(line: str, year: int, month: int) -> bool:
+    for match in _LINE_DATE_YM_RE.finditer(line):
+        if int(match.group(1)) == year and int(match.group(2)) == month:
+            return True
+    return False
+
+
+def _quote_matches_project_start_month(
+    project: ProjectCandidate, quote: str
+) -> bool:
+    """True when quote start month equals candidate start (YYYY.MM or YY.MM)."""
+    start_ym = _project_start_year_month(project)
+    if start_ym is None:
+        return False
+    year, month = start_ym
+    if _line_has_year_month(quote, year, month):
+        return True
+    # PPTX root evidence often uses multi-line YY.MM ~ YY.MM spans.
+    parsed = parse_project_date_range_from_texts(
+        [quote], project_name=project.project_name
+    )
+    if parsed is None:
+        return False
+    return parse_year_month(parsed[0]) == start_ym
+
+
+def _line_has_ws_folded_phrase(line: str, phrase: str) -> bool:
+    needle = _fold_ws_text(phrase.strip())
+    if not needle:
+        return False
+    return needle in _fold_ws_text(line)
+
+
+def _extract_semantic_exp_quote(code: str, text: str) -> str | None:
+    """Shortest actual substring in ``text`` that supports the EXP code."""
+    patterns = _EXP_SEMANTIC_PATTERNS.get(code)
+    if not patterns:
+        return None
+    for _strength, phrase, companions in patterns:
+        if phrase not in text:
+            continue
+        if not companions:
+            return phrase
+        for req in companions:
+            if req not in text:
+                continue
+            i_phrase = text.find(phrase)
+            i_req = text.find(req)
+            start = min(i_phrase, i_req)
+            end = max(i_phrase + len(phrase), i_req + len(req))
+            span = text[start:end].strip()
+            if span and _quote_supports_semantic_exp(code, span):
+                return span
+    return None
+
+
+def _iter_allowed_page_lines(
+    page_texts: dict[tuple[str, int], str],
+    allowed_documents: dict[str, set[int]],
+):
+    for doc_id, page_no in sorted(page_texts.keys()):
+        if doc_id not in allowed_documents:
+            continue
+        pages = allowed_documents[doc_id]
+        if pages and page_no not in pages:
+            continue
+        page_text = page_texts.get((doc_id, page_no)) or ""
+        for raw_line in page_text.splitlines():
+            line = raw_line.strip()
+            if line:
+                yield doc_id, page_no, line
+
+
+def _find_unique_project_source_row(
+    project: ProjectCandidate,
+    *,
+    page_texts: dict[tuple[str, int], str],
+    allowed_documents: dict[str, set[int]],
+    line_predicate: Any | None = None,
+) -> tuple[str, int, str] | None:
+    """Fail-closed unique project source line for evidence backfill.
+
+    Requires start month precision, a ``~`` date-range marker, and either a
+    unique project_name (exact/ws-fold) hit or a unique customer+start hit.
+    ``line_predicate`` may further restrict candidate lines (e.g. EXP phrases).
+    """
+    start_ym = _project_start_year_month(project)
+    if start_ym is None:
+        return None
+    year, month = start_ym
+    name = (project.project_name or "").strip() or None
+    customer = (project.customer_name or "").strip() or None
+    if name is None and customer is None:
+        return None
+
+    named_hits: list[tuple[str, int, str]] = []
+    customer_hits: list[tuple[str, int, str]] = []
+    for doc_id, page_no, line in _iter_allowed_page_lines(
+        page_texts, allowed_documents
+    ):
+        if not _PROJECT_ROW_RANGE_MARK_RE.search(line):
+            continue
+        if not _line_has_year_month(line, year, month):
+            continue
+        if line_predicate is not None and not line_predicate(line):
+            continue
+        name_matched = bool(
+            name is not None
+            and (name in line or _line_has_ws_folded_phrase(line, name))
+        )
+        customer_matched = bool(
+            customer is not None and _line_has_ws_folded_phrase(line, customer)
+        )
+        if not name_matched and not customer_matched:
+            continue
+        if _line_is_employment_history_row(line, name_matched=name_matched):
+            continue
+        hit = (doc_id, page_no, line)
+        if name_matched:
+            named_hits.append(hit)
+        if customer_matched:
+            customer_hits.append(hit)
+
+    def _unique(
+        hits: list[tuple[str, int, str]],
+    ) -> tuple[str, int, str] | None:
+        uniq = list(dict.fromkeys(hits))
+        if len(uniq) != 1:
+            return None
+        return uniq[0]
+
+    if named_hits:
+        return _unique(named_hits)
+    if customer_hits:
+        return _unique(customer_hits)
+    return None
+
+
+def _find_unique_semantic_project_exp_ref(
+    project: ProjectCandidate,
+    code: str,
+    *,
+    page_texts: dict[tuple[str, int], str],
+    allowed_documents: dict[str, set[int]],
+) -> SourceRef | None:
+    """Fail-closed unique project-row match for semantic EXP quote backfill."""
+    row = _find_unique_project_source_row(
+        project,
+        page_texts=page_texts,
+        allowed_documents=allowed_documents,
+        line_predicate=lambda line: _quote_supports_semantic_exp(code, line),
+    )
+    if row is None:
+        return None
+    doc_id, page_no, line = row
+    quote = _extract_semantic_exp_quote(code, line)
+    if not quote:
+        return None
+    return SourceRef(document_id=doc_id, page_no=page_no, quote_text=quote)
+
+
+def _quote_supports_semantic_project_job(code: str, quote: str) -> bool:
+    """True when quote supports a known PROJECT JOB semantic/literal rule."""
+    text = (quote or "").strip()
+    if not text:
+        return False
+    exp_alias = _JOB_SEMANTIC_EXP_ALIAS.get(code)
+    if exp_alias is not None:
+        return _quote_supports_semantic_exp(exp_alias, text)
+    pattern = _JOB_LITERAL_TOKEN_PATTERNS.get(code)
+    if pattern is None:
+        return False
+    return pattern.search(text) is not None
+
+
+def _extract_semantic_project_job_quote(code: str, text: str) -> str | None:
+    """Minimal actual substring in ``text`` that supports the JOB code."""
+    exp_alias = _JOB_SEMANTIC_EXP_ALIAS.get(code)
+    if exp_alias is not None:
+        return _extract_semantic_exp_quote(exp_alias, text)
+    pattern = _JOB_LITERAL_TOKEN_PATTERNS.get(code)
+    if pattern is None:
+        return None
+    match = pattern.search(text)
+    if match is None:
+        return None
+    return text[match.start() : match.end()]
+
+
+def _find_unique_semantic_project_job_ref(
+    project: ProjectCandidate,
+    code: str,
+    *,
+    page_texts: dict[tuple[str, int], str],
+    allowed_documents: dict[str, set[int]],
+) -> SourceRef | None:
+    """Fail-closed unique project-row match for semantic JOB quote backfill."""
+    row = _find_unique_project_source_row(
+        project,
+        page_texts=page_texts,
+        allowed_documents=allowed_documents,
+        line_predicate=lambda line: _quote_supports_semantic_project_job(
+            code, line
+        ),
+    )
+    if row is None:
+        return None
+    doc_id, page_no, line = row
+    quote = _extract_semantic_project_job_quote(code, line)
+    if not quote:
+        return None
+    return SourceRef(document_id=doc_id, page_no=page_no, quote_text=quote)
+
+
+def _biz_ref_is_same_project_row(
+    project: ProjectCandidate, ref: SourceRef
+) -> bool:
+    """True when a quote is fail-closed same-project evidence for BIZ.
+
+    Allows multi-line PPTX root spans (YY.MM ranges). Requires start-month
+    match plus project_name or customer ws-fold match. Rejects employment-
+    history section text. Does not accept same-page/same-year alone.
+    """
+    quote = (ref.quote_text or "").strip()
+    if not quote:
+        return False
+    if not _PROJECT_ROW_RANGE_MARK_RE.search(quote):
+        return False
+    if _EMPLOYMENT_SECTION_RE.search(quote):
+        return False
+    if not _quote_matches_project_start_month(project, quote):
+        return False
+    name = (project.project_name or "").strip()
+    customer = (project.customer_name or "").strip()
+    name_ok = bool(name) and (
+        name in quote or _line_has_ws_folded_phrase(quote, name)
+    )
+    cust_ok = bool(customer) and _line_has_ws_folded_phrase(quote, customer)
+    return name_ok or cust_ok
+
+
+def _find_reusable_project_root_ref_for_biz(
+    project: ProjectCandidate,
+) -> SourceRef | None:
+    """First project.root source_ref that is fail-closed same-project evidence."""
+    for ref in project.source_refs or []:
+        if _biz_ref_is_same_project_row(project, ref):
+            return ref
+    return None
+
+
+def backfill_project_biz_evidence(
+    candidate: ProfileCandidateDocument,
+    *,
+    page_texts: dict[tuple[str, int], str] | None,
+    allowed_documents: dict[str, set[int]],
+) -> ProfileCandidateDocument:
+    """v20: repair PROJECT business_domains refs from unique project source rows.
+
+    Keeps existing BIZ codes/counts; only fills/replaces ``source_refs`` when
+    fail-closed same-project evidence is found. Order:
+    1) preserve existing valid BIZ refs
+    2) reuse project.source_refs (multi-line PPTX roots allowed)
+    3) unique page_texts line-level project row
+    """
+    if not candidate.projects:
+        return candidate
+    changed = False
+    new_projects: list[ProjectCandidate] = []
+    for project in candidate.projects:
+        new_biz: list[CodeRefCandidate] = []
+        project_changed = False
+        root_reuse = _find_reusable_project_root_ref_for_biz(project)
+        for rel in project.business_domains:
+            if any(
+                _biz_ref_is_same_project_row(project, ref)
+                for ref in (rel.source_refs or [])
+            ):
+                new_biz.append(rel)
+                continue
+            if root_reuse is not None:
+                project_changed = True
+                new_biz.append(
+                    rel.model_copy(update={"source_refs": [root_reuse]})
+                )
+                continue
+            if not page_texts:
+                new_biz.append(rel)
+                continue
+            row = _find_unique_project_source_row(
+                project,
+                page_texts=page_texts,
+                allowed_documents=allowed_documents,
+            )
+            if row is None:
+                new_biz.append(rel)
+                continue
+            doc_id, page_no, line = row
+            match = SourceRef(
+                document_id=doc_id, page_no=page_no, quote_text=line
+            )
+            project_changed = True
+            new_biz.append(rel.model_copy(update={"source_refs": [match]}))
+        if project_changed:
+            changed = True
+            new_projects.append(
+                project.model_copy(update={"business_domains": new_biz})
+            )
+        else:
+            new_projects.append(project)
+    if not changed:
+        return candidate
+    return candidate.model_copy(update={"projects": new_projects})
+
+
+_PM_PL_TO_OPS_REPAIR_CODES = frozenset({"JOB-MGT-PM", "JOB-MGT-PL"})
+# JOB codes checked by v20 PROJECT JOB semantic guard (PM/PL keep separate guard).
+_JOB_SEMANTIC_GUARD_CODES = frozenset({"JOB-MGT", "JOB-OPS-SYS", "JOB-ARC-TA"})
+
+
+def repair_project_pm_pl_to_ops_sys(
+    candidate: ProfileCandidateDocument,
+    *,
+    page_texts: dict[tuple[str, int], str] | None,
+    allowed_documents: dict[str, set[int]],
+) -> tuple[ProfileCandidateDocument, int]:
+    """v20: reclassify unsupported PROJECT PM/PL → JOB-OPS-SYS when OPS evidence exists.
+
+    Applies only to existing ``project.jobs`` with code JOB-MGT-PM / JOB-MGT-PL
+    that lack literal PM/PL tokens in ``source_refs``, when a fail-closed unique
+    same-project source row strongly supports JOB-OPS-SYS. Sets
+    ``code=JOB-OPS-SYS`` and ``source_refs=[semantic span]``. Does not create
+    relations, increase relation count, or touch root jobs / EXP / TECH / BIZ /
+    scalars. Literal PM/PL (boundary-safe; PMO ≠ PM) never repairs.
+    """
+    if not page_texts or not candidate.projects:
+        return candidate, 0
+    repaired = 0
+    changed = False
+    new_projects: list[ProjectCandidate] = []
+    for project in candidate.projects:
+        new_jobs: list[CodeRefCandidate] = []
+        project_changed = False
+        for rel in project.jobs:
+            code = (rel.code or "").strip()
+            if code not in _PM_PL_TO_OPS_REPAIR_CODES:
+                new_jobs.append(rel)
+                continue
+            if _project_job_has_literal_pm_pl_evidence(rel):
+                new_jobs.append(rel)
+                continue
+            match = _find_unique_semantic_project_job_ref(
+                project,
+                "JOB-OPS-SYS",
+                page_texts=page_texts,
+                allowed_documents=allowed_documents,
+            )
+            if match is None:
+                new_jobs.append(rel)
+                continue
+            project_changed = True
+            repaired += 1
+            new_jobs.append(
+                rel.model_copy(
+                    update={"code": "JOB-OPS-SYS", "source_refs": [match]}
+                )
+            )
+        if project_changed:
+            changed = True
+            new_projects.append(project.model_copy(update={"jobs": new_jobs}))
+        else:
+            new_projects.append(project)
+    if not changed:
+        return candidate, 0
+    return candidate.model_copy(update={"projects": new_projects}), repaired
+
+
+def _project_job_has_literal_mgt_evidence(rel: CodeRefCandidate) -> bool:
+    """True when any JOB-MGT quote contains literal 사업관리."""
+    return any(
+        _quote_supports_semantic_project_job("JOB-MGT", ref.quote_text or "")
+        for ref in (rel.source_refs or [])
+    )
+
+
+def repair_project_mgt_to_ops_sys(
+    candidate: ProfileCandidateDocument,
+    *,
+    page_texts: dict[tuple[str, int], str] | None,
+    allowed_documents: dict[str, set[int]],
+) -> tuple[ProfileCandidateDocument, int]:
+    """v20: reclassify unsupported PROJECT JOB-MGT → JOB-OPS-SYS when OPS exists.
+
+    Applies only to existing ``project.jobs`` with code JOB-MGT that lack
+    literal ``사업관리`` in ``source_refs``, when a fail-closed unique
+    same-project source row strongly supports JOB-OPS-SYS. Sets
+    ``code=JOB-OPS-SYS`` and ``source_refs=[semantic span]``. Does not create
+    relations or touch root jobs / EXP / TECH / BIZ / scalars. Literal
+    사업관리 never repairs (preserve JOB-MGT).
+    """
+    if not page_texts or not candidate.projects:
+        return candidate, 0
+    repaired = 0
+    changed = False
+    new_projects: list[ProjectCandidate] = []
+    for project in candidate.projects:
+        new_jobs: list[CodeRefCandidate] = []
+        project_changed = False
+        for rel in project.jobs:
+            code = (rel.code or "").strip()
+            if code != "JOB-MGT":
+                new_jobs.append(rel)
+                continue
+            if _project_job_has_literal_mgt_evidence(rel):
+                new_jobs.append(rel)
+                continue
+            match = _find_unique_semantic_project_job_ref(
+                project,
+                "JOB-OPS-SYS",
+                page_texts=page_texts,
+                allowed_documents=allowed_documents,
+            )
+            if match is None:
+                new_jobs.append(rel)
+                continue
+            project_changed = True
+            repaired += 1
+            new_jobs.append(
+                rel.model_copy(
+                    update={"code": "JOB-OPS-SYS", "source_refs": [match]}
+                )
+            )
+        if project_changed:
+            changed = True
+            new_projects.append(project.model_copy(update={"jobs": new_jobs}))
+        else:
+            new_projects.append(project)
+    if not changed:
+        return candidate, 0
+    return candidate.model_copy(update={"projects": new_projects}), repaired
+
+
+def _project_job_has_semantic_guard_evidence(rel: CodeRefCandidate) -> bool:
+    """True when job is out of guard scope or has supporting semantic/literal quote."""
+    code = (rel.code or "").strip()
+    if code not in _JOB_SEMANTIC_GUARD_CODES:
+        return True
+    return any(
+        _quote_supports_semantic_project_job(code, ref.quote_text or "")
+        for ref in (rel.source_refs or [])
+    )
+
+
+def drop_project_jobs_without_semantic_evidence(
+    candidate: ProfileCandidateDocument,
+) -> ProfileCandidateDocument:
+    """v20: drop PROJECT JOB-MGT/OPS-SYS/TA lacking semantic/literal quotes.
+
+    JOB-MGT needs literal 사업관리; JOB-OPS-SYS needs strong OPS phrases;
+    JOB-ARC-TA needs boundary-safe TA. JOB-MGT-PM/PL and other JOB codes are
+    left for their dedicated guards / unchanged. Root jobs stay.
+    """
+    changed = False
+    new_projects: list[ProjectCandidate] = []
+    for project in candidate.projects:
+        kept_jobs = [
+            job
+            for job in project.jobs
+            if _project_job_has_semantic_guard_evidence(job)
+        ]
+        if len(kept_jobs) != len(project.jobs):
+            changed = True
+            new_projects.append(project.model_copy(update={"jobs": kept_jobs}))
+        else:
+            new_projects.append(project)
+    if not changed:
+        return candidate
+    return candidate.model_copy(update={"projects": new_projects})
+
+
+def backfill_semantic_project_job_evidence(
+    candidate: ProfileCandidateDocument,
+    *,
+    page_texts: dict[tuple[str, int], str] | None,
+    allowed_documents: dict[str, set[int]],
+) -> ProfileCandidateDocument:
+    """v20: repair PROJECT JOB refs from a unique semantic project source row.
+
+    Only existing ``project.jobs`` for known JOB semantic codes (OPS-SYS, MGT,
+    TA, PM, PL). Does not create/reclassify JOB codes. Leaves already-supporting
+    refs unchanged. Never modifies root jobs, EXP/TECH/BIZ, or project scalars.
+    """
+    if not page_texts or not candidate.projects:
+        return candidate
+    changed = False
+    new_projects: list[ProjectCandidate] = []
+    for project in candidate.projects:
+        new_jobs: list[CodeRefCandidate] = []
+        project_changed = False
+        for rel in project.jobs:
+            code = (rel.code or "").strip()
+            if code not in _JOB_SEMANTIC_BACKFILL_CODES:
+                new_jobs.append(rel)
+                continue
+            if any(
+                _quote_supports_semantic_project_job(code, ref.quote_text or "")
+                for ref in (rel.source_refs or [])
+            ):
+                new_jobs.append(rel)
+                continue
+            match = _find_unique_semantic_project_job_ref(
+                project,
+                code,
+                page_texts=page_texts,
+                allowed_documents=allowed_documents,
+            )
+            if match is None:
+                new_jobs.append(rel)
+                continue
+            project_changed = True
+            new_jobs.append(rel.model_copy(update={"source_refs": [match]}))
+        if project_changed:
+            changed = True
+            new_projects.append(project.model_copy(update={"jobs": new_jobs}))
+        else:
+            new_projects.append(project)
+    if not changed:
+        return candidate
+    return candidate.model_copy(update={"projects": new_projects})
+
+
+def backfill_semantic_project_expertise_evidence(
+    candidate: ProfileCandidateDocument,
+    *,
+    page_texts: dict[tuple[str, int], str] | None,
+    allowed_documents: dict[str, set[int]],
+) -> ProfileCandidateDocument:
+    """v20: repair PROJECT EXP refs from a unique semantic project source row.
+
+    Only existing ``project.expertise`` relations for known EXP codes. Does not
+    create new EXP codes. Leaves already-supporting refs unchanged. Never
+    modifies jobs/skills/domains/root expertise or project scalars.
+    """
+    if not page_texts or not candidate.projects:
+        return candidate
+    changed = False
+    new_projects: list[ProjectCandidate] = []
+    for project in candidate.projects:
+        new_exp: list[CodeRefCandidate] = []
+        project_changed = False
+        for rel in project.expertise:
+            code = (rel.code or "").strip()
+            if code not in _EXP_SEMANTIC_PATTERNS:
+                new_exp.append(rel)
+                continue
+            if any(
+                _quote_supports_semantic_exp(code, ref.quote_text or "")
+                for ref in (rel.source_refs or [])
+            ):
+                new_exp.append(rel)
+                continue
+            match = _find_unique_semantic_project_exp_ref(
+                project,
+                code,
+                page_texts=page_texts,
+                allowed_documents=allowed_documents,
+            )
+            if match is None:
+                new_exp.append(rel)
+                continue
+            project_changed = True
+            new_exp.append(rel.model_copy(update={"source_refs": [match]}))
+        if project_changed:
+            changed = True
+            new_projects.append(project.model_copy(update={"expertise": new_exp}))
+        else:
+            new_projects.append(project)
+    if not changed:
+        return candidate
+    return candidate.model_copy(update={"projects": new_projects})
+
+
+def drop_project_expertise_without_semantic_evidence(
+    candidate: ProfileCandidateDocument,
+) -> ProfileCandidateDocument:
+    """v20: drop PROJECT expertise whose quotes do not support known EXP codes.
+
+    Only ``project.expertise`` for EXP-INFRA/MGT/SEC-OPS/SEC-BUILD. Unknown EXP
+    codes, root expertise, jobs/skills/domains, and the project row stay.
+    Any one supporting quote keeps the relation.
+    """
+    changed = False
+    new_projects: list[ProjectCandidate] = []
+    for project in candidate.projects:
+        kept_exp: list[CodeRefCandidate] = []
+        dropped = False
+        for rel in project.expertise:
+            code = (rel.code or "").strip()
+            if code not in _EXP_SEMANTIC_PATTERNS:
+                kept_exp.append(rel)
+                continue
+            if any(
+                _quote_supports_semantic_exp(code, ref.quote_text or "")
+                for ref in (rel.source_refs or [])
+            ):
+                kept_exp.append(rel)
+                continue
+            dropped = True
+        if dropped:
+            changed = True
+            new_projects.append(project.model_copy(update={"expertise": kept_exp}))
+        else:
+            new_projects.append(project)
+    if not changed:
+        return candidate
+    return candidate.model_copy(update={"projects": new_projects})
+
+
+def drop_project_jobs_without_literal_pm_pl_evidence(
+    candidate: ProfileCandidateDocument,
+) -> ProfileCandidateDocument:
+    """v20: drop PROJECT JOB-MGT-PM/PL lacking literal PM/PL quote tokens.
+
+    Only project ``jobs`` relations are filtered. Root jobs, other JOB codes
+    (e.g. JOB-ARC-TA), skills/expertise/domains, and the project itself stay.
+    """
+    changed = False
+    new_projects: list[ProjectCandidate] = []
+    for project in candidate.projects:
+        kept_jobs = [
+            job
+            for job in project.jobs
+            if _project_job_has_literal_pm_pl_evidence(job)
+        ]
+        if len(kept_jobs) != len(project.jobs):
+            changed = True
+            new_projects.append(project.model_copy(update={"jobs": kept_jobs}))
+        else:
+            new_projects.append(project)
+    if not changed:
+        return candidate
+    return candidate.model_copy(update={"projects": new_projects})
+
+
 def apply_normalized_quote_evidence(
     candidate: ProfileCandidateDocument,
 ) -> ProfileCandidateDocument:
@@ -1517,3 +2692,175 @@ def apply_normalized_quote_evidence(
     ):
         return candidate
     return candidate.model_copy(update={"projects": kept})
+
+
+def _project_names_identity_match(a: ProjectCandidate, b: ProjectCandidate) -> bool:
+    na = (a.project_name or "").strip()
+    nb = (b.project_name or "").strip()
+    if not na or not nb:
+        return False
+    return na == nb or _fold_ws_text(na) == _fold_ws_text(nb)
+
+
+def _project_customers_identity_match(a: ProjectCandidate, b: ProjectCandidate) -> bool:
+    ca = (a.customer_name or "").strip()
+    cb = (b.customer_name or "").strip()
+    if not ca or not cb:
+        return False
+    return _fold_ws_text(ca) == _fold_ws_text(cb)
+
+
+def _project_date_parts_local(
+    value: Any,
+) -> tuple[int, int | None, int | None] | None:
+    """Parse PROJECT dates (YYYY.MM / YYYY-MM / YYYY.MM.DD / YYYY-MM-DD).
+
+    Local minimal helper — does not import diff_engine private parsers.
+    Year-only is rejected for identity (month precision required later).
+    """
+    text = _optional_text(value)
+    if text is None:
+        return None
+    folded = text.split("T", 1)[0] if "T" in text else text
+    folded = folded.replace(".", "-").replace("/", "-").strip()
+    parts = folded.split("-")
+    if not parts or not parts[0].isdigit() or len(parts[0]) != 4:
+        return None
+    year = int(parts[0])
+    if year < 1900 or year > 2100:
+        return None
+    month: int | None = None
+    day: int | None = None
+    if len(parts) >= 2 and parts[1].isdigit():
+        month = int(parts[1])
+        if month < 1 or month > 12:
+            return None
+    if len(parts) >= 3 and parts[2].isdigit():
+        day = int(parts[2])
+        if day < 1 or day > 31:
+            return None
+    if day is not None and month is None:
+        return None
+    return year, month, day
+
+
+def _project_dates_prefix_compatible(a: Any, b: Any) -> bool:
+    """Symmetric PROJECT date compatibility (no ±1 month, no year-only).
+
+    Month precision vs day-in-same-month is compatible in either direction.
+    Both sides need at least year+month.
+    """
+    if _optional_text(a) is None or _optional_text(b) is None:
+        return False
+    pa = _project_date_parts_local(a)
+    pb = _project_date_parts_local(b)
+    if pa is None or pb is None:
+        return False
+    ya, ma, da = pa
+    yb, mb, db = pb
+    if ma is None or mb is None:
+        return False
+    if ya != yb or ma != mb:
+        return False
+    if da is not None and db is not None and da != db:
+        return False
+    return True
+
+
+def _project_period_compatible(a: ProjectCandidate, b: ProjectCandidate) -> bool:
+    """Reuse PROJECT date precision policy (prefix-compatible; no ±1 month)."""
+    return _project_dates_prefix_compatible(
+        a.start_date, b.start_date
+    ) and _project_dates_prefix_compatible(a.end_date, b.end_date)
+
+
+def _project_ym_ordinal(value: Any) -> int | None:
+    """Month ordinal for overlap; requires year+month precision."""
+    parts = _project_date_parts_local(value)
+    if parts is None or parts[1] is None:
+        return None
+    year, month, _day = parts
+    return year * 12 + (month - 1)
+
+
+def _project_periods_month_overlap(
+    a: ProjectCandidate, b: ProjectCandidate
+) -> bool:
+    """Inclusive month-range overlap; missing/invalid bounds → False."""
+    sa = _project_ym_ordinal(a.start_date)
+    ea = _project_ym_ordinal(a.end_date)
+    sb = _project_ym_ordinal(b.start_date)
+    eb = _project_ym_ordinal(b.end_date)
+    if sa is None or ea is None or sb is None or eb is None:
+        return False
+    if ea < sa or eb < sb:
+        return False
+    return max(sa, sb) <= min(ea, eb)
+
+
+def _project_name_customer_start_overlap_match(
+    a: ProjectCandidate, b: ProjectCandidate
+) -> bool:
+    """Fail-closed second-pass duplicate when end months disagree but periods overlap.
+
+    Requires same name (exact/ws-fold), both customers non-empty + ws-fold equal,
+    start month-precision compatible, and month-unit period overlap.
+    """
+    return (
+        _project_names_identity_match(a, b)
+        and _project_customers_identity_match(a, b)
+        and _project_dates_prefix_compatible(a.start_date, b.start_date)
+        and _project_periods_month_overlap(a, b)
+    )
+
+
+def _second_project_matches_first(
+    first_projects: list[ProjectCandidate], second: ProjectCandidate
+) -> bool:
+    """True when second should not be appended (same identity or ambiguous).
+
+    Fail-closed: name+compatible dates match, or unique customer+compatible
+    dates match, or ambiguous multi customer+date hits → treat as covered /
+    non-supplement (never invent a duplicate). Also name+customer+compatible
+    start with month-period overlap (end may differ).
+    """
+    for first in first_projects:
+        if _project_names_identity_match(first, second) and _project_period_compatible(
+            first, second
+        ):
+            return True
+        if _project_name_customer_start_overlap_match(first, second):
+            return True
+    customer_hits = [
+        first
+        for first in first_projects
+        if _project_customers_identity_match(first, second)
+        and _project_period_compatible(first, second)
+    ]
+    # Unique customer hit → same project. Ambiguous (>1) → do not supplement.
+    return len(customer_hits) >= 1
+
+
+def supplement_projects_from_second_pass(
+    first: ProfileCandidateDocument,
+    second: ProfileCandidateDocument,
+) -> tuple[ProfileCandidateDocument, int]:
+    """Append unmatched second-pass projects; first projects/relations win.
+
+    Does not create source-only projects, does not merge scalars/relations for
+    matched identities, and never removes/overwrites first projects.
+    """
+    first_projects = list(first.projects)
+    extras: list[ProjectCandidate] = []
+    for cand in second.projects:
+        # Compare against first + already-accepted extras so second-pass
+        # internal duplicates are not appended twice.
+        if _second_project_matches_first(first_projects + extras, cand):
+            continue
+        extras.append(cand)
+    if not extras:
+        return first, 0
+    return (
+        first.model_copy(update={"projects": first_projects + extras}),
+        len(extras),
+    )

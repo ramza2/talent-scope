@@ -86,6 +86,30 @@ def parse_career_document_months(value: str | None) -> int | None:
     return None
 
 
+def format_career_document_months(total_months: int) -> str:
+    """Canonical short duration text from whole months."""
+    years, months = divmod(int(total_months), 12)
+    if years > 0 and months > 0:
+        return f"{years}년 {months}개월"
+    if years > 0:
+        return f"{years}년"
+    return f"{months}개월"
+
+
+def normalize_career_document_value_text(value: str | None) -> str | None:
+    """Strip grade/prefix noise to canonical duration when parseable.
+
+    Reuses ``parse_career_document_months``. Approximate / range / unparseable
+    values are returned unchanged (no guessing).
+    """
+    if value is None or not isinstance(value, str):
+        return value
+    months = parse_career_document_months(value)
+    if months is None:
+        return value
+    return format_career_document_months(months)
+
+
 def _has_approx_or_range_marker(text: str) -> bool:
     return _APPROX_OR_RANGE_MARKER.search(text) is not None
 

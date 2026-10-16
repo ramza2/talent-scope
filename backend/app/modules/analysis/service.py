@@ -49,13 +49,30 @@ from app.modules.analysis.compact_v8 import (
     apply_normalized_quote_evidence,
     backfill_exact_core_evidence,
     backfill_exact_project_evidence,
+    backfill_project_dates_from_root_evidence,
     build_document_alias_view,
+    backfill_semantic_core_expertise_evidence,
+    clear_education_status_without_literal_evidence,
+    drop_core_skills_without_quote_evidence,
+    drop_generic_activity_core_skills,
+    backfill_project_biz_evidence,
+    backfill_semantic_project_expertise_evidence,
+    backfill_semantic_project_job_evidence,
+    count_project_job_code_distribution,
+    count_project_jobs_with_quote_evidence,
+    drop_project_expertise_without_semantic_evidence,
+    drop_project_jobs_without_literal_pm_pl_evidence,
+    drop_project_jobs_without_semantic_evidence,
+    repair_project_mgt_to_ops_sys,
+    repair_project_pm_pl_to_ops_sys,
+    normalize_career_document_value,
     expand_compact_core,
     expand_compact_projects,
     is_valid_compact_projects_root,
     project_relation_diagnostic_counts,
     promote_exact_root_catalog_codes,
     repair_whitespace_project_evidence,
+    supplement_projects_from_second_pass,
 )
 from app.modules.analysis.diff_engine import DiffSpec, build_diffs
 from app.modules.analysis.normalize import normalize_candidate
@@ -1397,6 +1414,27 @@ class AnalysisService:
                     page_texts=page_texts,
                     allowed_documents=allowed_documents,
                 )
+            # v20: drop root TECH skills whose raw_value is activity-only, then
+            # drop skills that still lack quote evidence after exact backfill.
+            if prompt.drop_generic_activity_core_tech:
+                doc = drop_generic_activity_core_skills(doc)
+            if prompt.require_core_tech_quote_evidence:
+                doc = drop_core_skills_without_quote_evidence(doc)
+            # v20: keep only parseable total-career duration in p.cdv
+            # (strip grade/prefix noise; leave approx/range untouched).
+            if prompt.normalize_career_document_value:
+                doc = normalize_career_document_value(doc)
+            # v20: education st needs literal status words in quote evidence.
+            if prompt.require_literal_education_status_evidence:
+                doc = clear_education_status_without_literal_evidence(doc)
+            # v20: known root EXP codes get semantic phrase provenance when
+            # exact raw_value backfill left source_refs empty.
+            if prompt.backfill_semantic_core_exp_evidence:
+                doc = backfill_semantic_core_expertise_evidence(
+                    doc,
+                    page_texts=page_texts,
+                    allowed_documents=allowed_documents,
+                )
             return doc
 
         def _normalize_projects(raw: dict[str, Any]) -> ProfileCandidateDocument:
@@ -1443,6 +1481,9 @@ class AnalysisService:
                     doc,
                     page_texts=page_texts,
                 )
+            # v20: fill missing project s/e from unique root-quote date ranges.
+            if prompt.backfill_project_dates_from_root_evidence:
+                doc = backfill_project_dates_from_root_evidence(doc)
             projects_with_quote = sum(
                 1
                 for project in doc.projects
@@ -1453,10 +1494,76 @@ class AnalysisService:
             )
             # Snapshot after normalize/backfill, before strict quote filter.
             pre_strict = doc
+            # v20: repair known PROJECT EXP refs from a unique semantic
+            # project-row span before strict/semantic drop filters.
+            if prompt.backfill_semantic_project_exp_evidence:
+                doc = backfill_semantic_project_expertise_evidence(
+                    doc,
+                    page_texts=page_texts,
+                    allowed_documents=allowed_documents,
+                )
+            # v20: repair PROJECT BIZ relation provenance from unique project
+            # source rows (codes unchanged; no reclassification).
+            if prompt.backfill_project_biz_evidence:
+                doc = backfill_project_biz_evidence(
+                    doc,
+                    page_texts=page_texts,
+                    allowed_documents=allowed_documents,
+                )
+            # v20: reclassify unsupported PROJECT PM/PL → JOB-OPS-SYS when a
+            # unique same-project row has strong OPS semantic evidence.
+            project_job_pm_pl_to_ops_repaired = 0
+            if prompt.repair_project_pm_pl_to_ops_sys:
+                doc, project_job_pm_pl_to_ops_repaired = (
+                    repair_project_pm_pl_to_ops_sys(
+                        doc,
+                        page_texts=page_texts,
+                        allowed_documents=allowed_documents,
+                    )
+                )
+            # v20: reclassify unsupported PROJECT JOB-MGT → JOB-OPS-SYS when a
+            # unique same-project row has strong OPS semantic evidence.
+            project_job_mgt_to_ops_repaired = 0
+            if prompt.repair_project_mgt_to_ops_sys:
+                doc, project_job_mgt_to_ops_repaired = (
+                    repair_project_mgt_to_ops_sys(
+                        doc,
+                        page_texts=page_texts,
+                        allowed_documents=allowed_documents,
+                    )
+                )
+            # v20: repair known PROJECT JOB refs from unique semantic
+            # project-row spans before strict quote filter.
+            jobs_with_quote_before_job_backfill = (
+                count_project_jobs_with_quote_evidence(doc)
+            )
+            if prompt.backfill_semantic_project_job_evidence:
+                doc = backfill_semantic_project_job_evidence(
+                    doc,
+                    page_texts=page_texts,
+                    allowed_documents=allowed_documents,
+                )
+            job_semantic_backfilled_refs = max(
+                0,
+                count_project_jobs_with_quote_evidence(doc)
+                - jobs_with_quote_before_job_backfill,
+            )
+            pre_strict_job_codes = count_project_job_code_distribution(doc)
             # v10+: after normalize may clear quotes / drop invalid refs, re-check
             # that projects and j/t/x still have non-empty quote_text evidence.
             if prompt.strict_relation_evidence:
                 doc = apply_normalized_quote_evidence(doc)
+            # v20: JOB-MGT / OPS-SYS / TA need supporting semantic/literal quotes.
+            if prompt.require_semantic_project_job_evidence:
+                doc = drop_project_jobs_without_semantic_evidence(doc)
+            # v20: known PROJECT EXP codes need quote phrases that actually
+            # support the EXP (e.g. 업무분석 ≠ EXP-INFRA).
+            if prompt.require_semantic_project_exp_evidence:
+                doc = drop_project_expertise_without_semantic_evidence(doc)
+            # v20: JOB-MGT-PM/PL need literal PM/PL tokens in quote_text, not
+            # merely any non-empty quote (e.g. "부장" / "사업관리" alone).
+            if prompt.require_literal_pm_pl_project_job_evidence:
+                doc = drop_project_jobs_without_literal_pm_pl_evidence(doc)
             if prompt.backfill_exact_project_evidence or prompt.strict_relation_evidence:
                 logger.info(
                     "analysis project root evidence analysis_run_id=%s "
@@ -1546,6 +1653,19 @@ class AnalysisService:
                 rel["dropped_during_strict_filter_j"],
                 rel["dropped_during_strict_filter_t"],
                 rel["dropped_during_strict_filter_x"],
+            )
+            # Codes/counts only: pre-strict PROJECT job code distribution and
+            # how many JOB relations gained quote_text via semantic backfill.
+            logger.info(
+                "analysis project job codes analysis_run_id=%s "
+                "pre_strict_job_codes=%s job_semantic_backfilled_refs=%s "
+                "project_job_pm_pl_to_ops_repaired=%s "
+                "project_job_mgt_to_ops_repaired=%s",
+                base_log.get("analysis_run_id"),
+                pre_strict_job_codes,
+                job_semantic_backfilled_refs,
+                project_job_pm_pl_to_ops_repaired,
+                project_job_mgt_to_ops_repaired,
             )
             return doc
 
@@ -1640,6 +1760,60 @@ class AnalysisService:
             base_log.get("document_count"),
             vlm_pages,
             len(projects_doc.projects),
+        )
+
+        # v20: bounded PROJECT recall second-pass. Keep first normalized
+        # projects; append only unmatched second-pass survivors. Uses the
+        # shared recovery budget (max 1) and overall LLM call cap (max 3).
+        project_recall_second_pass = 0
+        project_first_count = len(projects_doc.projects)
+        project_second_count = 0
+        project_supplemented = 0
+        if (
+            prompt.recover_project_recall_second_pass
+            and recovery_budget > 0
+            and call_count < 3
+            and source_char_count >= _SPARSE_MIN_SOURCE_CHARS
+            and _documents_are_rich_profile_type(documents)
+        ):
+            recovery_budget -= 1
+            project_recall_second_pass = 1
+            try:
+                raw_second = _phase_call(
+                    phase="projects",
+                    system_prompt=prompt.projects_system_prompt,
+                    build_user_prompt=prompt.build_projects_user_prompt,
+                    code_catalog_text=projects_catalog,
+                    recovery_retry=True,
+                )
+                if prompt.validate_projects_recovery_root:
+                    _validate_projects_recovery_raw(raw_second)
+                second_doc = _normalize_projects(raw_second)
+                project_second_count = len(second_doc.projects)
+                projects_doc, project_supplemented = (
+                    supplement_projects_from_second_pass(projects_doc, second_doc)
+                )
+            except (
+                AIResponseTruncatedError,
+                AIResponseValidationError,
+                InsufficientCandidateError,
+                AIProviderError,
+            ):
+                # Fail closed: keep first-pass projects unchanged.
+                project_second_count = 0
+                project_supplemented = 0
+        logger.info(
+            "analysis project recall second pass analysis_run_id=%s "
+            "project_recall_second_pass=%s project_first_count=%s "
+            "project_second_count=%s project_supplemented=%s "
+            "project_union_count=%s llm_calls=%s",
+            base_log.get("analysis_run_id"),
+            project_recall_second_pass,
+            project_first_count,
+            project_second_count,
+            project_supplemented,
+            len(projects_doc.projects),
+            call_count,
         )
 
         merged = core.model_copy(update={"projects": list(projects_doc.projects)})

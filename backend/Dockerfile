@@ -33,7 +33,8 @@ RUN pip install --upgrade pip \
 # them only in the dedicated test target selected by docker-compose.server.yml.
 FROM base AS test
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends nodejs npm \
+    && apt-get install -y --no-install-recommends git nodejs npm \
+    && git config --system --add safe.directory /workspace \
     && rm -rf /var/lib/apt/lists/*
 
 FROM base AS runtime

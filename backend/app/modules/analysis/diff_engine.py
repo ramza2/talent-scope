@@ -12,7 +12,10 @@ from app.ai.schemas.profile_candidate import (
     ProfileCandidateDocument,
 )
 from app.core.person_name import person_name_match_key
-from app.modules.analysis.career_document_months import parse_career_document_months
+from app.modules.analysis.career_document_months import (
+    normalize_career_document_value_text,
+    parse_career_document_months,
+)
 
 EMPLOYMENT_FIELDS: tuple[str, ...] = (
     "company_name",
@@ -216,6 +219,30 @@ def _dump_model(row: Any) -> dict[str, Any]:
     return dict(row)
 
 
+def _career_document_value_change(old_val: Any, new_val: Any) -> str:
+    """career_document_value-only: semantic-equivalent cleanup → UPDATE.
+
+    When both sides parse to the same months and ``new_val`` is already
+    canonical duration text, emit UPDATE so a reviewer can replace a noisy
+    confirmed string with the cleaned candidate. Otherwise CONFLICT.
+    """
+    old_months = parse_career_document_months(
+        old_val if isinstance(old_val, str) else None
+    )
+    new_months = parse_career_document_months(
+        new_val if isinstance(new_val, str) else None
+    )
+    if old_months is None or new_months is None:
+        return "CONFLICT"
+    if old_months != new_months:
+        return "CONFLICT"
+    if not isinstance(new_val, str):
+        return "CONFLICT"
+    if normalize_career_document_value_text(new_val) != new_val:
+        return "CONFLICT"
+    return "UPDATE"
+
+
 def _diff_profile_scalars(
     candidate: ProfileCandidateDocument, profile_snap: dict[str, Any]
 ) -> list[DiffSpec]:
@@ -245,8 +272,10 @@ def _diff_profile_scalars(
             change = "SAME"
         elif old_val is None or old_val == "":
             change = "NEW"
+        elif field_name == "career_document_value":
+            change = _career_document_value_change(old_val, new_val)
         else:
-            # Never auto-UPDATE scalars when both sides are non-null.
+            # Never auto-UPDATE other scalars when both sides are non-null.
             change = "CONFLICT"
         specs.append(
             DiffSpec(
@@ -834,6 +863,49 @@ def _project_dates_equal(a: Any, b: Any) -> bool:
     return ka == kb
 
 
+def _project_date_parts(value: Any) -> tuple[int, int | None, int | None] | None:
+    """Parse project dates after folding ``.`` / ``/`` separators (PROJECT-only)."""
+    text = _norm_str(value)
+    if not text:
+        return None
+    folded = text.split("T", 1)[0] if "T" in text else text
+    folded = folded.replace(".", "-").replace("/", "-")
+    return parse_date_parts(folded)
+
+
+def _project_date_precision_compatible(*, candidate: Any, existing: Any) -> bool:
+    """Directional PROJECT-only date compatibility for identity/field diff.
+
+    Rules (no year-only, no fuzzy / ±1 month):
+    - Same canonical key (format fold of equal precision) → compatible.
+    - candidate ``YYYY.MM`` vs existing ``YYYY-MM-DD``: same year/month → compatible.
+    - candidate ``YYYY.MM`` vs existing ``YYYY.MM``: exact year/month → compatible.
+    - candidate ``YYYY-MM-DD`` vs existing ``YYYY-MM-DD``: exact day only.
+    - candidate day precision vs existing month precision → not compatible
+      (never shrink candidate day down to month).
+    """
+    if _project_dates_equal(candidate, existing):
+        return True
+    pc = _project_date_parts(candidate)
+    pe = _project_date_parts(existing)
+    if pc is None or pe is None:
+        return False
+    yc, mc, dc = pc
+    ye, me, de = pe
+    # Both sides need at least month precision; year-only is never enough.
+    if mc is None or me is None:
+        return False
+    if yc != ye or mc != me:
+        return False
+    if dc is None:
+        # Candidate month precision: existing month or any day in that month.
+        return True
+    if de is None:
+        # Candidate has a day; existing is month-only — do not shrink.
+        return False
+    return dc == de
+
+
 def _project_match_key(row: Any) -> tuple[str | None, str | None, str | None, str | None]:
     if isinstance(row, dict):
         return (
@@ -911,24 +983,39 @@ def _project_identity_fallback_matches(
 ) -> list[dict[str, Any]]:
     """Date-anchored identity fallback when exact natural-key match fails.
 
-    Requires both start and end dates on each side, exact normalized equality,
-    customer compatibility (equal ignoring whitespace, or one empty), and
-    conservative name compatibility. Never matches on name alone.
+    Requires both start and end dates on each side, precision-compatible dates
+    (directional month↔day rules), customer compatibility (equal ignoring
+    whitespace, or one empty), and conservative name compatibility. Never
+    matches on name alone.
     """
     cand_name = _norm_str(_field(project, "project_name"))
     cand_customer = _norm_str(_field(project, "customer_name"))
-    cand_start = _project_date_key(_field(project, "start_date"))
-    cand_end = _project_date_key(_field(project, "end_date"))
-    if not cand_name or not cand_start or not cand_end:
+    cand_start = _field(project, "start_date")
+    cand_end = _field(project, "end_date")
+    if (
+        not cand_name
+        or not _project_date_key(cand_start)
+        or not _project_date_key(cand_end)
+    ):
         return []
     out: list[dict[str, Any]] = []
     for row in existing:
         row_name = _norm_str(row.get("project_name"))
-        row_start = _project_date_key(row.get("start_date"))
-        row_end = _project_date_key(row.get("end_date"))
-        if not row_name or not row_start or not row_end:
+        row_start = row.get("start_date")
+        row_end = row.get("end_date")
+        if (
+            not row_name
+            or not _project_date_key(row_start)
+            or not _project_date_key(row_end)
+        ):
             continue
-        if row_start != cand_start or row_end != cand_end:
+        if not _project_date_precision_compatible(
+            candidate=cand_start, existing=row_start
+        ):
+            continue
+        if not _project_date_precision_compatible(
+            candidate=cand_end, existing=row_end
+        ):
             continue
         if not _project_customer_identity_compatible(
             cand_customer, _norm_str(row.get("customer_name"))
@@ -944,21 +1031,150 @@ def _project_name_date_review_matches(
     project: Any,
     existing: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Exact project_name + equal normalized dates (customer may differ)."""
+    """Exact project_name + precision-compatible dates (customer may differ).
+
+    Used when identity fallback rejects a customer mismatch. Does not expand
+    name matching beyond exact ``project_name`` equality.
+    """
     cand_name = _norm_str(_field(project, "project_name"))
-    cand_start = _project_date_key(_field(project, "start_date"))
-    cand_end = _project_date_key(_field(project, "end_date"))
-    if not cand_name or not cand_start or not cand_end:
+    cand_start = _field(project, "start_date")
+    cand_end = _field(project, "end_date")
+    if (
+        not cand_name
+        or not _project_date_key(cand_start)
+        or not _project_date_key(cand_end)
+    ):
         return []
     out: list[dict[str, Any]] = []
     for row in existing:
         if _norm_str(row.get("project_name")) != cand_name:
             continue
-        row_start = _project_date_key(row.get("start_date"))
-        row_end = _project_date_key(row.get("end_date"))
-        if not row_start or not row_end:
+        row_start = row.get("start_date")
+        row_end = row.get("end_date")
+        if not _project_date_key(row_start) or not _project_date_key(row_end):
             continue
-        if row_start != cand_start or row_end != cand_end:
+        if not _project_date_precision_compatible(
+            candidate=cand_start, existing=row_start
+        ):
+            continue
+        if not _project_date_precision_compatible(
+            candidate=cand_end, existing=row_end
+        ):
+            continue
+        out.append(row)
+    return out
+
+
+def _project_customer_date_review_matches(
+    project: Any,
+    existing: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Same customer + precision-compatible dates; name ignored (REVIEW-only).
+
+    Both sides must have a non-empty customer that is equal ignoring whitespace.
+    Never used for auto-link / SAME / UPDATE.
+    """
+    cand_customer = _norm_str(_field(project, "customer_name"))
+    cand_start = _field(project, "start_date")
+    cand_end = _field(project, "end_date")
+    if (
+        not cand_customer
+        or not _project_date_key(cand_start)
+        or not _project_date_key(cand_end)
+    ):
+        return []
+    out: list[dict[str, Any]] = []
+    for row in existing:
+        if not _project_customers_ws_equal(cand_customer, row.get("customer_name")):
+            continue
+        row_start = row.get("start_date")
+        row_end = row.get("end_date")
+        if not _project_date_key(row_start) or not _project_date_key(row_end):
+            continue
+        if not _project_date_precision_compatible(
+            candidate=cand_start, existing=row_start
+        ):
+            continue
+        if not _project_date_precision_compatible(
+            candidate=cand_end, existing=row_end
+        ):
+            continue
+        out.append(row)
+    return out
+
+
+def _project_month_ordinal(value: Any) -> int | None:
+    """Year*12+month for overlap checks; requires at least month precision."""
+    parts = _project_date_parts(value)
+    if parts is None:
+        return None
+    year, month, _day = parts
+    if month is None:
+        return None
+    return year * 12 + month
+
+
+def _project_periods_overlap(
+    *,
+    cand_start: Any,
+    cand_end: Any,
+    row_start: Any,
+    row_end: Any,
+) -> bool:
+    """Inclusive month-precision interval overlap (PROJECT REVIEW helpers)."""
+    cs = _project_month_ordinal(cand_start)
+    ce = _project_month_ordinal(cand_end)
+    rs = _project_month_ordinal(row_start)
+    re = _project_month_ordinal(row_end)
+    if cs is None or ce is None or rs is None or re is None:
+        return False
+    if cs > ce or rs > re:
+        return False
+    return cs <= re and rs <= ce
+
+
+def _project_customer_overlap_review_matches(
+    project: Any,
+    existing: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Same customer + precision-compatible start + overlapping period (REVIEW).
+
+    End dates need not be precision-compatible. Name is ignored. Never used for
+    auto-link / SAME / UPDATE — REVIEW only so a human can decide.
+    """
+    cand_customer = _norm_str(_field(project, "customer_name"))
+    cand_start = _field(project, "start_date")
+    cand_end = _field(project, "end_date")
+    if (
+        not cand_customer
+        or _project_month_ordinal(cand_start) is None
+        or _project_month_ordinal(cand_end) is None
+    ):
+        return []
+    out: list[dict[str, Any]] = []
+    for row in existing:
+        row_customer = row.get("customer_name")
+        if not _norm_str(row_customer):
+            continue
+        if not _project_customers_ws_equal(cand_customer, row_customer):
+            continue
+        row_start = row.get("start_date")
+        row_end = row.get("end_date")
+        if (
+            _project_month_ordinal(row_start) is None
+            or _project_month_ordinal(row_end) is None
+        ):
+            continue
+        if not _project_date_precision_compatible(
+            candidate=cand_start, existing=row_start
+        ):
+            continue
+        if not _project_periods_overlap(
+            cand_start=cand_start,
+            cand_end=cand_end,
+            row_start=row_start,
+            row_end=row_end,
+        ):
             continue
         out.append(row)
     return out
@@ -1027,39 +1243,9 @@ def _diff_projects(
             )
             continue
         if not matches:
-            # Same name (+ optional customer) but different dates → ambiguous REVIEW.
-            similar = [
-                row
-                for row in existing
-                if _norm_str(row.get("project_name")) == key[0]
-                and (
-                    key[1] is None
-                    or _norm_str(row.get("customer_name")) is None
-                    or _norm_str(row.get("customer_name")) == key[1]
-                )
-            ]
-            if similar:
-                # Unique similar project → surface existing id for review UX.
-                # Multiple similar candidates stay target-less (ambiguous).
-                target_id = (
-                    _as_uuid(similar[0].get("id")) if len(similar) == 1 else None
-                )
-                specs.append(
-                    DiffSpec(
-                        entity_type="PROJECT",
-                        candidate_path=path,
-                        existing_target_id=target_id,
-                        change_type="REVIEW",
-                        old_value=similar if len(similar) > 1 else similar[0],
-                        new_value=dump,
-                        confidence=project.confidence,
-                        source_refs=refs,
-                    )
-                )
-                continue
-
-            # Exact key missed (often limited name variants). Date-anchored
-            # identity fallback connects only when unique.
+            # Exact key missed. Prefer precision-compatible identity fallback
+            # before same-name/date-different REVIEW so month↔day same-month
+            # pairs (e.g. 2018.06 vs 2018-06-11) link instead of false REVIEW.
             identity = _project_identity_fallback_matches(project, existing)
             if len(identity) > 1:
                 specs.append(
@@ -1077,6 +1263,36 @@ def _diff_projects(
             if len(identity) == 1:
                 matches = identity
             else:
+                # Same name (+ optional customer) but incompatible dates → REVIEW.
+                similar = [
+                    row
+                    for row in existing
+                    if _norm_str(row.get("project_name")) == key[0]
+                    and (
+                        key[1] is None
+                        or _norm_str(row.get("customer_name")) is None
+                        or _norm_str(row.get("customer_name")) == key[1]
+                    )
+                ]
+                if similar:
+                    # Unique similar project → surface existing id for review UX.
+                    # Multiple similar candidates stay target-less (ambiguous).
+                    target_id = (
+                        _as_uuid(similar[0].get("id")) if len(similar) == 1 else None
+                    )
+                    specs.append(
+                        DiffSpec(
+                            entity_type="PROJECT",
+                            candidate_path=path,
+                            existing_target_id=target_id,
+                            change_type="REVIEW",
+                            old_value=similar if len(similar) > 1 else similar[0],
+                            new_value=dump,
+                            confidence=project.confidence,
+                            source_refs=refs,
+                        )
+                    )
+                    continue
                 # Same exact name + dates but incompatible customer (e.g. different
                 # non-empty orgs): do not auto-link; unique hit → targeted REVIEW.
                 name_date = _project_name_date_review_matches(project, existing)
@@ -1094,6 +1310,63 @@ def _diff_projects(
                             change_type="REVIEW",
                             old_value=(
                                 name_date if len(name_date) > 1 else name_date[0]
+                            ),
+                            new_value=dump,
+                            confidence=project.confidence,
+                            source_refs=refs,
+                        )
+                    )
+                    continue
+                # Same customer + precision-compatible dates, names not
+                # identity-compatible: potential match → REVIEW only (never
+                # auto-link / SAME / UPDATE).
+                customer_date = _project_customer_date_review_matches(
+                    project, existing
+                )
+                if customer_date:
+                    target_id = (
+                        _as_uuid(customer_date[0].get("id"))
+                        if len(customer_date) == 1
+                        else None
+                    )
+                    specs.append(
+                        DiffSpec(
+                            entity_type="PROJECT",
+                            candidate_path=path,
+                            existing_target_id=target_id,
+                            change_type="REVIEW",
+                            old_value=(
+                                customer_date
+                                if len(customer_date) > 1
+                                else customer_date[0]
+                            ),
+                            new_value=dump,
+                            confidence=project.confidence,
+                            source_refs=refs,
+                        )
+                    )
+                    continue
+                # Same customer + same start month + overlapping period, but
+                # end months differ: REVIEW-only (never auto-link).
+                customer_overlap = _project_customer_overlap_review_matches(
+                    project, existing
+                )
+                if customer_overlap:
+                    target_id = (
+                        _as_uuid(customer_overlap[0].get("id"))
+                        if len(customer_overlap) == 1
+                        else None
+                    )
+                    specs.append(
+                        DiffSpec(
+                            entity_type="PROJECT",
+                            candidate_path=path,
+                            existing_target_id=target_id,
+                            change_type="REVIEW",
+                            old_value=(
+                                customer_overlap
+                                if len(customer_overlap) > 1
+                                else customer_overlap[0]
                             ),
                             new_value=dump,
                             confidence=project.confidence,
@@ -1134,11 +1407,21 @@ def _diff_projects(
             if not (
                 (
                     field_name in {"start_date", "end_date"}
-                    and _project_dates_equal(old_v, new_v)
+                    and _project_date_precision_compatible(
+                        candidate=new_v, existing=old_v
+                    )
                 )
                 or (
                     field_name == "customer_name"
                     and _project_customers_ws_equal(old_v, new_v)
+                )
+                or (
+                    # Identity-compatible spelling variants already accepted for
+                    # match must not surface as project_name CONFLICT.
+                    field_name == "project_name"
+                    and _project_names_identity_compatible(
+                        _norm_str(old_v), _norm_str(new_v)
+                    )
                 )
             )
         ]

@@ -26,10 +26,11 @@ from app.ai.prompts import (
     profile_extract_v17,
     profile_extract_v18,
     profile_extract_v19,
+    profile_extract_v20,
 )
 from app.ai.providers.errors import AIProviderError
 
-CURRENT_PROFILE_PROMPT_VERSION = "profile-extract-v19"
+CURRENT_PROFILE_PROMPT_VERSION = "profile-extract-v20"
 
 ExtractionMode = Literal["single", "staged"]
 
@@ -59,6 +60,21 @@ class ProfilePromptSpec:
     validate_projects_recovery_root: bool = False
     validate_core_structured_completeness: bool = False
     repair_whitespace_project_evidence: bool = False
+    drop_generic_activity_core_tech: bool = False
+    require_core_tech_quote_evidence: bool = False
+    backfill_project_dates_from_root_evidence: bool = False
+    require_literal_pm_pl_project_job_evidence: bool = False
+    normalize_career_document_value: bool = False
+    require_literal_education_status_evidence: bool = False
+    backfill_semantic_core_exp_evidence: bool = False
+    require_semantic_project_exp_evidence: bool = False
+    backfill_semantic_project_exp_evidence: bool = False
+    backfill_project_biz_evidence: bool = False
+    backfill_semantic_project_job_evidence: bool = False
+    repair_project_pm_pl_to_ops_sys: bool = False
+    repair_project_mgt_to_ops_sys: bool = False
+    require_semantic_project_job_evidence: bool = False
+    recover_project_recall_second_pass: bool = False
 
 
 def _spec_from_module(module) -> ProfilePromptSpec:
@@ -110,6 +126,51 @@ def _spec_from_staged_module(module) -> ProfilePromptSpec:
         repair_whitespace_project_evidence=bool(
             getattr(module, "REPAIR_WHITESPACE_PROJECT_EVIDENCE", False)
         ),
+        drop_generic_activity_core_tech=bool(
+            getattr(module, "DROP_GENERIC_ACTIVITY_CORE_TECH", False)
+        ),
+        require_core_tech_quote_evidence=bool(
+            getattr(module, "REQUIRE_CORE_TECH_QUOTE_EVIDENCE", False)
+        ),
+        backfill_project_dates_from_root_evidence=bool(
+            getattr(module, "BACKFILL_PROJECT_DATES_FROM_ROOT_EVIDENCE", False)
+        ),
+        require_literal_pm_pl_project_job_evidence=bool(
+            getattr(module, "REQUIRE_LITERAL_PM_PL_PROJECT_JOB_EVIDENCE", False)
+        ),
+        normalize_career_document_value=bool(
+            getattr(module, "NORMALIZE_CAREER_DOCUMENT_VALUE", False)
+        ),
+        require_literal_education_status_evidence=bool(
+            getattr(module, "REQUIRE_LITERAL_EDUCATION_STATUS_EVIDENCE", False)
+        ),
+        backfill_semantic_core_exp_evidence=bool(
+            getattr(module, "BACKFILL_SEMANTIC_CORE_EXP_EVIDENCE", False)
+        ),
+        require_semantic_project_exp_evidence=bool(
+            getattr(module, "REQUIRE_SEMANTIC_PROJECT_EXP_EVIDENCE", False)
+        ),
+        backfill_semantic_project_exp_evidence=bool(
+            getattr(module, "BACKFILL_SEMANTIC_PROJECT_EXP_EVIDENCE", False)
+        ),
+        backfill_project_biz_evidence=bool(
+            getattr(module, "BACKFILL_PROJECT_BIZ_EVIDENCE", False)
+        ),
+        backfill_semantic_project_job_evidence=bool(
+            getattr(module, "BACKFILL_SEMANTIC_PROJECT_JOB_EVIDENCE", False)
+        ),
+        repair_project_pm_pl_to_ops_sys=bool(
+            getattr(module, "REPAIR_PROJECT_PM_PL_TO_OPS_SYS", False)
+        ),
+        repair_project_mgt_to_ops_sys=bool(
+            getattr(module, "REPAIR_PROJECT_MGT_TO_OPS_SYS", False)
+        ),
+        require_semantic_project_job_evidence=bool(
+            getattr(module, "REQUIRE_SEMANTIC_PROJECT_JOB_EVIDENCE", False)
+        ),
+        recover_project_recall_second_pass=bool(
+            getattr(module, "RECOVER_PROJECT_RECALL_SECOND_PASS", False)
+        ),
     )
 
 
@@ -133,6 +194,7 @@ _REGISTRY: dict[str, ProfilePromptSpec] = {
     profile_extract_v17.PROMPT_VERSION: _spec_from_staged_module(profile_extract_v17),
     profile_extract_v18.PROMPT_VERSION: _spec_from_staged_module(profile_extract_v18),
     profile_extract_v19.PROMPT_VERSION: _spec_from_staged_module(profile_extract_v19),
+    profile_extract_v20.PROMPT_VERSION: _spec_from_staged_module(profile_extract_v20),
 }
 
 
