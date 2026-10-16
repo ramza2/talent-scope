@@ -567,9 +567,6 @@ def test_fresh_replay_jobs_0_to_8() -> None:
     assert sum(1 for codes in strict_by_idx.values() for c in codes if c == "JOB-OPS-SYS") >= 5
     assert strict_by_idx[6] == []
 
-    open("/opt/cursor/artifacts/project-job-semantic-replay.txt", "w").write(
-        "\n".join(lines) + "\n"
-    )
 
 
 def test_v19_flag_false() -> None:
