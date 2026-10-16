@@ -550,9 +550,6 @@ def test_fresh_replay_biz_0_to_8_real_candidates() -> None:
     assert "근무경력" not in (
         out.projects[3].business_domains[0].source_refs[0].quote_text or ""
     )
-    open("/opt/cursor/artifacts/project-biz-evidence-replay.txt", "w").write(
-        "\n".join(lines) + "\n"
-    )
 
 
 def test_v19_flag_false() -> None:
