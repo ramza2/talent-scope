@@ -34,6 +34,7 @@ RUN pip install --upgrade pip \
 FROM base AS test
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git nodejs npm \
+    && git config --system --add safe.directory /workspace \
     && rm -rf /var/lib/apt/lists/*
 
 FROM base AS runtime
