@@ -48,6 +48,7 @@ from app.modules.analysis.code_catalog import (
 from app.modules.analysis.compact_v8 import (
     apply_normalized_quote_evidence,
     backfill_exact_core_evidence,
+    backfill_literal_core_tech_from_source,
     backfill_exact_project_evidence,
     backfill_project_dates_from_root_evidence,
     build_document_alias_view,
@@ -1411,6 +1412,16 @@ class AnalysisService:
             if prompt.backfill_exact_core_evidence:
                 doc = backfill_exact_core_evidence(
                     doc,
+                    page_texts=page_texts,
+                    allowed_documents=allowed_documents,
+                )
+            # v20: append missing leaf TECH skills when name/alias literals
+            # appear explicitly on source pages (before activity/quote guards).
+            if prompt.backfill_literal_core_tech_from_source:
+                doc = backfill_literal_core_tech_from_source(
+                    doc,
+                    codes=codes,
+                    aliases=aliases,
                     page_texts=page_texts,
                     allowed_documents=allowed_documents,
                 )

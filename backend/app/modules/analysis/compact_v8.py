@@ -1528,6 +1528,155 @@ def drop_core_skills_without_quote_evidence(
     return candidate.model_copy(update={"skills": kept})
 
 
+def _norm_tech_literal_key(value: str | None) -> str | None:
+    text = unicodedata.normalize("NFKC", (value or "")).strip()
+    if not text:
+        return None
+    return text.casefold()
+
+
+def _is_ascii_alnum_tech_token(literal: str) -> bool:
+    """True for short ASCII tokens like AD/NAC/SEP that need alnum boundaries."""
+    return bool(literal) and literal.isascii() and literal.isalnum()
+
+
+def _find_tech_literal_in_page(page_text: str, literal: str) -> str | None:
+    """Return matched quote from page (original NFKC casing) or None.
+
+    ASCII alnum tokens use alnum boundaries (ROAD must not match AD).
+    Other literals use case-insensitive NFKC substring match. No fuzzy.
+    """
+    lit = unicodedata.normalize("NFKC", literal).strip()
+    if not lit:
+        return None
+    page = unicodedata.normalize("NFKC", page_text or "")
+    if not page:
+        return None
+    if _is_ascii_alnum_tech_token(lit):
+        pattern = re.compile(
+            rf"(?<![A-Za-z0-9])({re.escape(lit)})(?![A-Za-z0-9])",
+            re.IGNORECASE,
+        )
+    else:
+        pattern = re.compile(f"({re.escape(lit)})", re.IGNORECASE)
+    match = pattern.search(page)
+    if match is None:
+        return None
+    return match.group(1)
+
+
+def _find_tech_literal_page_ref(
+    literal: str,
+    *,
+    page_texts: dict[tuple[str, int], str],
+    allowed_documents: dict[str, set[int]],
+) -> SourceRef | None:
+    """First deterministic page hit for ``literal`` in stable (doc, page) order."""
+    for doc_id, page_no in sorted(page_texts.keys()):
+        if doc_id not in allowed_documents:
+            continue
+        pages = allowed_documents[doc_id]
+        if pages and page_no not in pages:
+            continue
+        quote = _find_tech_literal_in_page(
+            page_texts.get((doc_id, page_no)) or "", literal
+        )
+        if quote is None:
+            continue
+        return SourceRef(document_id=doc_id, page_no=page_no, quote_text=quote)
+    return None
+
+
+def backfill_literal_core_tech_from_source(
+    candidate: ProfileCandidateDocument,
+    *,
+    codes: list[Any],
+    aliases: dict[str, list[str]],
+    page_texts: dict[tuple[str, int], str] | None,
+    allowed_documents: dict[str, set[int]],
+) -> ProfileCandidateDocument:
+    """v20: supplement missing root TECH skills from explicit source literals.
+
+    Only active TECH leaf codes (``parent_code`` set) are candidates. Literals
+    are CodeMaster.name and code_alias.alias. Ambiguous literals (same text →
+    multiple TECH codes) are skipped. Existing skill codes are never modified;
+    only missing codes are appended with quote evidence.
+    """
+    if not page_texts or not codes:
+        return candidate
+
+    leaf_techs = [
+        row
+        for row in codes
+        if getattr(row, "code_type", None) == "TECH"
+        and getattr(row, "parent_code", None)
+        and (getattr(row, "code", None) or "").strip()
+        and (getattr(row, "name", None) or "").strip()
+    ]
+    if not leaf_techs:
+        return candidate
+
+    # literal_key → codes that claim it (for fail-closed ambiguity).
+    literal_to_codes: dict[str, set[str]] = {}
+    code_literals: dict[str, list[str]] = {}
+    for row in leaf_techs:
+        code = str(row.code).strip()
+        lits: list[str] = []
+        seen_keys: set[str] = set()
+        for raw in (row.name, *(aliases.get(code) or ())):
+            text = unicodedata.normalize("NFKC", str(raw or "")).strip()
+            key = _norm_tech_literal_key(text)
+            if key is None or key in seen_keys:
+                continue
+            seen_keys.add(key)
+            lits.append(text)
+            literal_to_codes.setdefault(key, set()).add(code)
+        code_literals[code] = lits
+
+    existing_codes = {
+        (skill.code or "").strip()
+        for skill in candidate.skills
+        if (skill.code or "").strip()
+    }
+    extras: list[SkillCandidate] = []
+    for row in sorted(leaf_techs, key=lambda r: str(r.code)):
+        code = str(row.code).strip()
+        if code in existing_codes:
+            continue
+        # Deterministic literal order; skip ambiguous keys.
+        candidates_lits = sorted(
+            (
+                lit
+                for lit in code_literals.get(code, [])
+                if literal_to_codes.get(_norm_tech_literal_key(lit) or "") == {code}
+            ),
+            key=lambda s: s.casefold(),
+        )
+        for lit in candidates_lits:
+            ref = _find_tech_literal_page_ref(
+                lit,
+                page_texts=page_texts,
+                allowed_documents=allowed_documents,
+            )
+            if ref is None:
+                continue
+            extras.append(
+                SkillCandidate(
+                    code=code,
+                    raw_value=ref.quote_text,
+                    source_refs=[ref],
+                )
+            )
+            existing_codes.add(code)
+            break
+
+    if not extras:
+        return candidate
+    return candidate.model_copy(
+        update={"skills": list(candidate.skills) + extras}
+    )
+
+
 def _project_evidence_anchors(project: ProjectCandidate) -> tuple[str, ...]:
     """Scalar anchors for project root evidence, in priority order."""
     out: list[str] = []

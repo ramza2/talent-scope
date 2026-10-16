@@ -75,6 +75,7 @@ class ProfilePromptSpec:
     repair_project_mgt_to_ops_sys: bool = False
     require_semantic_project_job_evidence: bool = False
     recover_project_recall_second_pass: bool = False
+    backfill_literal_core_tech_from_source: bool = False
 
 
 def _spec_from_module(module) -> ProfilePromptSpec:
@@ -170,6 +171,9 @@ def _spec_from_staged_module(module) -> ProfilePromptSpec:
         ),
         recover_project_recall_second_pass=bool(
             getattr(module, "RECOVER_PROJECT_RECALL_SECOND_PASS", False)
+        ),
+        backfill_literal_core_tech_from_source=bool(
+            getattr(module, "BACKFILL_LITERAL_CORE_TECH_FROM_SOURCE", False)
         ),
     )
 

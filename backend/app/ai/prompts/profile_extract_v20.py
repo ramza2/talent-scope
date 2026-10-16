@@ -15,8 +15,10 @@ v19 contract plus clearer CORE TECH activity wording and runtime guards:
 - Feature flag REPAIR_PROJECT_MGT_TO_OPS_SYS
 - Feature flag REQUIRE_SEMANTIC_PROJECT_JOB_EVIDENCE
 - Feature flag RECOVER_PROJECT_RECALL_SECOND_PASS
+- Feature flag BACKFILL_LITERAL_CORE_TECH_FROM_SOURCE
 - Deterministic drop of root s[] activity-only phrases and quote-less TECH
 - Bounded PROJECT recall second-pass: keep first projects, append unmatched second only
+- Deterministic root TECH leaf supplement from explicit source name/alias literals
 
 - Deterministic drop of PROJECT JOB-MGT-PM/PL without literal PM/PL quote tokens
 - Deterministic career_document_value → duration-only text
@@ -61,6 +63,7 @@ REPAIR_PROJECT_PM_PL_TO_OPS_SYS = True
 REPAIR_PROJECT_MGT_TO_OPS_SYS = True
 REQUIRE_SEMANTIC_PROJECT_JOB_EVIDENCE = True
 RECOVER_PROJECT_RECALL_SECOND_PASS = True
+BACKFILL_LITERAL_CORE_TECH_FROM_SOURCE = True
 
 CORE_SCHEMA_GUIDE = """
 Compact CORE root (omit null/empty):
