@@ -164,6 +164,27 @@ def test_existing_ad_empty_refs_repaired_from_literal() -> None:
     assert skill.source_refs[0].document_id == _DOC
 
 
+def test_existing_canonical_raw_value_repaired_from_alias_only() -> None:
+    """LLM keeps canonical raw_value; alias-only page text repairs quote refs."""
+    from app.ai.schemas.profile_candidate import SkillCandidate
+
+    existing = SkillCandidate(
+        code="TECH-SEC-AD",
+        raw_value="Active Directory",
+        source_refs=[],
+    )
+    page_texts = {(_DOC, 1): "보유기술: AD"}
+    out = _run(_empty_core(skills=[existing]), page_texts=page_texts)
+    assert len(out.skills) == 1
+    skill = out.skills[0]
+    assert skill.code == "TECH-SEC-AD"
+    assert skill.raw_value == "Active Directory"
+    assert len(skill.source_refs) == 1
+    assert skill.source_refs[0].quote_text == "AD"
+    assert skill.source_refs[0].document_id == _DOC
+    assert skill.source_refs[0].page_no == 1
+
+
 def test_existing_ad_nac_sep_empty_refs_repaired_no_duplicate() -> None:
     from app.ai.schemas.profile_candidate import SkillCandidate
 

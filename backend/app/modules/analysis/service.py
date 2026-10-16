@@ -1395,60 +1395,6 @@ class AnalysisService:
                 raise InsufficientCandidateError()
             return candidate
 
-        def _log_core_tech_stage(
-            stage: str,
-            doc: ProfileCandidateDocument,
-            *,
-            include_tech_catalog_stats: bool = False,
-        ) -> None:
-            """INFO-only CORE skill stage probe; codes only, no PII/quotes."""
-            skill_codes = sorted(
-                {
-                    (skill.code or "").strip()
-                    for skill in doc.skills
-                    if (skill.code or "").strip()
-                }
-            )
-            allowed_page_count = sum(
-                len(pages) for pages in allowed_documents.values()
-            )
-            extra = ""
-            if include_tech_catalog_stats:
-                tech_rows = [
-                    row
-                    for row in codes
-                    if getattr(row, "code_type", None) == "TECH"
-                ]
-                tech_leaf_count = sum(
-                    1 for row in tech_rows if getattr(row, "parent_code", None)
-                )
-                tech_with_alias_count = sum(
-                    1
-                    for row in tech_rows
-                    if aliases.get(str(getattr(row, "code", "") or "").strip())
-                )
-                extra = (
-                    f" tech_active_count={len(tech_rows)}"
-                    f" tech_leaf_count={tech_leaf_count}"
-                    f" tech_with_alias_count={tech_with_alias_count}"
-                )
-            logger.info(
-                "analysis core tech stages analysis_run_id=%s "
-                "prompt_version=%s literal_backfill_flag=%s stage=%s "
-                "page_text_count=%s allowed_doc_count=%s "
-                "allowed_page_count=%s skill_count=%s skill_codes=%s%s",
-                base_log.get("analysis_run_id"),
-                prompt.prompt_version,
-                bool(prompt.backfill_literal_core_tech_from_source),
-                stage,
-                len(page_texts or {}),
-                len(allowed_documents),
-                allowed_page_count,
-                len(doc.skills),
-                skill_codes,
-                extra,
-            )
-
         def _normalize_core(raw: dict[str, Any]) -> ProfileCandidateDocument:
             expanded = expand_compact_core(raw, alias_to_id=alias_to_id)
             expanded["projects"] = []
@@ -1459,7 +1405,6 @@ class AnalysisService:
                 settings=self.settings,
                 page_texts=page_texts,
             )
-            _log_core_tech_stage("after_normalize_candidate", doc)
             # v11: promote raw_value that exactly equals an active typed catalog code.
             if prompt.promote_exact_catalog_codes:
                 doc = promote_exact_root_catalog_codes(doc, catalog=catalog_map)
@@ -1470,11 +1415,6 @@ class AnalysisService:
                     page_texts=page_texts,
                     allowed_documents=allowed_documents,
                 )
-            _log_core_tech_stage(
-                "after_backfill_exact_core_evidence",
-                doc,
-                include_tech_catalog_stats=True,
-            )
             # v20: append missing leaf TECH skills when name/alias literals
             # appear explicitly on source pages (before activity/quote guards).
             if prompt.backfill_literal_core_tech_from_source:
@@ -1485,17 +1425,12 @@ class AnalysisService:
                     page_texts=page_texts,
                     allowed_documents=allowed_documents,
                 )
-            _log_core_tech_stage("after_backfill_literal_core_tech", doc)
             # v20: drop root TECH skills whose raw_value is activity-only, then
             # drop skills that still lack quote evidence after exact backfill.
             if prompt.drop_generic_activity_core_tech:
                 doc = drop_generic_activity_core_skills(doc)
-            _log_core_tech_stage("after_drop_generic_activity_core_skills", doc)
             if prompt.require_core_tech_quote_evidence:
                 doc = drop_core_skills_without_quote_evidence(doc)
-            _log_core_tech_stage(
-                "after_drop_core_skills_without_quote_evidence", doc
-            )
             # v20: keep only parseable total-career duration in p.cdv
             # (strip grade/prefix noise; leave approx/range untouched).
             if prompt.normalize_career_document_value:
