@@ -95,8 +95,68 @@ Selector:
 
 DELETED person run은 기존 list visibility와 같이 제외한다.
 
-## 다음 단계 (계획)
+## Golden Set 정확도 평가
 
-실제 인력 약 10명 내외를 Golden Set으로 선정하고,  
-expected project / skill / expertise / evidence 등을 **별도 정답 기준**으로 평가하는 단계를 이어간다.  
-본 리포트의 JSON 출력 key는 그 자동화의 입력으로 재사용할 수 있도록 안정적으로 유지한다.
+`analysis_quality_report.py`가 구조·근거 보유 여부를 측정한다면,
+`analysis_golden_set_eval.py`는 사람이 확정한 정답셋과 기존
+`AnalysisRun.candidate_json`을 비교한다. DB는 읽기 전용이며 LLM/VLM 호출,
+재분석, Confirm, 운영 데이터 수정은 하지 않는다.
+
+Golden Set schema version은 `talentscope-analysis-golden-v1`이다.
+예시는 `docs/examples/analysis_golden_set.example.json`을 참고한다.
+
+평가 범위(v1):
+
+- root `jobs` / `skills` / `expertise` code precision / recall / F1
+- project 존재 precision / recall / F1
+- 매칭된 project의 `jobs` / `skills` / `expertise` / `business_domains` / `customer_types`
+- Golden Set에 기대 항목으로 명시된 entity의 `source_refs` 보유율
+
+Golden Set은 **부분 정답셋**을 허용한다. 필드를 생략하면 그 영역은 평가하지 않고,
+빈 배열 `[]`을 명시하면 해당 영역의 기대값이 0개라는 뜻이다.
+Project는 `project_name`이 필수이며 `customer_name`, `start_date`,
+`end_date`는 선택 제약이다. 이름/고객사는 공백 차이를 무시하고,
+Golden Set 날짜가 `YYYY.MM`이면 실제 day precision 값도 같은 월이면 매칭한다.
+
+`analysis_run_id`가 있으면 해당 run을 평가한다. 없으면 해당 인력의 최신
+`REVIEWING`/`CONFIRMED` run을 사용한다. 실제 기준셋은 재현성을 위해 가능하면
+`analysis_run_id`를 명시한다.
+
+서버 실행 예:
+
+```bash
+docker compose \
+  --env-file .env.server \
+  -f docker-compose.server.yml \
+  run --rm --no-deps \
+  -v "$PWD/backend:/workspace/backend:ro" \
+  -v "$PWD/golden:/workspace/golden:ro" \
+  --entrypoint python api \
+  /workspace/backend/scripts/analysis_golden_set_eval.py \
+  --golden-set /workspace/golden/analysis_golden_set.json
+```
+
+JSON 결과:
+
+```bash
+python backend/scripts/analysis_golden_set_eval.py \
+  --golden-set golden/analysis_golden_set.json \
+  --format json \
+  --output /tmp/golden-eval.json
+```
+
+### 실제 Golden Set 구축 순서
+
+1. 문서 유형과 경력 형태가 겹치지 않도록 실제 인력 약 10명을 선정한다.
+2. 각 인력의 프로젝트, JOB, TECH, EXP와 필요한 project relation을 사람이 원문 기준으로 확정한다.
+3. 정답 JSON에는 개인식별정보 원문/연락처를 넣지 않고 `person_id`,
+   `analysis_run_id`, 표준 code와 project identity만 저장한다.
+4. 동일 Golden Set으로 prompt/normalizer 변경 전후 결과를 반복 비교한다.
+5. 10명 기준셋이 안정화된 뒤에만 precision/recall/F1을 품질 gate 후보로 사용한다.
+
+기존 구조/근거 리포트 JSON 계약은 유지한다. Golden Set evaluator는 별도 도구이며
+기존 출력 key를 변경하지 않는다.
+
+## 다음 단계
+
+실제 인력 약 10명을 선정해 Golden Set JSON을 채우고 첫 baseline을 기록한다.
