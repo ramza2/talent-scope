@@ -1,0 +1,251 @@
+{
+  "schema_version": "talentscope-analysis-golden-v1",
+  "cases": [
+    {
+      "case_id": "kang-sangwon-v20-pilot",
+      "person_id": "244c8119-be6b-42a2-87a1-21cf74699171",
+      "analysis_run_id": "8f5230bb-0127-41f9-bc54-86fd973b45d4",
+      "expected": {
+        "jobs": [
+          "JOB-MGT-PM",
+          "JOB-MGT-PL",
+          "JOB-OPS-SYS"
+        ],
+        "skills": [
+          "TECH-SEC-AD",
+          "TECH-SEC-NAC",
+          "TECH-SEC-SEP"
+        ],
+        "expertise": [
+          "EXP-INFRA",
+          "EXP-MGT",
+          "EXP-SEC-BUILD",
+          "EXP-SEC-OPS"
+        ],
+        "projects": [
+          {
+            "project_name": "한국가스안전공사 정보시스템 통합 유지보수 용역",
+            "customer_name": "한국가스안전공사",
+            "start_date": "2023.02",
+            "end_date": "2024.09",
+            "jobs": [
+              "JOB-MGT-PM"
+            ],
+            "skills": [],
+            "expertise": [
+              "EXP-MGT"
+            ]
+          },
+          {
+            "project_name": "2022년 국가정보자원 관리원 광주센터 정보시스템1군 운영",
+            "customer_name": "국가정보자원 관리원(광주)",
+            "start_date": "2022.01",
+            "end_date": "2023.01",
+            "jobs": [
+              "JOB-OPS-SYS"
+            ],
+            "skills": [],
+            "expertise": [
+              "EXP-INFRA"
+            ]
+          },
+          {
+            "project_name": "2019년 국가정보자원 관리원 광주센터 정보시스템1군 운영",
+            "customer_name": "국가정보자원 관리원(광주)",
+            "start_date": "2019.01",
+            "end_date": "2021.12",
+            "jobs": [
+              "JOB-OPS-SYS"
+            ],
+            "skills": [],
+            "expertise": [
+              "EXP-INFRA"
+            ]
+          },
+          {
+            "project_name": "2018년 국가정보자원 관리원 광주센터 정보시스템1군 운영",
+            "customer_name": "국가정보자원 관리원(광주)",
+            "start_date": "2018.01",
+            "end_date": "2018.12",
+            "jobs": [
+              "JOB-OPS-SYS"
+            ],
+            "skills": [],
+            "expertise": [
+              "EXP-INFRA"
+            ]
+          },
+          {
+            "project_name": "한국전력공사 2016년 패키지SW 유지보수",
+            "customer_name": "한전KDN",
+            "start_date": "2016.01",
+            "end_date": "2017.12",
+            "jobs": [],
+            "skills": [],
+            "expertise": []
+          },
+          {
+            "project_name": "광주통합전산센터 2015년 정보보호 강화(HW)",
+            "customer_name": "국가정보자원 관리원(광주)",
+            "start_date": "2015.07",
+            "end_date": "2015.12",
+            "jobs": [
+              "JOB-MGT"
+            ],
+            "skills": [],
+            "expertise": [
+              "EXP-MGT",
+              "EXP-SEC-BUILD"
+            ]
+          },
+          {
+            "project_name": "현대/기아자동차 정보보안시스템 운영",
+            "customer_name": "현대오토에버",
+            "start_date": "2012.07",
+            "end_date": "2015.02",
+            "jobs": [
+              "JOB-MGT-PL",
+              "JOB-OPS-SYS"
+            ],
+            "skills": [
+              "TECH-SEC-AD",
+              "TECH-SEC-NAC",
+              "TECH-SEC-SEP"
+            ],
+            "expertise": [
+              "EXP-INFRA",
+              "EXP-SEC-OPS"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "kang-taeryeon-v20-pilot",
+      "person_id": "35450ca2-1620-4b9f-a7c2-551779ed4a30",
+      "analysis_run_id": "6b645724-fd9e-4461-9521-ec13ae2e8557",
+      "expected": {
+        "jobs": [
+          "JOB-OPS-SYS"
+        ],
+        "skills": [],
+        "expertise": [
+          "EXP-INFRA",
+          "EXP-MGT"
+        ],
+        "projects": [
+          {
+            "project_name": "2019년 제1차 범정부 정보자원 통합구축 HW1사업",
+            "customer_name": "국가정보자원관리원",
+            "start_date": "2019.07",
+            "end_date": "2020.01",
+            "jobs": [
+              "JOB-OPS-SYS"
+            ],
+            "skills": [],
+            "expertise": [
+              "EXP-INFRA"
+            ]
+          },
+          {
+            "project_name": "2018년 제1차 범정부 정보자원 통합구축 HW2 사업",
+            "customer_name": "국가정보자원관리원",
+            "start_date": "2018.06",
+            "end_date": "2019.01",
+            "jobs": [
+              "JOB-OPS-SYS"
+            ],
+            "skills": [],
+            "expertise": [
+              "EXP-INFRA"
+            ]
+          },
+          {
+            "project_name": "2017년 제2차 정보자원통합구축 HW1사업 (대전)",
+            "start_date": "2017.10",
+            "end_date": "2018.03",
+            "jobs": [
+              "JOB-MGT",
+              "JOB-OPS-SYS"
+            ],
+            "skills": [],
+            "expertise": [
+              "EXP-INFRA",
+              "EXP-MGT"
+            ]
+          },
+          {
+            "project_name": "2016년 HW자원통합구축 사업2-2(광주)",
+            "customer_name": "정부통합전산센터",
+            "start_date": "2016.08",
+            "end_date": "2017.03",
+            "jobs": [
+              "JOB-OPS-SYS"
+            ],
+            "skills": [],
+            "expertise": [
+              "EXP-INFRA"
+            ]
+          },
+          {
+            "project_name": "국방통합정보관리소 정보체계 이전/통합 사업",
+            "customer_name": "국방부",
+            "start_date": "2014.02",
+            "end_date": "2014.12",
+            "jobs": [
+              "JOB-OPS-SYS"
+            ],
+            "skills": [],
+            "expertise": [
+              "EXP-INFRA"
+            ]
+          },
+          {
+            "project_name": "2013년 차기 복권통합구축사업",
+            "start_date": "2013.09",
+            "end_date": "2013.12",
+            "jobs": [
+              "JOB-ARC-TA",
+              "JOB-OPS-SYS"
+            ],
+            "skills": [],
+            "expertise": [
+              "EXP-INFRA"
+            ]
+          },
+          {
+            "project_name": "2011년 제2차 자원통합 구축 HW1 사업(대전)",
+            "customer_name": "정부통합전산센터",
+            "start_date": "2011.06",
+            "end_date": "2011.12",
+            "jobs": [
+              "JOB-OPS-SYS"
+            ],
+            "skills": [],
+            "expertise": [
+              "EXP-INFRA"
+            ]
+          },
+          {
+            "project_name": "영화진흥위원회 전산실 유지보수 사업",
+            "customer_name": "영화진흥위원회",
+            "start_date": "2008.12",
+            "end_date": "2010.04",
+            "jobs": [],
+            "skills": [],
+            "expertise": []
+          },
+          {
+            "project_name": "2008년 정부통합전산센터 BCP 관련 BIA 구축 사업",
+            "customer_name": "행정안전부",
+            "start_date": "2008.09",
+            "end_date": "2008.12",
+            "jobs": [],
+            "skills": [],
+            "expertise": []
+          }
+        ]
+      }
+    }
+  ]
+}
