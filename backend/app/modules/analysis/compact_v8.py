@@ -3336,3 +3336,175 @@ def supplement_projects_from_second_pass(
         first.model_copy(update={"projects": first_projects + extras}),
         len(extras),
     )
+
+
+def _chunk_project_identity_key(
+    project: ProjectCandidate,
+) -> tuple[str, str, int | None, int | None] | None:
+    """Strong identity key for adaptive PROJECT chunk merge (fail-closed)."""
+    name = _fold_ws_text((project.project_name or "").strip())
+    customer = _fold_ws_text((project.customer_name or "").strip())
+    if not name or not customer:
+        return None
+    start = _project_ym_ordinal(project.start_date)
+    end = _project_ym_ordinal(project.end_date)
+    if start is None or end is None:
+        return None
+    return (name, customer, start, end)
+
+
+def _pick_canonical_scalar(values: list[str | None]) -> str | None:
+    nonempty = [v.strip() for v in values if isinstance(v, str) and v.strip()]
+    if not nonempty:
+        return None
+    # Longest first, then lexicographically smallest for order independence.
+    return sorted(nonempty, key=lambda s: (-len(s), s))[0]
+
+
+def _union_source_refs(refs_lists: list[list[SourceRef]]) -> list[SourceRef]:
+    seen: set[tuple[str, int, str]] = set()
+    out: list[SourceRef] = []
+    for refs in refs_lists:
+        for ref in refs or []:
+            doc_id = (getattr(ref, "document_id", None) or "").strip()
+            quote = (getattr(ref, "quote_text", None) or "").strip()
+            page_no = getattr(ref, "page_no", None)
+            if not doc_id or not quote or not isinstance(page_no, int):
+                continue
+            key = (doc_id, page_no, quote)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(ref)
+    out.sort(
+        key=lambda r: (
+            (r.document_id or ""),
+            int(r.page_no or 0),
+            (r.quote_text or ""),
+        )
+    )
+    return out
+
+
+def _union_code_ref_lists(
+    rel_lists: list[list[CodeRefCandidate]],
+) -> list[CodeRefCandidate]:
+    by_code: dict[str, list[CodeRefCandidate]] = {}
+    for rels in rel_lists:
+        for rel in rels or []:
+            code = (rel.code or "").strip()
+            if not code:
+                continue
+            by_code.setdefault(code, []).append(rel)
+    out: list[CodeRefCandidate] = []
+    for code in sorted(by_code):
+        group = by_code[code]
+        raw = _pick_canonical_scalar([g.raw_value for g in group])
+        refs = _union_source_refs([list(g.source_refs or []) for g in group])
+        out.append(CodeRefCandidate(code=code, raw_value=raw, source_refs=refs))
+    return out
+
+
+def _merge_same_identity_projects(
+    projects: list[ProjectCandidate],
+) -> ProjectCandidate:
+    """Merge projects that share a strong identity key (order-independent)."""
+    if len(projects) == 1:
+        return projects[0]
+    name = _pick_canonical_scalar([p.project_name for p in projects])
+    customer = _pick_canonical_scalar([p.customer_name for p in projects])
+    # Prefer earliest start / latest end among parseable month dates.
+    starts = [
+        ( _project_ym_ordinal(p.start_date), p.start_date)
+        for p in projects
+        if _project_ym_ordinal(p.start_date) is not None
+    ]
+    ends = [
+        (_project_ym_ordinal(p.end_date), p.end_date)
+        for p in projects
+        if _project_ym_ordinal(p.end_date) is not None
+    ]
+    start_date = (
+        sorted(starts, key=lambda item: (item[0], str(item[1])))[0][1]
+        if starts
+        else _pick_canonical_scalar([p.start_date for p in projects])
+    )
+    end_date = (
+        sorted(ends, key=lambda item: (-(item[0] or 0), str(item[1])))[0][1]
+        if ends
+        else _pick_canonical_scalar([p.end_date for p in projects])
+    )
+    durations = [
+        p.duration_months
+        for p in projects
+        if isinstance(p.duration_months, int) and p.duration_months >= 0
+    ]
+    duration = max(durations) if durations else None
+    responsibilities = _pick_canonical_scalar(
+        [p.responsibilities for p in projects]
+    )
+    summary = _pick_canonical_scalar([p.project_summary for p in projects])
+    return ProjectCandidate(
+        project_name=name,
+        customer_name=customer,
+        start_date=start_date,
+        end_date=end_date,
+        duration_months=duration,
+        responsibilities=responsibilities,
+        project_summary=summary,
+        jobs=_union_code_ref_lists([list(p.jobs) for p in projects]),
+        skills=_union_code_ref_lists([list(p.skills) for p in projects]),
+        expertise=_union_code_ref_lists([list(p.expertise) for p in projects]),
+        business_domains=_union_code_ref_lists(
+            [list(p.business_domains) for p in projects]
+        ),
+        customer_types=_union_code_ref_lists(
+            [list(p.customer_types) for p in projects]
+        ),
+        source_refs=_union_source_refs([list(p.source_refs) for p in projects]),
+    )
+
+
+def merge_project_chunk_candidates(
+    chunks: list[ProfileCandidateDocument],
+) -> ProfileCandidateDocument:
+    """Deterministic PROJECT-phase chunk merge (not second-pass supplement).
+
+    Groups by strong name+customer+period identity. Same identity unions root
+    refs and j/t/x/b/ct by code. Ambiguous (missing identity) projects stay
+    separate. Final project order is sorted for order-independent results.
+    """
+    if not chunks:
+        return ProfileCandidateDocument(
+            schema_version=SCHEMA_VERSION,
+            projects=[],
+        )
+    groups: dict[tuple[str, str, int | None, int | None], list[ProjectCandidate]] = {}
+    singles: list[ProjectCandidate] = []
+    for chunk in chunks:
+        for project in chunk.projects:
+            key = _chunk_project_identity_key(project)
+            if key is None:
+                singles.append(project)
+                continue
+            groups.setdefault(key, []).append(project)
+
+    merged: list[ProjectCandidate] = [
+        _merge_same_identity_projects(items) for items in groups.values()
+    ]
+    merged.extend(singles)
+
+    def _sort_key(p: ProjectCandidate) -> tuple:
+        return (
+            _project_ym_ordinal(p.start_date) is None,
+            _project_ym_ordinal(p.start_date) or 0,
+            _project_ym_ordinal(p.end_date) is None,
+            _project_ym_ordinal(p.end_date) or 0,
+            _fold_ws_text(p.project_name or ""),
+            _fold_ws_text(p.customer_name or ""),
+        )
+
+    merged.sort(key=_sort_key)
+    # Preserve non-project shell from the first chunk when present.
+    base = chunks[0]
+    return base.model_copy(update={"projects": merged})

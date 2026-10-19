@@ -34,6 +34,7 @@ class LLMProvider(Protocol):
         system_prompt: str,
         user_prompt: str,
         log_context: dict | None = None,
+        max_completion_tokens: int | None = None,
     ) -> dict: ...
 
 
@@ -64,6 +65,7 @@ class OpenAICompatibleLLMProvider:
         system_prompt: str,
         user_prompt: str,
         log_context: dict | None = None,
+        max_completion_tokens: int | None = None,
     ) -> dict:
         content = self._chat(
             system_prompt,
@@ -71,6 +73,7 @@ class OpenAICompatibleLLMProvider:
             log_context,
             timeout_seconds=float(self.settings.analysis_ai_request_timeout_seconds),
             enable_thinking=self.settings.analysis_llm_enable_thinking,
+            max_completion_tokens=max_completion_tokens,
         )
         return _parse_json_dict(content, allow_repair=True)
 
@@ -82,6 +85,7 @@ class OpenAICompatibleLLMProvider:
         *,
         timeout_seconds: float,
         enable_thinking: bool | None = None,
+        max_completion_tokens: int | None = None,
     ) -> str:
         payload: dict = {
             "model": self.settings.llm_model,
@@ -94,11 +98,15 @@ class OpenAICompatibleLLMProvider:
         # Profile-analysis toggle only: omit key entirely when unset.
         if enable_thinking is not None:
             payload["chat_template_kwargs"] = {"enable_thinking": enable_thinking}
+        if max_completion_tokens is not None:
+            payload["max_completion_tokens"] = int(max_completion_tokens)
         ctx = {
             **(log_context or {}),
             "provider": "llm",
             "input_char_count": len(system_prompt) + len(user_prompt),
         }
+        if max_completion_tokens is not None:
+            ctx["max_completion_tokens"] = int(max_completion_tokens)
         data = post_chat_completions(
             base_url=self.settings.llm_base_url,
             api_key=self.settings.llm_api_key,
@@ -178,6 +186,7 @@ class FakeLLMProvider:
         self.calls = 0
         self.last_system_prompt: str | None = None
         self.last_user_prompt: str | None = None
+        self.last_max_completion_tokens: int | None = None
 
     def extract_identity(
         self,
@@ -202,10 +211,12 @@ class FakeLLMProvider:
         system_prompt: str,
         user_prompt: str,
         log_context: dict | None = None,
+        max_completion_tokens: int | None = None,
     ) -> dict:
         self.calls += 1
         self.last_system_prompt = system_prompt
         self.last_user_prompt = user_prompt
+        self.last_max_completion_tokens = max_completion_tokens
         _ = log_context
         if self.fail:
             raise AIProviderError("injected LLM failure")

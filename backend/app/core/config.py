@@ -65,6 +65,16 @@ class Settings(BaseSettings):
     # None keeps historical Chat Completions payloads unchanged.
     analysis_llm_enable_thinking: bool | None = None
 
+    # ModelOps capability + adaptive token budgeting (ratios; no hard-coded windows).
+    analysis_capability_timeout_seconds: float = 5.0
+    analysis_token_safety_ratio: float = 0.08
+    analysis_core_output_ratio: float = 0.28
+    analysis_project_output_ratio: float = 0.35
+    # Conservative prompt estimator: tokens ≈ ceil(chars / chars_per_token).
+    analysis_prompt_chars_per_token: float = 2.0
+    analysis_project_split_max_depth: int = 3
+    analysis_project_split_max_calls: int = 8
+
     embedding_base_url: str = "https://gateway.example.test"
     embedding_api_key: str = "change-me"
     embedding_model: str = "embedding-model-alias"
