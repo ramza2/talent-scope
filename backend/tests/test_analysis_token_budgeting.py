@@ -396,6 +396,36 @@ def test_plan_uses_token_count_budget_callback_not_chars() -> None:
     assert any("D1" in p and "D2" not in p for p in planned)
     assert any("D2" in p for p in planned)
     assert calls  # token-count callback used
+    # root + each document — no unbounded body recursion.
+    assert len(calls) <= 3
+
+
+def test_planner_bounds_token_counts_for_huge_single_page() -> None:
+    from app.modules.analysis.token_budget import (
+        compute_prompt_chat_budget,
+        plan_project_source_chunks,
+    )
+
+    huge = (
+        "[DOCUMENT D1]\nfilename: a.pdf\ndocument_type: DOC-PROFILE\n"
+        "content:\n[PAGE 1]\n" + ("HUGE " * 5000)
+    )
+    calls = {"n": 0}
+
+    def budget_for_blocks(text: str):
+        calls["n"] += 1
+        # Always over-budget so a recursive planner would fan out.
+        return compute_prompt_chat_budget(
+            _count(prompt_tokens=9000, window=2000),
+            output_reserve_ratio=0.35,
+            safety_margin_ratio=0.08,
+            enable_thinking=False,
+        )
+
+    planned = plan_project_source_chunks(huge, budget_for_blocks=budget_for_blocks)
+    assert planned == [huge]
+    # root + single document only (page leaf deferred to extract).
+    assert calls["n"] == 2
 
 
 def test_split_page_and_subchunk_helpers() -> None:
@@ -828,7 +858,7 @@ def _run_staged(
     from app.modules.analysis.service import AnalysisService
     from app.modules.analysis.source_builder import DocumentSnapshot, PageSnapshot
 
-    settings = Settings(
+    settings_args = dict(
         llm_base_url="https://gateway.example.test",
         llm_api_key="k",
         llm_model="qwen3-14b",
@@ -836,8 +866,9 @@ def _run_staged(
         analysis_token_count_max_attempts=3,
         analysis_project_split_max_depth=3,
         analysis_project_split_max_calls=8,
-        **(settings_kwargs or {}),
     )
+    settings_args.update(settings_kwargs or {})
+    settings = Settings(**settings_args)
     monkeypatch.setattr(
         svc_mod,
         "fetch_model_capabilities",
@@ -1178,4 +1209,168 @@ def test_service_persistent_route_drift_fail_closed(monkeypatch) -> None:
     )
     with pytest.raises((InsufficientCandidateError, AIProviderError)):
         _run_staged(monkeypatch, llm, blocks, caps_fn=caps_fn)
+    assert not any(c["phase"] == "projects" for c in llm.chat_calls)
+
+
+def test_service_budget_fit_length_escalates_to_adaptive_not_recovery(monkeypatch) -> None:
+    """Initial fit + first Chat length → adaptive split; no full-source recovery."""
+    from app.ai.providers.errors import AIResponseTruncatedError
+    from app.ai.providers.token_count import TokenCountResult
+
+    project_chats = {"n": 0}
+
+    def count_fn(*, user_prompt, **kwargs):
+        aliased_both = (
+            "[DOCUMENT D1]" in user_prompt and "[DOCUMENT D2]" in user_prompt
+        )
+        # Root/combined always "fits" by token-count; length is the trigger.
+        return TokenCountResult(
+            model="qwen3-14b",
+            prompt_tokens=900 if aliased_both else 700,
+            context_window=10_000,
+            status="VERIFIED",
+            deployment_id="dep-1",
+            route_id="route-1",
+            routing_version=1,
+        )
+
+    def chat_fn(*, log_context, user_prompt, **kwargs):
+        phase = (log_context or {}).get("phase")
+        if phase == "core":
+            return _core_payload()
+        project_chats["n"] += 1
+        # First PROJECT chat (full-source single path) truncates.
+        if project_chats["n"] == 1:
+            assert "[DOCUMENT D1]" in user_prompt and "[DOCUMENT D2]" in user_prompt
+            raise AIResponseTruncatedError(
+                meta={"finish_reason": "length", "prompt_tokens": 900}
+            )
+        name = "DocA사업" if "문서A" in user_prompt else "DocB사업"
+        return _projects_payload(name)
+
+    llm = _BudgetLLM(count_fn=count_fn, chat_fn=chat_fn)
+    blocks = (
+        _doc_block(
+            "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            alias_body="",
+            pages="[PAGE 1]\n" + ("문서A " * 80),
+        )
+        + _doc_block(
+            "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            alias_body="",
+            pages="[PAGE 1]\n" + ("문서B " * 80),
+        )
+    )
+    doc = _run_staged(monkeypatch, llm, blocks)
+    project_calls = [c for c in llm.chat_calls if c["phase"] == "projects"]
+    assert project_chats["n"] >= 3  # 1 failed full + >=2 chunk successes
+    assert not any(c.get("recovery_retry") is True for c in project_calls)
+    assert any(
+        ("[DOCUMENT D1]" in (c.get("user_prompt") or ""))
+        and ("[DOCUMENT D2]" not in (c.get("user_prompt") or ""))
+        for c in project_calls
+    )
+    assert len(doc.projects) >= 1
+
+
+def test_service_budget_fit_prechat_overbudget_escalates_to_adaptive(
+    monkeypatch,
+) -> None:
+    """Root count fits; pre-chat recount over-budget → adaptive; no stale Chat."""
+    from app.ai.providers.token_count import TokenCountResult
+
+    count_i = {"n": 0}
+
+    def caps_fn(*_a, **_k):
+        return _caps_fixed(window=10_000)
+
+    def count_fn(*, user_prompt, **kwargs):
+        count_i["n"] += 1
+        aliased_both = (
+            "[DOCUMENT D1]" in user_prompt and "[DOCUMENT D2]" in user_prompt
+        )
+        # First root count fits; subsequent full-source recounts over-budget
+        # (simulates route/context change before Chat).
+        if aliased_both and count_i["n"] > 1:
+            return TokenCountResult(
+                model="qwen3-14b",
+                prompt_tokens=9000,
+                context_window=10_000,
+                status="VERIFIED",
+                deployment_id="dep-1",
+                route_id="route-1",
+                routing_version=1,
+            )
+        return TokenCountResult(
+            model="qwen3-14b",
+            prompt_tokens=700 if not aliased_both else 800,
+            context_window=10_000,
+            status="VERIFIED",
+            deployment_id="dep-1",
+            route_id="route-1",
+            routing_version=1,
+        )
+
+    llm = _BudgetLLM(
+        count_fn=count_fn,
+        project_payloads=[
+            _projects_payload("DocA사업"),
+            _projects_payload("DocB사업"),
+        ],
+    )
+    blocks = (
+        _doc_block(
+            "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            alias_body="",
+            pages="[PAGE 1]\n" + ("문서A " * 80),
+        )
+        + _doc_block(
+            "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            alias_body="",
+            pages="[PAGE 1]\n" + ("문서B " * 80),
+        )
+    )
+    doc = _run_staged(monkeypatch, llm, blocks, caps_fn=caps_fn)
+    project_calls = [c for c in llm.chat_calls if c["phase"] == "projects"]
+    # Never chat the combined full-source prompt after over-budget recount.
+    assert project_calls
+    assert not any(
+        "[DOCUMENT D1]" in (c.get("user_prompt") or "")
+        and "[DOCUMENT D2]" in (c.get("user_prompt") or "")
+        for c in project_calls
+    )
+    assert not any(c.get("recovery_retry") is True for c in project_calls)
+    assert len(doc.projects) >= 1
+
+
+def test_service_irreducible_overbudget_fail_closed(monkeypatch) -> None:
+    import pytest
+    from app.ai.providers.token_count import TokenCountResult
+    from app.modules.analysis.service import InsufficientCandidateError
+
+    def count_fn(**kwargs):
+        # Always over-budget vs 10k window (matches capability identity).
+        return TokenCountResult(
+            model="qwen3-14b",
+            prompt_tokens=9000,
+            context_window=10_000,
+            status="VERIFIED",
+            deployment_id="dep-1",
+            route_id="route-1",
+            routing_version=1,
+        )
+
+    llm = _BudgetLLM(count_fn=count_fn)
+    blocks = _doc_block(
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        alias_body="",
+        pages="[PAGE 1]\nSHORT",
+    )
+    with pytest.raises(InsufficientCandidateError):
+        _run_staged(
+            monkeypatch,
+            llm,
+            blocks,
+            settings_kwargs={"analysis_project_split_max_depth": 1},
+        )
     assert not any(c["phase"] == "projects" for c in llm.chat_calls)

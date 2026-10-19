@@ -178,10 +178,13 @@ def plan_project_source_chunks(
     *,
     budget_for_blocks,
 ) -> list[str]:
-    """Plan PROJECT chunks; ``budget_for_blocks`` must use /v1/token-count.
+    """Plan PROJECT chunks down to document/page level only.
 
-    ``budget_for_blocks(blocks) -> PromptChatBudget`` is authoritative for
-    fit. Structural splits never decide fitness by character heuristics alone.
+    ``budget_for_blocks(blocks) -> PromptChatBudget`` must use /v1/token-count
+    for fit. Over-budget pages are returned as-is so the extract path can
+    deepen body subchunks under ``analysis_project_split_max_depth`` /
+    ``analysis_project_split_max_calls`` — the planner must not recursively
+    fan out unbounded token-count calls.
     """
     root_budget = budget_for_blocks(document_blocks)
     if root_budget.fits:
@@ -195,29 +198,9 @@ def plan_project_source_chunks(
             continue
         page_chunks = split_block_by_pages(doc_block)
         if len(page_chunks) <= 1:
-            page_chunks = [doc_block]
-        for page_block in page_chunks:
-            page_budget = budget_for_blocks(page_block)
-            if page_budget.fits:
-                chunks.append(page_block)
-                continue
-            pending = [page_block]
-            while pending:
-                cur = pending.pop(0)
-                cur_budget = budget_for_blocks(cur)
-                if cur_budget.fits:
-                    chunks.append(cur)
-                    continue
-                # Structural shrink only; each part is re-measured above/below.
-                if len(cur) <= 256:
-                    # Irreducible for planner — keep and let Chat/length path fail closed.
-                    chunks.append(cur)
-                    continue
-                parts = split_page_block_text(
-                    cur, max_body_chars=max(256, len(cur) // 2)
-                )
-                if len(parts) <= 1:
-                    chunks.append(cur)
-                    continue
-                pending.extend(parts)
+            # Single page/body still over budget — defer deep split to extract.
+            chunks.append(doc_block)
+            continue
+        # Page is the planner leaf; body deepening is extract-bounded.
+        chunks.extend(page_chunks)
     return chunks or [document_blocks]

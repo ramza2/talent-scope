@@ -2123,32 +2123,25 @@ class AnalysisService:
                 last_token_count = None
                 raise InsufficientCandidateError() from prov_exc
 
-        def _run_projects_adaptive() -> ProfileCandidateDocument:
+        def _run_projects_split_path(
+            *,
+            root_budget: PromptChatBudget,
+            reason: str,
+            force_structural_split: bool = False,
+        ) -> ProfileCandidateDocument:
+            """Document/page(+bounded body) adaptive PROJECT path."""
             nonlocal used_project_adaptive_split
-            _refresh_capabilities(reason="projects_phase")
-            root_budget = _project_budget_for_blocks(
-                aliased_blocks, recovery_retry=False, force_recount=True
-            )
-            # Budget-fit → historical single PROJECT flow + optional second-pass.
-            if root_budget.fits:
-                used_project_adaptive_split = False
-                return _run_phase(
-                    phase="projects",
-                    system_prompt=prompt.projects_system_prompt,
-                    build_user_prompt=prompt.build_projects_user_prompt,
-                    code_catalog_text=projects_catalog,
-                    normalize_raw=_normalize_projects,
-                    needs_retry=_projects_needs_retry,
-                    fail_closed_if_bad=False,
-                    validate_recovery_raw=(
-                        _validate_projects_recovery_raw
-                        if prompt.validate_projects_recovery_root
-                        else None
-                    ),
-                    max_completion_tokens=root_budget.max_completion_tokens,
-                )
-
             used_project_adaptive_split = True
+            logger.info(
+                "analysis project adaptive split enter analysis_run_id=%s "
+                "reason=%s context_window=%s prompt_tokens=%s "
+                "force_structural_split=%s",
+                base_log.get("analysis_run_id"),
+                reason,
+                root_budget.context_window,
+                root_budget.prompt_tokens,
+                force_structural_split,
+            )
             try:
                 planned = plan_project_source_chunks(
                     aliased_blocks,
@@ -2159,6 +2152,16 @@ class AnalysisService:
             except AIProviderError as exc:
                 # Token-count outage while planning — fail closed, no fan-out.
                 raise InsufficientCandidateError() from exc
+            # length-driven escalate may still "fit" by token-count; force
+            # document/page partition so we do not re-chat the same full source.
+            if force_structural_split and len(planned) <= 1:
+                docs = split_document_blocks(aliased_blocks)
+                if len(docs) > 1:
+                    planned = docs
+                else:
+                    pages = split_block_by_pages(aliased_blocks)
+                    if len(pages) > 1:
+                        planned = pages
             logger.info(
                 "analysis project adaptive split analysis_run_id=%s "
                 "chunk_count=%s context_window=%s prompt_tokens=%s "
@@ -2180,6 +2183,90 @@ class AnalysisService:
                     )
                 )
             return merge_project_chunk_candidates(chunk_docs)
+
+        def _run_projects_adaptive() -> ProfileCandidateDocument:
+            nonlocal used_project_adaptive_split, recovery_budget
+            _refresh_capabilities(reason="projects_phase")
+            try:
+                root_budget = _project_budget_for_blocks(
+                    aliased_blocks, recovery_retry=False, force_recount=True
+                )
+            except AIProviderError as exc:
+                raise InsufficientCandidateError() from exc
+            # Budget-fit → try single PROJECT first pass. length / pre-chat
+            # over-budget escalate to adaptive split (no full-source recovery).
+            # Sparse/validation recovery semantics remain for non-length cases.
+            if root_budget.fits:
+                try:
+                    raw = _phase_call(
+                        phase="projects",
+                        system_prompt=prompt.projects_system_prompt,
+                        build_user_prompt=prompt.build_projects_user_prompt,
+                        code_catalog_text=projects_catalog,
+                        recovery_retry=False,
+                        max_completion_tokens=root_budget.max_completion_tokens,
+                    )
+                    candidate = _normalize_projects(raw)
+                except AIResponseTruncatedError as trunc_exc:
+                    logger.info(
+                        "analysis project single-path truncated → adaptive "
+                        "analysis_run_id=%s finish_reason=%s",
+                        base_log.get("analysis_run_id"),
+                        (trunc_exc.meta or {}).get("finish_reason"),
+                    )
+                    return _run_projects_split_path(
+                        root_budget=root_budget,
+                        reason="single_path_length",
+                        force_structural_split=True,
+                    )
+                except ProjectPromptOverBudgetError:
+                    logger.info(
+                        "analysis project single-path pre-chat over-budget → "
+                        "adaptive analysis_run_id=%s",
+                        base_log.get("analysis_run_id"),
+                    )
+                    return _run_projects_split_path(
+                        root_budget=root_budget,
+                        reason="single_path_pre_chat_over_budget",
+                    )
+
+                if _projects_needs_retry(candidate) and recovery_budget > 0:
+                    recovery_budget -= 1
+                    try:
+                        raw = _phase_call(
+                            phase="projects",
+                            system_prompt=prompt.projects_system_prompt,
+                            build_user_prompt=prompt.build_projects_user_prompt,
+                            code_catalog_text=projects_catalog,
+                            recovery_retry=True,
+                            max_completion_tokens=root_budget.max_completion_tokens,
+                        )
+                        if prompt.validate_projects_recovery_root:
+                            _validate_projects_recovery_raw(raw)
+                        candidate = _normalize_projects(raw)
+                    except AIResponseTruncatedError as trunc_exc:
+                        logger.info(
+                            "analysis project sparse-recovery truncated → "
+                            "adaptive analysis_run_id=%s finish_reason=%s",
+                            base_log.get("analysis_run_id"),
+                            (trunc_exc.meta or {}).get("finish_reason"),
+                        )
+                        return _run_projects_split_path(
+                            root_budget=root_budget,
+                            reason="sparse_recovery_length",
+                            force_structural_split=True,
+                        )
+                    except ProjectPromptOverBudgetError:
+                        return _run_projects_split_path(
+                            root_budget=root_budget,
+                            reason="sparse_recovery_pre_chat_over_budget",
+                        )
+                used_project_adaptive_split = False
+                return candidate
+
+            return _run_projects_split_path(
+                root_budget=root_budget, reason="root_over_budget"
+            )
 
         projects_doc = _run_projects_adaptive()
         logger.info(
