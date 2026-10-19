@@ -31,26 +31,32 @@ def _project(
     start: str,
     end: str,
     jobs: list[tuple[str, str]] | None = None,
+    expertise: list[tuple[str, str]] | None = None,
+    skills: list[tuple[str, str]] | None = None,
     root_quote: str | None = None,
     document_id: str = _DOC,
 ):
     from app.ai.schemas.profile_candidate import CodeRefCandidate, ProjectCandidate
 
-    job_rels = [
-        CodeRefCandidate(
-            code=code,
-            raw_value=code,
-            source_refs=[_ref(quote, document_id=document_id)],
-        )
-        for code, quote in (jobs or [])
-    ]
+    def _rels(items: list[tuple[str, str]] | None):
+        return [
+            CodeRefCandidate(
+                code=code,
+                raw_value=code,
+                source_refs=[_ref(quote, document_id=document_id)],
+            )
+            for code, quote in (items or [])
+        ]
+
     return ProjectCandidate(
         project_name=name,
         customer_name=customer,
         start_date=start,
         end_date=end,
         source_refs=[_ref(root_quote or name, document_id=document_id)],
-        jobs=job_rels,
+        jobs=_rels(jobs),
+        expertise=_rels(expertise),
+        skills=_rels(skills),
     )
 
 
@@ -454,6 +460,267 @@ def test_crossdoc_near_period_title_variant_suppresses_second() -> None:
     assert len(out.projects) == 1
     assert out.projects[0].project_name == "광주통합전산센터 2015년 정보보호 강화(HW)"
     assert out.projects[0].start_date == "2015.07"
+
+
+def test_crossdoc_one_to_one_merges_missing_supported_job_exp() -> None:
+    from app.ai.schemas.profile_candidate import CodeRefCandidate
+    from app.modules.analysis.compact_v8 import supplement_projects_from_second_pass
+
+    first = _doc(
+        [
+            _project(
+                name="2017년 제2차 정보자원통합구축 HW1사업 (대전)",
+                customer="정부통합전산센터",
+                start="2017.10",
+                end="2018.03",
+                document_id=_DOC,
+                jobs=[
+                    (
+                        "JOB-OPS-SYS",
+                        "시스템구축 및 운영 > IT시스템기술지원",
+                    )
+                ],
+            )
+        ]
+    )
+    # Preserve existing same-code relation fields.
+    first.projects[0].jobs[0] = first.projects[0].jobs[0].model_copy(
+        update={
+            "raw_value": "FIRST-OPS-RAW",
+            "source_refs": [_ref("FIRST-OPS-QUOTE", document_id=_DOC)],
+        }
+    )
+    second = _doc(
+        [
+            _project(
+                name="2017년 제2차 정보자원통합구축 HW1사업 (대전)",
+                customer="정부통합전산센터",
+                start="2017.10",
+                end="2018.03",
+                document_id=_DOC_B,
+                jobs=[
+                    (
+                        "JOB-OPS-SYS",
+                        "시스템구축 및 운영 > IT시스템관리",
+                    ),
+                    ("JOB-MGT", "사업관리"),
+                ],
+                expertise=[("EXP-MGT", "사업관리"), ("EXP-INFRA", "정보시스템 운영")],
+                skills=[("TECH-SEC-AD", "AD")],
+            )
+        ]
+    )
+    out, n = supplement_projects_from_second_pass(first, second)
+    assert n == 0
+    assert len(out.projects) == 1
+    proj = out.projects[0]
+    assert proj.project_name == "2017년 제2차 정보자원통합구축 HW1사업 (대전)"
+    assert proj.start_date == "2017.10"
+    assert proj.source_refs[0].document_id == _DOC
+    job_by_code = {j.code: j for j in proj.jobs}
+    assert set(job_by_code) == {"JOB-OPS-SYS", "JOB-MGT"}
+    assert job_by_code["JOB-OPS-SYS"].raw_value == "FIRST-OPS-RAW"
+    assert job_by_code["JOB-OPS-SYS"].source_refs[0].quote_text == "FIRST-OPS-QUOTE"
+    assert job_by_code["JOB-MGT"].source_refs[0].quote_text == "사업관리"
+    exp_codes = {e.code for e in proj.expertise}
+    assert exp_codes == {"EXP-MGT", "EXP-INFRA"}
+    assert proj.skills == []
+    assert isinstance(job_by_code["JOB-MGT"], CodeRefCandidate)
+
+
+def test_crossdoc_aggregate_propagates_supported_job_exp_to_segments() -> None:
+    from app.modules.analysis.compact_v8 import supplement_projects_from_second_pass
+
+    customer = "국가정보자원 관리원(광주)"
+    first = _doc(
+        [
+            _project(
+                name="2018년 광주센터 정보시스템1군 운영",
+                customer=customer,
+                start="2018.01",
+                end="2018.12",
+                document_id=_DOC,
+            ),
+            _project(
+                name="2019년 광주센터 정보시스템1군 운영",
+                customer=customer,
+                start="2019.01",
+                end="2021.12",
+                document_id=_DOC,
+            ),
+            _project(
+                name="2022년 광주센터 정보시스템1군 운영",
+                customer=customer,
+                start="2022.01",
+                end="2023.01",
+                document_id=_DOC,
+            ),
+        ]
+    )
+    second = _doc(
+        [
+            _project(
+                name="광주센터 정보시스템 1군 유지보수 운영",
+                customer=customer,
+                start="2018.01",
+                end="2023.01",
+                document_id=_DOC_B,
+                jobs=[
+                    (
+                        "JOB-OPS-SYS",
+                        "시스템구축 및 운영 > IT시스템기술지원",
+                    )
+                ],
+                expertise=[("EXP-INFRA", "정보시스템 운영")],
+                skills=[("TECH-SEC-AD", "AD")],
+            )
+        ]
+    )
+    out, n = supplement_projects_from_second_pass(first, second)
+    assert n == 0
+    assert len(out.projects) == 3
+    for proj in out.projects:
+        assert {j.code for j in proj.jobs} == {"JOB-OPS-SYS"}
+        assert {e.code for e in proj.expertise} == {"EXP-INFRA"}
+        assert proj.skills == []
+        assert proj.source_refs[0].document_id == _DOC
+
+
+def test_crossdoc_unsupported_job_evidence_not_merged() -> None:
+    from app.modules.analysis.compact_v8 import supplement_projects_from_second_pass
+
+    first = _doc(
+        [
+            _project(
+                name="2013년 차기 복권통합구축사업",
+                customer="기획재정부",
+                start="2013.09",
+                end="2013.12",
+                document_id=_DOC,
+            )
+        ]
+    )
+    second = _doc(
+        [
+            _project(
+                name="2013년 차기 복권통합구축사업",
+                customer="기획재정부",
+                start="2013.09",
+                end="2013.12",
+                document_id=_DOC_B,
+                jobs=[("JOB-OPS-SYS", "단순 업무 지원")],
+                expertise=[("EXP-INFRA", "관련 업무")],
+            )
+        ]
+    )
+    out, n = supplement_projects_from_second_pass(first, second)
+    assert n == 0
+    assert out.projects[0].jobs == []
+    assert out.projects[0].expertise == []
+
+
+def test_same_document_relation_not_merged() -> None:
+    from app.modules.analysis.compact_v8 import supplement_projects_from_second_pass
+
+    first = _doc(
+        [
+            _project(
+                name="2017년 제2차 정보자원통합구축 HW1사업 (대전)",
+                customer="정부통합전산센터",
+                start="2017.10",
+                end="2018.03",
+                document_id=_DOC,
+            )
+        ]
+    )
+    second = _doc(
+        [
+            _project(
+                name="2017년 제2차 정보자원통합구축 HW1사업 (대전)",
+                customer="정부통합전산센터",
+                start="2017.10",
+                end="2018.03",
+                document_id=_DOC,
+                jobs=[("JOB-MGT", "사업관리")],
+                expertise=[("EXP-MGT", "사업관리")],
+            )
+        ]
+    )
+    out, n = supplement_projects_from_second_pass(first, second)
+    assert n == 0
+    assert out.projects[0].jobs == []
+    assert out.projects[0].expertise == []
+
+
+def test_ambiguous_customer_date_relation_not_merged() -> None:
+    from app.modules.analysis.compact_v8 import supplement_projects_from_second_pass
+
+    first = _doc(
+        [
+            _project(
+                name="A사업",
+                customer="정부통합전산센터",
+                start="2011.06",
+                end="2011.12",
+                document_id=_DOC,
+            ),
+            _project(
+                name="B사업",
+                customer="정부통합전산센터",
+                start="2011.06",
+                end="2011.12",
+                document_id=_DOC,
+            ),
+        ]
+    )
+    second = _doc(
+        [
+            _project(
+                name="2011년 제2차 자원통합 구축 HW1 사업(대전)",
+                customer="정부통합전산센터",
+                start="2011.06",
+                end="2011.12",
+                document_id=_DOC_B,
+                jobs=[("JOB-MGT", "사업관리")],
+                expertise=[("EXP-MGT", "사업관리")],
+            )
+        ]
+    )
+    out, n = supplement_projects_from_second_pass(first, second)
+    assert n == 0
+    assert len(out.projects) == 2
+    assert all(p.jobs == [] and p.expertise == [] for p in out.projects)
+
+
+def test_crossdoc_second_skills_not_merged() -> None:
+    from app.modules.analysis.compact_v8 import supplement_projects_from_second_pass
+
+    first = _doc(
+        [
+            _project(
+                name="국방통합정보관리소 정보체계 이전/통합 사업",
+                customer="국방부",
+                start="2014.02",
+                end="2014.12",
+                document_id=_DOC,
+            )
+        ]
+    )
+    second = _doc(
+        [
+            _project(
+                name="국방통합정보관리소 정보체계 이전/통합 사업",
+                customer="국방부",
+                start="2014.02",
+                end="2014.12",
+                document_id=_DOC_B,
+                skills=[("TECH-SEC-AD", "AD"), ("TECH-SEC-NAC", "NAC")],
+            )
+        ]
+    )
+    out, n = supplement_projects_from_second_pass(first, second)
+    assert n == 0
+    assert out.projects[0].skills == []
 
 
 def test_crossdoc_aggregate_unrelated_name_still_supplements() -> None:
