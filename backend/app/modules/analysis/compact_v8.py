@@ -3338,6 +3338,11 @@ def supplement_projects_from_second_pass(
     )
 
 
+_CHUNK_DOC_KOSA = "DOC-KOSA"
+_CHUNK_DOC_PROFILE = "DOC-PROFILE"
+_CHUNK_KOSA_PROFILE_TYPES = frozenset({_CHUNK_DOC_KOSA, _CHUNK_DOC_PROFILE})
+
+
 def _chunk_project_identity_key(
     project: ProjectCandidate,
 ) -> tuple[str, str, int | None, int | None] | None:
@@ -3405,6 +3410,44 @@ def _union_code_ref_lists(
     return out
 
 
+def _merge_project_relations_and_refs(
+    projects: list[ProjectCandidate],
+    *,
+    project_name: str | None,
+    customer_name: str | None,
+    start_date: str | None,
+    end_date: str | None,
+) -> ProjectCandidate:
+    durations = [
+        p.duration_months
+        for p in projects
+        if isinstance(p.duration_months, int) and p.duration_months >= 0
+    ]
+    return ProjectCandidate(
+        project_name=project_name,
+        customer_name=customer_name,
+        start_date=start_date,
+        end_date=end_date,
+        duration_months=max(durations) if durations else None,
+        responsibilities=_pick_canonical_scalar(
+            [p.responsibilities for p in projects]
+        ),
+        project_summary=_pick_canonical_scalar(
+            [p.project_summary for p in projects]
+        ),
+        jobs=_union_code_ref_lists([list(p.jobs) for p in projects]),
+        skills=_union_code_ref_lists([list(p.skills) for p in projects]),
+        expertise=_union_code_ref_lists([list(p.expertise) for p in projects]),
+        business_domains=_union_code_ref_lists(
+            [list(p.business_domains) for p in projects]
+        ),
+        customer_types=_union_code_ref_lists(
+            [list(p.customer_types) for p in projects]
+        ),
+        source_refs=_union_source_refs([list(p.source_refs) for p in projects]),
+    )
+
+
 def _merge_same_identity_projects(
     projects: list[ProjectCandidate],
 ) -> ProjectCandidate:
@@ -3413,9 +3456,8 @@ def _merge_same_identity_projects(
         return projects[0]
     name = _pick_canonical_scalar([p.project_name for p in projects])
     customer = _pick_canonical_scalar([p.customer_name for p in projects])
-    # Prefer earliest start / latest end among parseable month dates.
     starts = [
-        ( _project_ym_ordinal(p.start_date), p.start_date)
+        (_project_ym_ordinal(p.start_date), p.start_date)
         for p in projects
         if _project_ym_ordinal(p.start_date) is not None
     ]
@@ -3434,45 +3476,371 @@ def _merge_same_identity_projects(
         if ends
         else _pick_canonical_scalar([p.end_date for p in projects])
     )
-    durations = [
-        p.duration_months
-        for p in projects
-        if isinstance(p.duration_months, int) and p.duration_months >= 0
-    ]
-    duration = max(durations) if durations else None
-    responsibilities = _pick_canonical_scalar(
-        [p.responsibilities for p in projects]
-    )
-    summary = _pick_canonical_scalar([p.project_summary for p in projects])
-    return ProjectCandidate(
+    return _merge_project_relations_and_refs(
+        projects,
         project_name=name,
         customer_name=customer,
         start_date=start_date,
         end_date=end_date,
-        duration_months=duration,
-        responsibilities=responsibilities,
-        project_summary=summary,
-        jobs=_union_code_ref_lists([list(p.jobs) for p in projects]),
-        skills=_union_code_ref_lists([list(p.skills) for p in projects]),
-        expertise=_union_code_ref_lists([list(p.expertise) for p in projects]),
-        business_domains=_union_code_ref_lists(
-            [list(p.business_domains) for p in projects]
+    )
+
+
+def _project_doc_types(
+    project: ProjectCandidate, document_type_by_id: dict[str, str]
+) -> set[str]:
+    types: set[str] = set()
+    for doc_id in _project_root_document_ids(project):
+        code = (document_type_by_id.get(doc_id) or "").strip()
+        if code:
+            types.add(code)
+    return types
+
+
+def _project_is_single_doc_type(
+    project: ProjectCandidate,
+    expected: str,
+    document_type_by_id: dict[str, str],
+) -> bool:
+    docs = _project_root_document_ids(project)
+    if not docs:
+        return False
+    types = _project_doc_types(project, document_type_by_id)
+    if types != {expected}:
+        return False
+    # Every root doc id must resolve to the expected type.
+    return all(
+        (document_type_by_id.get(doc_id) or "").strip() == expected for doc_id in docs
+    )
+
+
+def _is_kosa_profile_cross_doc_pair(
+    a: ProjectCandidate,
+    b: ProjectCandidate,
+    document_type_by_id: dict[str, str],
+) -> bool:
+    """True only for cross-document DOC-KOSA ↔ DOC-PROFILE root refs."""
+    if not document_type_by_id:
+        return False
+    if not _projects_are_cross_document(a, b):
+        return False
+    types = _project_doc_types(a, document_type_by_id) | _project_doc_types(
+        b, document_type_by_id
+    )
+    if types != _CHUNK_KOSA_PROFILE_TYPES:
+        return False
+    # Both sides must resolve types for every root doc id.
+    for project in (a, b):
+        docs = _project_root_document_ids(project)
+        if not docs:
+            return False
+        for doc_id in docs:
+            if not (document_type_by_id.get(doc_id) or "").strip():
+                return False
+    return True
+
+
+def _kosa_profile_complementary_1to1_match(
+    a: ProjectCandidate,
+    b: ProjectCandidate,
+    document_type_by_id: dict[str, str],
+) -> bool:
+    """Relaxed 1:1 identity for KOSA↔PROFILE (customer may differ)."""
+    if not _is_kosa_profile_cross_doc_pair(a, b, document_type_by_id):
+        return False
+    a_kosa = _project_is_single_doc_type(a, _CHUNK_DOC_KOSA, document_type_by_id)
+    a_profile = _project_is_single_doc_type(
+        a, _CHUNK_DOC_PROFILE, document_type_by_id
+    )
+    b_kosa = _project_is_single_doc_type(b, _CHUNK_DOC_KOSA, document_type_by_id)
+    b_profile = _project_is_single_doc_type(
+        b, _CHUNK_DOC_PROFILE, document_type_by_id
+    )
+    if not ((a_kosa and b_profile) or (a_profile and b_kosa)):
+        return False
+    if not _project_names_have_strong_lexical_anchor(a, b):
+        return False
+    if not _project_period_compatible(a, b):
+        return False
+    return True
+
+
+def _merge_kosa_profile_1to1(
+    kosa: ProjectCandidate, profile: ProjectCandidate
+) -> ProjectCandidate:
+    """Scalar policy: KOSA name/dates, PROFILE customer; union relations/refs."""
+    name = (kosa.project_name or "").strip() or (profile.project_name or None)
+    customer = (profile.customer_name or "").strip() or (
+        kosa.customer_name or None
+    )
+    start = (kosa.start_date or "").strip() or (profile.start_date or None)
+    end = (kosa.end_date or "").strip() or (profile.end_date or None)
+    return _merge_project_relations_and_refs(
+        [kosa, profile],
+        project_name=name,
+        customer_name=customer,
+        start_date=start,
+        end_date=end,
+    )
+
+
+def _kosa_profile_aggregate_segment_indices(
+    pool: list[ProjectCandidate],
+    profile_idx: int,
+    document_type_by_id: dict[str, str],
+) -> list[int]:
+    """KOSA segment indices forming an adjacent chain under PROFILE aggregate.
+
+    Requires strong lexical anchors, KOSA/PROFILE type pair, envelope start
+    equal to aggregate start month, and |aggregate_end - envelope_end| <= 1.
+    Customer equality is not required. Empty on ambiguity guards elsewhere.
+    """
+    profile = pool[profile_idx]
+    if not _project_is_single_doc_type(
+        profile, _CHUNK_DOC_PROFILE, document_type_by_id
+    ):
+        return []
+    ps = _project_ym_ordinal(profile.start_date)
+    pe = _project_ym_ordinal(profile.end_date)
+    if ps is None or pe is None or pe < ps:
+        return []
+
+    eligible: list[tuple[int, int, int]] = []
+    for idx, cand in enumerate(pool):
+        if idx == profile_idx:
+            continue
+        if not _project_is_single_doc_type(
+            cand, _CHUNK_DOC_KOSA, document_type_by_id
+        ):
+            continue
+        if not _is_kosa_profile_cross_doc_pair(
+            cand, profile, document_type_by_id
+        ):
+            continue
+        if not _project_names_have_strong_lexical_anchor(cand, profile):
+            continue
+        fs = _project_ym_ordinal(cand.start_date)
+        fe = _project_ym_ordinal(cand.end_date)
+        if fs is None or fe is None or fe < fs:
+            continue
+        # Allow aggregate end to extend one month past segment ends.
+        if fs < ps or fe > pe + 1:
+            continue
+        eligible.append((fs, fe, idx))
+
+    if len(eligible) < 2:
+        return []
+
+    eligible.sort(key=lambda item: (item[0], item[1], item[2]))
+    n = len(eligible)
+    best: list[int] = []
+    for i in range(n):
+        if eligible[i][0] != ps:
+            continue
+        chain_max_end = eligible[i][1]
+        chain_indices = [eligible[i][2]]
+        for j in range(i + 1, n):
+            next_start, next_end, next_idx = eligible[j]
+            if next_start > chain_max_end + 1:
+                break
+            chain_max_end = max(chain_max_end, next_end)
+            chain_indices.append(next_idx)
+        if abs(chain_max_end - pe) <= 1 and len(chain_indices) >= 2:
+            if len(chain_indices) > len(best):
+                best = chain_indices
+    return best
+
+
+def _merge_kosa_profile_aggregate(
+    profile: ProjectCandidate, segments: list[ProjectCandidate]
+) -> ProjectCandidate:
+    """Aggregate scalar policy: PROFILE name/customer; KOSA envelope dates."""
+    ordered = sorted(
+        segments,
+        key=lambda p: (
+            _project_ym_ordinal(p.start_date) or 0,
+            _project_ym_ordinal(p.end_date) or 0,
+            _fold_ws_text(p.project_name or ""),
         ),
-        customer_types=_union_code_ref_lists(
-            [list(p.customer_types) for p in projects]
+    )
+    starts = [
+        (_project_ym_ordinal(p.start_date), p.start_date)
+        for p in ordered
+        if _project_ym_ordinal(p.start_date) is not None
+    ]
+    ends = [
+        (_project_ym_ordinal(p.end_date), p.end_date)
+        for p in ordered
+        if _project_ym_ordinal(p.end_date) is not None
+    ]
+    start_date = (
+        sorted(starts, key=lambda item: (item[0], str(item[1])))[0][1]
+        if starts
+        else profile.start_date
+    )
+    end_date = (
+        sorted(ends, key=lambda item: (-(item[0] or 0), str(item[1])))[0][1]
+        if ends
+        else profile.end_date
+    )
+    name = (profile.project_name or "").strip() or _pick_canonical_scalar(
+        [p.project_name for p in ordered]
+    )
+    customer = (profile.customer_name or "").strip() or _pick_canonical_scalar(
+        [p.customer_name for p in ordered]
+    )
+    return _merge_project_relations_and_refs(
+        [profile, *ordered],
+        project_name=name,
+        customer_name=customer,
+        start_date=start_date,
+        end_date=end_date,
+    )
+
+
+def _apply_kosa_profile_complementary_merge(
+    projects: list[ProjectCandidate],
+    document_type_by_id: dict[str, str],
+) -> list[ProjectCandidate]:
+    """1:1 then aggregate complementary merges; fail closed on ambiguity."""
+    if not projects or not document_type_by_id:
+        return list(projects)
+
+    # Stable working order for deterministic pair discovery.
+    work = sorted(projects, key=_chunk_project_sort_key)
+    used: set[int] = set()
+    out: list[ProjectCandidate] = []
+
+    # --- 1:1 mutual unique complementary pairs ---
+    kosa_idxs = [
+        i
+        for i, p in enumerate(work)
+        if _project_is_single_doc_type(p, _CHUNK_DOC_KOSA, document_type_by_id)
+    ]
+    profile_idxs = [
+        i
+        for i, p in enumerate(work)
+        if _project_is_single_doc_type(p, _CHUNK_DOC_PROFILE, document_type_by_id)
+    ]
+    kosa_to_profiles: dict[int, list[int]] = {i: [] for i in kosa_idxs}
+    profile_to_kosas: dict[int, list[int]] = {i: [] for i in profile_idxs}
+    for ki in kosa_idxs:
+        for pi in profile_idxs:
+            if _kosa_profile_complementary_1to1_match(
+                work[ki], work[pi], document_type_by_id
+            ):
+                kosa_to_profiles[ki].append(pi)
+                profile_to_kosas[pi].append(ki)
+
+    pair_keys: list[tuple[int, int]] = []
+    for ki, partners in kosa_to_profiles.items():
+        if len(partners) != 1:
+            continue
+        pi = partners[0]
+        if len(profile_to_kosas.get(pi, [])) != 1:
+            continue
+        pair_keys.append((ki, pi))
+    # Deterministic pair application order.
+    pair_keys.sort(
+        key=lambda pair: (
+            _chunk_project_sort_key(work[pair[0]]),
+            _chunk_project_sort_key(work[pair[1]]),
+        )
+    )
+    for ki, pi in pair_keys:
+        if ki in used or pi in used:
+            continue
+        out.append(_merge_kosa_profile_1to1(work[ki], work[pi]))
+        used.add(ki)
+        used.add(pi)
+
+    # --- Aggregate: PROFILE + 2+ KOSA segments ---
+    remaining_profile = [
+        i
+        for i in profile_idxs
+        if i not in used
+    ]
+    # Prefer earlier PROFILE aggregates first (deterministic).
+    remaining_profile.sort(key=lambda i: _chunk_project_sort_key(work[i]))
+    claimed_kosa: set[int] = set()
+    for pi in remaining_profile:
+        if pi in used:
+            continue
+        # Build a temporary pool view with used slots still present but skip
+        # already-used indices inside the helper via membership checks.
+        segs = _kosa_profile_aggregate_segment_indices(
+            work, pi, document_type_by_id
+        )
+        segs = [s for s in segs if s not in used and s not in claimed_kosa]
+        if len(segs) < 2:
+            continue
+        # Ambiguity: another remaining PROFILE claims the exact same segment set.
+        ambiguous = False
+        seg_set = frozenset(segs)
+        for other_pi in remaining_profile:
+            if other_pi == pi or other_pi in used:
+                continue
+            other = _kosa_profile_aggregate_segment_indices(
+                work, other_pi, document_type_by_id
+            )
+            other = [s for s in other if s not in used and s not in claimed_kosa]
+            if frozenset(other) == seg_set and len(other) >= 2:
+                ambiguous = True
+                break
+        if ambiguous:
+            continue
+        out.append(
+            _merge_kosa_profile_aggregate(
+                work[pi], [work[s] for s in segs]
+            )
+        )
+        used.add(pi)
+        claimed_kosa.update(segs)
+        used.update(segs)
+
+    for i, project in enumerate(work):
+        if i not in used:
+            out.append(project)
+    return out
+
+
+def _chunk_project_sort_key(project: ProjectCandidate) -> tuple:
+    """Total deterministic order (includes singles without strong identity)."""
+    doc_ids = tuple(sorted(_project_root_document_ids(project)))
+    first_quote = ""
+    for ref in sorted(
+        project.source_refs or [],
+        key=lambda r: (
+            (r.document_id or ""),
+            int(r.page_no or 0),
+            (r.quote_text or ""),
         ),
-        source_refs=_union_source_refs([list(p.source_refs) for p in projects]),
+    ):
+        q = (ref.quote_text or "").strip()
+        if q:
+            first_quote = q
+            break
+    return (
+        _project_ym_ordinal(project.start_date) is None,
+        _project_ym_ordinal(project.start_date) or 0,
+        _project_ym_ordinal(project.end_date) is None,
+        _project_ym_ordinal(project.end_date) or 0,
+        _fold_ws_text(project.project_name or ""),
+        _fold_ws_text(project.customer_name or ""),
+        doc_ids,
+        _fold_ws_text(first_quote),
     )
 
 
 def merge_project_chunk_candidates(
     chunks: list[ProfileCandidateDocument],
+    *,
+    document_type_by_id: dict[str, str] | None = None,
 ) -> ProfileCandidateDocument:
     """Deterministic PROJECT-phase chunk merge (not second-pass supplement).
 
-    Groups by strong name+customer+period identity. Same identity unions root
-    refs and j/t/x/b/ct by code. Ambiguous (missing identity) projects stay
-    separate. Final project order is sorted for order-independent results.
+    1) Strict name+customer+period identity groups (unchanged).
+    2) Optional DOC-KOSA ↔ DOC-PROFILE complementary 1:1 / aggregate merge
+       when ``document_type_by_id`` is provided.
     """
     if not chunks:
         return ProfileCandidateDocument(
@@ -3494,17 +3862,14 @@ def merge_project_chunk_candidates(
     ]
     merged.extend(singles)
 
-    def _sort_key(p: ProjectCandidate) -> tuple:
-        return (
-            _project_ym_ordinal(p.start_date) is None,
-            _project_ym_ordinal(p.start_date) or 0,
-            _project_ym_ordinal(p.end_date) is None,
-            _project_ym_ordinal(p.end_date) or 0,
-            _fold_ws_text(p.project_name or ""),
-            _fold_ws_text(p.customer_name or ""),
-        )
+    type_map = {
+        str(k).strip(): str(v).strip()
+        for k, v in (document_type_by_id or {}).items()
+        if str(k).strip() and str(v).strip()
+    }
+    if type_map:
+        merged = _apply_kosa_profile_complementary_merge(merged, type_map)
 
-    merged.sort(key=_sort_key)
-    # Preserve non-project shell from the first chunk when present.
+    merged.sort(key=_chunk_project_sort_key)
     base = chunks[0]
     return base.model_copy(update={"projects": merged})

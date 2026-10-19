@@ -1284,6 +1284,11 @@ class AnalysisService:
             codes, aliases, code_types=PROJECTS_CATALOG_TYPES
         )
         compact_tag = prompt.prompt_version.rsplit("-", 1)[-1]
+        document_type_by_id: dict[str, str] = {
+            str(doc.id): str(doc.document_type_code).strip()
+            for doc in documents
+            if getattr(doc, "document_type_code", None)
+        }
 
         logger.info(
             "analysis compact protocol analysis_run_id=%s compact_protocol=%s "
@@ -2049,7 +2054,9 @@ class AnalysisService:
                             recovery_retry=recovery_retry,
                         )
                     )
-                return merge_project_chunk_candidates(nested)
+                return merge_project_chunk_candidates(
+                    nested, document_type_by_id=document_type_by_id
+                )
 
             try:
                 budget = _project_budget_for_blocks(
@@ -2182,7 +2189,9 @@ class AnalysisService:
                         recovery_retry=False,
                     )
                 )
-            return merge_project_chunk_candidates(chunk_docs)
+            return merge_project_chunk_candidates(
+                chunk_docs, document_type_by_id=document_type_by_id
+            )
 
         def _run_projects_adaptive() -> ProfileCandidateDocument:
             nonlocal used_project_adaptive_split, recovery_budget
