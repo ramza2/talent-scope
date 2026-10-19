@@ -169,14 +169,7 @@ def test_first_7_plus_second_missing_2_union_9() -> None:
     names = [p.project_name for p in out.projects]
     assert "2011년 제2차 자원통합 구축 HW1 사업(대전)" in names
     assert "2008년 정부통합전산센터 BCP 관련 BIA 구축 사업" in names
-    open("/opt/cursor/artifacts/project-recall-second-pass-replay.txt", "w").write(
-        "\n".join(
-            f"[{i}] name={p.project_name!r} start={p.start_date} "
-            f"jobs={[j.code for j in p.jobs]}"
-            for i, p in enumerate(out.projects)
-        )
-        + f"\nunion={len(out.projects)} supplemented={n}\n"
-    )
+    # Diagnostic dump removed — keep test portable (no hard-coded artifact path).
 
 
 def test_same_7_twice_union_7() -> None:

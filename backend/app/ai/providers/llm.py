@@ -14,6 +14,7 @@ from app.ai.providers.openai_compat import (
     extract_message_content,
     post_chat_completions,
 )
+from app.ai.providers.token_count import TokenCountResult, count_chat_prompt_tokens
 from app.ai.schemas.identity import IdentityExtraction
 from app.ai.utils.json_extract import parse_json_object
 from app.core.config import Settings, get_settings
@@ -34,7 +35,16 @@ class LLMProvider(Protocol):
         system_prompt: str,
         user_prompt: str,
         log_context: dict | None = None,
+        max_completion_tokens: int | None = None,
     ) -> dict: ...
+
+    def count_prompt_tokens(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        log_context: dict | None = None,
+    ) -> TokenCountResult: ...
 
 
 class OpenAICompatibleLLMProvider:
@@ -64,6 +74,7 @@ class OpenAICompatibleLLMProvider:
         system_prompt: str,
         user_prompt: str,
         log_context: dict | None = None,
+        max_completion_tokens: int | None = None,
     ) -> dict:
         content = self._chat(
             system_prompt,
@@ -71,8 +82,25 @@ class OpenAICompatibleLLMProvider:
             log_context,
             timeout_seconds=float(self.settings.analysis_ai_request_timeout_seconds),
             enable_thinking=self.settings.analysis_llm_enable_thinking,
+            max_completion_tokens=max_completion_tokens,
         )
         return _parse_json_dict(content, allow_repair=True)
+
+    def count_prompt_tokens(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        log_context: dict | None = None,
+    ) -> TokenCountResult:
+        """Exact ModelOps token-count using the same thinking toggle as Chat."""
+        return count_chat_prompt_tokens(
+            self.settings,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            enable_thinking=self.settings.analysis_llm_enable_thinking,
+            log_context=log_context,
+        )
 
     def _chat(
         self,
@@ -82,6 +110,7 @@ class OpenAICompatibleLLMProvider:
         *,
         timeout_seconds: float,
         enable_thinking: bool | None = None,
+        max_completion_tokens: int | None = None,
     ) -> str:
         payload: dict = {
             "model": self.settings.llm_model,
@@ -94,11 +123,15 @@ class OpenAICompatibleLLMProvider:
         # Profile-analysis toggle only: omit key entirely when unset.
         if enable_thinking is not None:
             payload["chat_template_kwargs"] = {"enable_thinking": enable_thinking}
+        if max_completion_tokens is not None:
+            payload["max_completion_tokens"] = int(max_completion_tokens)
         ctx = {
             **(log_context or {}),
             "provider": "llm",
             "input_char_count": len(system_prompt) + len(user_prompt),
         }
+        if max_completion_tokens is not None:
+            ctx["max_completion_tokens"] = int(max_completion_tokens)
         data = post_chat_completions(
             base_url=self.settings.llm_base_url,
             api_key=self.settings.llm_api_key,
@@ -178,6 +211,7 @@ class FakeLLMProvider:
         self.calls = 0
         self.last_system_prompt: str | None = None
         self.last_user_prompt: str | None = None
+        self.last_max_completion_tokens: int | None = None
 
     def extract_identity(
         self,
@@ -196,16 +230,43 @@ class FakeLLMProvider:
             return _parse_identity_content(self.raw_content, allow_repair=True)
         return self.identity.model_copy()
 
+    def count_prompt_tokens(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        log_context: dict | None = None,
+    ) -> TokenCountResult:
+        from app.ai.providers.token_count import TokenCountResult as TCR
+
+        _ = log_context
+        if self.fail:
+            raise AIProviderError("injected token-count failure")
+        # Test double only — prompt_tokens scales with input length; window from ctor.
+        prompt_tokens = max(1, (len(system_prompt) + len(user_prompt)) // 4)
+        window = int(getattr(self, "fake_context_window", 100_000))
+        return TCR(
+            model="fake",
+            prompt_tokens=prompt_tokens,
+            context_window=window,
+            status="VERIFIED",
+            deployment_id="fake-dep",
+            route_id="fake-route",
+            routing_version=1,
+        )
+
     def complete_json(
         self,
         *,
         system_prompt: str,
         user_prompt: str,
         log_context: dict | None = None,
+        max_completion_tokens: int | None = None,
     ) -> dict:
         self.calls += 1
         self.last_system_prompt = system_prompt
         self.last_user_prompt = user_prompt
+        self.last_max_completion_tokens = max_completion_tokens
         _ = log_context
         if self.fail:
             raise AIProviderError("injected LLM failure")
