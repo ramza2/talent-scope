@@ -2990,6 +2990,172 @@ def _project_name_customer_start_overlap_match(
     )
 
 
+def _project_root_document_ids(project: ProjectCandidate) -> set[str]:
+    """Document ids from root source_refs only (no relation dig)."""
+    out: set[str] = set()
+    for ref in project.source_refs or []:
+        doc_id = (getattr(ref, "document_id", None) or "").strip()
+        if doc_id:
+            out.add(doc_id)
+    return out
+
+
+def _projects_are_cross_document(
+    a: ProjectCandidate, b: ProjectCandidate
+) -> bool:
+    """True when both have root doc ids and the sets are disjoint."""
+    da = _project_root_document_ids(a)
+    db = _project_root_document_ids(b)
+    if not da or not db:
+        return False
+    return da.isdisjoint(db)
+
+
+_PROJECT_NAME_YEAR_RE = re.compile(r"(?:19|20)\d{2}년?")
+# Longer generics first so replacements do not leave shorter fragments.
+_PROJECT_NAME_GENERIC_FRAGMENTS: tuple[str, ...] = (
+    "유지보수",
+    "프로젝트",
+    "업무분석",
+    "업무이관",
+    "사업",
+    "구축",
+    "운영",
+)
+
+
+def _fold_project_name_lex(value: str | None) -> str:
+    """NFKC/casefold name with whitespace and punctuation removed."""
+    text = unicodedata.normalize("NFKC", value or "").casefold()
+    chars: list[str] = []
+    for ch in text:
+        if ch.isspace():
+            continue
+        if unicodedata.category(ch).startswith("P"):
+            continue
+        chars.append(ch)
+    return "".join(chars)
+
+
+def _strip_weak_project_name_parts(folded: str) -> str:
+    """Drop year tokens and generic activity fragments for anchor checks."""
+    text = _PROJECT_NAME_YEAR_RE.sub("", folded)
+    for frag in _PROJECT_NAME_GENERIC_FRAGMENTS:
+        text = text.replace(frag, "")
+    return text
+
+
+def _longest_common_substring_len(a: str, b: str) -> int:
+    if not a or not b:
+        return 0
+    # Bound DP to short project-name strings.
+    prev = [0] * (len(b) + 1)
+    best = 0
+    for ch_a in a:
+        cur = [0] * (len(b) + 1)
+        for j, ch_b in enumerate(b, start=1):
+            if ch_a == ch_b:
+                cur[j] = prev[j - 1] + 1
+                if cur[j] > best:
+                    best = cur[j]
+        prev = cur
+    return best
+
+
+def _project_names_have_strong_lexical_anchor(
+    a: ProjectCandidate, b: ProjectCandidate
+) -> bool:
+    """Distinctive name overlap; years/generic verbs alone never suffice.
+
+    Fail-open (False) when overlap is weak — prefer appending over false dedupe.
+    """
+    fa = _fold_project_name_lex(a.project_name)
+    fb = _fold_project_name_lex(b.project_name)
+    if not fa or not fb:
+        return False
+    if _longest_common_substring_len(fa, fb) < 6:
+        return False
+    sa = _strip_weak_project_name_parts(fa)
+    sb = _strip_weak_project_name_parts(fb)
+    if not sa or not sb:
+        return False
+    return _longest_common_substring_len(sa, sb) >= 4
+
+
+def _second_is_aggregate_of_first_segments(
+    first_projects: list[ProjectCandidate], second: ProjectCandidate
+) -> bool:
+    """Suppress second when it is a cross-doc aggregate of contiguous first segments."""
+    second_start = _project_ym_ordinal(second.start_date)
+    second_end = _project_ym_ordinal(second.end_date)
+    if (
+        second_start is None
+        or second_end is None
+        or second_end < second_start
+    ):
+        return False
+
+    eligible: list[tuple[int, int]] = []
+    for first in first_projects:
+        if not _project_customers_identity_match(first, second):
+            continue
+        if not _projects_are_cross_document(first, second):
+            continue
+        if not _project_names_have_strong_lexical_anchor(first, second):
+            continue
+        fs = _project_ym_ordinal(first.start_date)
+        fe = _project_ym_ordinal(first.end_date)
+        if fs is None or fe is None or fe < fs:
+            continue
+        if fs < second_start or fe > second_end:
+            continue
+        eligible.append((fs, fe))
+
+    if len(eligible) < 2:
+        return False
+
+    eligible.sort(key=lambda item: (item[0], item[1]))
+    # Find a contiguous chain of >=2 periods whose union equals second span.
+    n = len(eligible)
+    for i in range(n):
+        chain_max_end = eligible[i][1]
+        for j in range(i + 1, n):
+            next_start, next_end = eligible[j]
+            prev_end = chain_max_end
+            if next_start > prev_end + 1:
+                break
+            chain_max_end = max(chain_max_end, next_end)
+            if (
+                eligible[i][0] == second_start
+                and chain_max_end == second_end
+            ):
+                return True
+    return False
+
+
+def _second_is_near_period_title_variant(
+    first: ProjectCandidate, second: ProjectCandidate
+) -> bool:
+    """Suppress cross-doc same-customer title variants with near start/same end."""
+    if not _project_customers_identity_match(first, second):
+        return False
+    if not _projects_are_cross_document(first, second):
+        return False
+    if not _project_names_have_strong_lexical_anchor(first, second):
+        return False
+    fs = _project_ym_ordinal(first.start_date)
+    fe = _project_ym_ordinal(first.end_date)
+    ss = _project_ym_ordinal(second.start_date)
+    se = _project_ym_ordinal(second.end_date)
+    if fs is None or fe is None or ss is None or se is None:
+        return False
+    if fe != se:
+        return False
+    if abs(fs - ss) > 1:
+        return False
+    return _project_periods_month_overlap(first, second)
+
+
 def _second_project_matches_first(
     first_projects: list[ProjectCandidate], second: ProjectCandidate
 ) -> bool:
@@ -2998,7 +3164,8 @@ def _second_project_matches_first(
     Fail-closed: name+compatible dates match, or unique customer+compatible
     dates match, or ambiguous multi customer+date hits → treat as covered /
     non-supplement (never invent a duplicate). Also name+customer+compatible
-    start with month-period overlap (end may differ).
+    start with month-period overlap (end may differ). Cross-document aggregate
+    spans and near-period title variants are also suppressed.
     """
     for first in first_projects:
         if _project_names_identity_match(first, second) and _project_period_compatible(
@@ -3007,6 +3174,10 @@ def _second_project_matches_first(
             return True
         if _project_name_customer_start_overlap_match(first, second):
             return True
+        if _second_is_near_period_title_variant(first, second):
+            return True
+    if _second_is_aggregate_of_first_segments(first_projects, second):
+        return True
     customer_hits = [
         first
         for first in first_projects
