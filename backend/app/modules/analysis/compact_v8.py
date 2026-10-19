@@ -3082,10 +3082,15 @@ def _project_names_have_strong_lexical_anchor(
     return _longest_common_substring_len(sa, sb) >= 4
 
 
-def _second_is_aggregate_of_first_segments(
+def _aggregate_contained_first_indices(
     first_projects: list[ProjectCandidate], second: ProjectCandidate
-) -> bool:
-    """Suppress second when it is a cross-doc aggregate of contiguous first segments."""
+) -> list[int]:
+    """Indices of contiguous cross-doc first segments covered by second aggregate.
+
+    Empty when aggregate suppression does not apply. Guards match
+    ``_second_is_aggregate_of_first_segments`` (customer, lexical anchor,
+    containment, contiguous/adjacent chain, exact span coverage).
+    """
     second_start = _project_ym_ordinal(second.start_date)
     second_end = _project_ym_ordinal(second.end_date)
     if (
@@ -3093,10 +3098,10 @@ def _second_is_aggregate_of_first_segments(
         or second_end is None
         or second_end < second_start
     ):
-        return False
+        return []
 
-    eligible: list[tuple[int, int]] = []
-    for first in first_projects:
+    eligible: list[tuple[int, int, int]] = []
+    for idx, first in enumerate(first_projects):
         if not _project_customers_identity_match(first, second):
             continue
         if not _projects_are_cross_document(first, second):
@@ -3109,28 +3114,35 @@ def _second_is_aggregate_of_first_segments(
             continue
         if fs < second_start or fe > second_end:
             continue
-        eligible.append((fs, fe))
+        eligible.append((fs, fe, idx))
 
     if len(eligible) < 2:
-        return False
+        return []
 
-    eligible.sort(key=lambda item: (item[0], item[1]))
-    # Find a contiguous chain of >=2 periods whose union equals second span.
+    eligible.sort(key=lambda item: (item[0], item[1], item[2]))
     n = len(eligible)
     for i in range(n):
         chain_max_end = eligible[i][1]
+        chain_indices = [eligible[i][2]]
         for j in range(i + 1, n):
-            next_start, next_end = eligible[j]
-            prev_end = chain_max_end
-            if next_start > prev_end + 1:
+            next_start, next_end, next_idx = eligible[j]
+            if next_start > chain_max_end + 1:
                 break
             chain_max_end = max(chain_max_end, next_end)
+            chain_indices.append(next_idx)
             if (
                 eligible[i][0] == second_start
                 and chain_max_end == second_end
             ):
-                return True
-    return False
+                return chain_indices
+    return []
+
+
+def _second_is_aggregate_of_first_segments(
+    first_projects: list[ProjectCandidate], second: ProjectCandidate
+) -> bool:
+    """Suppress second when it is a cross-doc aggregate of contiguous first segments."""
+    return bool(_aggregate_contained_first_indices(first_projects, second))
 
 
 def _second_is_near_period_title_variant(
@@ -3156,6 +3168,41 @@ def _second_is_near_period_title_variant(
     return _project_periods_month_overlap(first, second)
 
 
+# Match kinds for second-pass identity. Only strong/aggregate may merge JOB/EXP.
+_SECOND_MATCH_NONE = "none"
+_SECOND_MATCH_STRONG = "strong"
+_SECOND_MATCH_AGGREGATE = "aggregate"
+_SECOND_MATCH_CUSTOMER_ONLY = "customer_only"
+
+
+def _classify_second_project_match(
+    first_projects: list[ProjectCandidate], second: ProjectCandidate
+) -> tuple[str, list[int]]:
+    """Classify second-pass identity; return (kind, first indices for optional merge)."""
+    for idx, first in enumerate(first_projects):
+        if _project_names_identity_match(first, second) and _project_period_compatible(
+            first, second
+        ):
+            return _SECOND_MATCH_STRONG, [idx]
+        if _project_name_customer_start_overlap_match(first, second):
+            return _SECOND_MATCH_STRONG, [idx]
+        if _second_is_near_period_title_variant(first, second):
+            return _SECOND_MATCH_STRONG, [idx]
+    aggregate_indices = _aggregate_contained_first_indices(first_projects, second)
+    if aggregate_indices:
+        return _SECOND_MATCH_AGGREGATE, aggregate_indices
+    customer_hits = [
+        idx
+        for idx, first in enumerate(first_projects)
+        if _project_customers_identity_match(first, second)
+        and _project_period_compatible(first, second)
+    ]
+    # Unique or ambiguous customer+date → suppress only; never relation-merge.
+    if customer_hits:
+        return _SECOND_MATCH_CUSTOMER_ONLY, []
+    return _SECOND_MATCH_NONE, []
+
+
 def _second_project_matches_first(
     first_projects: list[ProjectCandidate], second: ProjectCandidate
 ) -> bool:
@@ -3167,45 +3214,123 @@ def _second_project_matches_first(
     start with month-period overlap (end may differ). Cross-document aggregate
     spans and near-period title variants are also suppressed.
     """
-    for first in first_projects:
-        if _project_names_identity_match(first, second) and _project_period_compatible(
-            first, second
-        ):
-            return True
-        if _project_name_customer_start_overlap_match(first, second):
-            return True
-        if _second_is_near_period_title_variant(first, second):
-            return True
-    if _second_is_aggregate_of_first_segments(first_projects, second):
-        return True
-    customer_hits = [
-        first
-        for first in first_projects
-        if _project_customers_identity_match(first, second)
-        and _project_period_compatible(first, second)
-    ]
-    # Unique customer hit → same project. Ambiguous (>1) → do not supplement.
-    return len(customer_hits) >= 1
+    kind, _indices = _classify_second_project_match(first_projects, second)
+    return kind != _SECOND_MATCH_NONE
+
+
+def _second_job_relation_mergeable(rel: CodeRefCandidate) -> bool:
+    """True when second JOB may be appended under v20 semantic/literal guards."""
+    code = (rel.code or "").strip()
+    if not code or not _refs_nonempty(rel.source_refs):
+        return False
+    if code in _PM_PL_LITERAL_JOB_PATTERNS:
+        return _project_job_has_literal_pm_pl_evidence(rel)
+    if code in _JOB_SEMANTIC_GUARD_CODES:
+        return _project_job_has_semantic_guard_evidence(rel)
+    return False
+
+
+def _second_exp_relation_mergeable(rel: CodeRefCandidate) -> bool:
+    """True when second EXP may be appended under v20 semantic EXP guards."""
+    code = (rel.code or "").strip()
+    if code not in _EXP_SEMANTIC_PATTERNS:
+        return False
+    if not _refs_nonempty(rel.source_refs):
+        return False
+    return any(
+        _quote_supports_semantic_exp(code, ref.quote_text or "")
+        for ref in (rel.source_refs or [])
+    )
+
+
+def _merge_missing_supported_job_exp_relations(
+    first: ProjectCandidate, second: ProjectCandidate
+) -> ProjectCandidate:
+    """Append missing supported JOB/EXP from second; never overwrite first.
+
+    Cross-document only. Skills / business_domains / customer_types untouched.
+    Scalars and root source_refs stay on first.
+    """
+    if not _projects_are_cross_document(first, second):
+        return first
+
+    existing_job_codes = {
+        (rel.code or "").strip()
+        for rel in first.jobs
+        if (rel.code or "").strip()
+    }
+    existing_exp_codes = {
+        (rel.code or "").strip()
+        for rel in first.expertise
+        if (rel.code or "").strip()
+    }
+
+    new_jobs = list(first.jobs)
+    jobs_changed = False
+    for rel in second.jobs:
+        code = (rel.code or "").strip()
+        if not code or code in existing_job_codes:
+            continue
+        if not _second_job_relation_mergeable(rel):
+            continue
+        new_jobs.append(rel)
+        existing_job_codes.add(code)
+        jobs_changed = True
+
+    new_exp = list(first.expertise)
+    exp_changed = False
+    for rel in second.expertise:
+        code = (rel.code or "").strip()
+        if not code or code in existing_exp_codes:
+            continue
+        if not _second_exp_relation_mergeable(rel):
+            continue
+        new_exp.append(rel)
+        existing_exp_codes.add(code)
+        exp_changed = True
+
+    if not jobs_changed and not exp_changed:
+        return first
+    updates: dict[str, Any] = {}
+    if jobs_changed:
+        updates["jobs"] = new_jobs
+    if exp_changed:
+        updates["expertise"] = new_exp
+    return first.model_copy(update=updates)
 
 
 def supplement_projects_from_second_pass(
     first: ProfileCandidateDocument,
     second: ProfileCandidateDocument,
 ) -> tuple[ProfileCandidateDocument, int]:
-    """Append unmatched second-pass projects; first projects/relations win.
+    """Append unmatched second-pass projects; merge missing JOB/EXP on strong matches.
 
-    Does not create source-only projects, does not merge scalars/relations for
-    matched identities, and never removes/overwrites first projects.
+    First scalars / root refs always win. On strong cross-document identity or
+    aggregate containment, append only missing supported JOB/EXP codes from
+    second (no overwrite, no skills/domains merge). Customer-only / ambiguous
+    suppressions do not merge relations. Same-document matches stay first-wins.
     """
     first_projects = list(first.projects)
     extras: list[ProjectCandidate] = []
     for cand in second.projects:
-        # Compare against first + already-accepted extras so second-pass
-        # internal duplicates are not appended twice.
-        if _second_project_matches_first(first_projects + extras, cand):
+        pool = first_projects + extras
+        kind, indices = _classify_second_project_match(pool, cand)
+        if kind == _SECOND_MATCH_NONE:
+            extras.append(cand)
             continue
-        extras.append(cand)
-    if not extras:
+        if kind in (_SECOND_MATCH_STRONG, _SECOND_MATCH_AGGREGATE) and indices:
+            for idx in indices:
+                if idx < len(first_projects):
+                    first_projects[idx] = _merge_missing_supported_job_exp_relations(
+                        first_projects[idx], cand
+                    )
+                else:
+                    eidx = idx - len(first_projects)
+                    extras[eidx] = _merge_missing_supported_job_exp_relations(
+                        extras[eidx], cand
+                    )
+        # CUSTOMER_ONLY: suppress append only (no relation merge).
+    if first_projects == list(first.projects) and not extras:
         return first, 0
     return (
         first.model_copy(update={"projects": first_projects + extras}),
