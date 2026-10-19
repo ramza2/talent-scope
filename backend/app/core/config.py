@@ -65,12 +65,11 @@ class Settings(BaseSettings):
     # None keeps historical Chat Completions payloads unchanged.
     analysis_llm_enable_thinking: bool | None = None
 
-    # ModelOps capability + adaptive token budgeting (ratios; no hard-coded windows).
+    # ModelOps capability + PROJECT adaptive token budgeting (ratios only).
     analysis_capability_timeout_seconds: float = 5.0
     analysis_token_count_timeout_seconds: float = 30.0
-    # context_safety_margin_ratio / project_output_reserve_ratio aliases.
+    # context_safety_margin_ratio / project_output_reserve_ratio.
     analysis_token_safety_ratio: float = 0.08
-    analysis_core_output_ratio: float = 0.28
     analysis_project_output_ratio: float = 0.35
     analysis_project_split_max_depth: int = 3
     analysis_project_split_max_calls: int = 8

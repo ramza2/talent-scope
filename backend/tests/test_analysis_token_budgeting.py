@@ -418,6 +418,26 @@ def test_split_page_and_subchunk_helpers() -> None:
     assert len(parts) >= 3
 
 
+def test_subchunk_preserves_original_page_marker_on_all_parts() -> None:
+    from app.modules.analysis.token_budget import split_page_block_text
+
+    block = (
+        "[DOCUMENT D1]\nfilename: a.pdf\ndocument_type: DOC-PROFILE\n"
+        "content:\n[PAGE 3]\n" + ("BODYTEXT " * 200)
+    )
+    parts = split_page_block_text(block, max_body_chars=120)
+    assert len(parts) >= 2
+    for part in parts:
+        assert part.startswith(
+            "[DOCUMENT D1]\nfilename: a.pdf\ndocument_type: DOC-PROFILE\n"
+            "content:\n[PAGE 3]\n"
+        )
+        # Must not invent a different page number.
+        assert "[PAGE 1]" not in part
+        assert "[PAGE 2]" not in part
+        assert part.count("[PAGE 3]") == 1
+
+
 def _proj(name, customer, start, end, *, doc, jobs=None, skills=None, biz=None):
     from app.ai.schemas.profile_candidate import (
         CodeRefCandidate,
@@ -661,3 +681,501 @@ def test_provider_count_prompt_tokens_uses_thinking_toggle(monkeypatch) -> None:
     assert seen["enable_thinking"] is False
     assert seen["system"] == "S"
     assert seen["user"] == "U"
+
+
+# ---------------------------------------------------------------------------
+# Service-level adaptive PROJECT regressions (no DB)
+# ---------------------------------------------------------------------------
+
+
+def _doc_block(doc_id: str, *, alias_body: str, pages: str) -> str:
+    return (
+        f"[DOCUMENT]\n"
+        f"document_id: {doc_id}\n"
+        f"filename: {doc_id[:8]}.pdf\n"
+        f"document_type: DOC-PROFILE\n"
+        f"content:\n{pages}"
+    )
+
+
+def _core_payload() -> dict:
+    return {
+        "p": {"n": "홍길동", "tg": "EXPERT", "ac": "ABC테크", "cdv": "10년"},
+        "j": [{"v": "PL", "c": "JOB-MGT-PL", "t": "PRIMARY"}],
+        "s": [{"v": "Python", "c": "TECH-LANG-PYTHON"}],
+        "x": [{"v": "사업관리", "c": "EXP-MGT"}],
+        "w": [{"co": "ABC테크", "ti": "책임", "s": "2018-01", "e": "2024-12"}],
+        "e": [{"sc": "서울대", "mj": "컴공", "dg": "학사"}],
+        "c": [{"n": "정보처리기사", "acq": "2010.12"}],
+        "conf": 0.9,
+    }
+
+
+def _projects_payload(name: str = "복구프로젝트-1") -> dict:
+    return {
+        "pr": [
+            {
+                "n": name,
+                "cust": "고객-1",
+                "s": "2020-01",
+                "e": "2021-12",
+                "resp": "PL 운영",
+                "r": [{"d": "D1", "p": 1, "q": name}],
+            }
+        ]
+    }
+
+
+class _BudgetLLM:
+    """Controllable LLM for staged CORE/PROJECT adaptive budget tests."""
+
+    def __init__(
+        self,
+        *,
+        count_fn,
+        chat_fn=None,
+        core_payload=None,
+        project_payloads=None,
+    ) -> None:
+        self.count_fn = count_fn
+        self.chat_fn = chat_fn
+        self.core_payload = core_payload or _core_payload()
+        self.project_payloads = list(project_payloads or [_projects_payload()])
+        self.project_chat_i = 0
+        self.count_calls = 0
+        self.chat_calls: list[dict] = []
+        self.count_log: list[dict] = []
+
+    def count_prompt_tokens(self, *, system_prompt, user_prompt, log_context=None):
+        self.count_calls += 1
+        ctx = dict(log_context or {})
+        self.count_log.append(ctx)
+        return self.count_fn(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            log_context=ctx,
+            call_index=self.count_calls,
+        )
+
+    def complete_json(
+        self,
+        *,
+        system_prompt,
+        user_prompt,
+        log_context=None,
+        max_completion_tokens=None,
+    ):
+        ctx = dict(log_context or {})
+        self.chat_calls.append(
+            {
+                "phase": ctx.get("phase"),
+                "max_completion_tokens": max_completion_tokens,
+                "recovery_retry": ctx.get("recovery_retry"),
+                "split_depth": ctx.get("split_depth"),
+                "chunk_index": ctx.get("chunk_index"),
+                "user_prompt": user_prompt,
+            }
+        )
+        if self.chat_fn is not None:
+            return self.chat_fn(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                log_context=ctx,
+                max_completion_tokens=max_completion_tokens,
+            )
+        phase = ctx.get("phase")
+        if phase == "core":
+            return dict(self.core_payload)
+        if self.project_chat_i >= len(self.project_payloads):
+            return dict(self.project_payloads[-1])
+        payload = self.project_payloads[self.project_chat_i]
+        self.project_chat_i += 1
+        if isinstance(payload, Exception):
+            raise payload
+        return dict(payload)
+
+
+def _caps_fixed(*, window=10_000, deployment="dep-1", route="route-1", routing=1):
+    from app.ai.providers.model_capabilities import ModelCapabilities
+
+    return ModelCapabilities(
+        model_id="qwen3-14b",
+        context_window=window,
+        supports_thinking=True,
+        supports_tools=True,
+        deployment_id=deployment,
+        route_id=route,
+        routing_version=routing,
+        status="VERIFIED",
+    )
+
+
+def _run_staged(
+    monkeypatch,
+    llm,
+    document_blocks: str,
+    *,
+    settings_kwargs=None,
+    caps_fn=None,
+):
+    import uuid
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    import app.modules.analysis.service as svc_mod
+    from app.ai.prompts.profile_extract import resolve_profile_prompt
+    from app.core.config import Settings
+    from app.modules.analysis.service import AnalysisService
+    from app.modules.analysis.source_builder import DocumentSnapshot, PageSnapshot
+
+    settings = Settings(
+        llm_base_url="https://gateway.example.test",
+        llm_api_key="k",
+        llm_model="qwen3-14b",
+        analysis_llm_enable_thinking=False,
+        analysis_token_count_max_attempts=3,
+        analysis_project_split_max_depth=3,
+        analysis_project_split_max_calls=8,
+        **(settings_kwargs or {}),
+    )
+    monkeypatch.setattr(
+        svc_mod,
+        "fetch_model_capabilities",
+        caps_fn or (lambda *_a, **_k: _caps_fixed()),
+    )
+    monkeypatch.setattr(svc_mod, "get_settings", lambda: settings)
+
+    doc_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    if "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb" in document_blocks:
+        docs = (
+            DocumentSnapshot(
+                id=uuid.UUID(doc_id),
+                original_filename="a.pdf",
+                extension="pdf",
+                mime_type="application/pdf",
+                storage_key="k1",
+                preview_storage_key=None,
+                document_type_code="DOC-PROFILE",
+                document_type_name="프로필",
+                version_no=1,
+                person_id=uuid.uuid4(),
+                pages=[PageSnapshot(page_no=1, extracted_text="x" * 600, layout_json=None)],
+            ),
+            DocumentSnapshot(
+                id=uuid.UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
+                original_filename="b.pdf",
+                extension="pdf",
+                mime_type="application/pdf",
+                storage_key="k2",
+                preview_storage_key=None,
+                document_type_code="DOC-PROFILE",
+                document_type_name="프로필",
+                version_no=1,
+                person_id=uuid.uuid4(),
+                pages=[PageSnapshot(page_no=1, extracted_text="y" * 600, layout_json=None)],
+            ),
+        )
+        allowed = {
+            doc_id: {1},
+            "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb": {1},
+        }
+        page_texts = {
+            (doc_id, 1): "문서A DocA사업 복구프로젝트-1 P1 고객-1 2020-01 2021-12",
+            ("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", 1): (
+                "문서B DocB사업 복구프로젝트-1 P2 고객-1 2020-01 2021-12"
+            ),
+        }
+    else:
+        docs = (
+            DocumentSnapshot(
+                id=uuid.UUID(doc_id),
+                original_filename="a.pdf",
+                extension="pdf",
+                mime_type="application/pdf",
+                storage_key="k1",
+                preview_storage_key=None,
+                document_type_code="DOC-PROFILE",
+                document_type_name="프로필",
+                version_no=1,
+                person_id=uuid.uuid4(),
+                pages=[
+                    PageSnapshot(
+                        page_no=1,
+                        extracted_text=(
+                            "경력 프로젝트 본문 복구프로젝트-1 P1 P2 DocA사업 "
+                            "DocB사업 고객-1 2020-01 2021-12"
+                        ),
+                        layout_json=None,
+                    )
+                ],
+            ),
+        )
+        allowed = {doc_id: {1, 2, 3}}
+        page_texts = {
+            (doc_id, 1): (
+                "경력 프로젝트 본문 복구프로젝트-1 P1 P2 DocA사업 DocB사업 "
+                "고객-1 2020-01 2021-12 AAA 문서A 문서B"
+            ),
+            (doc_id, 2): "문서A DocA사업 고객-1 2020-01 2021-12",
+            (doc_id, 3): "문서B DocB사업 고객-1 2020-01 2021-12",
+        }
+    repo = MagicMock()
+    repo.list_active_codes.return_value = [
+        SimpleNamespace(
+            code="JOB-MGT-PL", code_type="JOB", name="PL", is_active=True, parent_code=None
+        ),
+        SimpleNamespace(
+            code="TECH-LANG-PYTHON",
+            code_type="TECH",
+            name="Python",
+            is_active=True,
+            parent_code=None,
+        ),
+        SimpleNamespace(
+            code="EXP-MGT", code_type="EXP", name="사업관리", is_active=True, parent_code=None
+        ),
+    ]
+    repo.list_aliases_for_codes.return_value = []
+
+    service = AnalysisService.__new__(AnalysisService)
+    service.repo = repo
+    service.settings = settings
+    service.llm = llm
+    service.db = MagicMock()
+    service.storage = MagicMock()
+
+    catalog_map = {
+        "JOB-MGT-PL": ("JOB", True),
+        "TECH-LANG-PYTHON": ("TECH", True),
+        "EXP-MGT": ("EXP", True),
+    }
+    prompt = resolve_profile_prompt("profile-extract-v20")
+    return service._extract_staged_compact_candidate(
+        prompt=prompt,
+        document_blocks=document_blocks,
+        catalog_map=catalog_map,
+        allowed_documents=allowed,
+        page_texts=page_texts,
+        documents=docs,
+        source_char_count=max(600, len(document_blocks)),
+        base_log={"analysis_run_id": "test-run"},
+        vlm_pages=0,
+    )
+
+
+def test_service_budget_fit_keeps_single_path_and_second_pass(monkeypatch) -> None:
+    from app.ai.providers.token_count import TokenCountResult
+
+    def count_fn(**kwargs):
+        return TokenCountResult(
+            model="qwen3-14b",
+            prompt_tokens=500,
+            context_window=10_000,
+            status="VERIFIED",
+            deployment_id="dep-1",
+            route_id="route-1",
+            routing_version=1,
+        )
+
+    llm = _BudgetLLM(
+        count_fn=count_fn,
+        project_payloads=[_projects_payload("P1"), _projects_payload("P2")],
+    )
+    blocks = _doc_block(
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        alias_body="",
+        pages="[PAGE 1]\n" + ("경력 프로젝트 본문 " * 40),
+    )
+    doc = _run_staged(monkeypatch, llm, blocks)
+    phases = [c["phase"] for c in llm.chat_calls]
+    assert phases[0] == "core"
+    assert phases.count("projects") >= 2  # first + second-pass
+    assert any(c.get("recovery_retry") is True for c in llm.chat_calls)
+    # CORE must not receive an explicit completion cap.
+    assert llm.chat_calls[0]["max_completion_tokens"] is None
+    assert len(doc.projects) >= 1
+
+
+def test_service_over_budget_splits_and_skips_full_second_pass(monkeypatch) -> None:
+    from app.ai.providers.token_count import TokenCountResult
+
+    def count_fn(*, user_prompt, **kwargs):
+        # Combined two-doc prompt is over; single-doc fits.
+        has_d1 = "D1" in user_prompt or "aaaaaaaa" in user_prompt
+        has_d2 = "D2" in user_prompt or "bbbbbbbb" in user_prompt
+        # After aliasing: D1/D2 markers.
+        aliased_both = ("[DOCUMENT D1]" in user_prompt and "[DOCUMENT D2]" in user_prompt)
+        prompt_tokens = 9000 if aliased_both else 800
+        return TokenCountResult(
+            model="qwen3-14b",
+            prompt_tokens=prompt_tokens,
+            context_window=10_000,
+            status="VERIFIED",
+            deployment_id="dep-1",
+            route_id="route-1",
+            routing_version=1,
+        )
+
+    llm = _BudgetLLM(
+        count_fn=count_fn,
+        project_payloads=[
+            _projects_payload("DocA사업"),
+            _projects_payload("DocB사업"),
+        ],
+    )
+    blocks = (
+        _doc_block(
+            "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            alias_body="",
+            pages="[PAGE 1]\n" + ("문서A " * 80),
+        )
+        + _doc_block(
+            "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            alias_body="",
+            pages="[PAGE 1]\n" + ("문서B " * 80),
+        )
+    )
+    doc = _run_staged(monkeypatch, llm, blocks)
+    project_chats = [c for c in llm.chat_calls if c["phase"] == "projects"]
+    assert len(project_chats) >= 2
+    # Adaptive path: no full-source second-pass recovery_retry on staged budget.
+    assert not any(
+        c.get("recovery_retry") is True and c.get("split_depth") in (None, 0)
+        and "[DOCUMENT D1]" in (c.get("user_prompt") or "")
+        and "[DOCUMENT D2]" in (c.get("user_prompt") or "")
+        for c in project_chats
+    )
+    assert len(doc.projects) >= 1
+
+
+def test_service_provider_503_does_not_fan_out_chunks(monkeypatch) -> None:
+    import pytest
+    from app.ai.providers.errors import AIProviderError
+    from app.ai.providers.token_count import TokenCountResult
+    from app.modules.analysis.service import InsufficientCandidateError
+
+    state = {"n": 0}
+
+    def count_fn(*, user_prompt, call_index, **kwargs):
+        state["n"] += 1
+        aliased_both = (
+            "[DOCUMENT D1]" in user_prompt and "[DOCUMENT D2]" in user_prompt
+        )
+        if aliased_both:
+            return TokenCountResult(
+                model="qwen3-14b",
+                prompt_tokens=9000,
+                context_window=10_000,
+                status="VERIFIED",
+                deployment_id="dep-1",
+                route_id="route-1",
+                routing_version=1,
+            )
+        # First per-chunk count fails as provider outage.
+        raise AIProviderError("token-count HTTP 503")
+
+    llm = _BudgetLLM(count_fn=count_fn)
+    blocks = (
+        _doc_block(
+            "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            alias_body="",
+            pages="[PAGE 1]\n" + ("문서A " * 80),
+        )
+        + _doc_block(
+            "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            alias_body="",
+            pages="[PAGE 1]\n" + ("문서B " * 80),
+        )
+    )
+    with pytest.raises(InsufficientCandidateError):
+        _run_staged(monkeypatch, llm, blocks)
+    # Must not chat PROJECT after provider outage; no page-level fan-out chats.
+    assert not any(c["phase"] == "projects" for c in llm.chat_calls)
+
+
+def test_service_length_retries_only_failed_chunk(monkeypatch) -> None:
+    from app.ai.providers.errors import AIResponseTruncatedError
+    from app.ai.providers.token_count import TokenCountResult
+
+    chat_i = {"n": 0}
+
+    def count_fn(*, user_prompt, **kwargs):
+        aliased_both = (
+            "[DOCUMENT D1]" in user_prompt and "[DOCUMENT D2]" in user_prompt
+        )
+        return TokenCountResult(
+            model="qwen3-14b",
+            prompt_tokens=9000 if aliased_both else 700,
+            context_window=10_000,
+            status="VERIFIED",
+            deployment_id="dep-1",
+            route_id="route-1",
+            routing_version=1,
+        )
+
+    def chat_fn(*, log_context, user_prompt, **kwargs):
+        phase = (log_context or {}).get("phase")
+        if phase == "core":
+            return _core_payload()
+        chat_i["n"] += 1
+        # First project chunk truncates once; subsequent succeed.
+        if chat_i["n"] == 1:
+            raise AIResponseTruncatedError(
+                meta={"finish_reason": "length", "prompt_tokens": 700}
+            )
+        name = "DocA사업" if "문서A" in user_prompt else "DocB사업"
+        return _projects_payload(name)
+
+    llm = _BudgetLLM(count_fn=count_fn, chat_fn=chat_fn)
+    blocks = (
+        _doc_block(
+            "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            alias_body="",
+            pages="[PAGE 1]\nAAA\n\n[PAGE 2]\n" + ("문서A " * 80),
+        )
+        + _doc_block(
+            "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            alias_body="",
+            pages="[PAGE 1]\n" + ("문서B " * 80),
+        )
+    )
+    doc = _run_staged(monkeypatch, llm, blocks)
+    project_chats = [c for c in llm.chat_calls if c["phase"] == "projects"]
+    assert any((c.get("split_depth") or 0) >= 1 for c in project_chats)
+    assert len(doc.projects) >= 1
+
+
+def test_service_persistent_route_drift_fail_closed(monkeypatch) -> None:
+    import pytest
+    from app.ai.providers.errors import AIProviderError
+    from app.ai.providers.token_count import TokenCountResult
+    from app.modules.analysis.service import InsufficientCandidateError
+
+    # Capabilities keep advancing so every count mismatches.
+    cap_state = {"v": 0}
+
+    def caps_fn(*_a, **_k):
+        cap_state["v"] += 1
+        return _caps_fixed(routing=cap_state["v"])
+
+    def count_fn(**kwargs):
+        # Always report previous routing_version vs refreshed capability.
+        return TokenCountResult(
+            model="qwen3-14b",
+            prompt_tokens=500,
+            context_window=10_000,
+            status="VERIFIED",
+            deployment_id="dep-1",
+            route_id="route-1",
+            routing_version=max(0, cap_state["v"] - 1),
+        )
+
+    llm = _BudgetLLM(count_fn=count_fn)
+    blocks = _doc_block(
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        alias_body="",
+        pages="[PAGE 1]\n" + ("본문 " * 40),
+    )
+    with pytest.raises((InsufficientCandidateError, AIProviderError)):
+        _run_staged(monkeypatch, llm, blocks, caps_fn=caps_fn)
+    assert not any(c["phase"] == "projects" for c in llm.chat_calls)

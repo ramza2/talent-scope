@@ -11,25 +11,6 @@ from app.ai.providers.token_count import TokenCountResult
 
 
 @dataclass(frozen=True)
-class PhaseTokenBudget:
-    """Ratio-derived completion reserve from a live context_window.
-
-    Used when an exact prompt_tokens measurement is not yet available
-    (e.g. CORE max_completion hint). PROJECT budgeting prefers
-    ``PromptChatBudget`` from exact token-count.
-    """
-
-    context_window: int
-    max_completion_tokens: int
-    safety_tokens: int
-    output_ratio: float
-    safety_ratio: float
-    deployment_id: str | None
-    route_id: str | None
-    routing_version: int | None
-
-
-@dataclass(frozen=True)
 class PromptChatBudget:
     """Exact prompt + ratio reserves checked against context_window."""
 
@@ -54,31 +35,6 @@ def _validate_ratios(*, output_ratio: float, safety_ratio: float) -> None:
         raise ValueError("safety_ratio must be in [0, 1)")
     if out_r + safety_r >= 1.0:
         raise ValueError("output_ratio + safety_ratio must be < 1")
-
-
-def compute_phase_token_budget(
-    capabilities: ModelCapabilities,
-    *,
-    output_ratio: float,
-    safety_ratio: float,
-) -> PhaseTokenBudget:
-    """Derive phase output reserve from verified context_window ratios."""
-    window = int(capabilities.context_window)
-    if window <= 0:
-        raise ValueError("context_window must be positive")
-    _validate_ratios(output_ratio=output_ratio, safety_ratio=safety_ratio)
-    safety_tokens = max(1, int(math.floor(window * float(safety_ratio))))
-    max_completion = max(1, int(math.floor(window * float(output_ratio))))
-    return PhaseTokenBudget(
-        context_window=window,
-        max_completion_tokens=max_completion,
-        safety_tokens=safety_tokens,
-        output_ratio=float(output_ratio),
-        safety_ratio=float(safety_ratio),
-        deployment_id=capabilities.deployment_id,
-        route_id=capabilities.route_id,
-        routing_version=capabilities.routing_version,
-    )
 
 
 def compute_prompt_chat_budget(
@@ -147,6 +103,7 @@ _DOCUMENT_SPLIT_RE = re.compile(
     r"(?=\[DOCUMENT(?:\s+[^\]]+)?\]\n)"
 )
 _PAGE_SPLIT_RE = re.compile(r"(?=\[PAGE\s+\d+\]\n)")
+_LEADING_PAGE_MARKER_RE = re.compile(r"^(\[PAGE\s+\d+\]\n)")
 
 
 def split_document_blocks(document_blocks: str) -> list[str]:
@@ -190,7 +147,12 @@ def split_text_into_bounded_chunks(text: str, *, max_chars: int) -> list[str]:
 def split_page_block_text(
     document_block: str, *, max_body_chars: int
 ) -> list[str]:
-    """Re-split a single-page (or header+body) block into smaller body chunks."""
+    """Re-split a single-page block into smaller body chunks.
+
+    Preserves the document header and the original ``[PAGE n]`` marker on
+    every subchunk. Never invents page numbers — only reuses a leading
+    marker already present in the source body.
+    """
     text = document_block or ""
     marker = "content:\n"
     idx = text.find(marker)
@@ -198,10 +160,17 @@ def split_page_block_text(
         return split_text_into_bounded_chunks(text, max_chars=max_body_chars)
     header = text[: idx + len(marker)]
     body = text[idx + len(marker) :]
-    if len(body) <= max_body_chars:
+    page_marker = ""
+    page_match = _LEADING_PAGE_MARKER_RE.match(body)
+    if page_match:
+        page_marker = page_match.group(1)
+        page_body = body[len(page_marker) :]
+    else:
+        page_body = body
+    if len(page_body) <= max_body_chars:
         return [text]
-    pieces = split_text_into_bounded_chunks(body, max_chars=max_body_chars)
-    return [f"{header}{piece}" for piece in pieces]
+    pieces = split_text_into_bounded_chunks(page_body, max_chars=max_body_chars)
+    return [f"{header}{page_marker}{piece}" for piece in pieces]
 
 
 def plan_project_source_chunks(

@@ -86,9 +86,7 @@ from app.modules.analysis.diff_engine import DiffSpec, build_diffs
 from app.modules.analysis.normalize import normalize_candidate
 from app.modules.analysis.repository import AnalysisRepository
 from app.modules.analysis.token_budget import (
-    PhaseTokenBudget,
     PromptChatBudget,
-    compute_phase_token_budget,
     compute_prompt_chat_budget,
     plan_project_source_chunks,
     split_block_by_pages,
@@ -156,6 +154,10 @@ class InsufficientCandidateError(Exception):
         "AI 분석 결과에서 유효한 프로필 정보를 충분히 추출하지 못했습니다. "
         "다시 분석해 주세요."
     )
+
+
+class ProjectPromptOverBudgetError(AIProviderError):
+    """PROJECT prompt exceeds verified token budget (eligible for adaptive split)."""
 
 
 _RAW_TOP_LEVEL_KEYS_LOG_LIMIT = 30
@@ -1298,11 +1300,10 @@ class AnalysisService:
         token_count_calls = 0
         used_project_adaptive_split = False
         capabilities: ModelCapabilities | None = None
-        core_budget: PhaseTokenBudget | None = None
         last_token_count: TokenCountResult | None = None
 
         def _refresh_capabilities(*, reason: str) -> ModelCapabilities:
-            nonlocal capabilities, core_budget, last_token_count
+            nonlocal capabilities, last_token_count
             previous = capabilities
             caps = fetch_model_capabilities(self.settings)
             if capabilities_route_changed(previous, caps):
@@ -1319,11 +1320,6 @@ class AnalysisService:
                 )
                 # Discard previous token-count when route identity moves.
                 last_token_count = None
-                core_budget = compute_phase_token_budget(
-                    caps,
-                    output_ratio=self.settings.analysis_core_output_ratio,
-                    safety_ratio=self.settings.analysis_token_safety_ratio,
-                )
             capabilities = caps
             return caps
 
@@ -1362,30 +1358,29 @@ class AnalysisService:
                     )
                 except AIProviderError as exc:
                     last_error = exc
+                    last_token_count = None
                     continue
-                # Observed route drift vs capability / prior count → recount.
+                # Route drift vs current capability → never use mismatched count.
                 if capabilities is not None and token_count_route_changed(
                     capabilities, count
                 ):
                     logger.info(
                         "analysis token_count route drift analysis_run_id=%s "
-                        "phase=%s deployment_id=%s route_id=%s "
+                        "phase=%s attempt=%s deployment_id=%s route_id=%s "
                         "routing_version=%s",
                         base_log.get("analysis_run_id"),
                         phase,
+                        attempt,
                         count.deployment_id,
                         count.route_id,
                         count.routing_version,
                     )
-                    _refresh_capabilities(reason="token_count_route_drift")
-                    if attempt < max_attempts:
-                        continue
-                if (
-                    not force_recount
-                    and last_token_count is not None
-                    and token_count_route_changed(last_token_count, count)
-                ):
                     last_token_count = None
+                    _refresh_capabilities(reason="token_count_route_drift")
+                    last_error = AIProviderError(
+                        "token-count route identity mismatch"
+                    )
+                    continue
                 last_token_count = count
                 budget = compute_prompt_chat_budget(
                     count,
@@ -1473,7 +1468,7 @@ class AnalysisService:
                     force_recount=True,
                 )
                 if not budget.fits:
-                    raise AIProviderError(
+                    raise ProjectPromptOverBudgetError(
                         "project prompt exceeds token budget before chat"
                     )
                 max_completion_tokens = budget.max_completion_tokens
@@ -1959,7 +1954,8 @@ class AnalysisService:
                 return False
             return _documents_are_rich_profile_type(documents)
 
-        assert core_budget is not None
+        # CORE: keep historical complete_json (no explicit completion cap).
+        # PROJECT-only exact token-count budgeting applies below.
         core = _run_phase(
             phase="core",
             system_prompt=prompt.core_system_prompt,
@@ -1968,7 +1964,6 @@ class AnalysisService:
             normalize_raw=_normalize_core,
             needs_retry=_core_needs_retry,
             fail_closed_if_bad=True,
-            max_completion_tokens=core_budget.max_completion_tokens,
         )
         logger.info(
             "analysis candidate quality run_id=%s phase=core compact_protocol=%s "
@@ -2034,7 +2029,7 @@ class AnalysisService:
             chunk_index: int,
             recovery_retry: bool,
         ) -> ProfileCandidateDocument:
-            """Extract one PROJECT chunk; on length/oversize, shrink only this chunk."""
+            """Extract one PROJECT chunk; shrink only on oversize/length."""
             nonlocal last_token_count
 
             def _shrink_and_retry(cause: Exception) -> ProfileCandidateDocument:
@@ -2065,10 +2060,8 @@ class AnalysisService:
                     force_recount=True,
                 )
             except AIProviderError as exc:
-                # Token-count failure at minimal chunk → fail closed.
-                if split_depth >= int(self.settings.analysis_project_split_max_depth):
-                    raise InsufficientCandidateError() from exc
-                return _shrink_and_retry(exc)
+                # Token-count 422/429/503/timeout/route-drift — not a size issue.
+                raise InsufficientCandidateError() from exc
 
             if not budget.fits:
                 logger.info(
@@ -2082,7 +2075,9 @@ class AnalysisService:
                     budget.context_window,
                 )
                 return _shrink_and_retry(
-                    AIProviderError("project chunk exceeds token budget")
+                    ProjectPromptOverBudgetError(
+                        "project chunk exceeds token budget"
+                    )
                 )
 
             try:
@@ -2119,10 +2114,14 @@ class AnalysisService:
                     budget.context_window,
                 )
                 return _shrink_and_retry(trunc_exc)
-            except AIProviderError as prov_exc:
-                # Budget race / provider overflow after count → shrink this chunk.
+            except ProjectPromptOverBudgetError as over_exc:
+                # count→chat race: recount observed over-budget → shrink.
                 last_token_count = None
-                return _shrink_and_retry(prov_exc)
+                return _shrink_and_retry(over_exc)
+            except AIProviderError as prov_exc:
+                # Generic timeout/5xx — fail closed, do not fan-out chunks.
+                last_token_count = None
+                raise InsufficientCandidateError() from prov_exc
 
         def _run_projects_adaptive() -> ProfileCandidateDocument:
             nonlocal used_project_adaptive_split
@@ -2150,12 +2149,16 @@ class AnalysisService:
                 )
 
             used_project_adaptive_split = True
-            planned = plan_project_source_chunks(
-                aliased_blocks,
-                budget_for_blocks=lambda blocks: _project_budget_for_blocks(
-                    blocks, recovery_retry=False, force_recount=True
-                ),
-            )
+            try:
+                planned = plan_project_source_chunks(
+                    aliased_blocks,
+                    budget_for_blocks=lambda blocks: _project_budget_for_blocks(
+                        blocks, recovery_retry=False, force_recount=True
+                    ),
+                )
+            except AIProviderError as exc:
+                # Token-count outage while planning — fail closed, no fan-out.
+                raise InsufficientCandidateError() from exc
             logger.info(
                 "analysis project adaptive split analysis_run_id=%s "
                 "chunk_count=%s context_window=%s prompt_tokens=%s "
