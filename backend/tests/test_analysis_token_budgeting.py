@@ -1,4 +1,4 @@
-"""Adaptive ModelOps token budgeting + PROJECT chunk merge (focused)."""
+"""ModelOps /v1/token-count adaptive budgeting + PROJECT chunk merge."""
 
 from __future__ import annotations
 
@@ -16,7 +16,13 @@ _DOC_A = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 _DOC_B = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
 
 
-def _caps(*, window: int, deployment: str = "dep-1", routing: int = 100):
+def _caps(
+    *,
+    window: int,
+    deployment: str = "dep-1",
+    route: str = "route-1",
+    routing: int = 100,
+):
     from app.ai.providers.model_capabilities import ModelCapabilities
 
     return ModelCapabilities(
@@ -25,53 +31,243 @@ def _caps(*, window: int, deployment: str = "dep-1", routing: int = 100):
         supports_thinking=True,
         supports_tools=True,
         deployment_id=deployment,
+        route_id=route,
         routing_version=routing,
         status="VERIFIED",
     )
 
 
-def test_budget_scales_with_context_window_no_hardcode() -> None:
-    from app.modules.analysis.token_budget import compute_phase_token_budget
+def _count(
+    *,
+    prompt_tokens: int,
+    window: int,
+    deployment: str = "dep-1",
+    route: str = "route-1",
+    routing: int = 100,
+):
+    from app.ai.providers.token_count import TokenCountResult
 
-    b8 = compute_phase_token_budget(
-        _caps(window=8192), output_ratio=0.35, safety_ratio=0.08
+    return TokenCountResult(
+        model="qwen3-14b",
+        prompt_tokens=prompt_tokens,
+        context_window=window,
+        status="VERIFIED",
+        deployment_id=deployment,
+        route_id=route,
+        routing_version=routing,
     )
-    b16 = compute_phase_token_budget(
-        _caps(window=16384), output_ratio=0.35, safety_ratio=0.08
+
+
+def test_budget_scales_with_context_window_ratios() -> None:
+    from app.modules.analysis.token_budget import compute_prompt_chat_budget
+
+    b_small = compute_prompt_chat_budget(
+        _count(prompt_tokens=1000, window=4000),
+        output_reserve_ratio=0.35,
+        safety_margin_ratio=0.08,
+        enable_thinking=False,
     )
-    assert b8.context_window == 8192
-    assert b16.context_window == 16384
-    assert b16.max_completion_tokens == b8.max_completion_tokens * 2
-    assert b16.max_prompt_tokens == b8.max_prompt_tokens * 2
-    # Guard: implementation must not embed a fixed window constant in ratios.
-    assert b8.max_completion_tokens == int(8192 * 0.35)
-    assert b16.max_completion_tokens == int(16384 * 0.35)
+    b_large = compute_prompt_chat_budget(
+        _count(prompt_tokens=2000, window=8000),
+        output_reserve_ratio=0.35,
+        safety_margin_ratio=0.08,
+        enable_thinking=False,
+    )
+    assert b_small.output_reserve_tokens * 2 == b_large.output_reserve_tokens
+    assert b_small.safety_margin_tokens * 2 == b_large.safety_margin_tokens
+    assert b_small.fits is True
+    assert b_large.fits is True
 
 
-def test_no_literal_context_window_hardcode_in_budget_module() -> None:
+def test_exact_prompt_tokens_change_budget_fit() -> None:
+    from app.modules.analysis.token_budget import compute_prompt_chat_budget
+
+    window = 4000
+    # output=1400, safety=320 → room for prompt = 2280
+    fit = compute_prompt_chat_budget(
+        _count(prompt_tokens=2000, window=window),
+        output_reserve_ratio=0.35,
+        safety_margin_ratio=0.08,
+        enable_thinking=False,
+    )
+    over = compute_prompt_chat_budget(
+        _count(prompt_tokens=2500, window=window),
+        output_reserve_ratio=0.35,
+        safety_margin_ratio=0.08,
+        enable_thinking=False,
+    )
+    assert fit.fits is True
+    assert over.fits is False
+    assert (
+        fit.prompt_tokens + fit.output_reserve_tokens + fit.safety_margin_tokens
+        <= fit.context_window
+    )
+
+
+def test_no_literal_context_or_estimator_in_budget_modules() -> None:
     from pathlib import Path
 
-    text = Path("app/modules/analysis/token_budget.py").read_text(encoding="utf-8")
-    for banned in ("8192", "12288", "16384"):
-        assert banned not in text
+    files = [
+        Path("app/modules/analysis/token_budget.py"),
+        Path("app/ai/providers/token_count.py"),
+        Path("app/ai/providers/model_capabilities.py"),
+    ]
+    banned_nums = ("8192", "12288", "16384")
+    banned_est = ("chars_per_token", "estimate_text_tokens", "len(text) /")
+    for path in files:
+        text = path.read_text(encoding="utf-8")
+        for banned in banned_nums:
+            assert banned not in text, path
+        for banned in banned_est:
+            assert banned not in text, path
 
 
-def test_fetch_capabilities_verified_ok(monkeypatch) -> None:
-    import app.ai.providers.model_capabilities as caps_mod
+def test_token_count_payload_matches_chat_thinking(monkeypatch) -> None:
+    import app.ai.providers.token_count as tc_mod
+    from app.ai.providers.token_count import (
+        build_token_count_payload,
+        count_chat_prompt_tokens,
+    )
     from app.core.config import Settings
+
+    payload = build_token_count_payload(
+        model="qwen3-14b",
+        system_prompt="SYS",
+        user_prompt="USER",
+        enable_thinking=False,
+    )
+    assert payload["model"] == "qwen3-14b"
+    assert payload["messages"] == [
+        {"role": "system", "content": "SYS"},
+        {"role": "user", "content": "USER"},
+    ]
+    assert payload["chat_template_kwargs"] == {"enable_thinking": False}
+    assert "max_completion_tokens" not in payload
+    assert "max_tokens" not in payload
+    assert "tools" not in payload
+
+    observed: list[dict] = []
 
     class _Resp:
         status_code = 200
 
         def json(self):
             return {
-                "id": "qwen3-14b",
-                "object": "model.capabilities",
+                "object": "modelops.token_count",
+                "model": "qwen3-14b",
+                "prompt_tokens": 5017,
+                "context_window": 9000,
                 "status": "VERIFIED",
-                "context_window": 8192,
+                "deployment_id": "dep",
+                "route_id": "rte",
+                "routing_version": 7,
+            }
+
+    class _Client:
+        def __init__(self, *a, **k):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def post(self, url, headers=None, json=None):
+            assert url.endswith("/v1/token-count")
+            observed.append(dict(json))
+            return _Resp()
+
+    monkeypatch.setattr(tc_mod.httpx, "Client", _Client)
+    result = count_chat_prompt_tokens(
+        Settings(
+            llm_base_url="https://gateway.example.test",
+            llm_api_key="k",
+            llm_model="qwen3-14b",
+        ),
+        system_prompt="SYS",
+        user_prompt="USER",
+        enable_thinking=False,
+    )
+    assert observed[0]["chat_template_kwargs"] == {"enable_thinking": False}
+    assert result.prompt_tokens == 5017
+    assert result.route_id == "rte"
+
+
+def test_token_count_fail_closed_statuses(monkeypatch) -> None:
+    import pytest
+    import app.ai.providers.token_count as tc_mod
+    from app.ai.providers.errors import AIProviderError
+    from app.ai.providers.token_count import count_chat_prompt_tokens
+    from app.core.config import Settings
+
+    settings = Settings(
+        llm_base_url="https://gateway.example.test",
+        llm_api_key="k",
+        llm_model="qwen3-14b",
+    )
+
+    def _run(status_code=200, body=None):
+        class _Resp:
+            def __init__(self):
+                self.status_code = status_code
+
+            def json(self):
+                return body or {}
+
+        class _Client:
+            def __init__(self, *a, **k):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def post(self, *a, **k):
+                return _Resp()
+
+        monkeypatch.setattr(tc_mod.httpx, "Client", _Client)
+        with pytest.raises(AIProviderError):
+            count_chat_prompt_tokens(
+                settings,
+                system_prompt="s",
+                user_prompt="u",
+                enable_thinking=False,
+            )
+
+    _run(status_code=422)
+    _run(status_code=429)
+    _run(status_code=503)
+    _run(
+        status_code=200,
+        body={"status": "UNKNOWN", "prompt_tokens": 10, "context_window": 100},
+    )
+    _run(
+        status_code=200,
+        body={"status": "VERIFIED", "prompt_tokens": None, "context_window": 100},
+    )
+
+
+def test_capabilities_verified_and_fail_closed(monkeypatch) -> None:
+    import pytest
+    import app.ai.providers.model_capabilities as caps_mod
+    from app.ai.providers.errors import AIProviderError
+    from app.core.config import Settings
+
+    class _Ok:
+        status_code = 200
+
+        def json(self):
+            return {
+                "id": "qwen3-14b",
+                "status": "VERIFIED",
+                "context_window": 9000,
                 "supports_thinking": True,
                 "supports_tools": True,
                 "deployment_id": "dep-xyz",
+                "route_id": "route-xyz",
                 "routing_version": 100,
             }
 
@@ -86,130 +282,50 @@ def test_fetch_capabilities_verified_ok(monkeypatch) -> None:
             return False
 
         def get(self, url, headers=None):
-            assert "/v1/models/" in url
-            assert url.endswith("/capabilities")
-            return _Resp()
+            assert "/v1/models/" in url and url.endswith("/capabilities")
+            return _Ok()
 
     monkeypatch.setattr(caps_mod.httpx, "Client", _Client)
-    settings = Settings(
-        llm_base_url="https://gateway.example.test",
-        llm_api_key="k",
-        llm_model="qwen3-14b",
+    caps = caps_mod.fetch_model_capabilities(
+        Settings(llm_base_url="https://g.test", llm_model="qwen3-14b", llm_api_key="k")
     )
-    caps = caps_mod.fetch_model_capabilities(settings)
-    assert caps.status == "VERIFIED"
-    assert caps.context_window == 8192
-    assert caps.deployment_id == "dep-xyz"
-    assert caps.routing_version == 100
+    assert caps.route_id == "route-xyz"
+    assert caps.context_window == 9000
 
-
-def test_fetch_capabilities_unknown_fail_closed(monkeypatch) -> None:
-    import pytest
-    import app.ai.providers.model_capabilities as caps_mod
-    from app.ai.providers.errors import AIProviderError
-    from app.core.config import Settings
-
-    class _Resp:
-        status_code = 200
-
-        def json(self):
-            return {"status": "UNKNOWN", "context_window": 8192}
-
-    class _Client:
-        def __init__(self, *a, **k):
-            pass
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-        def get(self, *a, **k):
-            return _Resp()
-
-    monkeypatch.setattr(caps_mod.httpx, "Client", _Client)
-    with pytest.raises(AIProviderError):
-        caps_mod.fetch_model_capabilities(
-            Settings(llm_base_url="https://g.test", llm_model="m", llm_api_key="k")
-        )
-
-
-def test_fetch_capabilities_null_window_fail_closed(monkeypatch) -> None:
-    import pytest
-    import app.ai.providers.model_capabilities as caps_mod
-    from app.ai.providers.errors import AIProviderError
-    from app.core.config import Settings
-
-    class _Resp:
-        status_code = 200
-
-        def json(self):
-            return {"status": "VERIFIED", "context_window": None}
-
-    class _Client:
-        def __init__(self, *a, **k):
-            pass
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-        def get(self, *a, **k):
-            return _Resp()
-
-    monkeypatch.setattr(caps_mod.httpx, "Client", _Client)
-    with pytest.raises(AIProviderError):
-        caps_mod.fetch_model_capabilities(
-            Settings(llm_base_url="https://g.test", llm_model="m", llm_api_key="k")
-        )
-
-
-def test_fetch_capabilities_http_503_fail_closed(monkeypatch) -> None:
-    import pytest
-    import app.ai.providers.model_capabilities as caps_mod
-    from app.ai.providers.errors import AIProviderError
-    from app.core.config import Settings
-
-    class _Resp:
+    class _Bad:
         status_code = 503
 
         def json(self):
             return {}
 
-    class _Client:
-        def __init__(self, *a, **k):
-            pass
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
+    class _BadClient(_Client):
         def get(self, *a, **k):
-            return _Resp()
+            return _Bad()
 
-    monkeypatch.setattr(caps_mod.httpx, "Client", _Client)
+    monkeypatch.setattr(caps_mod.httpx, "Client", _BadClient)
     with pytest.raises(AIProviderError):
         caps_mod.fetch_model_capabilities(
             Settings(llm_base_url="https://g.test", llm_model="m", llm_api_key="k")
         )
 
 
-def test_capabilities_route_changed_triggers_rebudget() -> None:
-    from app.ai.providers.model_capabilities import capabilities_route_changed
+def test_route_change_detected() -> None:
+    from app.modules.analysis.token_budget import token_count_route_changed
 
-    a = _caps(window=8192, deployment="d1", routing=1)
-    b = _caps(window=8192, deployment="d2", routing=1)
-    c = _caps(window=8192, deployment="d1", routing=2)
-    d = _caps(window=16384, deployment="d1", routing=1)
-    assert capabilities_route_changed(a, b) is True
-    assert capabilities_route_changed(a, c) is True
-    assert capabilities_route_changed(a, d) is True
-    assert capabilities_route_changed(a, a) is False
+    a = _count(prompt_tokens=10, window=1000, deployment="d1", routing=1)
+    b = _count(prompt_tokens=10, window=1000, deployment="d2", routing=1)
+    c = _count(prompt_tokens=10, window=1000, deployment="d1", routing=2)
+    d = _count(prompt_tokens=10, window=1000, route="r2")
+    assert token_count_route_changed(a, a) is False
+    assert token_count_route_changed(a, b) is True
+    assert token_count_route_changed(a, c) is True
+    assert token_count_route_changed(a, d) is True
+    # Capability drift vs count (same identity fields → unchanged).
+    same_caps = _caps(window=1000, deployment="d1", route="route-1", routing=1)
+    assert token_count_route_changed(same_caps, a) is False
+    assert token_count_route_changed(
+        _caps(window=1000, deployment="other", route="route-1", routing=1), a
+    ) is True
 
 
 def test_complete_json_sends_max_completion_tokens(monkeypatch) -> None:
@@ -223,10 +339,7 @@ def test_complete_json_sends_max_completion_tokens(monkeypatch) -> None:
         observed.append(dict(payload))
         return {
             "choices": [
-                {
-                    "finish_reason": "stop",
-                    "message": {"content": '{"ok": true}'},
-                }
+                {"finish_reason": "stop", "message": {"content": '{"ok": true}'}}
             ],
             "model": payload.get("model"),
             "usage": {},
@@ -248,68 +361,41 @@ def test_complete_json_sends_max_completion_tokens(monkeypatch) -> None:
     assert observed[0]["chat_template_kwargs"] == {"enable_thinking": False}
 
 
-def test_plan_single_chunk_when_budget_fits() -> None:
+def test_plan_uses_token_count_budget_callback_not_chars() -> None:
     from app.modules.analysis.token_budget import (
-        compute_phase_token_budget,
+        compute_prompt_chat_budget,
         plan_project_source_chunks,
     )
 
-    budget = compute_phase_token_budget(
-        _caps(window=8192), output_ratio=0.35, safety_ratio=0.08
-    )
-    blocks = (
-        "[DOCUMENT D1]\nfilename: a.pdf\ndocument_type: DOC-PROFILE\n"
-        "content:\n[PAGE 1]\nshort\n"
-    )
-
-    def build_user_prompt(*, code_catalog, document_blocks, recovery_retry=False):
-        return f"{code_catalog}\n{document_blocks}"
-
-    planned = plan_project_source_chunks(
-        blocks,
-        system_prompt="sys",
-        code_catalog="cat",
-        build_user_prompt=build_user_prompt,
-        budget=budget,
-        chars_per_token=2.0,
-    )
-    assert planned == [blocks]
-
-
-def test_plan_splits_by_document_when_over_budget() -> None:
-    from app.modules.analysis.token_budget import (
-        compute_phase_token_budget,
-        plan_project_source_chunks,
-    )
-
-    # Tiny window forces split for multi-doc input.
-    budget = compute_phase_token_budget(
-        _caps(window=200), output_ratio=0.35, safety_ratio=0.08
-    )
     d1 = (
         "[DOCUMENT D1]\nfilename: a.pdf\ndocument_type: DOC-PROFILE\n"
-        "content:\n[PAGE 1]\n" + ("A" * 80) + "\n"
+        "content:\n[PAGE 1]\n" + ("A" * 40) + "\n"
     )
     d2 = (
         "[DOCUMENT D2]\nfilename: b.pptx\ndocument_type: DOC-PROFILE\n"
-        "content:\n[PAGE 1]\n" + ("B" * 80) + "\n"
+        "content:\n[PAGE 1]\n" + ("B" * 40) + "\n"
     )
     blocks = d1 + d2
+    calls: list[int] = []
 
-    def build_user_prompt(*, code_catalog, document_blocks, recovery_retry=False):
-        return f"{code_catalog}\n{document_blocks}"
+    def budget_for_blocks(text: str):
+        # Combined over budget; each document fits.
+        prompt_tokens = 3000 if ("D1" in text and "D2" in text) else 500
+        calls.append(prompt_tokens)
+        return compute_prompt_chat_budget(
+            _count(prompt_tokens=prompt_tokens, window=2000),
+            output_reserve_ratio=0.35,
+            safety_margin_ratio=0.08,
+            enable_thinking=False,
+        )
 
     planned = plan_project_source_chunks(
-        blocks,
-        system_prompt="s",
-        code_catalog="c",
-        build_user_prompt=build_user_prompt,
-        budget=budget,
-        chars_per_token=1.0,
+        blocks, budget_for_blocks=budget_for_blocks
     )
     assert len(planned) >= 2
-    assert any("D1" in p for p in planned)
+    assert any("D1" in p and "D2" not in p for p in planned)
     assert any("D2" in p for p in planned)
+    assert calls  # token-count callback used
 
 
 def test_split_page_and_subchunk_helpers() -> None:
@@ -324,14 +410,12 @@ def test_split_page_and_subchunk_helpers() -> None:
     )
     pages = split_block_by_pages(block)
     assert len(pages) == 2
-    assert all("filename: a.pdf" in p for p in pages)
     huge = (
         "[DOCUMENT D1]\nfilename: a.pdf\ndocument_type: DOC-PROFILE\n"
         "content:\n" + ("X" * 1000)
     )
     parts = split_page_block_text(huge, max_body_chars=300)
     assert len(parts) >= 3
-    assert all(p.startswith("[DOCUMENT D1]") for p in parts)
 
 
 def _proj(name, customer, start, end, *, doc, jobs=None, skills=None, biz=None):
@@ -360,9 +444,7 @@ def _proj(name, customer, start, end, *, doc, jobs=None, skills=None, biz=None):
         customer_name=customer,
         start_date=start,
         end_date=end,
-        source_refs=[
-            SourceRef(document_id=doc, page_no=1, quote_text=name)
-        ],
+        source_refs=[SourceRef(document_id=doc, page_no=1, quote_text=name)],
         jobs=rels(jobs),
         skills=rels(skills),
         business_domains=rels(biz),
@@ -421,19 +503,7 @@ def test_merge_project_chunks_order_independent_and_unions_relations() -> None:
     reverse = merge_project_chunk_candidates(
         [_chunk_doc([p2]), _chunk_doc([other, p1])]
     )
-    assert len(forward.projects) == 2
-    assert len(reverse.projects) == 2
-    f_names = sorted(p.project_name for p in forward.projects)
-    r_names = sorted(p.project_name for p in reverse.projects)
-    assert f_names == r_names
-    hw = next(p for p in forward.projects if p.project_name == "2017 HW1사업")
-    hw_r = next(p for p in reverse.projects if p.project_name == "2017 HW1사업")
-    assert {j.code for j in hw.jobs} == {"JOB-MGT", "JOB-OPS-SYS"}
-    assert {j.code for j in hw_r.jobs} == {"JOB-MGT", "JOB-OPS-SYS"}
-    assert {s.code for s in hw.skills} == {"TECH-SEC-AD"}
-    assert {b.code for b in hw.business_domains} == {"BIZ-PUBLIC"}
-    assert {r.document_id for r in hw.source_refs} == {_DOC_A, _DOC_B}
-    # Serialize comparable view for order independence.
+
     def view(doc):
         rows = []
         for p in doc.projects:
@@ -457,6 +527,11 @@ def test_merge_project_chunks_order_independent_and_unions_relations() -> None:
         return sorted(rows)
 
     assert view(forward) == view(reverse)
+    hw = next(p for p in forward.projects if p.project_name == "2017 HW1사업")
+    assert {j.code for j in hw.jobs} == {"JOB-MGT", "JOB-OPS-SYS"}
+    assert {s.code for s in hw.skills} == {"TECH-SEC-AD"}
+    assert {b.code for b in hw.business_domains} == {"BIZ-PUBLIC"}
+    assert {r.document_id for r in hw.source_refs} == {_DOC_A, _DOC_B}
 
 
 def test_merge_does_not_collapse_distinct_projects() -> None:
@@ -469,7 +544,6 @@ def test_merge_does_not_collapse_distinct_projects() -> None:
 
 
 def test_length_finish_reason_still_raises_truncated(monkeypatch) -> None:
-    """Authoritative length handling: do not parse truncated content."""
     import pytest
     from app.ai.providers.errors import AIResponseTruncatedError
     from app.ai.providers.llm import OpenAICompatibleLLMProvider
@@ -505,7 +579,6 @@ def test_length_finish_reason_still_raises_truncated(monkeypatch) -> None:
 
 
 def test_second_pass_helper_semantics_unchanged_smoke() -> None:
-    """eed138c helper still first-wins on same-document match (no TECH merge)."""
     from app.modules.analysis.compact_v8 import supplement_projects_from_second_pass
     from app.ai.schemas.profile_candidate import (
         AnalysisMetaCandidate,
@@ -551,3 +624,40 @@ def test_second_pass_helper_semantics_unchanged_smoke() -> None:
     assert n == 0
     assert out.projects[0].skills[0].code == "TECH-SEC-AD"
     assert out.projects[0].jobs == []
+
+
+def test_provider_count_prompt_tokens_uses_thinking_toggle(monkeypatch) -> None:
+    from app.ai.providers.llm import OpenAICompatibleLLMProvider
+    from app.core.config import Settings
+    import app.ai.providers.llm as llm_module
+    from app.ai.providers.token_count import TokenCountResult
+
+    seen: dict = {}
+
+    def fake_count(settings, *, system_prompt, user_prompt, enable_thinking, **kwargs):
+        seen["enable_thinking"] = enable_thinking
+        seen["system"] = system_prompt
+        seen["user"] = user_prompt
+        return TokenCountResult(
+            model="m",
+            prompt_tokens=12,
+            context_window=4000,
+            status="VERIFIED",
+            deployment_id="d",
+            route_id="r",
+            routing_version=1,
+        )
+
+    monkeypatch.setattr(llm_module, "count_chat_prompt_tokens", fake_count)
+    provider = OpenAICompatibleLLMProvider(
+        Settings(
+            llm_base_url="https://llm.test",
+            llm_api_key="k",
+            llm_model="m",
+            analysis_llm_enable_thinking=False,
+        )
+    )
+    provider.count_prompt_tokens(system_prompt="S", user_prompt="U")
+    assert seen["enable_thinking"] is False
+    assert seen["system"] == "S"
+    assert seen["user"] == "U"

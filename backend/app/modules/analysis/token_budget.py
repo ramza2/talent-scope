@@ -1,4 +1,4 @@
-"""Adaptive token budgeting helpers (ratios-driven; no hard-coded context sizes)."""
+"""ModelOps token-count based phase budgets (no local token estimators)."""
 
 from __future__ import annotations
 
@@ -7,32 +7,45 @@ import re
 from dataclasses import dataclass
 
 from app.ai.providers.model_capabilities import ModelCapabilities
+from app.ai.providers.token_count import TokenCountResult
 
 
 @dataclass(frozen=True)
 class PhaseTokenBudget:
-    """Per-phase completion/prompt budget derived from a live context_window."""
+    """Ratio-derived completion reserve from a live context_window.
+
+    Used when an exact prompt_tokens measurement is not yet available
+    (e.g. CORE max_completion hint). PROJECT budgeting prefers
+    ``PromptChatBudget`` from exact token-count.
+    """
 
     context_window: int
     max_completion_tokens: int
-    max_prompt_tokens: int
     safety_tokens: int
     output_ratio: float
     safety_ratio: float
     deployment_id: str | None
+    route_id: str | None
     routing_version: int | None
 
 
-def compute_phase_token_budget(
-    capabilities: ModelCapabilities,
-    *,
-    output_ratio: float,
-    safety_ratio: float,
-) -> PhaseTokenBudget:
-    """Derive phase budget from verified context_window and ratios only."""
-    window = int(capabilities.context_window)
-    if window <= 0:
-        raise ValueError("context_window must be positive")
+@dataclass(frozen=True)
+class PromptChatBudget:
+    """Exact prompt + ratio reserves checked against context_window."""
+
+    context_window: int
+    prompt_tokens: int
+    output_reserve_tokens: int
+    safety_margin_tokens: int
+    max_completion_tokens: int
+    fits: bool
+    deployment_id: str | None
+    route_id: str | None
+    routing_version: int | None
+    enable_thinking: bool | None
+
+
+def _validate_ratios(*, output_ratio: float, safety_ratio: float) -> None:
     out_r = float(output_ratio)
     safety_r = float(safety_ratio)
     if not (0.0 < out_r < 1.0):
@@ -42,49 +55,92 @@ def compute_phase_token_budget(
     if out_r + safety_r >= 1.0:
         raise ValueError("output_ratio + safety_ratio must be < 1")
 
-    safety_tokens = max(1, int(math.floor(window * safety_r)))
-    max_completion = max(1, int(math.floor(window * out_r)))
-    # Leave room for prompt + completion + safety inside the window.
-    max_prompt = max(1, window - max_completion - safety_tokens)
+
+def compute_phase_token_budget(
+    capabilities: ModelCapabilities,
+    *,
+    output_ratio: float,
+    safety_ratio: float,
+) -> PhaseTokenBudget:
+    """Derive phase output reserve from verified context_window ratios."""
+    window = int(capabilities.context_window)
+    if window <= 0:
+        raise ValueError("context_window must be positive")
+    _validate_ratios(output_ratio=output_ratio, safety_ratio=safety_ratio)
+    safety_tokens = max(1, int(math.floor(window * float(safety_ratio))))
+    max_completion = max(1, int(math.floor(window * float(output_ratio))))
     return PhaseTokenBudget(
         context_window=window,
         max_completion_tokens=max_completion,
-        max_prompt_tokens=max_prompt,
         safety_tokens=safety_tokens,
-        output_ratio=out_r,
-        safety_ratio=safety_r,
+        output_ratio=float(output_ratio),
+        safety_ratio=float(safety_ratio),
         deployment_id=capabilities.deployment_id,
+        route_id=capabilities.route_id,
         routing_version=capabilities.routing_version,
     )
 
 
-def estimate_text_tokens(text: str, *, chars_per_token: float) -> int:
-    """Conservative token estimate (hint only; never treat as exact).
-
-    No external tokenizer. Larger chars_per_token → lower estimate; keep
-    chars_per_token small (e.g. 2.0) so CJK-heavy prompts are over-estimated.
-    """
-    if not text:
-        return 0
-    cpt = float(chars_per_token)
-    if cpt <= 0:
-        cpt = 1.0
-    return max(1, int(math.ceil(len(text) / cpt)))
-
-
-def prompt_fits_budget(
+def compute_prompt_chat_budget(
+    count: TokenCountResult,
     *,
-    system_prompt: str,
-    user_prompt: str,
-    budget: PhaseTokenBudget,
-    chars_per_token: float,
-) -> bool:
-    """True when conservative prompt estimate fits max_prompt_tokens."""
-    est = estimate_text_tokens(
-        (system_prompt or "") + (user_prompt or ""),
-        chars_per_token=chars_per_token,
+    output_reserve_ratio: float,
+    safety_margin_ratio: float,
+    enable_thinking: bool | None,
+) -> PromptChatBudget:
+    """Budget Chat completion from exact token-count + ratio reserves.
+
+    Requires:
+    ``prompt_tokens + output_reserve + safety_margin <= context_window``.
+    Thinking ON uses the same enable_thinking flag as Chat; thinking tokens
+    consume the completion reserve (max_completion_tokens).
+    """
+    window = int(count.context_window)
+    prompt_tokens = int(count.prompt_tokens)
+    if window <= 0 or prompt_tokens <= 0:
+        raise ValueError("token-count window/prompt_tokens must be positive")
+    _validate_ratios(
+        output_ratio=output_reserve_ratio, safety_ratio=safety_margin_ratio
     )
-    return est <= budget.max_prompt_tokens
+    output_reserve = max(
+        1, int(math.floor(window * float(output_reserve_ratio)))
+    )
+    safety_margin = max(
+        1, int(math.floor(window * float(safety_margin_ratio)))
+    )
+    fits = (prompt_tokens + output_reserve + safety_margin) <= window
+    # When fitting, request the full ratio reserve. When not, report a
+    # residual completion room for diagnostics only (caller must split).
+    residual = window - prompt_tokens - safety_margin
+    max_completion = output_reserve if fits else max(0, residual)
+    return PromptChatBudget(
+        context_window=window,
+        prompt_tokens=prompt_tokens,
+        output_reserve_tokens=output_reserve,
+        safety_margin_tokens=safety_margin,
+        max_completion_tokens=max_completion,
+        fits=fits,
+        deployment_id=count.deployment_id,
+        route_id=count.route_id,
+        routing_version=count.routing_version,
+        enable_thinking=enable_thinking,
+    )
+
+
+def token_count_route_changed(
+    previous: TokenCountResult | ModelCapabilities | PromptChatBudget | None,
+    current: TokenCountResult | ModelCapabilities | PromptChatBudget,
+) -> bool:
+    """True when observed ModelOps route identity fields differ."""
+    if previous is None:
+        return True
+    return (
+        previous.deployment_id != current.deployment_id
+        or getattr(previous, "route_id", None)
+        != getattr(current, "route_id", None)
+        or previous.routing_version != current.routing_version
+        or previous.context_window != current.context_window
+    )
 
 
 _DOCUMENT_SPLIT_RE = re.compile(
@@ -109,7 +165,6 @@ def split_block_by_pages(document_block: str) -> list[str]:
     text = document_block or ""
     if not text.strip():
         return []
-    # Header ends at "content:\n"
     marker = "content:\n"
     idx = text.find(marker)
     if idx < 0:
@@ -123,7 +178,7 @@ def split_block_by_pages(document_block: str) -> list[str]:
 
 
 def split_text_into_bounded_chunks(text: str, *, max_chars: int) -> list[str]:
-    """Split oversized page/body text into bounded character windows."""
+    """Structural body split only — fitness must be rechecked via token-count."""
     raw = text or ""
     if max_chars <= 0:
         return [raw] if raw else []
@@ -152,58 +207,46 @@ def split_page_block_text(
 def plan_project_source_chunks(
     document_blocks: str,
     *,
-    system_prompt: str,
-    code_catalog: str,
-    build_user_prompt,
-    budget: PhaseTokenBudget,
-    chars_per_token: float,
-    recovery_retry: bool = False,
+    budget_for_blocks,
 ) -> list[str]:
-    """Plan PROJECT source chunks using conservative fit estimates (hints).
+    """Plan PROJECT chunks; ``budget_for_blocks`` must use /v1/token-count.
 
-    Returns a single-element list when the full prompt fits; otherwise splits
-    document → pages → bounded body chunks until each estimated prompt fits
-    or cannot shrink further.
+    ``budget_for_blocks(blocks) -> PromptChatBudget`` is authoritative for
+    fit. Structural splits never decide fitness by character heuristics alone.
     """
-
-    def _fits(blocks: str) -> bool:
-        user = build_user_prompt(
-            code_catalog=code_catalog,
-            document_blocks=blocks,
-            recovery_retry=recovery_retry,
-        )
-        return prompt_fits_budget(
-            system_prompt=system_prompt,
-            user_prompt=user,
-            budget=budget,
-            chars_per_token=chars_per_token,
-        )
-
-    if _fits(document_blocks):
+    root_budget = budget_for_blocks(document_blocks)
+    if root_budget.fits:
         return [document_blocks]
 
     chunks: list[str] = []
     for doc_block in split_document_blocks(document_blocks) or [document_blocks]:
-        if _fits(doc_block):
+        doc_budget = budget_for_blocks(doc_block)
+        if doc_budget.fits:
             chunks.append(doc_block)
             continue
         page_chunks = split_block_by_pages(doc_block)
         if len(page_chunks) <= 1:
             page_chunks = [doc_block]
         for page_block in page_chunks:
-            if _fits(page_block):
+            page_budget = budget_for_blocks(page_block)
+            if page_budget.fits:
                 chunks.append(page_block)
                 continue
-            # Shrink body until fit or irreducible.
-            max_chars = max(256, len(page_block) // 2)
             pending = [page_block]
             while pending:
                 cur = pending.pop(0)
-                if _fits(cur) or len(cur) <= 256:
+                cur_budget = budget_for_blocks(cur)
+                if cur_budget.fits:
                     chunks.append(cur)
                     continue
-                max_chars = max(256, len(cur) // 2)
-                parts = split_page_block_text(cur, max_body_chars=max_chars)
+                # Structural shrink only; each part is re-measured above/below.
+                if len(cur) <= 256:
+                    # Irreducible for planner — keep and let Chat/length path fail closed.
+                    chunks.append(cur)
+                    continue
+                parts = split_page_block_text(
+                    cur, max_body_chars=max(256, len(cur) // 2)
+                )
                 if len(parts) <= 1:
                     chunks.append(cur)
                     continue

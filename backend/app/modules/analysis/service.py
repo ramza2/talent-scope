@@ -31,6 +31,7 @@ from app.ai.providers.model_capabilities import (
     capabilities_route_changed,
     fetch_model_capabilities,
 )
+from app.ai.providers.token_count import TokenCountResult
 from app.ai.providers.vlm import OpenAICompatibleVLMProvider, VLMProvider
 from app.ai.schemas.profile_candidate import (
     PROFILE_SCALAR_FIELDS,
@@ -86,12 +87,14 @@ from app.modules.analysis.normalize import normalize_candidate
 from app.modules.analysis.repository import AnalysisRepository
 from app.modules.analysis.token_budget import (
     PhaseTokenBudget,
+    PromptChatBudget,
     compute_phase_token_budget,
+    compute_prompt_chat_budget,
     plan_project_source_chunks,
-    prompt_fits_budget,
     split_block_by_pages,
     split_document_blocks,
     split_page_block_text,
+    token_count_route_changed,
 )
 from app.modules.analysis.schemas import (
     AnalysisDetail,
@@ -1292,38 +1295,128 @@ class AnalysisService:
         call_count = 0
         recovery_budget = 1
         project_split_calls = 0
+        token_count_calls = 0
+        used_project_adaptive_split = False
         capabilities: ModelCapabilities | None = None
         core_budget: PhaseTokenBudget | None = None
-        project_budget: PhaseTokenBudget | None = None
+        last_token_count: TokenCountResult | None = None
 
         def _refresh_capabilities(*, reason: str) -> ModelCapabilities:
-            nonlocal capabilities, core_budget, project_budget
+            nonlocal capabilities, core_budget, last_token_count
             previous = capabilities
             caps = fetch_model_capabilities(self.settings)
             if capabilities_route_changed(previous, caps):
                 logger.info(
                     "analysis capability rebudget analysis_run_id=%s reason=%s "
-                    "context_window=%s deployment_id=%s routing_version=%s",
+                    "context_window=%s deployment_id=%s route_id=%s "
+                    "routing_version=%s",
                     base_log.get("analysis_run_id"),
                     reason,
                     caps.context_window,
                     caps.deployment_id,
+                    caps.route_id,
                     caps.routing_version,
                 )
+                # Discard previous token-count when route identity moves.
+                last_token_count = None
                 core_budget = compute_phase_token_budget(
                     caps,
                     output_ratio=self.settings.analysis_core_output_ratio,
-                    safety_ratio=self.settings.analysis_token_safety_ratio,
-                )
-                project_budget = compute_phase_token_budget(
-                    caps,
-                    output_ratio=self.settings.analysis_project_output_ratio,
                     safety_ratio=self.settings.analysis_token_safety_ratio,
                 )
             capabilities = caps
             return caps
 
         _refresh_capabilities(reason="analysis_start")
+
+        def _count_prompt_budget(
+            *,
+            phase: str,
+            system_prompt: str,
+            user_prompt: str,
+            output_reserve_ratio: float,
+            split_depth: int = 0,
+            chunk_index: int | None = None,
+            force_recount: bool = False,
+        ) -> PromptChatBudget:
+            """Exact /v1/token-count + ratio budget. Never guesses tokens."""
+            nonlocal last_token_count, token_count_calls
+            max_attempts = max(1, int(self.settings.analysis_token_count_max_attempts))
+            enable_thinking = self.settings.analysis_llm_enable_thinking
+            last_error: Exception | None = None
+            for attempt in range(1, max_attempts + 1):
+                token_count_calls += 1
+                if force_recount or attempt > 1:
+                    _refresh_capabilities(reason=f"token_count_{phase}")
+                try:
+                    count = self.llm.count_prompt_tokens(
+                        system_prompt=system_prompt,
+                        user_prompt=user_prompt,
+                        log_context={
+                            **base_log,
+                            "phase": phase,
+                            "token_count_attempt": attempt,
+                            "split_depth": split_depth,
+                            "chunk_index": chunk_index,
+                        },
+                    )
+                except AIProviderError as exc:
+                    last_error = exc
+                    continue
+                # Observed route drift vs capability / prior count → recount.
+                if capabilities is not None and token_count_route_changed(
+                    capabilities, count
+                ):
+                    logger.info(
+                        "analysis token_count route drift analysis_run_id=%s "
+                        "phase=%s deployment_id=%s route_id=%s "
+                        "routing_version=%s",
+                        base_log.get("analysis_run_id"),
+                        phase,
+                        count.deployment_id,
+                        count.route_id,
+                        count.routing_version,
+                    )
+                    _refresh_capabilities(reason="token_count_route_drift")
+                    if attempt < max_attempts:
+                        continue
+                if (
+                    not force_recount
+                    and last_token_count is not None
+                    and token_count_route_changed(last_token_count, count)
+                ):
+                    last_token_count = None
+                last_token_count = count
+                budget = compute_prompt_chat_budget(
+                    count,
+                    output_reserve_ratio=output_reserve_ratio,
+                    safety_margin_ratio=self.settings.analysis_token_safety_ratio,
+                    enable_thinking=enable_thinking,
+                )
+                logger.info(
+                    "analysis prompt budget analysis_run_id=%s phase=%s "
+                    "status=VERIFIED context_window=%s prompt_tokens=%s "
+                    "requested_output_tokens=%s safety_margin=%s fits=%s "
+                    "deployment_id=%s route_id=%s routing_version=%s "
+                    "split_depth=%s chunk_index=%s enable_thinking=%s",
+                    base_log.get("analysis_run_id"),
+                    phase,
+                    budget.context_window,
+                    budget.prompt_tokens,
+                    budget.output_reserve_tokens,
+                    budget.safety_margin_tokens,
+                    budget.fits,
+                    budget.deployment_id,
+                    budget.route_id,
+                    budget.routing_version,
+                    split_depth,
+                    chunk_index,
+                    enable_thinking,
+                )
+                return budget
+            raise AIProviderError(
+                f"token-count failed for phase={phase}"
+            ) from last_error
 
         def _phase_call(
             *,
@@ -1338,8 +1431,9 @@ class AnalysisService:
             count_toward_project_split: bool = False,
             split_depth: int = 0,
             chunk_index: int | None = None,
+            precounted_budget: PromptChatBudget | None = None,
         ) -> dict[str, Any]:
-            nonlocal call_count, project_split_calls
+            nonlocal call_count, project_split_calls, last_token_count
             if count_toward_staged_budget and call_count >= 3:
                 raise AIProviderError("staged extraction exceeded LLM call budget")
             if count_toward_project_split:
@@ -1362,31 +1456,92 @@ class AnalysisService:
                 document_blocks=blocks_for_prompt,
                 recovery_retry=recovery_retry,
             )
-            raw = self.llm.complete_json(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                max_completion_tokens=max_completion_tokens,
-                log_context={
-                    **base_log,
-                    "phase": phase,
-                    "attempt": call_count,
-                    "recovery_retry": recovery_retry,
-                    "compact_protocol": compact_tag,
-                    "doc_alias_count": len(alias_to_id),
-                    "max_completion_tokens": max_completion_tokens,
-                    "split_depth": split_depth,
-                    "chunk_index": chunk_index,
-                    "deployment_id": (
-                        capabilities.deployment_id if capabilities else None
-                    ),
-                    "routing_version": (
-                        capabilities.routing_version if capabilities else None
-                    ),
-                    "context_window": (
-                        capabilities.context_window if capabilities else None
-                    ),
-                },
-            )
+            budget = precounted_budget
+            if phase == "projects":
+                # Always re-measure with /v1/token-count immediately before Chat.
+                # Count↔Chat is not an atomic route pin; never treat prior count
+                # as a lease. Discard previous count when capability identity moves.
+                _refresh_capabilities(reason="projects_pre_chat")
+                last_token_count = None
+                budget = _count_prompt_budget(
+                    phase=phase,
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    output_reserve_ratio=self.settings.analysis_project_output_ratio,
+                    split_depth=split_depth,
+                    chunk_index=chunk_index,
+                    force_recount=True,
+                )
+                if not budget.fits:
+                    raise AIProviderError(
+                        "project prompt exceeds token budget before chat"
+                    )
+                max_completion_tokens = budget.max_completion_tokens
+
+            try:
+                raw = self.llm.complete_json(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    max_completion_tokens=max_completion_tokens,
+                    log_context={
+                        **base_log,
+                        "phase": phase,
+                        "attempt": call_count,
+                        "recovery_retry": recovery_retry,
+                        "compact_protocol": compact_tag,
+                        "doc_alias_count": len(alias_to_id),
+                        "max_completion_tokens": max_completion_tokens,
+                        "prompt_tokens": (
+                            budget.prompt_tokens if budget is not None else None
+                        ),
+                        "safety_margin": (
+                            budget.safety_margin_tokens
+                            if budget is not None
+                            else None
+                        ),
+                        "split_depth": split_depth,
+                        "chunk_index": chunk_index,
+                        "deployment_id": (
+                            budget.deployment_id
+                            if budget is not None
+                            else (
+                                capabilities.deployment_id
+                                if capabilities
+                                else None
+                            )
+                        ),
+                        "route_id": (
+                            budget.route_id
+                            if budget is not None
+                            else (capabilities.route_id if capabilities else None)
+                        ),
+                        "routing_version": (
+                            budget.routing_version
+                            if budget is not None
+                            else (
+                                capabilities.routing_version
+                                if capabilities
+                                else None
+                            )
+                        ),
+                        "context_window": (
+                            budget.context_window
+                            if budget is not None
+                            else (
+                                capabilities.context_window
+                                if capabilities
+                                else None
+                            )
+                        ),
+                    },
+                )
+            except AIResponseTruncatedError:
+                # length / overflow → discard prior count for next attempt.
+                last_token_count = None
+                raise
+            except AIProviderError:
+                last_token_count = None
+                raise
             if not isinstance(raw, dict):
                 raise AIResponseValidationError(
                     f"profile JSON root is not an object (phase={phase})"
@@ -1804,7 +1959,7 @@ class AnalysisService:
                 return False
             return _documents_are_rich_profile_type(documents)
 
-        assert core_budget is not None and project_budget is not None
+        assert core_budget is not None
         core = _run_phase(
             phase="core",
             system_prompt=prompt.core_system_prompt,
@@ -1838,9 +1993,7 @@ class AnalysisService:
             len(core.projects),
         )
 
-        def _subsplit_project_chunk(blocks: str, *, depth: int) -> list[str]:
-            if depth <= 0:
-                return [blocks]
+        def _subsplit_project_chunk(blocks: str) -> list[str]:
             docs = split_document_blocks(blocks)
             if len(docs) > 1:
                 return docs
@@ -1851,6 +2004,29 @@ class AnalysisService:
                 blocks, max_body_chars=max(256, len(blocks) // 2)
             )
 
+        def _project_budget_for_blocks(
+            blocks: str,
+            *,
+            recovery_retry: bool = False,
+            split_depth: int = 0,
+            chunk_index: int | None = None,
+            force_recount: bool = False,
+        ) -> PromptChatBudget:
+            user_prompt = prompt.build_projects_user_prompt(
+                code_catalog=projects_catalog,
+                document_blocks=blocks,
+                recovery_retry=recovery_retry,
+            )
+            return _count_prompt_budget(
+                phase="projects",
+                system_prompt=prompt.projects_system_prompt or "",
+                user_prompt=user_prompt,
+                output_reserve_ratio=self.settings.analysis_project_output_ratio,
+                split_depth=split_depth,
+                chunk_index=chunk_index,
+                force_recount=force_recount,
+            )
+
         def _extract_project_chunk(
             blocks: str,
             *,
@@ -1858,49 +2034,16 @@ class AnalysisService:
             chunk_index: int,
             recovery_retry: bool,
         ) -> ProfileCandidateDocument:
-            """Extract one PROJECT chunk; on length, shrink only this chunk."""
-            nonlocal project_budget
-            _refresh_capabilities(reason="project_chunk")
-            assert project_budget is not None
-            try:
-                raw = _phase_call(
-                    phase="projects",
-                    system_prompt=prompt.projects_system_prompt,
-                    build_user_prompt=prompt.build_projects_user_prompt,
-                    code_catalog_text=projects_catalog,
-                    recovery_retry=recovery_retry,
-                    document_blocks_override=blocks,
-                    max_completion_tokens=project_budget.max_completion_tokens,
-                    count_toward_staged_budget=False,
-                    count_toward_project_split=True,
-                    split_depth=split_depth,
-                    chunk_index=chunk_index,
-                )
-                if (
-                    recovery_retry
-                    and prompt.validate_projects_recovery_root
-                ):
-                    _validate_projects_recovery_raw(raw)
-                return _normalize_projects(raw)
-            except AIResponseTruncatedError as trunc_exc:
-                logger.info(
-                    "analysis project chunk truncated analysis_run_id=%s "
-                    "split_depth=%s chunk_index=%s finish_reason=%s "
-                    "deployment_id=%s routing_version=%s context_window=%s",
-                    base_log.get("analysis_run_id"),
-                    split_depth,
-                    chunk_index,
-                    (trunc_exc.meta or {}).get("finish_reason"),
-                    capabilities.deployment_id if capabilities else None,
-                    capabilities.routing_version if capabilities else None,
-                    capabilities.context_window if capabilities else None,
-                )
+            """Extract one PROJECT chunk; on length/oversize, shrink only this chunk."""
+            nonlocal last_token_count
+
+            def _shrink_and_retry(cause: Exception) -> ProfileCandidateDocument:
                 max_depth = int(self.settings.analysis_project_split_max_depth)
                 if split_depth >= max_depth:
-                    raise InsufficientCandidateError() from trunc_exc
-                parts = _subsplit_project_chunk(blocks, depth=1)
+                    raise InsufficientCandidateError() from cause
+                parts = _subsplit_project_chunk(blocks)
                 if len(parts) <= 1:
-                    raise InsufficientCandidateError() from trunc_exc
+                    raise InsufficientCandidateError() from cause
                 nested: list[ProfileCandidateDocument] = []
                 for sub_i, part in enumerate(parts):
                     nested.append(
@@ -1913,66 +2056,115 @@ class AnalysisService:
                     )
                 return merge_project_chunk_candidates(nested)
 
+            try:
+                budget = _project_budget_for_blocks(
+                    blocks,
+                    recovery_retry=recovery_retry,
+                    split_depth=split_depth,
+                    chunk_index=chunk_index,
+                    force_recount=True,
+                )
+            except AIProviderError as exc:
+                # Token-count failure at minimal chunk → fail closed.
+                if split_depth >= int(self.settings.analysis_project_split_max_depth):
+                    raise InsufficientCandidateError() from exc
+                return _shrink_and_retry(exc)
+
+            if not budget.fits:
+                logger.info(
+                    "analysis project chunk over budget analysis_run_id=%s "
+                    "split_depth=%s chunk_index=%s prompt_tokens=%s "
+                    "context_window=%s",
+                    base_log.get("analysis_run_id"),
+                    split_depth,
+                    chunk_index,
+                    budget.prompt_tokens,
+                    budget.context_window,
+                )
+                return _shrink_and_retry(
+                    AIProviderError("project chunk exceeds token budget")
+                )
+
+            try:
+                raw = _phase_call(
+                    phase="projects",
+                    system_prompt=prompt.projects_system_prompt,
+                    build_user_prompt=prompt.build_projects_user_prompt,
+                    code_catalog_text=projects_catalog,
+                    recovery_retry=recovery_retry,
+                    document_blocks_override=blocks,
+                    count_toward_staged_budget=False,
+                    count_toward_project_split=True,
+                    split_depth=split_depth,
+                    chunk_index=chunk_index,
+                    precounted_budget=budget,
+                )
+                if recovery_retry and prompt.validate_projects_recovery_root:
+                    _validate_projects_recovery_raw(raw)
+                return _normalize_projects(raw)
+            except AIResponseTruncatedError as trunc_exc:
+                last_token_count = None
+                logger.info(
+                    "analysis project chunk truncated analysis_run_id=%s "
+                    "split_depth=%s chunk_index=%s finish_reason=%s "
+                    "deployment_id=%s route_id=%s routing_version=%s "
+                    "context_window=%s",
+                    base_log.get("analysis_run_id"),
+                    split_depth,
+                    chunk_index,
+                    (trunc_exc.meta or {}).get("finish_reason"),
+                    budget.deployment_id,
+                    budget.route_id,
+                    budget.routing_version,
+                    budget.context_window,
+                )
+                return _shrink_and_retry(trunc_exc)
+            except AIProviderError as prov_exc:
+                # Budget race / provider overflow after count → shrink this chunk.
+                last_token_count = None
+                return _shrink_and_retry(prov_exc)
+
         def _run_projects_adaptive() -> ProfileCandidateDocument:
+            nonlocal used_project_adaptive_split
             _refresh_capabilities(reason="projects_phase")
-            assert project_budget is not None
+            root_budget = _project_budget_for_blocks(
+                aliased_blocks, recovery_retry=False, force_recount=True
+            )
+            # Budget-fit → historical single PROJECT flow + optional second-pass.
+            if root_budget.fits:
+                used_project_adaptive_split = False
+                return _run_phase(
+                    phase="projects",
+                    system_prompt=prompt.projects_system_prompt,
+                    build_user_prompt=prompt.build_projects_user_prompt,
+                    code_catalog_text=projects_catalog,
+                    normalize_raw=_normalize_projects,
+                    needs_retry=_projects_needs_retry,
+                    fail_closed_if_bad=False,
+                    validate_recovery_raw=(
+                        _validate_projects_recovery_raw
+                        if prompt.validate_projects_recovery_root
+                        else None
+                    ),
+                    max_completion_tokens=root_budget.max_completion_tokens,
+                )
+
+            used_project_adaptive_split = True
             planned = plan_project_source_chunks(
                 aliased_blocks,
-                system_prompt=prompt.projects_system_prompt or "",
-                code_catalog=projects_catalog,
-                build_user_prompt=prompt.build_projects_user_prompt,
-                budget=project_budget,
-                chars_per_token=self.settings.analysis_prompt_chars_per_token,
-                recovery_retry=False,
-            )
-            # Budget-fit single chunk → keep historical single PROJECT flow
-            # (counts toward staged call budget + shared recovery).
-            if len(planned) == 1 and prompt_fits_budget(
-                system_prompt=prompt.projects_system_prompt or "",
-                user_prompt=prompt.build_projects_user_prompt(
-                    code_catalog=projects_catalog,
-                    document_blocks=planned[0],
-                    recovery_retry=False,
+                budget_for_blocks=lambda blocks: _project_budget_for_blocks(
+                    blocks, recovery_retry=False, force_recount=True
                 ),
-                budget=project_budget,
-                chars_per_token=self.settings.analysis_prompt_chars_per_token,
-            ):
-                try:
-                    return _run_phase(
-                        phase="projects",
-                        system_prompt=prompt.projects_system_prompt,
-                        build_user_prompt=prompt.build_projects_user_prompt,
-                        code_catalog_text=projects_catalog,
-                        normalize_raw=_normalize_projects,
-                        needs_retry=_projects_needs_retry,
-                        fail_closed_if_bad=False,
-                        validate_recovery_raw=(
-                            _validate_projects_recovery_raw
-                            if prompt.validate_projects_recovery_root
-                            else None
-                        ),
-                        max_completion_tokens=project_budget.max_completion_tokens,
-                    )
-                except InsufficientCandidateError:
-                    # Single-flow truncated after recovery → try adaptive split.
-                    planned = (
-                        split_document_blocks(aliased_blocks)
-                        or split_block_by_pages(aliased_blocks)
-                        or [aliased_blocks]
-                    )
-                    if len(planned) <= 1:
-                        planned = split_page_block_text(
-                            aliased_blocks,
-                            max_body_chars=max(256, len(aliased_blocks) // 2),
-                        )
-
+            )
             logger.info(
                 "analysis project adaptive split analysis_run_id=%s "
-                "chunk_count=%s context_window=%s max_completion_tokens=%s",
+                "chunk_count=%s context_window=%s prompt_tokens=%s "
+                "requested_output_tokens=%s",
                 base_log.get("analysis_run_id"),
                 len(planned),
-                project_budget.context_window,
-                project_budget.max_completion_tokens,
+                root_budget.context_window,
+                root_budget.prompt_tokens,
+                root_budget.output_reserve_tokens,
             )
             chunk_docs: list[ProfileCandidateDocument] = []
             for idx, chunk_blocks in enumerate(planned):
@@ -1990,24 +2182,27 @@ class AnalysisService:
         logger.info(
             "analysis candidate quality run_id=%s phase=projects "
             "compact_protocol=%s document_count=%s vlm_pages=%s project_count=%s "
-            "project_split_calls=%s",
+            "project_split_calls=%s used_adaptive_split=%s token_count_calls=%s",
             base_log.get("analysis_run_id"),
             compact_tag,
             base_log.get("document_count"),
             vlm_pages,
             len(projects_doc.projects),
             project_split_calls,
+            used_project_adaptive_split,
+            token_count_calls,
         )
 
-        # v20: bounded PROJECT recall second-pass. Keep first normalized
-        # projects; append only unmatched second-pass survivors. Uses the
-        # shared recovery budget (max 1) and overall LLM call cap (max 3).
+        # v20: bounded PROJECT recall second-pass only on single-path budget fit.
+        # Adaptive split already covers documents/pages; do not re-run full-source
+        # second-pass (would reintroduce context overflow).
         project_recall_second_pass = 0
         project_first_count = len(projects_doc.projects)
         project_second_count = 0
         project_supplemented = 0
         if (
-            prompt.recover_project_recall_second_pass
+            (not used_project_adaptive_split)
+            and prompt.recover_project_recall_second_pass
             and recovery_budget > 0
             and call_count < 3
             and source_char_count >= _SPARSE_MIN_SOURCE_CHARS
@@ -2022,11 +2217,6 @@ class AnalysisService:
                     build_user_prompt=prompt.build_projects_user_prompt,
                     code_catalog_text=projects_catalog,
                     recovery_retry=True,
-                    max_completion_tokens=(
-                        project_budget.max_completion_tokens
-                        if project_budget is not None
-                        else None
-                    ),
                 )
                 if prompt.validate_projects_recovery_root:
                     _validate_projects_recovery_raw(raw_second)
@@ -2048,7 +2238,7 @@ class AnalysisService:
             "analysis project recall second pass analysis_run_id=%s "
             "project_recall_second_pass=%s project_first_count=%s "
             "project_second_count=%s project_supplemented=%s "
-            "project_union_count=%s llm_calls=%s",
+            "project_union_count=%s llm_calls=%s used_adaptive_split=%s",
             base_log.get("analysis_run_id"),
             project_recall_second_pass,
             project_first_count,
@@ -2056,6 +2246,7 @@ class AnalysisService:
             project_supplemented,
             len(projects_doc.projects),
             call_count,
+            used_project_adaptive_split,
         )
 
         merged = core.model_copy(update={"projects": list(projects_doc.projects)})

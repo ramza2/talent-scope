@@ -14,6 +14,7 @@ from app.ai.providers.openai_compat import (
     extract_message_content,
     post_chat_completions,
 )
+from app.ai.providers.token_count import TokenCountResult, count_chat_prompt_tokens
 from app.ai.schemas.identity import IdentityExtraction
 from app.ai.utils.json_extract import parse_json_object
 from app.core.config import Settings, get_settings
@@ -36,6 +37,14 @@ class LLMProvider(Protocol):
         log_context: dict | None = None,
         max_completion_tokens: int | None = None,
     ) -> dict: ...
+
+    def count_prompt_tokens(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        log_context: dict | None = None,
+    ) -> TokenCountResult: ...
 
 
 class OpenAICompatibleLLMProvider:
@@ -76,6 +85,22 @@ class OpenAICompatibleLLMProvider:
             max_completion_tokens=max_completion_tokens,
         )
         return _parse_json_dict(content, allow_repair=True)
+
+    def count_prompt_tokens(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        log_context: dict | None = None,
+    ) -> TokenCountResult:
+        """Exact ModelOps token-count using the same thinking toggle as Chat."""
+        return count_chat_prompt_tokens(
+            self.settings,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            enable_thinking=self.settings.analysis_llm_enable_thinking,
+            log_context=log_context,
+        )
 
     def _chat(
         self,
@@ -204,6 +229,31 @@ class FakeLLMProvider:
         if self.raw_content is not None:
             return _parse_identity_content(self.raw_content, allow_repair=True)
         return self.identity.model_copy()
+
+    def count_prompt_tokens(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        log_context: dict | None = None,
+    ) -> TokenCountResult:
+        from app.ai.providers.token_count import TokenCountResult as TCR
+
+        _ = log_context
+        if self.fail:
+            raise AIProviderError("injected token-count failure")
+        # Test double only — prompt_tokens scales with input length; window from ctor.
+        prompt_tokens = max(1, (len(system_prompt) + len(user_prompt)) // 4)
+        window = int(getattr(self, "fake_context_window", 100_000))
+        return TCR(
+            model="fake",
+            prompt_tokens=prompt_tokens,
+            context_window=window,
+            status="VERIFIED",
+            deployment_id="fake-dep",
+            route_id="fake-route",
+            routing_version=1,
+        )
 
     def complete_json(
         self,
