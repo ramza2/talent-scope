@@ -38,6 +38,8 @@ def _proj(
     jobs=None,
     expertise=None,
     skills=None,
+    responsibilities: str | None = None,
+    project_summary: str | None = None,
 ):
     from app.ai.schemas.profile_candidate import CodeRefCandidate, ProjectCandidate
 
@@ -58,6 +60,8 @@ def _proj(
         customer_name=customer,
         start_date=start,
         end_date=end,
+        responsibilities=responsibilities,
+        project_summary=project_summary,
         source_refs=[_ref(name, document_id=doc)],
         jobs=rels(jobs),
         expertise=rels(expertise),
@@ -104,65 +108,16 @@ def _view(doc):
     return sorted(rows)
 
 
+def _dump_projects(doc):
+    return [p.model_dump(mode="json") for p in doc.projects]
+
+
 def _kosa_live_rows():
+    """Live run 14723c93-5c5a-420d-ae74-36e78689f2f7 KOSA rows (8)."""
     return [
         _proj(
-            "2019년 제1차 범정부 정보자원 통합구축 HW1사업",
-            "정부통합전산센터",
-            "2019.07",
-            "2020.01",
-            doc=_DOC_KOSA,
-            jobs=[("JOB-OPS-SYS", "시스템 운영")],
-            expertise=[("EXP-INFRA", "인프라")],
-        ),
-        _proj(
-            "2018년 제1차 범정부 정보자원 통합구축 HW2 사업",
-            "정부통합전산센터",
-            "2018.06",
-            "2019.01",
-            doc=_DOC_KOSA,
-            jobs=[("JOB-OPS-SYS", "시스템 운영")],
-            expertise=[("EXP-INFRA", "인프라")],
-        ),
-        _proj(
-            "2017년 HW자원통합구축 사업2-1(대전)",
-            "정부통합전산센터",
-            "2017.10",
-            "2018.03",
-            doc=_DOC_KOSA,
-            jobs=[("JOB-OPS-SYS", "시스템 운영")],
-            expertise=[("EXP-INFRA", "인프라")],
-        ),
-        _proj(
-            "2016년 HW자원통합구축 사업2-2(광주)",
-            "정부통합전산센터",
-            "2016.08",
-            "2017.03",
-            doc=_DOC_KOSA,
-            jobs=[("JOB-OPS-SYS", "시스템 운영")],
-            expertise=[("EXP-INFRA", "인프라")],
-        ),
-        _proj(
-            "국방통합정보관리소 정보체계 이전/통합 사업",
-            "국방부",
-            "2014.02",
-            "2014.12",
-            doc=_DOC_KOSA,
-            jobs=[("JOB-OPS-SYS", "시스템 운영")],
-            expertise=[("EXP-INFRA", "인프라")],
-        ),
-        _proj(
-            "2013년 차기 복권통합구축사업",
-            "기획재정부",
-            "2013.09",
-            "2013.12",
-            doc=_DOC_KOSA,
-            jobs=[("JOB-OPS-SYS", "시스템 운영")],
-            expertise=[("EXP-INFRA", "인프라")],
-        ),
-        _proj(
             "2011년 HW자원통합구축 사업2-1(대전)",
-            "정부통합전산센터",
+            "(주)투루텍",
             "2011.06.10",
             "2011.11.15",
             doc=_DOC_KOSA,
@@ -171,9 +126,63 @@ def _kosa_live_rows():
         ),
         _proj(
             "2011년 HW자원통합구축 사업2-1(대전)",
-            "정부통합전산센터",
+            "(주)투루텍",
             "2011.11.16",
             "2011.12.24",
+            doc=_DOC_KOSA,
+            jobs=[("JOB-OPS-SYS", "시스템 운영")],
+            expertise=[("EXP-INFRA", "인프라")],
+        ),
+        _proj(
+            "2013년 차기 복권통합구축사업",
+            "인사이텍 주식회사",
+            "2013.09.16",
+            "2013.12.31",
+            doc=_DOC_KOSA,
+            jobs=[("JOB-OPS-SYS", "시스템 운영")],
+            expertise=[("EXP-INFRA", "인프라")],
+        ),
+        _proj(
+            "국방통합정보관리소 정보체계 이전/통합 사업",
+            "(주)타이호인스트",
+            "2014.02.07",
+            "2014.12.06",
+            doc=_DOC_KOSA,
+            jobs=[("JOB-OPS-SYS", "시스템 운영")],
+            expertise=[("EXP-INFRA", "인프라")],
+        ),
+        _proj(
+            "2016년 HW자원통합구축 사업2-2(광주)",
+            "(주)아이티센",
+            "2016.08.25",
+            "2017.03.25",
+            doc=_DOC_KOSA,
+            jobs=[("JOB-OPS-SYS", "시스템 운영")],
+            expertise=[("EXP-INFRA", "인프라")],
+        ),
+        _proj(
+            "2017년 제2차 정보자원통합구축 HW1사업 (대전)",
+            "(주)에스제이정보통신",
+            "2017.10.19",
+            "2018.03.22",
+            doc=_DOC_KOSA,
+            jobs=[("JOB-OPS-SYS", "시스템 운영")],
+            expertise=[("EXP-INFRA", "인프라")],
+        ),
+        _proj(
+            "2018년 제1차 범정부 정보자원 통합구축 HW2 사업",
+            "(주)휴먼정보",
+            "2018.06.11",
+            "2019.01.10",
+            doc=_DOC_KOSA,
+            jobs=[("JOB-OPS-SYS", "시스템 운영")],
+            expertise=[("EXP-INFRA", "인프라")],
+        ),
+        _proj(
+            "2019년 제1차 범정부 정보자원 통합구축 HW1사업",
+            "(주)휴먼정보",
+            "2019.07.15",
+            "2020.01.15",
             doc=_DOC_KOSA,
             jobs=[("JOB-OPS-SYS", "시스템 운영")],
             expertise=[("EXP-INFRA", "인프라")],
@@ -182,69 +191,15 @@ def _kosa_live_rows():
 
 
 def _profile_live_rows():
+    """Live run 14723c93-5c5a-420d-ae74-36e78689f2f7 PROFILE rows (9)."""
     return [
         _proj(
-            "2019년 제1차 범정부 정보자원 통합구축 HW1사업",
-            "국가정보자원관리원",
-            "2019.07",
-            "2020.01",
+            "2008년 정부통합전산센터 BCP 관련 BIA 구축 사업",
+            "행정안전부",
+            "2008.09",
+            "2008.12",
             doc=_DOC_PROFILE,
             jobs=[("JOB-MGT", "사업관리")],
-            expertise=[("EXP-MGT", "사업관리")],
-        ),
-        _proj(
-            "2018년 제1차 범정부 정보자원 통합구축 HW2 사업",
-            "국가정보자원관리원",
-            "2018.06",
-            "2019.01",
-            doc=_DOC_PROFILE,
-            jobs=[("JOB-MGT", "사업관리")],
-            expertise=[("EXP-MGT", "사업관리")],
-        ),
-        _proj(
-            "2017년 제2차 정보자원통합구축 HW1사업 (대전)",
-            "국가정보자원관리원",
-            "2017.10",
-            "2018.03",
-            doc=_DOC_PROFILE,
-            jobs=[("JOB-MGT", "사업관리")],
-            expertise=[("EXP-MGT", "사업관리")],
-        ),
-        _proj(
-            "2016년 제2차 정보자원통합구축 HW2사업 (광주)",
-            "국가정보자원관리원",
-            "2016.08",
-            "2017.03",
-            doc=_DOC_PROFILE,
-            jobs=[("JOB-MGT", "사업관리")],
-            expertise=[("EXP-MGT", "사업관리")],
-        ),
-        _proj(
-            "국방통합정보관리소 정보체계 이전 통합 사업",
-            "국방부",
-            "2014.02",
-            "2014.12",
-            doc=_DOC_PROFILE,
-            jobs=[("JOB-MGT", "사업관리")],
-            expertise=[("EXP-MGT", "사업관리")],
-        ),
-        _proj(
-            "2013년 차기 복권통합구축사업",
-            "기획재정부",
-            "2013.09",
-            "2013.12",
-            doc=_DOC_PROFILE,
-            jobs=[("JOB-ARC-TA", "TA")],
-            expertise=[("EXP-INFRA", "인프라")],
-        ),
-        _proj(
-            "2011년 제2차 자원통합 구축 HW1 사업(대전)",
-            "국가정보자원관리원",
-            "2011.06",
-            "2012.01",
-            doc=_DOC_PROFILE,
-            jobs=[("JOB-MGT", "사업관리")],
-            expertise=[("EXP-MGT", "사업관리")],
         ),
         _proj(
             "영화진흥위원회 전산실 유지보수 사업",
@@ -255,12 +210,67 @@ def _profile_live_rows():
             jobs=[("JOB-MGT", "사업관리")],
         ),
         _proj(
-            "2008년 정부통합전산센터 BCP 관련 BIA 구축 사업",
-            "행정안전부",
-            "2008.09",
-            "2008.12",
+            "2011년 제2차 자원통합 구축 HW1 사업(대전)",
+            "정부통합 전산센터",
+            "2011.06",
+            "2012.01",
             doc=_DOC_PROFILE,
             jobs=[("JOB-MGT", "사업관리")],
+            expertise=[("EXP-MGT", "사업관리")],
+        ),
+        _proj(
+            "2013년 차기 복권통합구축사업",
+            "복권위원회",
+            "2013.09",
+            "2013.12",
+            doc=_DOC_PROFILE,
+            jobs=[("JOB-ARC-TA", "TA")],
+            expertise=[("EXP-INFRA", "인프라")],
+        ),
+        _proj(
+            "국방 메가센터 정보시스템 이전통합사업(육군)",
+            "국방부",
+            "2014.02",
+            "2014.12",
+            doc=_DOC_PROFILE,
+            jobs=[("JOB-MGT", "사업관리")],
+            expertise=[("EXP-MGT", "사업관리")],
+        ),
+        _proj(
+            "2016년 제2차 범정부 정보자원 통합구축 HW2 사업",
+            "정부통합 전산센터",
+            "2016.08",
+            "2017.03",
+            doc=_DOC_PROFILE,
+            jobs=[("JOB-MGT", "사업관리")],
+            expertise=[("EXP-MGT", "사업관리")],
+        ),
+        _proj(
+            "2017년 제2차 범정부 정보자원 통합구축 HW1 사업",
+            "국가정보자원관리원",
+            "2017.10",
+            "2018.03",
+            doc=_DOC_PROFILE,
+            jobs=[("JOB-MGT", "사업관리")],
+            expertise=[("EXP-MGT", "사업관리")],
+        ),
+        _proj(
+            "2018년 제1차 범정부 정보자원 통합구축 HW2 사업",
+            "국가정보자원관리원",
+            "2018.06",
+            "2019.01",
+            doc=_DOC_PROFILE,
+            jobs=[("JOB-MGT", "사업관리")],
+            expertise=[("EXP-MGT", "사업관리")],
+        ),
+        _proj(
+            "2019년 제1차 범정부 정보자원 통합구축 HW1 사업",
+            "국가정보자원관리원",
+            "2019.07",
+            "2020.01",
+            doc=_DOC_PROFILE,
+            jobs=[("JOB-MGT", "사업관리")],
+            expertise=[("EXP-MGT", "사업관리")],
         ),
     ]
 
@@ -279,12 +289,8 @@ def test_live_kosa_profile_merge_yields_nine_order_independent() -> None:
     )
     assert len(forward.projects) == 9
     assert _view(forward) == _view(reverse)
+    assert _dump_projects(forward) == _dump_projects(reverse)
 
-    by_year = {
-        (p.start_date or "")[:4]: p
-        for p in forward.projects
-        if (p.start_date or "").startswith(("201", "200"))
-    }
     # 2019 dual relations + customer from PROFILE + KOSA day/name preference
     p2019 = next(
         p for p in forward.projects if (p.start_date or "").startswith("2019")
@@ -299,23 +305,24 @@ def test_live_kosa_profile_merge_yields_nine_order_independent() -> None:
     )
     assert {j.code for j in p2013.jobs} == {"JOB-OPS-SYS", "JOB-ARC-TA"}
     assert "EXP-INFRA" in {x.code for x in p2013.expertise}
+    assert p2013.customer_name == "복권위원회"
+    assert {r.document_id for r in p2013.source_refs} == {_DOC_KOSA, _DOC_PROFILE}
 
     p2011 = next(
         p for p in forward.projects if (p.start_date or "").startswith("2011")
     )
     assert p2011.project_name == "2011년 제2차 자원통합 구축 HW1 사업(대전)"
-    assert p2011.customer_name == "국가정보자원관리원"
+    assert p2011.customer_name == "정부통합 전산센터"
     assert p2011.start_date == "2011.06.10"
     assert p2011.end_date == "2011.12.24"
     assert {j.code for j in p2011.jobs} == {"JOB-OPS-SYS", "JOB-MGT"}
     assert {x.code for x in p2011.expertise} == {"EXP-INFRA", "EXP-MGT"}
-    # No duplicate codes
     assert len(p2011.jobs) == len({j.code for j in p2011.jobs})
+    assert {r.document_id for r in p2011.source_refs} == {_DOC_KOSA, _DOC_PROFILE}
 
     names = {p.project_name for p in forward.projects}
     assert "영화진흥위원회 전산실 유지보수 사업" in names
     assert any("BCP" in (n or "") or "BIA" in (n or "") for n in names)
-    _ = by_year
 
 
 def test_missing_doc_type_map_keeps_strict_only() -> None:
@@ -324,9 +331,8 @@ def test_missing_doc_type_map_keeps_strict_only() -> None:
     kosa = _kosa_live_rows()
     profile = _profile_live_rows()
     out = merge_project_chunk_candidates([_chunk(kosa), _chunk(profile)])
-    # Without type map, only strict identity merges (e.g. 2013 same name/customer).
-    # Complementary KOSA↔PROFILE customer-mismatch merges must not run.
-    assert len(out.projects) == 16
+    # Live customers differ across docs → no strict identity collapse.
+    assert len(out.projects) == 17
     p2019s = [
         p for p in out.projects if (p.start_date or "").startswith("2019")
     ]
@@ -432,12 +438,178 @@ def test_ambiguous_one_to_many_non_aggregate_not_merged() -> None:
         "2020.01",
         doc=_DOC_PROFILE,
     )
-    # Force second profile to also strong-match via same core title tokens.
     out = merge_project_chunk_candidates(
         [_chunk([kosa]), _chunk([p1, p2])], document_type_by_id=_TYPE_MAP
     )
-    # Ambiguous 1:N → keep separate (no false complementary merge).
     assert len(out.projects) == 3
+
+
+def test_aggregate_exact_same_segment_set_ambiguous_no_merge() -> None:
+    from app.modules.analysis.compact_v8 import merge_project_chunk_candidates
+
+    k1 = _proj(
+        "2011년 HW자원통합구축 사업2-1(대전)",
+        "(주)투루텍",
+        "2011.06.10",
+        "2011.11.15",
+        doc=_DOC_KOSA,
+    )
+    k2 = _proj(
+        "2011년 HW자원통합구축 사업2-1(대전)",
+        "(주)투루텍",
+        "2011.11.16",
+        "2011.12.24",
+        doc=_DOC_KOSA,
+    )
+    p1 = _proj(
+        "2011년 제2차 자원통합 구축 HW1 사업(대전)",
+        "정부통합 전산센터",
+        "2011.06",
+        "2012.01",
+        doc=_DOC_PROFILE,
+    )
+    p2 = _proj(
+        "2011년 제2차 자원통합구축 HW1사업(대전) 요약",
+        "국가정보자원관리원",
+        "2011.06",
+        "2012.01",
+        doc=_DOC_PROFILE,
+    )
+    out = merge_project_chunk_candidates(
+        [_chunk([k1, k2]), _chunk([p1, p2])], document_type_by_id=_TYPE_MAP
+    )
+    assert len(out.projects) == 4
+
+
+def test_aggregate_partial_overlap_segment_sets_ambiguous_no_merge() -> None:
+    from app.modules.analysis.compact_v8 import merge_project_chunk_candidates
+
+    # Three contiguous KOSA segments; two PROFILE aggregates share the middle.
+    ka = _proj(
+        "2011년 HW자원통합구축 사업 A",
+        "(주)투루텍",
+        "2011.01.01",
+        "2011.04.30",
+        doc=_DOC_KOSA,
+    )
+    kb = _proj(
+        "2011년 HW자원통합구축 사업 B",
+        "(주)투루텍",
+        "2011.05.01",
+        "2011.08.31",
+        doc=_DOC_KOSA,
+    )
+    kc = _proj(
+        "2011년 HW자원통합구축 사업 C",
+        "(주)투루텍",
+        "2011.09.01",
+        "2011.12.31",
+        doc=_DOC_KOSA,
+    )
+    p_ab = _proj(
+        "2011년 제2차 자원통합 구축 HW 사업 AB",
+        "정부통합 전산센터",
+        "2011.01",
+        "2011.08",
+        doc=_DOC_PROFILE,
+    )
+    p_bc = _proj(
+        "2011년 제2차 자원통합 구축 HW 사업 BC",
+        "국가정보자원관리원",
+        "2011.05",
+        "2011.12",
+        doc=_DOC_PROFILE,
+    )
+    out = merge_project_chunk_candidates(
+        [_chunk([ka, kb, kc]), _chunk([p_ab, p_bc])],
+        document_type_by_id=_TYPE_MAP,
+    )
+    assert len(out.projects) == 5
+
+
+def test_aggregate_disjoint_segment_sets_both_merge() -> None:
+    from app.modules.analysis.compact_v8 import merge_project_chunk_candidates
+
+    k11a = _proj(
+        "2011년 HW자원통합구축 사업2-1(대전)",
+        "(주)투루텍",
+        "2011.06.10",
+        "2011.11.15",
+        doc=_DOC_KOSA,
+    )
+    k11b = _proj(
+        "2011년 HW자원통합구축 사업2-1(대전)",
+        "(주)투루텍",
+        "2011.11.16",
+        "2011.12.24",
+        doc=_DOC_KOSA,
+    )
+    k16a = _proj(
+        "2016년 HW자원통합구축 사업2-2(광주)",
+        "(주)아이티센",
+        "2016.08.25",
+        "2016.11.30",
+        doc=_DOC_KOSA,
+    )
+    k16b = _proj(
+        "2016년 HW자원통합구축 사업2-2(광주)",
+        "(주)아이티센",
+        "2016.12.01",
+        "2017.03.25",
+        doc=_DOC_KOSA,
+    )
+    p11 = _proj(
+        "2011년 제2차 자원통합 구축 HW1 사업(대전)",
+        "정부통합 전산센터",
+        "2011.06",
+        "2012.01",
+        doc=_DOC_PROFILE,
+    )
+    p16 = _proj(
+        "2016년 제2차 범정부 정보자원 통합구축 HW2 사업",
+        "정부통합 전산센터",
+        "2016.08",
+        "2017.03",
+        doc=_DOC_PROFILE,
+    )
+    out = merge_project_chunk_candidates(
+        [_chunk([k11a, k11b, k16a, k16b]), _chunk([p11, p16])],
+        document_type_by_id=_TYPE_MAP,
+    )
+    assert len(out.projects) == 2
+    starts = sorted((p.start_date or "")[:4] for p in out.projects)
+    assert starts == ["2011", "2016"]
+
+
+def test_missing_identity_singles_serialized_order_independent() -> None:
+    """Incomplete-identity singles with differing jobs/refs must dump identically."""
+    from app.modules.analysis.compact_v8 import merge_project_chunk_candidates
+
+    # Same name/customer/empty dates/doc/root quote; different jobs + responsibilities.
+    # Missing dates keep identity incomplete (no false merge).
+    a = _proj(
+        "미확인 사업",
+        "고객A",
+        "",
+        "",
+        doc=_DOC_KOSA,
+        jobs=[("JOB-OPS-SYS", "운영")],
+        responsibilities="서버 운영",
+    )
+    b = _proj(
+        "미확인 사업",
+        "고객A",
+        "",
+        "",
+        doc=_DOC_KOSA,
+        jobs=[("JOB-MGT", "관리")],
+        responsibilities="사업 관리",
+    )
+    forward = merge_project_chunk_candidates([_chunk([a, b])])
+    reverse = merge_project_chunk_candidates([_chunk([b, a])])
+    assert len(forward.projects) == 2
+    assert _dump_projects(forward) == _dump_projects(reverse)
+    assert forward.projects[0].jobs[0].code != forward.projects[1].jobs[0].code
 
 
 def test_strict_exact_identity_still_merges_without_type_map() -> None:

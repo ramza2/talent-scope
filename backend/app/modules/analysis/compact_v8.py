@@ -3754,53 +3754,122 @@ def _apply_kosa_profile_complementary_merge(
         used.add(pi)
 
     # --- Aggregate: PROFILE + 2+ KOSA segments ---
-    remaining_profile = [
-        i
-        for i in profile_idxs
-        if i not in used
-    ]
-    # Prefer earlier PROFILE aggregates first (deterministic).
-    remaining_profile.sort(key=lambda i: _chunk_project_sort_key(work[i]))
-    claimed_kosa: set[int] = set()
+    # Precompute the full candidate graph first so used/claimed state during
+    # application never changes which segments a PROFILE claims.
+    available_kosa = {i for i in kosa_idxs if i not in used}
+    remaining_profile = [i for i in profile_idxs if i not in used]
+    candidate_segs: dict[int, frozenset[int]] = {}
     for pi in remaining_profile:
-        if pi in used:
-            continue
-        # Build a temporary pool view with used slots still present but skip
-        # already-used indices inside the helper via membership checks.
         segs = _kosa_profile_aggregate_segment_indices(
             work, pi, document_type_by_id
         )
-        segs = [s for s in segs if s not in used and s not in claimed_kosa]
-        if len(segs) < 2:
+        seg_set = frozenset(s for s in segs if s in available_kosa)
+        if len(seg_set) >= 2:
+            candidate_segs[pi] = seg_set
+
+    # Any shared KOSA segment across PROFILE aggregate candidates → fail closed
+    # for every overlapping claim (exact or partial). Greedy claim forbidden.
+    ambiguous_profiles: set[int] = set()
+    profile_candidates = sorted(
+        candidate_segs.keys(),
+        key=lambda i: _chunk_project_sort_key(work[i]),
+    )
+    for i, pi in enumerate(profile_candidates):
+        for pj in profile_candidates[i + 1 :]:
+            if candidate_segs[pi] & candidate_segs[pj]:
+                ambiguous_profiles.add(pi)
+                ambiguous_profiles.add(pj)
+
+    for pi in profile_candidates:
+        if pi in ambiguous_profiles or pi in used:
             continue
-        # Ambiguity: another remaining PROFILE claims the exact same segment set.
-        ambiguous = False
-        seg_set = frozenset(segs)
-        for other_pi in remaining_profile:
-            if other_pi == pi or other_pi in used:
-                continue
-            other = _kosa_profile_aggregate_segment_indices(
-                work, other_pi, document_type_by_id
-            )
-            other = [s for s in other if s not in used and s not in claimed_kosa]
-            if frozenset(other) == seg_set and len(other) >= 2:
-                ambiguous = True
-                break
-        if ambiguous:
+        segs = candidate_segs[pi]
+        # Disjoint non-ambiguous candidates never share segments; skip if so.
+        if segs & used:
             continue
+        ordered_segs = sorted(
+            segs,
+            key=lambda s: (
+                _project_ym_ordinal(work[s].start_date) or 0,
+                _project_ym_ordinal(work[s].end_date) or 0,
+                _fold_ws_text(work[s].project_name or ""),
+                s,
+            ),
+        )
         out.append(
             _merge_kosa_profile_aggregate(
-                work[pi], [work[s] for s in segs]
+                work[pi], [work[s] for s in ordered_segs]
             )
         )
         used.add(pi)
-        claimed_kosa.update(segs)
         used.update(segs)
 
     for i, project in enumerate(work):
         if i not in used:
             out.append(project)
     return out
+
+
+def _code_ref_content_signature(rel: CodeRefCandidate) -> tuple:
+    """Canonical comparable signature for a relation (no repr/hash)."""
+    refs = tuple(
+        sorted(
+            (
+                (r.document_id or ""),
+                int(r.page_no or 0),
+                _fold_ws_text(r.quote_text or ""),
+            )
+            for r in (rel.source_refs or [])
+        )
+    )
+    return (
+        _fold_ws_text(rel.code or ""),
+        _fold_ws_text(rel.raw_value or ""),
+        refs,
+    )
+
+
+def _chunk_project_content_signature(project: ProjectCandidate) -> tuple:
+    """Tie-break signature so distinct serialized projects never share a key."""
+    conf = project.confidence
+    conf_sig = "" if conf is None else f"{float(conf):.6f}"
+    return (
+        _fold_ws_text(project.responsibilities or ""),
+        _fold_ws_text(project.project_summary or ""),
+        -1 if project.duration_months is None else int(project.duration_months),
+        conf_sig,
+        tuple(sorted(_code_ref_content_signature(r) for r in (project.jobs or []))),
+        tuple(
+            sorted(_code_ref_content_signature(r) for r in (project.skills or []))
+        ),
+        tuple(
+            sorted(
+                _code_ref_content_signature(r) for r in (project.expertise or [])
+            )
+        ),
+        tuple(
+            sorted(
+                _code_ref_content_signature(r)
+                for r in (project.business_domains or [])
+            )
+        ),
+        tuple(
+            sorted(
+                _code_ref_content_signature(r)
+                for r in (project.customer_types or [])
+            )
+        ),
+        tuple(
+            sorted(
+                (
+                    (r.document_id or ""),
+                    int(r.page_no or 0),
+                    _fold_ws_text(r.quote_text or ""),
+                )
+                for r in (project.source_refs or [])
+            )
+        ),
+    )
 
 
 def _chunk_project_sort_key(project: ProjectCandidate) -> tuple:
@@ -3828,6 +3897,7 @@ def _chunk_project_sort_key(project: ProjectCandidate) -> tuple:
         _fold_ws_text(project.customer_name or ""),
         doc_ids,
         _fold_ws_text(first_quote),
+        _chunk_project_content_signature(project),
     )
 
 
