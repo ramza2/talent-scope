@@ -63,8 +63,8 @@ def test_profile_extract_registry_current_is_v20() -> None:
     assert v20.RECOVER_PROJECT_RECALL_SECOND_PASS is True
     assert cur.backfill_literal_core_tech_from_source is True
     assert v20.BACKFILL_LITERAL_CORE_TECH_FROM_SOURCE is True
-    assert cur.supplement_semantic_project_relations_from_source is True
-    assert v20.SUPPLEMENT_SEMANTIC_PROJECT_RELATIONS_FROM_SOURCE is True
+    assert cur.supplement_semantic_project_relations_from_source is False
+    assert v20.SUPPLEMENT_SEMANTIC_PROJECT_RELATIONS_FROM_SOURCE is False
     assert cur.repair_whitespace_project_evidence is True
     assert cur.strict_relation_evidence is True
 

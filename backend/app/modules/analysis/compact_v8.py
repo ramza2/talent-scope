@@ -1180,9 +1180,25 @@ def _refs_nonempty(refs: list[SourceRef] | None) -> bool:
 
 # v20 semantic EXP phrases (CORE backfill + PROJECT relation guard).
 # Higher strength wins for backfill; ties break by sorted (document_id, page_no).
+# CORE / shared baseline phrases (v20 contract). PROJECT-only extensions live in
+# ``_PROJECT_EXP_SEMANTIC_PATTERNS`` so Root EXP adjudication stays unchanged.
 _EXP_SEMANTIC_PATTERNS: dict[str, tuple[tuple[int, str, tuple[str, ...]], ...]] = {
     "EXP-INFRA": (
         # quote phrase, optional same-text companions
+        (3, "시스템구축 및 운영", ("IT시스템기술지원", "IT시스템관리")),
+        (2, "정보시스템 운영", ()),
+        (1, "시스템 운영", ()),
+    ),
+    "EXP-MGT": ((1, "사업관리", ()),),
+    "EXP-SEC-OPS": ((1, "보안 운영", ()),),
+    "EXP-SEC-BUILD": ((1, "보안 구축", ()),),
+}
+
+# PROJECT relation backfill/supplement/guard only (not used for Root EXP).
+_PROJECT_EXP_SEMANTIC_PATTERNS: dict[
+    str, tuple[tuple[int, str, tuple[str, ...]], ...]
+] = {
+    "EXP-INFRA": (
         (3, "시스템구축 및 운영", ("IT시스템기술지원", "IT시스템관리")),
         (2, "정보시스템1군 운영", ()),
         (2, "정보시스템 운영", ()),
@@ -1223,9 +1239,12 @@ def _text_has_semantic_phrase(text: str, phrase: str) -> bool:
     return _semantic_phrase_start(text, phrase) >= 0
 
 
-def _quote_supports_semantic_exp(code: str, quote: str) -> bool:
-    """True when quote text itself supports a known EXP prompt-contract phrase."""
-    patterns = _EXP_SEMANTIC_PATTERNS.get(code)
+def _quote_supports_semantic_exp_patterns(
+    code: str,
+    quote: str,
+    patterns_by_code: dict[str, tuple[tuple[int, str, tuple[str, ...]], ...]],
+) -> bool:
+    patterns = patterns_by_code.get(code)
     if not patterns:
         return False
     text = (quote or "").strip()
@@ -1238,6 +1257,20 @@ def _quote_supports_semantic_exp(code: str, quote: str) -> bool:
             continue
         return True
     return False
+
+
+def _quote_supports_semantic_exp(code: str, quote: str) -> bool:
+    """True when quote text itself supports a known CORE EXP phrase."""
+    return _quote_supports_semantic_exp_patterns(
+        code, quote, _EXP_SEMANTIC_PATTERNS
+    )
+
+
+def _quote_supports_semantic_project_exp(code: str, quote: str) -> bool:
+    """True when quote supports a known PROJECT EXP phrase."""
+    return _quote_supports_semantic_exp_patterns(
+        code, quote, _PROJECT_EXP_SEMANTIC_PATTERNS
+    )
 
 
 def _semantic_exp_page_match(
@@ -2248,9 +2281,13 @@ def _line_has_ws_folded_phrase(line: str, phrase: str) -> bool:
     return needle in _fold_ws_text(line)
 
 
-def _extract_semantic_exp_quote(code: str, text: str) -> str | None:
+def _extract_semantic_exp_quote_from_patterns(
+    code: str,
+    text: str,
+    patterns_by_code: dict[str, tuple[tuple[int, str, tuple[str, ...]], ...]],
+) -> str | None:
     """Shortest actual substring in ``text`` that supports the EXP code."""
-    patterns = _EXP_SEMANTIC_PATTERNS.get(code)
+    patterns = patterns_by_code.get(code)
     if not patterns:
         return None
     for _strength, phrase, companions in patterns:
@@ -2266,9 +2303,25 @@ def _extract_semantic_exp_quote(code: str, text: str) -> str | None:
             start = min(i_phrase, i_req)
             end = max(i_phrase + len(phrase), i_req + len(req))
             span = text[start:end].strip()
-            if span and _quote_supports_semantic_exp(code, span):
+            if span and _quote_supports_semantic_exp_patterns(
+                code, span, patterns_by_code
+            ):
                 return span
     return None
+
+
+def _extract_semantic_exp_quote(code: str, text: str) -> str | None:
+    """Shortest CORE EXP supporting substring in ``text``."""
+    return _extract_semantic_exp_quote_from_patterns(
+        code, text, _EXP_SEMANTIC_PATTERNS
+    )
+
+
+def _extract_semantic_project_exp_quote(code: str, text: str) -> str | None:
+    """Shortest PROJECT EXP supporting substring in ``text``."""
+    return _extract_semantic_exp_quote_from_patterns(
+        code, text, _PROJECT_EXP_SEMANTIC_PATTERNS
+    )
 
 
 def _iter_allowed_page_lines(
@@ -2288,15 +2341,32 @@ def _iter_allowed_page_lines(
                 yield doc_id, page_no, line
 
 
-def _project_owned_source_span(
-    project: ProjectCandidate, line: str
-) -> str | None:
-    """Return the unique evidence span owned by ``project``, else None.
+def _iter_exact_phrase_starts(text: str, phrase: str) -> list[int]:
+    if not phrase:
+        return []
+    starts: list[int] = []
+    idx = 0
+    while True:
+        found = text.find(phrase, idx)
+        if found < 0:
+            return starts
+        starts.append(found)
+        idx = found + 1
 
-    Multi-range PPTX lines are partitioned by full period ranges so duties
-    belonging to another project on the same physical line are excluded.
-    Identity (name/customer) may look back before the range; evidence quotes
-    are taken from ``range.start .. next_range.start``.
+
+def _project_owned_source_span(
+    project: ProjectCandidate,
+    line: str,
+    *,
+    sibling_names: frozenset[str] | None = None,
+) -> str | None:
+    """Return the unique name+period+duty span owned by ``project``.
+
+    PPTX career rows are shaped roughly as
+    ``프로젝트명 | 개요 | YYYY.MM~YYYY.MM | 담당업무 | 고객사``.
+    Multi-project lines therefore keep the project name (before the period),
+    the matched period, and following duties/customer until the next sibling
+    project name. Fail closed when ownership is not unique.
     """
     start_ym = _project_start_year_month(project)
     if start_ym is None:
@@ -2312,7 +2382,6 @@ def _project_owned_source_span(
         return None
     ranges = list(_PROJECT_FULL_RANGE_RE.finditer(text))
     if not ranges:
-        # Single poorly-shaped range line: keep whole-line semantics.
         if not _line_has_year_month(text, year, month):
             return None
         name_matched = bool(
@@ -2328,40 +2397,68 @@ def _project_owned_source_span(
             return None
         return text
 
-    owned_evidence: list[str] = []
+    siblings = {
+        n.strip()
+        for n in (sibling_names or frozenset())
+        if n and n.strip() and n.strip() != (name or "")
+    }
+    owned: list[str] = []
     for i, match in enumerate(ranges):
         if not _line_has_year_month(match.group(0), year, month):
             continue
-        identity_start = 0 if i == 0 else ranges[i - 1].end()
-        evidence_end = (
-            ranges[i + 1].start() if i + 1 < len(ranges) else len(text)
-        )
-        # Name may sit before the range; customer/duties usually after end date.
-        identity_span = text[identity_start:evidence_end]
-        name_matched = bool(
-            name is not None
-            and (
-                name in identity_span
-                or _line_has_ws_folded_phrase(identity_span, name)
-            )
-        )
+        window_start = 0 if i == 0 else ranges[i - 1].end()
+        pre_range = text[window_start:match.start()]
+        name_matched = False
+        block_start = window_start
+        if name is not None:
+            name_starts = _iter_exact_phrase_starts(pre_range, name)
+            if not name_starts and _line_has_ws_folded_phrase(pre_range, name):
+                # ws-fold hit without exact index: keep window start.
+                name_matched = True
+                block_start = window_start
+            elif name_starts:
+                name_matched = True
+                # Rightmost name before this period (closest to the range).
+                block_start = window_start + name_starts[-1]
         customer_matched = bool(
             customer is not None
-            and _line_has_ws_folded_phrase(identity_span, customer)
+            and _line_has_ws_folded_phrase(
+                text[match.start() : (ranges[i + 1].start() if i + 1 < len(ranges) else len(text))],
+                customer,
+            )
         )
-        if not name_matched and not customer_matched:
+        # Multi-range lines require the project name before the period so the
+        # next title cannot own this range by customer alone.
+        if len(ranges) > 1:
+            if not name_matched:
+                continue
+        elif not name_matched and not customer_matched:
             continue
-        if _line_is_employment_history_row(
-            identity_span, name_matched=name_matched
-        ):
+
+        block_end = len(text)
+        if i + 1 < len(ranges):
+            block_end = ranges[i + 1].start()
+        # Cut before the next sibling project title when it appears after this
+        # period (name | overview | period | duty | customer | NEXT_NAME ...).
+        search_from = match.end()
+        earliest_sib: int | None = None
+        for sib in siblings:
+            for rel in _iter_exact_phrase_starts(text[search_from:], sib):
+                abs_pos = search_from + rel
+                if earliest_sib is None or abs_pos < earliest_sib:
+                    earliest_sib = abs_pos
+        if earliest_sib is not None and earliest_sib < block_end:
+            block_end = earliest_sib
+
+        span = text[block_start:block_end].strip()
+        if not span or not _line_has_year_month(span, year, month):
             continue
-        # Evidence omits prior-project duties (starts at this range).
-        evidence = text[match.start() : evidence_end].strip()
-        if evidence:
-            owned_evidence.append(evidence)
-    if len(owned_evidence) != 1:
+        if _line_is_employment_history_row(span, name_matched=name_matched):
+            continue
+        owned.append(span)
+    if len(owned) != 1:
         return None
-    return owned_evidence[0]
+    return owned[0]
 
 
 def _find_unique_project_source_row(
@@ -2370,13 +2467,15 @@ def _find_unique_project_source_row(
     page_texts: dict[tuple[str, int], str],
     allowed_documents: dict[str, set[int]],
     line_predicate: Any | None = None,
+    sibling_names: frozenset[str] | None = None,
 ) -> tuple[str, int, str] | None:
     """Fail-closed unique project source span for evidence backfill.
 
     Requires start month precision, a ``~`` date-range marker, and either a
-    unique project_name (exact/ws-fold) hit or a unique customer+start hit.
-    On multi-project PPTX lines, only the owned period segment is used.
-    ``line_predicate`` may further restrict candidate spans (e.g. EXP phrases).
+    unique project_name hit or (single-range only) customer+start hit.
+    On multi-project PPTX lines, the owned span includes project name + period
+    + duties and excludes the next sibling title. ``line_predicate`` may
+    further restrict candidate spans (e.g. EXP phrases).
     """
     name = (project.project_name or "").strip() or None
     customer = (project.customer_name or "").strip() or None
@@ -2390,19 +2489,19 @@ def _find_unique_project_source_row(
     ):
         if not _PROJECT_ROW_RANGE_MARK_RE.search(line):
             continue
-        # Ownership + identity already fail-closed inside helper; ``owned`` is
-        # the evidence window (may omit leading project_name before dates).
-        owned = _project_owned_source_span(project, line)
+        owned = _project_owned_source_span(
+            project, line, sibling_names=sibling_names
+        )
         if owned is None:
             continue
         if line_predicate is not None and not line_predicate(owned):
             continue
         name_matched = bool(
             name is not None
-            and (name in line or _line_has_ws_folded_phrase(line, name))
+            and (name in owned or _line_has_ws_folded_phrase(owned, name))
         )
         customer_matched = bool(
-            customer is not None and _line_has_ws_folded_phrase(line, customer)
+            customer is not None and _line_has_ws_folded_phrase(owned, customer)
         )
         hit = (doc_id, page_no, owned)
         if name_matched:
@@ -2425,24 +2524,56 @@ def _find_unique_project_source_row(
     return None
 
 
+def _candidate_sibling_project_names(
+    candidate: ProfileCandidateDocument,
+) -> frozenset[str]:
+    return frozenset(
+        (p.project_name or "").strip()
+        for p in (candidate.projects or [])
+        if (p.project_name or "").strip()
+    )
+
+
+def _project_duty_evidence_text(span: str) -> str:
+    """Duty/customer text after the period range inside an owned span.
+
+    Prevents project titles such as ``정보시스템1군 운영사업`` from counting
+    as EXP/JOB duty evidence by themselves.
+    """
+    text = (span or "").strip()
+    if not text:
+        return ""
+    match = _PROJECT_FULL_RANGE_RE.search(text)
+    if match is None:
+        return text
+    after = text[match.end() :].strip()
+    return after
+
+
 def _find_unique_semantic_project_exp_ref(
     project: ProjectCandidate,
     code: str,
     *,
     page_texts: dict[tuple[str, int], str],
     allowed_documents: dict[str, set[int]],
+    sibling_names: frozenset[str] | None = None,
 ) -> SourceRef | None:
     """Fail-closed unique project-row match for semantic EXP quote backfill."""
     row = _find_unique_project_source_row(
         project,
         page_texts=page_texts,
         allowed_documents=allowed_documents,
-        line_predicate=lambda line: _quote_supports_semantic_exp(code, line),
+        sibling_names=sibling_names,
+        line_predicate=lambda span: _quote_supports_semantic_project_exp(
+            code, _project_duty_evidence_text(span)
+        ),
     )
     if row is None:
         return None
-    doc_id, page_no, line = row
-    quote = _extract_semantic_exp_quote(code, line)
+    doc_id, page_no, span = row
+    quote = _extract_semantic_project_exp_quote(
+        code, _project_duty_evidence_text(span)
+    )
     if not quote:
         return None
     return SourceRef(document_id=doc_id, page_no=page_no, quote_text=quote)
@@ -2455,7 +2586,7 @@ def _quote_supports_semantic_project_job(code: str, quote: str) -> bool:
         return False
     exp_alias = _JOB_SEMANTIC_EXP_ALIAS.get(code)
     if exp_alias is not None:
-        return _quote_supports_semantic_exp(exp_alias, text)
+        return _quote_supports_semantic_project_exp(exp_alias, text)
     pattern = _JOB_LITERAL_TOKEN_PATTERNS.get(code)
     if pattern is None:
         return False
@@ -2466,7 +2597,7 @@ def _extract_semantic_project_job_quote(code: str, text: str) -> str | None:
     """Minimal actual substring in ``text`` that supports the JOB code."""
     exp_alias = _JOB_SEMANTIC_EXP_ALIAS.get(code)
     if exp_alias is not None:
-        return _extract_semantic_exp_quote(exp_alias, text)
+        return _extract_semantic_project_exp_quote(exp_alias, text)
     pattern = _JOB_LITERAL_TOKEN_PATTERNS.get(code)
     if pattern is None:
         return None
@@ -2482,20 +2613,24 @@ def _find_unique_semantic_project_job_ref(
     *,
     page_texts: dict[tuple[str, int], str],
     allowed_documents: dict[str, set[int]],
+    sibling_names: frozenset[str] | None = None,
 ) -> SourceRef | None:
     """Fail-closed unique project-row match for semantic JOB quote backfill."""
     row = _find_unique_project_source_row(
         project,
         page_texts=page_texts,
         allowed_documents=allowed_documents,
-        line_predicate=lambda line: _quote_supports_semantic_project_job(
-            code, line
+        sibling_names=sibling_names,
+        line_predicate=lambda span: _quote_supports_semantic_project_job(
+            code, _project_duty_evidence_text(span)
         ),
     )
     if row is None:
         return None
-    doc_id, page_no, line = row
-    quote = _extract_semantic_project_job_quote(code, line)
+    doc_id, page_no, span = row
+    quote = _extract_semantic_project_job_quote(
+        code, _project_duty_evidence_text(span)
+    )
     if not quote:
         return None
     return SourceRef(document_id=doc_id, page_no=page_no, quote_text=quote)
@@ -2580,6 +2715,7 @@ def backfill_project_biz_evidence(
                 project,
                 page_texts=page_texts,
                 allowed_documents=allowed_documents,
+                sibling_names=_candidate_sibling_project_names(candidate),
             )
             if row is None:
                 new_biz.append(rel)
@@ -2624,6 +2760,7 @@ def repair_project_pm_pl_to_ops_sys(
     """
     if not page_texts or not candidate.projects:
         return candidate, 0
+    siblings = _candidate_sibling_project_names(candidate)
     repaired = 0
     changed = False
     new_projects: list[ProjectCandidate] = []
@@ -2643,6 +2780,7 @@ def repair_project_pm_pl_to_ops_sys(
                 "JOB-OPS-SYS",
                 page_texts=page_texts,
                 allowed_documents=allowed_documents,
+                sibling_names=siblings,
             )
             if match is None:
                 new_jobs.append(rel)
@@ -2689,6 +2827,7 @@ def repair_project_mgt_to_ops_sys(
     """
     if not page_texts or not candidate.projects:
         return candidate, 0
+    siblings = _candidate_sibling_project_names(candidate)
     repaired = 0
     changed = False
     new_projects: list[ProjectCandidate] = []
@@ -2708,6 +2847,7 @@ def repair_project_mgt_to_ops_sys(
                 "JOB-OPS-SYS",
                 page_texts=page_texts,
                 allowed_documents=allowed_documents,
+                sibling_names=siblings,
             )
             if match is None:
                 new_jobs.append(rel)
@@ -2781,6 +2921,7 @@ def backfill_semantic_project_job_evidence(
     """
     if not page_texts or not candidate.projects:
         return candidate
+    siblings = _candidate_sibling_project_names(candidate)
     changed = False
     new_projects: list[ProjectCandidate] = []
     for project in candidate.projects:
@@ -2802,6 +2943,7 @@ def backfill_semantic_project_job_evidence(
                 code,
                 page_texts=page_texts,
                 allowed_documents=allowed_documents,
+                sibling_names=siblings,
             )
             if match is None:
                 new_jobs.append(rel)
@@ -2826,12 +2968,15 @@ def backfill_semantic_project_expertise_evidence(
 ) -> ProfileCandidateDocument:
     """v20: repair PROJECT EXP refs from a unique semantic project source row.
 
-    Only existing ``project.expertise`` relations for known EXP codes. Does not
-    create new EXP codes. Leaves already-supporting refs unchanged. Never
-    modifies jobs/skills/domains/root expertise or project scalars.
+    Only existing ``project.expertise`` relations for known PROJECT EXP codes.
+    Does not create new EXP codes. Leaves already-supporting refs unchanged.
+    Unsupported/wrong quotes are replaced when a unique same-project span
+    supports the code; otherwise the relation is left for the drop guard.
+    Never modifies jobs/skills/domains/root expertise or project scalars.
     """
     if not page_texts or not candidate.projects:
         return candidate
+    siblings = _candidate_sibling_project_names(candidate)
     changed = False
     new_projects: list[ProjectCandidate] = []
     for project in candidate.projects:
@@ -2839,11 +2984,11 @@ def backfill_semantic_project_expertise_evidence(
         project_changed = False
         for rel in project.expertise:
             code = (rel.code or "").strip()
-            if code not in _EXP_SEMANTIC_PATTERNS:
+            if code not in _PROJECT_EXP_SEMANTIC_PATTERNS:
                 new_exp.append(rel)
                 continue
             if any(
-                _quote_supports_semantic_exp(code, ref.quote_text or "")
+                _quote_supports_semantic_project_exp(code, ref.quote_text or "")
                 for ref in (rel.source_refs or [])
             ):
                 new_exp.append(rel)
@@ -2853,6 +2998,7 @@ def backfill_semantic_project_expertise_evidence(
                 code,
                 page_texts=page_texts,
                 allowed_documents=allowed_documents,
+                sibling_names=siblings,
             )
             if match is None:
                 new_exp.append(rel)
@@ -2899,6 +3045,7 @@ def supplement_semantic_project_relations_from_source(
     """
     if not page_texts or not candidate.projects:
         return candidate
+    siblings = _candidate_sibling_project_names(candidate)
     changed = False
     new_projects: list[ProjectCandidate] = []
     for project in candidate.projects:
@@ -2922,6 +3069,7 @@ def supplement_semantic_project_relations_from_source(
                 code,
                 page_texts=page_texts,
                 allowed_documents=allowed_documents,
+                sibling_names=siblings,
             )
             if match is None:
                 continue
@@ -2944,6 +3092,7 @@ def supplement_semantic_project_relations_from_source(
                 code,
                 page_texts=page_texts,
                 allowed_documents=allowed_documents,
+                sibling_names=siblings,
             )
             if match is None:
                 continue
@@ -2978,9 +3127,9 @@ def drop_project_expertise_without_semantic_evidence(
 ) -> ProfileCandidateDocument:
     """v20: drop PROJECT expertise whose quotes do not support known EXP codes.
 
-    Only ``project.expertise`` for EXP-INFRA/MGT/SEC-OPS/SEC-BUILD. Unknown EXP
-    codes, root expertise, jobs/skills/domains, and the project row stay.
-    Any one supporting quote keeps the relation.
+    Only ``project.expertise`` for PROJECT EXP-INFRA/MGT/SEC-OPS/SEC-BUILD.
+    Unknown EXP codes, root expertise, jobs/skills/domains, and the project
+    row stay. Any one supporting PROJECT-phrase quote keeps the relation.
     """
     changed = False
     new_projects: list[ProjectCandidate] = []
@@ -2989,11 +3138,13 @@ def drop_project_expertise_without_semantic_evidence(
         dropped = False
         for rel in project.expertise:
             code = (rel.code or "").strip()
-            if code not in _EXP_SEMANTIC_PATTERNS:
+            if code not in _PROJECT_EXP_SEMANTIC_PATTERNS:
                 kept_exp.append(rel)
                 continue
             if any(
-                _quote_supports_semantic_exp(code, ref.quote_text or "")
+                _quote_supports_semantic_project_exp(
+                    code, ref.quote_text or ""
+                )
                 for ref in (rel.source_refs or [])
             ):
                 kept_exp.append(rel)
@@ -3444,12 +3595,12 @@ def _second_job_relation_mergeable(rel: CodeRefCandidate) -> bool:
 def _second_exp_relation_mergeable(rel: CodeRefCandidate) -> bool:
     """True when second EXP may be appended under v20 semantic EXP guards."""
     code = (rel.code or "").strip()
-    if code not in _EXP_SEMANTIC_PATTERNS:
+    if code not in _PROJECT_EXP_SEMANTIC_PATTERNS:
         return False
     if not _refs_nonempty(rel.source_refs):
         return False
     return any(
-        _quote_supports_semantic_exp(code, ref.quote_text or "")
+        _quote_supports_semantic_project_exp(code, ref.quote_text or "")
         for ref in (rel.source_refs or [])
     )
 
