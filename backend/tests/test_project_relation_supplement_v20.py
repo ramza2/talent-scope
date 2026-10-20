@@ -134,9 +134,11 @@ def _run_backfill(projects, page_texts, *, enhanced: bool = False):
     return drop_project_jobs_without_literal_pm_pl_evidence(out)
 
 
-def test_flag_default_false_on_v19_and_v20() -> None:
+def test_flag_default_false_on_v19_v20_v21_true_on_v22() -> None:
     from app.ai.prompts.profile_extract import resolve_profile_prompt
     from app.ai.prompts import profile_extract_v20 as v20
+    from app.ai.prompts import profile_extract_v21 as v21
+    from app.ai.prompts import profile_extract_v22 as v22
 
     assert resolve_profile_prompt(
         "profile-extract-v19"
@@ -145,6 +147,14 @@ def test_flag_default_false_on_v19_and_v20() -> None:
     assert resolve_profile_prompt(
         "profile-extract-v20"
     ).supplement_semantic_project_relations_from_source is False
+    assert v21.SUPPLEMENT_SEMANTIC_PROJECT_RELATIONS_FROM_SOURCE is False
+    assert resolve_profile_prompt(
+        "profile-extract-v21"
+    ).supplement_semantic_project_relations_from_source is False
+    assert v22.SUPPLEMENT_SEMANTIC_PROJECT_RELATIONS_FROM_SOURCE is True
+    assert resolve_profile_prompt(
+        "profile-extract-v22"
+    ).supplement_semantic_project_relations_from_source is True
 
 
 def test_core_exp_patterns_do_not_include_project_only_phrases() -> None:

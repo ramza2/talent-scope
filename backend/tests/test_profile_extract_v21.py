@@ -15,17 +15,12 @@ os.environ["APP_ENV"] = "test"
 _DOC = "e3bcbf71-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 
 
-def test_profile_extract_registry_current_is_v21() -> None:
+def test_profile_extract_registry_v21_resolves() -> None:
     from app.ai.prompts import profile_extract_v20 as v20
     from app.ai.prompts import profile_extract_v21 as v21
-    from app.ai.prompts.profile_extract import (
-        CURRENT_PROFILE_PROMPT_VERSION,
-        current_profile_prompt,
-        resolve_profile_prompt,
-    )
+    from app.ai.prompts.profile_extract import resolve_profile_prompt
 
-    assert CURRENT_PROFILE_PROMPT_VERSION == "profile-extract-v21"
-    cur = current_profile_prompt()
+    cur = resolve_profile_prompt("profile-extract-v21")
     assert cur.prompt_version == "profile-extract-v21"
     assert cur.backfill_semantic_core_job_evidence is True
     assert cur.require_semantic_core_job_evidence is True
@@ -33,6 +28,9 @@ def test_profile_extract_registry_current_is_v21() -> None:
     assert v21.BACKFILL_SEMANTIC_CORE_JOB_EVIDENCE is True
     assert v21.REQUIRE_SEMANTIC_CORE_JOB_EVIDENCE is True
     assert v21.SUPPLEMENT_SEMANTIC_CORE_EXP_FROM_SOURCE is True
+    # v21 keeps PROJECT supplement off (baseline PROJECT runtime).
+    assert cur.supplement_semantic_project_relations_from_source is False
+    assert v21.SUPPLEMENT_SEMANTIC_PROJECT_RELATIONS_FROM_SOURCE is False
     # Inherits v20 CORE/PROJECT guards.
     assert cur.backfill_semantic_core_exp_evidence is True
     assert cur.require_semantic_project_job_evidence is True
@@ -42,10 +40,11 @@ def test_profile_extract_registry_current_is_v21() -> None:
     assert v20_spec.backfill_semantic_core_job_evidence is False
     assert v20_spec.require_semantic_core_job_evidence is False
     assert v20_spec.supplement_semantic_core_exp_from_source is False
+    assert v20_spec.supplement_semantic_project_relations_from_source is False
     assert not hasattr(v20, "BACKFILL_SEMANTIC_CORE_JOB_EVIDENCE")
     assert not hasattr(v20, "REQUIRE_SEMANTIC_CORE_JOB_EVIDENCE")
     assert not hasattr(v20, "SUPPLEMENT_SEMANTIC_CORE_EXP_FROM_SOURCE")
-    # PROJECT contract unchanged from v20.
+    # PROJECT prompt/schema contract unchanged from v20.
     assert v21.PROJECTS_SYSTEM_PROMPT == v20.PROJECTS_SYSTEM_PROMPT
     assert v21.PROJECTS_SCHEMA_GUIDE == v20.PROJECTS_SCHEMA_GUIDE
 
