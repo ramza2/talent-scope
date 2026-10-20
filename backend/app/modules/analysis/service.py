@@ -83,6 +83,7 @@ from app.modules.analysis.compact_v8 import (
     promote_exact_root_catalog_codes,
     merge_project_chunk_candidates,
     repair_whitespace_project_evidence,
+    supplement_literal_project_tech_from_source,
     supplement_projects_from_second_pass,
     supplement_semantic_project_relations_from_source,
 )
@@ -1847,6 +1848,16 @@ class AnalysisService:
             if prompt.supplement_semantic_project_relations_from_source:
                 doc = supplement_semantic_project_relations_from_source(
                     doc,
+                    page_texts=page_texts,
+                    allowed_documents=allowed_documents,
+                )
+            # v23: append missing PROJECT TECH leaf skills when unambiguous
+            # name/alias literals appear in the same-project owned evidence.
+            if prompt.supplement_literal_project_tech_from_source:
+                doc = supplement_literal_project_tech_from_source(
+                    doc,
+                    codes=codes,
+                    aliases=aliases,
                     page_texts=page_texts,
                     allowed_documents=allowed_documents,
                 )

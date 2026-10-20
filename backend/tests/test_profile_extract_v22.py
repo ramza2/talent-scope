@@ -13,18 +13,13 @@ os.environ.setdefault("APP_SECRET_KEY", "test-secret")
 os.environ["APP_ENV"] = "test"
 
 
-def test_profile_extract_registry_current_is_v22() -> None:
+def test_profile_extract_registry_v22_resolves() -> None:
     from app.ai.prompts import profile_extract_v20 as v20
     from app.ai.prompts import profile_extract_v21 as v21
     from app.ai.prompts import profile_extract_v22 as v22
-    from app.ai.prompts.profile_extract import (
-        CURRENT_PROFILE_PROMPT_VERSION,
-        current_profile_prompt,
-        resolve_profile_prompt,
-    )
+    from app.ai.prompts.profile_extract import resolve_profile_prompt
 
-    assert CURRENT_PROFILE_PROMPT_VERSION == "profile-extract-v22"
-    cur = current_profile_prompt()
+    cur = resolve_profile_prompt("profile-extract-v22")
     assert cur.prompt_version == "profile-extract-v22"
 
     # v21 CORE flags remain enabled.
@@ -38,6 +33,9 @@ def test_profile_extract_registry_current_is_v22() -> None:
     # v22 enables PROJECT relation supplement (+ enhanced row semantics).
     assert cur.supplement_semantic_project_relations_from_source is True
     assert v22.SUPPLEMENT_SEMANTIC_PROJECT_RELATIONS_FROM_SOURCE is True
+    # PROJECT TECH supplement stays off on v22.
+    assert cur.supplement_literal_project_tech_from_source is False
+    assert v22.SUPPLEMENT_LITERAL_PROJECT_TECH_FROM_SOURCE is False
 
     # PROJECT prompt/schema contract unchanged from v20/v21.
     assert v22.PROJECTS_SYSTEM_PROMPT == v20.PROJECTS_SYSTEM_PROMPT
@@ -52,6 +50,8 @@ def test_profile_extract_registry_current_is_v22() -> None:
     assert v21_spec.supplement_semantic_project_relations_from_source is False
     assert v20_spec.backfill_semantic_core_job_evidence is False
     assert v21_spec.backfill_semantic_core_job_evidence is True
+    assert v20_spec.supplement_literal_project_tech_from_source is False
+    assert v21_spec.supplement_literal_project_tech_from_source is False
 
 
 def test_v22_activates_enhanced_project_semantics_wiring() -> None:

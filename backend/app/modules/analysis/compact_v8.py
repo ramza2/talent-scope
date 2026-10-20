@@ -3797,6 +3797,195 @@ def supplement_semantic_project_relations_from_source(
     return candidate.model_copy(update={"projects": new_projects})
 
 
+def _extend_owned_span_with_following_detail_lines(
+    *,
+    page_text: str,
+    owned_span: str,
+    sibling_names: frozenset[str],
+) -> str:
+    """Include same-page detail lines after the owned row until a sibling row.
+
+    Career PDFs often put tech literals on lines under the period row
+    (e.g. ``보안솔루션 운영(AD,SEP,NAC 등)``). Stop at the next sibling
+    project title or another ``~`` period row.
+    """
+    span = (owned_span or "").strip()
+    if not span:
+        return ""
+    lines = [ln.strip() for ln in (page_text or "").splitlines() if ln.strip()]
+    if not lines:
+        return span
+    start_idx: int | None = None
+    for i, line in enumerate(lines):
+        if span == line or span in line or line in span:
+            start_idx = i
+            break
+    if start_idx is None:
+        return span
+    chunks = [span]
+    siblings = {n.strip() for n in sibling_names if n and n.strip()}
+    for line in lines[start_idx + 1 :]:
+        if any(
+            sib in line or _line_has_ws_folded_phrase(line, sib)
+            for sib in siblings
+        ):
+            break
+        if _PROJECT_ROW_RANGE_MARK_RE.search(line) and _PROJECT_FULL_RANGE_RE.search(
+            line
+        ):
+            break
+        chunks.append(line)
+    return "\n".join(chunks)
+
+
+def _leaf_tech_unique_literals(
+    codes: list[Any],
+    aliases: dict[str, list[str]],
+) -> dict[str, list[str]]:
+    """Map TECH leaf code → unique (non-ambiguous) name/alias literals."""
+    leaf_techs = [
+        row
+        for row in codes
+        if getattr(row, "code_type", None) == "TECH"
+        and getattr(row, "parent_code", None)
+        and (getattr(row, "code", None) or "").strip()
+        and (getattr(row, "name", None) or "").strip()
+    ]
+    literal_to_codes: dict[str, set[str]] = {}
+    code_literals: dict[str, list[str]] = {}
+    for row in leaf_techs:
+        code = str(row.code).strip()
+        lits: list[str] = []
+        seen_keys: set[str] = set()
+        for raw in (row.name, *(aliases.get(code) or ())):
+            text = unicodedata.normalize("NFKC", str(raw or "")).strip()
+            key = _norm_tech_literal_key(text)
+            if key is None or key in seen_keys:
+                continue
+            seen_keys.add(key)
+            lits.append(text)
+            literal_to_codes.setdefault(key, set()).add(code)
+        code_literals[code] = lits
+    out: dict[str, list[str]] = {}
+    for code, lits in code_literals.items():
+        unique = [
+            lit
+            for lit in lits
+            if literal_to_codes.get(_norm_tech_literal_key(lit) or "") == {code}
+        ]
+        out[code] = sorted(unique, key=lambda s: s.casefold())
+    return out
+
+
+def _find_unique_project_tech_literal_ref(
+    project: ProjectCandidate,
+    code: str,
+    *,
+    literals: list[str],
+    page_texts: dict[tuple[str, int], str],
+    allowed_documents: dict[str, set[int]],
+    sibling_names: frozenset[str],
+) -> SourceRef | None:
+    """Fail-closed unique same-project TECH literal hit (owned span + details)."""
+    if not literals:
+        return None
+    row = _find_unique_project_source_row(
+        project,
+        page_texts=page_texts,
+        allowed_documents=allowed_documents,
+        sibling_names=sibling_names,
+        enhanced_project_relation_semantics=True,
+    )
+    if row is None:
+        return None
+    doc_id, page_no, owned = row
+    evidence = _extend_owned_span_with_following_detail_lines(
+        page_text=page_texts.get((doc_id, page_no)) or "",
+        owned_span=owned,
+        sibling_names=sibling_names,
+    )
+    if not evidence:
+        return None
+    hits: list[str] = []
+    for lit in literals:
+        quote = _find_tech_literal_in_page(evidence, lit)
+        if quote is not None:
+            hits.append(quote)
+    # Deterministic: first unique literal hit in sorted literal order.
+    if not hits:
+        return None
+    return SourceRef(document_id=doc_id, page_no=page_no, quote_text=hits[0])
+
+
+def supplement_literal_project_tech_from_source(
+    candidate: ProfileCandidateDocument,
+    *,
+    codes: list[Any],
+    aliases: dict[str, list[str]],
+    page_texts: dict[tuple[str, int], str] | None,
+    allowed_documents: dict[str, set[int]],
+) -> ProfileCandidateDocument:
+    """v23: append missing PROJECT TECH when unique same-project literals exist.
+
+    Only TECH leaf codes with unambiguous name/alias literals. Evidence must
+    sit in the project's owned row (plus same-page detail lines until the next
+    sibling). Never overwrites existing ``project.skills`` / source_refs.
+    Does not invent TECH from root-only / other-project / ambiguous page hits.
+    Root skills, JOB/EXP/BIZ, and project scalars stay untouched.
+    """
+    if not page_texts or not candidate.projects or not codes:
+        return candidate
+    code_literals = _leaf_tech_unique_literals(codes, aliases)
+    if not code_literals:
+        return candidate
+    siblings = _candidate_sibling_project_names(candidate)
+    changed = False
+    new_projects: list[ProjectCandidate] = []
+    for project in candidate.projects:
+        existing = {
+            (rel.code or "").strip()
+            for rel in (project.skills or [])
+            if (rel.code or "").strip()
+        }
+        added: list[CodeRefCandidate] = []
+        for code in sorted(code_literals):
+            if code in existing:
+                continue
+            match = _find_unique_project_tech_literal_ref(
+                project,
+                code,
+                literals=code_literals[code],
+                page_texts=page_texts,
+                allowed_documents=allowed_documents,
+                sibling_names=siblings,
+            )
+            if match is None:
+                continue
+            quote = (match.quote_text or "").strip()
+            if not quote:
+                continue
+            added.append(
+                CodeRefCandidate(
+                    code=code,
+                    raw_value=quote,
+                    source_refs=[match],
+                )
+            )
+            existing.add(code)
+        if not added:
+            new_projects.append(project)
+            continue
+        changed = True
+        new_projects.append(
+            project.model_copy(
+                update={"skills": list(project.skills or []) + added}
+            )
+        )
+    if not changed:
+        return candidate
+    return candidate.model_copy(update={"projects": new_projects})
+
+
 def drop_project_expertise_without_semantic_evidence(
     candidate: ProfileCandidateDocument,
     *,
