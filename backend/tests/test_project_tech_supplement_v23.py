@@ -14,6 +14,8 @@ os.environ.setdefault("APP_SECRET_KEY", "test-secret")
 os.environ["APP_ENV"] = "test"
 
 _DOC = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+_PPTX = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+_PDF = "cccccccc-cccc-cccc-cccc-cccccccccccc"
 
 
 def _code(
@@ -48,10 +50,10 @@ def _aliases():
     }
 
 
-def _ref(quote: str, *, page_no: int = 1):
+def _ref(quote: str, *, document_id: str = _DOC, page_no: int = 1):
     from app.ai.schemas.profile_candidate import SourceRef
 
-    return SourceRef(document_id=_DOC, page_no=page_no, quote_text=quote)
+    return SourceRef(document_id=document_id, page_no=page_no, quote_text=quote)
 
 
 def _project(
@@ -63,6 +65,8 @@ def _project(
     jobs=None,
     expertise=None,
     skills=None,
+    document_id: str = _DOC,
+    page_no: int = 1,
 ):
     from app.ai.schemas.profile_candidate import CodeRefCandidate, ProjectCandidate
 
@@ -73,7 +77,11 @@ def _project(
                 CodeRefCandidate(
                     code=code,
                     raw_value=code,
-                    source_refs=[_ref(quote)] if quote else [],
+                    source_refs=(
+                        [_ref(quote, document_id=document_id, page_no=page_no)]
+                        if quote
+                        else []
+                    ),
                 )
             )
         return out
@@ -83,7 +91,7 @@ def _project(
         customer_name=customer,
         start_date=start,
         end_date=end,
-        source_refs=[_ref(name)],
+        source_refs=[_ref(name, document_id=document_id, page_no=page_no)],
         jobs=_rels(jobs),
         expertise=_rels(expertise),
         skills=_rels(skills),
@@ -109,7 +117,9 @@ def _run(projects, page_texts, *, codes=None, aliases=None):
         summary=SummaryCandidate(),
         analysis=AnalysisMetaCandidate(),
     )
-    allowed = {_DOC: {page for (_d, page) in page_texts}}
+    allowed: dict[str, set[int]] = {}
+    for doc_id, page in page_texts:
+        allowed.setdefault(doc_id, set()).add(page)
     out = supplement_literal_project_tech_from_source(
         candidate,
         codes=codes if codes is not None else _catalog(),
@@ -170,6 +180,175 @@ def test_gangsangwon_hyundai_sec_ops_supplements_ad_sep_nac() -> None:
     assert out.projects[0].end_date == "2015.02"
     assert {j.code for j in out.projects[0].jobs} == {"JOB-MGT-PL", "JOB-OPS-SYS"}
     assert {x.code for x in out.projects[0].expertise} == {"EXP-SEC-OPS"}
+
+
+def test_cross_doc_pptx_period_pdf_section_supplements_ad_sep_nac() -> None:
+    """PPTX period row + PDF career section (title synonym) → PDF page refs.
+
+    Real 강상원 layout: period/dates live on PPTX page 1; AD/SEP/NAC sit under
+    ``1. … 정보보안 운영 PL`` on a separate PDF page 2.
+    """
+    page_texts = {
+        (_PPTX, 1): (
+            "현대/기아자동차 정보보안시스템 운영 | 운영 | 2012.07~2015.02 | "
+            "PL 운영 | 현대오토에버"
+        ),
+        (_PDF, 2): (
+            "1. 현대/기아자동차 정보보안 운영 PL\n"
+            "가. 보안상황실 운영 및 관리\n"
+            "1) 보안솔루션 운영(AD,SEP,NAC 등)\n"
+            "2) 보안솔루션 기술지원 및 장애대응 등\n"
+            "2. 차세대 보안관제 구축\n"
+            "가. Oracle 운영"
+        ),
+    }
+    projects = [
+        _project(
+            name="현대/기아자동차 정보보안시스템 운영",
+            customer="현대오토에버",
+            start="2012.07",
+            end="2015.02",
+            jobs=[("JOB-MGT-PL", "PL"), ("JOB-OPS-SYS", "정보보안시스템 운영")],
+            expertise=[("EXP-SEC-OPS", "정보보안시스템 운영")],
+            document_id=_PPTX,
+            page_no=1,
+        ),
+        _project(
+            name="차세대 보안관제 구축",
+            customer="고객B",
+            start="2016.01",
+            end="2016.12",
+            document_id=_PPTX,
+            page_no=1,
+        ),
+    ]
+    out = _run(projects, page_texts)
+    skills = {s.code: s for s in out.projects[0].skills}
+    assert set(skills) == {"TECH-SEC-AD", "TECH-SEC-SEP", "TECH-SEC-NAC"}
+    for code in ("TECH-SEC-AD", "TECH-SEC-SEP", "TECH-SEC-NAC"):
+        ref = skills[code].source_refs[0]
+        assert ref.document_id == _PDF
+        assert ref.page_no == 2
+    assert skills["TECH-SEC-AD"].source_refs[0].quote_text == "AD"
+    assert skills["TECH-SEC-SEP"].source_refs[0].quote_text == "SEP"
+    assert skills["TECH-SEC-NAC"].source_refs[0].quote_text == "NAC"
+    # Next-project Oracle must not bleed into the first project.
+    assert "TECH-DB-ORACLE" not in skills
+    # Dates stay from PPTX period row; never inferred from PDF employment.
+    assert out.projects[0].start_date == "2012.07"
+    assert out.projects[0].end_date == "2015.02"
+    assert {j.code for j in out.projects[0].jobs} == {"JOB-MGT-PL", "JOB-OPS-SYS"}
+    assert {x.code for x in out.projects[0].expertise} == {"EXP-SEC-OPS"}
+
+
+def test_cross_doc_ambiguous_title_key_skips_tech() -> None:
+    """Two candidates sharing the limited synonym key → fail closed."""
+    page_texts = {
+        (_PPTX, 1): (
+            "현대/기아자동차 정보보안시스템 운영 | 운영 | 2012.07~2015.02 | "
+            "PL 운영 | 현대오토에버\n"
+            "현대/기아자동차 정보보안 운영 | 운영 | 2016.01~2016.12 | "
+            "PL 운영 | 고객B"
+        ),
+        (_PDF, 2): (
+            "1. 현대/기아자동차 정보보안 운영 PL\n"
+            "1) 보안솔루션 운영(AD,SEP,NAC 등)"
+        ),
+    }
+    out = _run(
+        [
+            _project(
+                name="현대/기아자동차 정보보안시스템 운영",
+                customer="현대오토에버",
+                start="2012.07",
+                end="2015.02",
+                document_id=_PPTX,
+            ),
+            _project(
+                name="현대/기아자동차 정보보안 운영",
+                customer="고객B",
+                start="2016.01",
+                end="2016.12",
+                document_id=_PPTX,
+            ),
+        ],
+        page_texts,
+    )
+    assert out.projects[0].skills == []
+    assert out.projects[1].skills == []
+
+
+def test_cross_doc_stops_before_next_numbered_project() -> None:
+    """Detail harvest stops at the next top-level ``N.`` project heading."""
+    page_texts = {
+        (_PPTX, 1): (
+            "현대/기아자동차 정보보안시스템 운영 | 운영 | 2012.07~2015.02 | "
+            "PL 운영 | 현대오토에버"
+        ),
+        (_PDF, 2): (
+            "1. 현대/기아자동차 정보보안 운영 PL\n"
+            "1) 보안솔루션 운영(AD)\n"
+            "2. 차세대 보안관제 구축\n"
+            "1) 보안솔루션 운영(SEP,NAC)\n"
+        ),
+    }
+    out = _run(
+        [
+            _project(
+                name="현대/기아자동차 정보보안시스템 운영",
+                customer="현대오토에버",
+                start="2012.07",
+                end="2015.02",
+                document_id=_PPTX,
+            ),
+            _project(
+                name="차세대 보안관제 구축",
+                customer="고객B",
+                start="2016.01",
+                end="2016.12",
+                document_id=_PPTX,
+            ),
+        ],
+        page_texts,
+    )
+    assert {s.code for s in out.projects[0].skills} == {"TECH-SEC-AD"}
+    assert {s.code for s in out.projects[1].skills} == {
+        "TECH-SEC-SEP",
+        "TECH-SEC-NAC",
+    }
+    assert out.projects[0].skills[0].source_refs[0].page_no == 2
+    assert out.projects[0].skills[0].source_refs[0].document_id == _PDF
+
+
+def test_cross_doc_multi_section_hit_fail_closed() -> None:
+    """Same normalized title on two PDF pages → ambiguous, skip TECH."""
+    page_texts = {
+        (_PPTX, 1): (
+            "현대/기아자동차 정보보안시스템 운영 | 운영 | 2012.07~2015.02 | "
+            "PL 운영 | 현대오토에버"
+        ),
+        (_PDF, 2): (
+            "1. 현대/기아자동차 정보보안 운영 PL\n"
+            "1) 보안솔루션 운영(AD)"
+        ),
+        (_PDF, 3): (
+            "1. 현대/기아자동차 정보보안 운영 PL\n"
+            "1) 보안솔루션 운영(SEP,NAC)"
+        ),
+    }
+    out = _run(
+        [
+            _project(
+                name="현대/기아자동차 정보보안시스템 운영",
+                customer="현대오토에버",
+                start="2012.07",
+                end="2015.02",
+                document_id=_PPTX,
+            )
+        ],
+        page_texts,
+    )
+    assert out.projects[0].skills == []
 
 
 def test_other_project_tech_not_bound() -> None:

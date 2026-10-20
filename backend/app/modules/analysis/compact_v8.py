@@ -3877,6 +3877,152 @@ def _leaf_tech_unique_literals(
     return out
 
 
+# PDF career headings: ``1. TITLE``, ``가. …``, ``1) …``.
+_PROJECT_TECH_SECTION_NUM_PREFIX_RE = re.compile(
+    r"^(?:\d+|[가-힣])[\.\)]\s*"
+)
+# Trailing role tokens on PDF headings (``… 운영 PL``).
+_PROJECT_TECH_SECTION_ROLE_SUFFIX_RE = re.compile(
+    r"\s+(?:PM|PL|TA)\s*$", re.IGNORECASE
+)
+# Next top-level numbered project heading (``2. …``), not ``1)`` sub-items.
+_PROJECT_TECH_TOP_LEVEL_HEADING_RE = re.compile(r"^\d+\.\s+\S")
+# Limited title synonym only (not broad fuzzy matching).
+_PROJECT_TECH_TITLE_SYNONYMS: tuple[tuple[str, str], ...] = (
+    ("정보보안시스템 운영", "정보보안 운영"),
+)
+
+
+def _project_tech_title_match_key(title: str) -> str:
+    """Normalize project/PDF section titles for fail-closed TECH linking."""
+    text = unicodedata.normalize("NFKC", (title or "")).strip()
+    if not text:
+        return ""
+    text = _PROJECT_TECH_SECTION_NUM_PREFIX_RE.sub("", text)
+    text = _PROJECT_TECH_SECTION_ROLE_SUFFIX_RE.sub("", text)
+    for src, dst in _PROJECT_TECH_TITLE_SYNONYMS:
+        text = text.replace(src, dst)
+    return _fold_ws_text(text)
+
+
+def _project_tech_sibling_title_keys(
+    sibling_names: frozenset[str],
+) -> frozenset[str]:
+    return frozenset(
+        key
+        for name in sibling_names
+        if (key := _project_tech_title_match_key(name))
+    )
+
+
+def _is_project_tech_section_stop_line(
+    line: str,
+    *,
+    own_key: str,
+    sibling_keys: frozenset[str],
+    sibling_names: frozenset[str],
+) -> bool:
+    """True when detail collection must stop (next project / employment / row)."""
+    text = (line or "").strip()
+    if not text:
+        return False
+    if _EMPLOYMENT_SECTION_RE.search(text):
+        return True
+    if _PROJECT_ROW_RANGE_MARK_RE.search(text) and _PROJECT_FULL_RANGE_RE.search(
+        text
+    ):
+        return True
+    for sib in sibling_names:
+        if sib and (sib in text or _line_has_ws_folded_phrase(text, sib)):
+            return True
+    line_key = _project_tech_title_match_key(text)
+    if (
+        line_key
+        and line_key != own_key
+        and (
+            line_key in sibling_keys
+            or bool(_PROJECT_TECH_TOP_LEVEL_HEADING_RE.match(text))
+        )
+    ):
+        return True
+    return False
+
+
+def _collect_project_tech_section_evidence(
+    lines: list[str],
+    start_idx: int,
+    *,
+    own_key: str,
+    sibling_keys: frozenset[str],
+    sibling_names: frozenset[str],
+) -> str:
+    chunks = [lines[start_idx]]
+    for line in lines[start_idx + 1 :]:
+        if _is_project_tech_section_stop_line(
+            line,
+            own_key=own_key,
+            sibling_keys=sibling_keys,
+            sibling_names=sibling_names,
+        ):
+            break
+        chunks.append(line)
+    return "\n".join(chunks)
+
+
+def _iter_project_tech_section_evidence(
+    project: ProjectCandidate,
+    *,
+    page_texts: dict[tuple[str, int], str],
+    allowed_documents: dict[str, set[int]],
+    sibling_names: frozenset[str],
+) -> list[tuple[str, int, str]]:
+    """PDF career sections uniquely titled for ``project`` (may lack dates)."""
+    own_name = (project.project_name or "").strip()
+    own_key = _project_tech_title_match_key(own_name)
+    if not own_key:
+        return []
+    # ``sibling_names`` includes every candidate title (also self). Drop self
+    # before uniqueness / stop checks so a solo project is not fail-closed.
+    other_names = frozenset(n for n in sibling_names if n and n != own_name)
+    sibling_keys = _project_tech_sibling_title_keys(other_names)
+    # Fail closed when another candidate project shares the same match key.
+    if own_key in sibling_keys:
+        return []
+
+    hits: list[tuple[str, int, str]] = []
+    for doc_id, page_no in sorted(page_texts.keys()):
+        if doc_id not in allowed_documents:
+            continue
+        pages = allowed_documents[doc_id]
+        if pages and page_no not in pages:
+            continue
+        page_text = page_texts.get((doc_id, page_no)) or ""
+        lines = [ln.strip() for ln in page_text.splitlines() if ln.strip()]
+        for i, line in enumerate(lines):
+            if _project_tech_title_match_key(line) != own_key:
+                continue
+            evidence = _collect_project_tech_section_evidence(
+                lines,
+                i,
+                own_key=own_key,
+                sibling_keys=sibling_keys,
+                sibling_names=other_names,
+            )
+            if evidence:
+                hits.append((doc_id, page_no, evidence))
+    return hits
+
+
+def _first_literal_hit_in_evidence(
+    evidence: str, literals: list[str]
+) -> str | None:
+    for lit in literals:
+        quote = _find_tech_literal_in_page(evidence, lit)
+        if quote is not None:
+            return quote
+    return None
+
+
 def _find_unique_project_tech_literal_ref(
     project: ProjectCandidate,
     code: str,
@@ -3886,9 +4032,16 @@ def _find_unique_project_tech_literal_ref(
     allowed_documents: dict[str, set[int]],
     sibling_names: frozenset[str],
 ) -> SourceRef | None:
-    """Fail-closed unique same-project TECH literal hit (owned span + details)."""
+    """Fail-closed unique same-project TECH literal hit.
+
+    Order:
+    1) Owned period-row span on the same page (+ following detail lines)
+    2) Cross-document PDF career section with limited title normalization
+       (e.g. ``정보보안시스템 운영`` ↔ ``정보보안 운영 PL``), unique only
+    """
     if not literals:
         return None
+
     row = _find_unique_project_source_row(
         project,
         page_texts=page_texts,
@@ -3896,25 +4049,33 @@ def _find_unique_project_tech_literal_ref(
         sibling_names=sibling_names,
         enhanced_project_relation_semantics=True,
     )
-    if row is None:
-        return None
-    doc_id, page_no, owned = row
-    evidence = _extend_owned_span_with_following_detail_lines(
-        page_text=page_texts.get((doc_id, page_no)) or "",
-        owned_span=owned,
+    if row is not None:
+        doc_id, page_no, owned = row
+        evidence = _extend_owned_span_with_following_detail_lines(
+            page_text=page_texts.get((doc_id, page_no)) or "",
+            owned_span=owned,
+            sibling_names=sibling_names,
+        )
+        quote = _first_literal_hit_in_evidence(evidence, literals)
+        if quote is not None:
+            return SourceRef(
+                document_id=doc_id, page_no=page_no, quote_text=quote
+            )
+
+    sections = _iter_project_tech_section_evidence(
+        project,
+        page_texts=page_texts,
+        allowed_documents=allowed_documents,
         sibling_names=sibling_names,
     )
-    if not evidence:
+    # Exactly one section may own the project; multi-hit is ambiguous.
+    if len(sections) != 1:
         return None
-    hits: list[str] = []
-    for lit in literals:
-        quote = _find_tech_literal_in_page(evidence, lit)
-        if quote is not None:
-            hits.append(quote)
-    # Deterministic: first unique literal hit in sorted literal order.
-    if not hits:
+    doc_id, page_no, evidence = sections[0]
+    quote = _first_literal_hit_in_evidence(evidence, literals)
+    if quote is None:
         return None
-    return SourceRef(document_id=doc_id, page_no=page_no, quote_text=hits[0])
+    return SourceRef(document_id=doc_id, page_no=page_no, quote_text=quote)
 
 
 def supplement_literal_project_tech_from_source(
@@ -3928,9 +4089,10 @@ def supplement_literal_project_tech_from_source(
     """v23: append missing PROJECT TECH when unique same-project literals exist.
 
     Only TECH leaf codes with unambiguous name/alias literals. Evidence must
-    sit in the project's owned row (plus same-page detail lines until the next
-    sibling). Never overwrites existing ``project.skills`` / source_refs.
-    Does not invent TECH from root-only / other-project / ambiguous page hits.
+    sit in the project's owned period row (plus same-page details) or in a
+    uniquely matched PDF career section (limited title synonyms; no date
+    inference). Never overwrites existing ``project.skills`` / source_refs.
+    Does not invent TECH from root-only / other-project / ambiguous hits.
     Root skills, JOB/EXP/BIZ, and project scalars stay untouched.
     """
     if not page_texts or not candidate.projects or not codes:
