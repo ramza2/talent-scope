@@ -2340,6 +2340,23 @@ _JOB_LITERAL_TOKEN_PATTERNS: dict[str, re.Pattern[str]] = {
 _JOB_SEMANTIC_BACKFILL_CODES = frozenset(_JOB_SEMANTIC_EXP_ALIAS) | frozenset(
     _JOB_LITERAL_TOKEN_PATTERNS
 )
+# ``PM 사업관리`` / ``PL 사업관리`` count as PM/PL duty, not standalone JOB-MGT.
+_PM_PL_PREFIXED_MGT_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:PM|PL)(?![A-Za-z0-9])\s*사업관리",
+    re.IGNORECASE,
+)
+# JOB-OPS-SYS may use this SEC-OPS title phrase with duty 운영 without
+# promoting the relation to EXP-INFRA.
+_JOB_OPS_SYS_SEC_TITLE_PHRASE = "정보보안시스템 운영"
+
+
+def _text_has_standalone_project_mgt(text: str) -> bool:
+    """True when ``사업관리`` remains after removing PM/PL-prefixed spans."""
+    raw = text or ""
+    if "사업관리" not in raw:
+        return False
+    stripped = _PM_PL_PREFIXED_MGT_RE.sub(" ", raw)
+    return "사업관리" in stripped
 
 
 def _project_job_has_literal_pm_pl_evidence(rel: CodeRefCandidate) -> bool:
@@ -2962,8 +2979,38 @@ def _extract_project_row_semantic_exp_quote(code: str, span: str) -> str | None:
     return _extract_semantic_project_exp_quote(code, span)
 
 
+def _project_row_supports_job_ops_sys(span: str) -> bool:
+    """JOB-OPS-SYS from INFRA phrases or SEC system-ops title+duty.
+
+    SEC path uses ``정보보안시스템 운영`` + duty ``운영`` and does not imply
+    EXP-INFRA (security ops stay EXP-SEC-OPS).
+    """
+    if _project_row_supports_semantic_exp("EXP-INFRA", span):
+        return True
+    head, duty = _project_row_title_and_duty(span)
+    phrase = _JOB_OPS_SYS_SEC_TITLE_PHRASE
+    if _text_has_semantic_phrase(duty, phrase):
+        return True
+    if not _text_has_semantic_phrase(head, phrase):
+        return False
+    corr = _PROJECT_TITLE_PHRASE_DUTY_TOKENS.get(phrase, ("운영",))
+    return bool(duty and any(tok in duty for tok in corr))
+
+
 def _project_row_supports_semantic_job(code: str, span: str) -> bool:
     """PROJECT JOB support using owned-row title/overview + duty rules."""
+    if code == "JOB-OPS-SYS":
+        return _project_row_supports_job_ops_sys(span)
+    if code == "JOB-MGT":
+        # Require standalone 사업관리; ``PM 사업관리`` / ``PL 사업관리`` alone
+        # must not also create JOB-MGT beside JOB-MGT-PM/PL.
+        _head, duty = _project_row_title_and_duty(span)
+        if _text_has_standalone_project_mgt(duty):
+            return True
+        # Duty-local full EXP-MGT support only when 사업관리 is standalone.
+        if _quote_supports_semantic_project_exp("EXP-MGT", duty):
+            return _text_has_standalone_project_mgt(duty)
+        return False
     exp_alias = _JOB_SEMANTIC_EXP_ALIAS.get(code)
     if exp_alias is not None:
         return _project_row_supports_semantic_exp(exp_alias, span)
@@ -2977,6 +3024,21 @@ def _project_row_supports_semantic_job(code: str, span: str) -> bool:
 
 def _extract_project_row_semantic_job_quote(code: str, span: str) -> str | None:
     if not _project_row_supports_semantic_job(code, span):
+        return None
+    if code == "JOB-OPS-SYS":
+        if _project_row_supports_semantic_exp("EXP-INFRA", span):
+            return _extract_project_row_semantic_exp_quote("EXP-INFRA", span)
+        head, duty = _project_row_title_and_duty(span)
+        phrase = _JOB_OPS_SYS_SEC_TITLE_PHRASE
+        if _text_has_semantic_phrase(duty, phrase):
+            return phrase
+        if _text_has_semantic_phrase(head, phrase):
+            return phrase
+        return None
+    if code == "JOB-MGT":
+        _head, duty = _project_row_title_and_duty(span)
+        if _text_has_standalone_project_mgt(duty) and "사업관리" in duty:
+            return "사업관리"
         return None
     exp_alias = _JOB_SEMANTIC_EXP_ALIAS.get(code)
     if exp_alias is not None:
@@ -3047,6 +3109,17 @@ def _quote_supports_semantic_project_job(
     text = (quote or "").strip()
     if not text:
         return False
+    if code == "JOB-OPS-SYS":
+        if enhanced_project_relation_semantics:
+            if _quote_supports_semantic_project_exp("EXP-INFRA", text):
+                return True
+            # SEC system-ops quote may evidence JOB-OPS-SYS without EXP-INFRA.
+            return _text_has_semantic_phrase(text, _JOB_OPS_SYS_SEC_TITLE_PHRASE)
+        return _quote_supports_semantic_exp("EXP-INFRA", text)
+    if code == "JOB-MGT":
+        if enhanced_project_relation_semantics:
+            return _text_has_standalone_project_mgt(text)
+        return _quote_supports_semantic_exp("EXP-MGT", text)
     exp_alias = _JOB_SEMANTIC_EXP_ALIAS.get(code)
     if exp_alias is not None:
         if enhanced_project_relation_semantics:
@@ -3065,6 +3138,16 @@ def _extract_semantic_project_job_quote(
     enhanced_project_relation_semantics: bool = False,
 ) -> str | None:
     """Minimal actual substring in ``text`` that supports the JOB code."""
+    if code == "JOB-OPS-SYS" and enhanced_project_relation_semantics:
+        if _quote_supports_semantic_project_exp("EXP-INFRA", text):
+            return _extract_semantic_project_exp_quote("EXP-INFRA", text)
+        if _text_has_semantic_phrase(text, _JOB_OPS_SYS_SEC_TITLE_PHRASE):
+            return _JOB_OPS_SYS_SEC_TITLE_PHRASE
+        return None
+    if code == "JOB-MGT" and enhanced_project_relation_semantics:
+        if _text_has_standalone_project_mgt(text):
+            return "사업관리"
+        return None
     exp_alias = _JOB_SEMANTIC_EXP_ALIAS.get(code)
     if exp_alias is not None:
         if enhanced_project_relation_semantics:

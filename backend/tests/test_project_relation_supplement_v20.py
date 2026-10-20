@@ -279,7 +279,11 @@ def _gangsangwon_live_projects(*, with_bad_quotes: bool):
             customer="현대오토에버",
             start="2012.07",
             end="2015.02",
-            jobs=[("JOB-MGT-PL", bad)] if with_bad_quotes else None,
+            jobs=(
+                [("JOB-MGT-PL", bad), ("JOB-OPS-SYS", bad)]
+                if with_bad_quotes
+                else None
+            ),
             expertise=[("EXP-SEC-OPS", bad)] if with_bad_quotes else None,
         ),
     ]
@@ -320,8 +324,13 @@ def test_gangsangwon_live_pptx_title_duty_backfill() -> None:
     assert "EXP-INFRA" not in {x.code for x in p2015.expertise}
 
     p_sec = out.projects[4]
-    assert {j.code for j in p_sec.jobs} == {"JOB-MGT-PL"}
-    assert p_sec.jobs[0].source_refs[0].quote_text == "PL"
+    assert {j.code for j in p_sec.jobs} == {"JOB-MGT-PL", "JOB-OPS-SYS"}
+    assert next(
+        j for j in p_sec.jobs if j.code == "JOB-MGT-PL"
+    ).source_refs[0].quote_text == "PL"
+    assert next(
+        j for j in p_sec.jobs if j.code == "JOB-OPS-SYS"
+    ).source_refs[0].quote_text == "정보보안시스템 운영"
     assert {x.code for x in p_sec.expertise} == {"EXP-SEC-OPS"}
     assert p_sec.expertise[0].source_refs[0].quote_text == "정보보안시스템 운영"
     assert "EXP-INFRA" not in {x.code for x in p_sec.expertise}
@@ -343,9 +352,15 @@ def test_gangsangwon_live_pptx_title_duty_supplement() -> None:
     assert {x.code for x in p2015.expertise} == {"EXP-MGT", "EXP-SEC-BUILD"}
 
     p_sec = out.projects[4]
-    assert {j.code for j in p_sec.jobs} == {"JOB-MGT-PL"}
+    assert {j.code for j in p_sec.jobs} == {"JOB-MGT-PL", "JOB-OPS-SYS"}
     assert {x.code for x in p_sec.expertise} == {"EXP-SEC-OPS"}
-    assert p_sec.jobs[0].source_refs[0].quote_text == "PL"
+    assert "EXP-INFRA" not in {x.code for x in p_sec.expertise}
+    assert next(
+        j for j in p_sec.jobs if j.code == "JOB-MGT-PL"
+    ).source_refs[0].quote_text == "PL"
+    assert next(
+        j for j in p_sec.jobs if j.code == "JOB-OPS-SYS"
+    ).source_refs[0].quote_text == "정보보안시스템 운영"
 
 
 def test_title_phrase_without_duty_corroboration_no_relation() -> None:
@@ -555,9 +570,11 @@ def test_pptx_combined_line_does_not_mix_other_project_duties() -> None:
     assert a_jobs == {"JOB-OPS-SYS"}
     assert a_exp == {"EXP-INFRA"}
     assert "EXP-SEC-OPS" not in a_exp
+    # SEC duty evidences JOB-OPS-SYS + EXP-SEC-OPS; never EXP-INFRA.
+    assert b_jobs == {"JOB-OPS-SYS"}
     assert b_exp == {"EXP-SEC-OPS"}
-    assert "JOB-OPS-SYS" not in b_jobs
     assert "EXP-INFRA" not in b_exp
+    assert "EXP-SEC-OPS" not in a_exp
 
 
 def test_ambiguous_multi_project_match_no_supplement() -> None:
@@ -630,6 +647,83 @@ def test_existing_relation_and_refs_preserved() -> None:
     assert len([x for x in out.projects[0].expertise if x.code == "EXP-INFRA"]) == 1
     assert "JOB-MGT" in {j.code for j in out.projects[0].jobs}
     assert "EXP-MGT" in {x.code for x in out.projects[0].expertise}
+
+
+def test_pm_saupgwanri_does_not_duplicate_job_mgt() -> None:
+    """``PM 사업관리`` → JOB-MGT-PM only; no extra JOB-MGT without standalone duty."""
+    page_texts = {
+        (_DOC, 1): (
+            "한국가스안전공사 정보시스템 운영 | 개요 | 2016.01~2016.12 | "
+            "PM 사업관리 | 한국가스안전공사"
+        )
+    }
+    out = _run_supplement(
+        [
+            _project(
+                name="한국가스안전공사 정보시스템 운영",
+                customer="한국가스안전공사",
+                start="2016.01",
+                end="2016.12",
+            )
+        ],
+        page_texts,
+    )
+    jobs = {j.code for j in out.projects[0].jobs}
+    assert "JOB-MGT-PM" in jobs
+    assert "JOB-MGT" not in jobs
+    # Title 정보시스템 운영 + duty 운영 is absent (duty is PM 사업관리) → no OPS
+    # from duty 운영; title phrase needs duty 운영 corroboration.
+    assert "JOB-OPS-SYS" not in jobs
+
+
+def test_standalone_saupgwanri_keeps_job_mgt() -> None:
+    """Plain duty 사업관리 (정보보호 강화) still supplements JOB-MGT."""
+    page_texts = {
+        (_DOC, 1): (
+            "광주통합전산센터 2015년 정보보호 강화(HW) | 구축 | "
+            "2015.07~2015.12 | 구축, 사업관리 | 국가정보자원 관리원(광주)"
+        )
+    }
+    out = _run_supplement(
+        [
+            _project(
+                name="광주통합전산센터 2015년 정보보호 강화(HW)",
+                customer="국가정보자원 관리원(광주)",
+                start="2015.07",
+                end="2015.12",
+            )
+        ],
+        page_texts,
+    )
+    assert {j.code for j in out.projects[0].jobs} == {"JOB-MGT"}
+    assert "EXP-MGT" in {x.code for x in out.projects[0].expertise}
+    assert "EXP-SEC-BUILD" in {x.code for x in out.projects[0].expertise}
+
+
+def test_sec_system_ops_supplements_job_ops_sys_with_pl_not_infra() -> None:
+    """정보보안시스템 운영 + PL 운영 → JOB-OPS-SYS + PL; no EXP-INFRA."""
+    page_texts = {
+        (_DOC, 1): (
+            "현대/기아자동차 정보보안시스템 운영 | 운영 | "
+            "2012.07~2015.02 | PL 운영 | 현대오토에버"
+        )
+    }
+    out = _run_supplement(
+        [
+            _project(
+                name="현대/기아자동차 정보보안시스템 운영",
+                customer="현대오토에버",
+                start="2012.07",
+                end="2015.02",
+            )
+        ],
+        page_texts,
+    )
+    assert {j.code for j in out.projects[0].jobs} == {"JOB-MGT-PL", "JOB-OPS-SYS"}
+    assert {x.code for x in out.projects[0].expertise} == {"EXP-SEC-OPS"}
+    assert "EXP-INFRA" not in {x.code for x in out.projects[0].expertise}
+    ops = next(j for j in out.projects[0].jobs if j.code == "JOB-OPS-SYS")
+    assert ops.source_refs[0].quote_text == "정보보안시스템 운영"
 
 
 def test_gangtaeryeon_style_ops_infra_mgt_ta_still_work() -> None:
