@@ -256,7 +256,7 @@ def test_existing_relation_and_refs_preserved() -> None:
             "운영사업 2017.03 ~ 2017.12 고객A 정보시스템1군 운영 사업관리"
         )
     }
-    existing_quote = "기존OPS근거"
+    existing_quote = "정보시스템1군 운영"
     out = _doc(
         [
             _project(
@@ -265,7 +265,7 @@ def test_existing_relation_and_refs_preserved() -> None:
                 start="2017.03",
                 end="2017.12",
                 jobs=[("JOB-OPS-SYS", existing_quote)],
-                expertise=[("EXP-INFRA", "정보시스템1군 운영")],
+                expertise=[("EXP-INFRA", existing_quote)],
             )
         ],
         page_texts,

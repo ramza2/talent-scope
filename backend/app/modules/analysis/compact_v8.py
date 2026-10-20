@@ -1200,6 +1200,29 @@ _EXP_SEMANTIC_PATTERNS: dict[str, tuple[tuple[int, str, tuple[str, ...]], ...]] 
 }
 
 
+def _semantic_phrase_start(text: str, phrase: str, *, start: int = 0) -> int:
+    """Index of ``phrase`` in ``text``, or -1.
+
+    Rejects the weak INFRA phrase ``시스템 운영`` when it is only the tail of
+    ``*보안시스템 운영`` (e.g. 정보보안시스템 운영 → SEC-OPS, not INFRA).
+    """
+    if not phrase:
+        return -1
+    idx = start
+    while True:
+        found = text.find(phrase, idx)
+        if found < 0:
+            return -1
+        if phrase == "시스템 운영" and found >= 2 and text[found - 2 : found] == "보안":
+            idx = found + 1
+            continue
+        return found
+
+
+def _text_has_semantic_phrase(text: str, phrase: str) -> bool:
+    return _semantic_phrase_start(text, phrase) >= 0
+
+
 def _quote_supports_semantic_exp(code: str, quote: str) -> bool:
     """True when quote text itself supports a known EXP prompt-contract phrase."""
     patterns = _EXP_SEMANTIC_PATTERNS.get(code)
@@ -1209,7 +1232,7 @@ def _quote_supports_semantic_exp(code: str, quote: str) -> bool:
     if not text:
         return False
     for _strength, phrase, companions in patterns:
-        if phrase not in text:
+        if not _text_has_semantic_phrase(text, phrase):
             continue
         if companions and not any(req in text for req in companions):
             continue
@@ -1238,7 +1261,7 @@ def _semantic_exp_page_match(
         if not page_text:
             continue
         for strength, quote, companions in patterns:
-            if quote not in page_text:
+            if not _text_has_semantic_phrase(page_text, quote):
                 continue
             if companions and not any(req in page_text for req in companions):
                 continue
@@ -2231,14 +2254,14 @@ def _extract_semantic_exp_quote(code: str, text: str) -> str | None:
     if not patterns:
         return None
     for _strength, phrase, companions in patterns:
-        if phrase not in text:
+        i_phrase = _semantic_phrase_start(text, phrase)
+        if i_phrase < 0:
             continue
         if not companions:
             return phrase
         for req in companions:
             if req not in text:
                 continue
-            i_phrase = text.find(phrase)
             i_req = text.find(req)
             start = min(i_phrase, i_req)
             end = max(i_phrase + len(phrase), i_req + len(req))
@@ -2310,7 +2333,11 @@ def _project_owned_source_span(
         if not _line_has_year_month(match.group(0), year, month):
             continue
         identity_start = 0 if i == 0 else ranges[i - 1].end()
-        identity_span = text[identity_start:match.end()]
+        evidence_end = (
+            ranges[i + 1].start() if i + 1 < len(ranges) else len(text)
+        )
+        # Name may sit before the range; customer/duties usually after end date.
+        identity_span = text[identity_start:evidence_end]
         name_matched = bool(
             name is not None
             and (
@@ -2328,7 +2355,7 @@ def _project_owned_source_span(
             identity_span, name_matched=name_matched
         ):
             continue
-        evidence_end = ranges[i + 1].start() if i + 1 < len(ranges) else len(text)
+        # Evidence omits prior-project duties (starts at this range).
         evidence = text[match.start() : evidence_end].strip()
         if evidence:
             owned_evidence.append(evidence)
