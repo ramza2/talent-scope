@@ -16,6 +16,7 @@ v19 contract plus clearer CORE TECH activity wording and runtime guards:
 - Feature flag REQUIRE_SEMANTIC_PROJECT_JOB_EVIDENCE
 - Feature flag RECOVER_PROJECT_RECALL_SECOND_PASS
 - Feature flag BACKFILL_LITERAL_CORE_TECH_FROM_SOURCE
+- Feature flag SUPPLEMENT_SEMANTIC_PROJECT_RELATIONS_FROM_SOURCE
 - Deterministic drop of root s[] activity-only phrases and quote-less TECH
 - Bounded PROJECT recall second-pass: keep first projects, append unmatched second only
 - Deterministic root TECH leaf supplement from explicit source name/alias literals
@@ -28,6 +29,8 @@ v19 contract plus clearer CORE TECH activity wording and runtime guards:
 - Deterministic project-row semantic quote backfill for known PROJECT EXP
 - Deterministic project-row evidence backfill for PROJECT business_domains
 - Deterministic project-row semantic quote backfill for known PROJECT JOB
+- Deterministic supplement of missing PROJECT JOB/EXP from unique same-project
+  semantic phrases (no overwrite; PPTX multi-row spans scoped)
 - Deterministic PROJECT PM/PL→JOB-OPS-SYS repair when unsupported PM/PL has strong OPS row evidence
 - Deterministic PROJECT JOB-MGT→JOB-OPS-SYS repair when unsupported MGT has strong OPS row evidence
 - Deterministic drop of PROJECT JOB-MGT/OPS-SYS/TA lacking semantic/literal quote evidence
@@ -64,6 +67,7 @@ REPAIR_PROJECT_MGT_TO_OPS_SYS = True
 REQUIRE_SEMANTIC_PROJECT_JOB_EVIDENCE = True
 RECOVER_PROJECT_RECALL_SECOND_PASS = True
 BACKFILL_LITERAL_CORE_TECH_FROM_SOURCE = True
+SUPPLEMENT_SEMANTIC_PROJECT_RELATIONS_FROM_SOURCE = True
 
 CORE_SCHEMA_GUIDE = """
 Compact CORE root (omit null/empty):

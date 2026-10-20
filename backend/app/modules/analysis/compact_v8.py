@@ -1184,12 +1184,19 @@ _EXP_SEMANTIC_PATTERNS: dict[str, tuple[tuple[int, str, tuple[str, ...]], ...]] 
     "EXP-INFRA": (
         # quote phrase, optional same-text companions
         (3, "시스템구축 및 운영", ("IT시스템기술지원", "IT시스템관리")),
+        (2, "정보시스템1군 운영", ()),
         (2, "정보시스템 운영", ()),
         (1, "시스템 운영", ()),
     ),
     "EXP-MGT": ((1, "사업관리", ()),),
-    "EXP-SEC-OPS": ((1, "보안 운영", ()),),
-    "EXP-SEC-BUILD": ((1, "보안 구축", ()),),
+    "EXP-SEC-OPS": (
+        (2, "정보보안시스템 운영", ()),
+        (1, "보안 운영", ()),
+    ),
+    "EXP-SEC-BUILD": (
+        (2, "정보보호 강화", ("구축",)),
+        (1, "보안 구축", ()),
+    ),
 }
 
 
@@ -2130,6 +2137,11 @@ _LINE_DATE_YM_RE = re.compile(
     r"(?<!\d)(\d{4})[./\-](\d{1,2})(?:[./\-]\d{1,2})?(?!\d)"
 )
 _PROJECT_ROW_RANGE_MARK_RE = re.compile(r"[~～]")
+# Full project period range ``YYYY.MM(.DD) ~ YYYY.MM(.DD)`` (end year optional).
+_PROJECT_FULL_RANGE_RE = re.compile(
+    r"(?<!\d)(?:19|20)\d{2}[./\-]\d{1,2}(?:[./\-]\d{1,2})?\s*[~～]\s*"
+    r"(?:(?:19|20)?\d{2}[./\-]\d{1,2}(?:[./\-]\d{1,2})?)"
+)
 # Project-row shape markers (name/customer/period table rows). Absence plus
 # employment section/title cues means the line is not usable as project evidence.
 _PROJECT_ROW_STRUCTURE_RE = re.compile(
@@ -2253,6 +2265,78 @@ def _iter_allowed_page_lines(
                 yield doc_id, page_no, line
 
 
+def _project_owned_source_span(
+    project: ProjectCandidate, line: str
+) -> str | None:
+    """Return the unique evidence span owned by ``project``, else None.
+
+    Multi-range PPTX lines are partitioned by full period ranges so duties
+    belonging to another project on the same physical line are excluded.
+    Identity (name/customer) may look back before the range; evidence quotes
+    are taken from ``range.start .. next_range.start``.
+    """
+    start_ym = _project_start_year_month(project)
+    if start_ym is None:
+        return None
+    year, month = start_ym
+    name = (project.project_name or "").strip() or None
+    customer = (project.customer_name or "").strip() or None
+    if name is None and customer is None:
+        return None
+
+    text = (line or "").strip()
+    if not text or not _PROJECT_ROW_RANGE_MARK_RE.search(text):
+        return None
+    ranges = list(_PROJECT_FULL_RANGE_RE.finditer(text))
+    if not ranges:
+        # Single poorly-shaped range line: keep whole-line semantics.
+        if not _line_has_year_month(text, year, month):
+            return None
+        name_matched = bool(
+            name is not None
+            and (name in text or _line_has_ws_folded_phrase(text, name))
+        )
+        customer_matched = bool(
+            customer is not None and _line_has_ws_folded_phrase(text, customer)
+        )
+        if not name_matched and not customer_matched:
+            return None
+        if _line_is_employment_history_row(text, name_matched=name_matched):
+            return None
+        return text
+
+    owned_evidence: list[str] = []
+    for i, match in enumerate(ranges):
+        if not _line_has_year_month(match.group(0), year, month):
+            continue
+        identity_start = 0 if i == 0 else ranges[i - 1].end()
+        identity_span = text[identity_start:match.end()]
+        name_matched = bool(
+            name is not None
+            and (
+                name in identity_span
+                or _line_has_ws_folded_phrase(identity_span, name)
+            )
+        )
+        customer_matched = bool(
+            customer is not None
+            and _line_has_ws_folded_phrase(identity_span, customer)
+        )
+        if not name_matched and not customer_matched:
+            continue
+        if _line_is_employment_history_row(
+            identity_span, name_matched=name_matched
+        ):
+            continue
+        evidence_end = ranges[i + 1].start() if i + 1 < len(ranges) else len(text)
+        evidence = text[match.start() : evidence_end].strip()
+        if evidence:
+            owned_evidence.append(evidence)
+    if len(owned_evidence) != 1:
+        return None
+    return owned_evidence[0]
+
+
 def _find_unique_project_source_row(
     project: ProjectCandidate,
     *,
@@ -2260,16 +2344,13 @@ def _find_unique_project_source_row(
     allowed_documents: dict[str, set[int]],
     line_predicate: Any | None = None,
 ) -> tuple[str, int, str] | None:
-    """Fail-closed unique project source line for evidence backfill.
+    """Fail-closed unique project source span for evidence backfill.
 
     Requires start month precision, a ``~`` date-range marker, and either a
     unique project_name (exact/ws-fold) hit or a unique customer+start hit.
-    ``line_predicate`` may further restrict candidate lines (e.g. EXP phrases).
+    On multi-project PPTX lines, only the owned period segment is used.
+    ``line_predicate`` may further restrict candidate spans (e.g. EXP phrases).
     """
-    start_ym = _project_start_year_month(project)
-    if start_ym is None:
-        return None
-    year, month = start_ym
     name = (project.project_name or "").strip() or None
     customer = (project.customer_name or "").strip() or None
     if name is None and customer is None:
@@ -2282,9 +2363,12 @@ def _find_unique_project_source_row(
     ):
         if not _PROJECT_ROW_RANGE_MARK_RE.search(line):
             continue
-        if not _line_has_year_month(line, year, month):
+        # Ownership + identity already fail-closed inside helper; ``owned`` is
+        # the evidence window (may omit leading project_name before dates).
+        owned = _project_owned_source_span(project, line)
+        if owned is None:
             continue
-        if line_predicate is not None and not line_predicate(line):
+        if line_predicate is not None and not line_predicate(owned):
             continue
         name_matched = bool(
             name is not None
@@ -2293,14 +2377,10 @@ def _find_unique_project_source_row(
         customer_matched = bool(
             customer is not None and _line_has_ws_folded_phrase(line, customer)
         )
-        if not name_matched and not customer_matched:
-            continue
-        if _line_is_employment_history_row(line, name_matched=name_matched):
-            continue
-        hit = (doc_id, page_no, line)
+        hit = (doc_id, page_no, owned)
         if name_matched:
             named_hits.append(hit)
-        if customer_matched:
+        elif customer_matched:
             customer_hits.append(hit)
 
     def _unique(
@@ -2757,6 +2837,110 @@ def backfill_semantic_project_expertise_evidence(
             new_projects.append(project.model_copy(update={"expertise": new_exp}))
         else:
             new_projects.append(project)
+    if not changed:
+        return candidate
+    return candidate.model_copy(update={"projects": new_projects})
+
+
+_PROJECT_RELATION_SUPPLEMENT_JOB_CODES: tuple[str, ...] = (
+    "JOB-OPS-SYS",
+    "JOB-MGT",
+    "JOB-ARC-TA",
+    "JOB-MGT-PM",
+    "JOB-MGT-PL",
+)
+_PROJECT_RELATION_SUPPLEMENT_EXP_CODES: tuple[str, ...] = (
+    "EXP-INFRA",
+    "EXP-MGT",
+    "EXP-SEC-OPS",
+    "EXP-SEC-BUILD",
+)
+
+
+def supplement_semantic_project_relations_from_source(
+    candidate: ProfileCandidateDocument,
+    *,
+    page_texts: dict[tuple[str, int], str] | None,
+    allowed_documents: dict[str, set[int]],
+) -> ProfileCandidateDocument:
+    """Append missing PROJECT JOB/EXP when unique same-project evidence exists.
+
+    Creates new relations only for known semantic codes. Never overwrites
+    existing relations/refs. Uses actual source quotes. Multi-project PPTX
+    lines are scoped via owned period segments. Plain 운영/구축 alone never
+    matches. Root jobs/expertise stay untouched.
+    """
+    if not page_texts or not candidate.projects:
+        return candidate
+    changed = False
+    new_projects: list[ProjectCandidate] = []
+    for project in candidate.projects:
+        existing_jobs = {
+            (rel.code or "").strip()
+            for rel in (project.jobs or [])
+            if (rel.code or "").strip()
+        }
+        existing_exp = {
+            (rel.code or "").strip()
+            for rel in (project.expertise or [])
+            if (rel.code or "").strip()
+        }
+        added_jobs: list[CodeRefCandidate] = []
+        added_exp: list[CodeRefCandidate] = []
+        for code in _PROJECT_RELATION_SUPPLEMENT_JOB_CODES:
+            if code in existing_jobs:
+                continue
+            match = _find_unique_semantic_project_job_ref(
+                project,
+                code,
+                page_texts=page_texts,
+                allowed_documents=allowed_documents,
+            )
+            if match is None:
+                continue
+            quote = (match.quote_text or "").strip()
+            if not quote:
+                continue
+            added_jobs.append(
+                CodeRefCandidate(
+                    code=code,
+                    raw_value=quote,
+                    source_refs=[match],
+                )
+            )
+            existing_jobs.add(code)
+        for code in _PROJECT_RELATION_SUPPLEMENT_EXP_CODES:
+            if code in existing_exp:
+                continue
+            match = _find_unique_semantic_project_exp_ref(
+                project,
+                code,
+                page_texts=page_texts,
+                allowed_documents=allowed_documents,
+            )
+            if match is None:
+                continue
+            quote = (match.quote_text or "").strip()
+            if not quote:
+                continue
+            added_exp.append(
+                CodeRefCandidate(
+                    code=code,
+                    raw_value=quote,
+                    source_refs=[match],
+                )
+            )
+            existing_exp.add(code)
+        if not added_jobs and not added_exp:
+            new_projects.append(project)
+            continue
+        changed = True
+        updates: dict[str, Any] = {}
+        if added_jobs:
+            updates["jobs"] = list(project.jobs or []) + added_jobs
+        if added_exp:
+            updates["expertise"] = list(project.expertise or []) + added_exp
+        new_projects.append(project.model_copy(update=updates))
     if not changed:
         return candidate
     return candidate.model_copy(update={"projects": new_projects})

@@ -76,6 +76,7 @@ class ProfilePromptSpec:
     require_semantic_project_job_evidence: bool = False
     recover_project_recall_second_pass: bool = False
     backfill_literal_core_tech_from_source: bool = False
+    supplement_semantic_project_relations_from_source: bool = False
 
 
 def _spec_from_module(module) -> ProfilePromptSpec:
@@ -174,6 +175,11 @@ def _spec_from_staged_module(module) -> ProfilePromptSpec:
         ),
         backfill_literal_core_tech_from_source=bool(
             getattr(module, "BACKFILL_LITERAL_CORE_TECH_FROM_SOURCE", False)
+        ),
+        supplement_semantic_project_relations_from_source=bool(
+            getattr(
+                module, "SUPPLEMENT_SEMANTIC_PROJECT_RELATIONS_FROM_SOURCE", False
+            )
         ),
     )
 
