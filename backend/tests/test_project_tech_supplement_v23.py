@@ -278,6 +278,87 @@ def test_cross_doc_ambiguous_title_key_skips_tech() -> None:
     assert out.projects[1].skills == []
 
 
+def test_duplicate_identical_project_name_skips_tech_supplement() -> None:
+    """Same project_name + different periods → no auto-TECH (count-aware)."""
+    page_texts = {
+        (_DOC, 1): (
+            "현대/기아자동차 정보보안시스템 운영 | 운영 | 2012.07~2015.02 | "
+            "PL 운영 | 현대오토에버\n"
+            "보안솔루션 운영(AD,SEP,NAC 등)\n"
+            "현대/기아자동차 정보보안시스템 운영 | 운영 | 2016.01~2016.12 | "
+            "PL 운영 | 고객B\n"
+            "보안솔루션 운영(AD)"
+        )
+    }
+    out = _run(
+        [
+            _project(
+                name="현대/기아자동차 정보보안시스템 운영",
+                customer="현대오토에버",
+                start="2012.07",
+                end="2015.02",
+            ),
+            _project(
+                name="현대/기아자동차 정보보안시스템 운영",
+                customer="고객B",
+                start="2016.01",
+                end="2016.12",
+            ),
+        ],
+        page_texts,
+    )
+    assert out.projects[0].skills == []
+    assert out.projects[1].skills == []
+
+
+def test_duplicate_title_preserves_existing_tech_and_spares_unique() -> None:
+    """Ambiguous pair keeps prior TECH; a uniquely titled sibling still supplements."""
+    page_texts = {
+        (_DOC, 1): (
+            "현대/기아자동차 정보보안시스템 운영 | 운영 | 2012.07~2015.02 | "
+            "PL 운영 | 현대오토에버\n"
+            "보안솔루션 운영(SEP)\n"
+            "현대/기아자동차 정보보안시스템 운영 | 운영 | 2016.01~2016.12 | "
+            "PL 운영 | 고객B\n"
+            "보안솔루션 운영(NAC)\n"
+            "차세대 보안관제 구축 | 개요 | 2017.01~2017.12 | 운영 | 고객C\n"
+            "보안솔루션 운영(AD)"
+        )
+    }
+    existing_quote = "SEP"
+    out = _run(
+        [
+            _project(
+                name="현대/기아자동차 정보보안시스템 운영",
+                customer="현대오토에버",
+                start="2012.07",
+                end="2015.02",
+                skills=[("TECH-SEC-SEP", existing_quote)],
+            ),
+            _project(
+                name="현대/기아자동차 정보보안시스템 운영",
+                customer="고객B",
+                start="2016.01",
+                end="2016.12",
+            ),
+            _project(
+                name="차세대 보안관제 구축",
+                customer="고객C",
+                start="2017.01",
+                end="2017.12",
+            ),
+        ],
+        page_texts,
+    )
+    p0_skills = out.projects[0].skills
+    assert len(p0_skills) == 1
+    assert p0_skills[0].code == "TECH-SEC-SEP"
+    assert p0_skills[0].source_refs[0].quote_text == existing_quote
+    assert out.projects[1].skills == []
+    assert {s.code for s in out.projects[2].skills} == {"TECH-SEC-AD"}
+    assert out.projects[2].skills[0].source_refs[0].quote_text == "AD"
+
+
 def test_cross_doc_stops_before_next_numbered_project() -> None:
     """Detail harvest stops at the next top-level ``N.`` project heading."""
     page_texts = {

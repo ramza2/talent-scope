@@ -3915,6 +3915,24 @@ def _project_tech_sibling_title_keys(
     )
 
 
+def _ambiguous_project_tech_title_keys(
+    projects: list[ProjectCandidate] | None,
+) -> frozenset[str]:
+    """Normalized titles that appear on 2+ PROJECT candidates (count-aware).
+
+    ``_candidate_sibling_project_names`` collapses identical strings; this
+    walks ``candidate.projects`` so duplicate names / synonym collisions
+    still fail closed for v23 TECH supplement.
+    """
+    counts: dict[str, int] = {}
+    for project in projects or []:
+        key = _project_tech_title_match_key(project.project_name or "")
+        if not key:
+            continue
+        counts[key] = counts.get(key, 0) + 1
+    return frozenset(key for key, n in counts.items() if n >= 2)
+
+
 def _is_project_tech_section_stop_line(
     line: str,
     *,
@@ -4101,9 +4119,15 @@ def supplement_literal_project_tech_from_source(
     if not code_literals:
         return candidate
     siblings = _candidate_sibling_project_names(candidate)
+    ambiguous_title_keys = _ambiguous_project_tech_title_keys(candidate.projects)
     changed = False
     new_projects: list[ProjectCandidate] = []
     for project in candidate.projects:
+        own_key = _project_tech_title_match_key(project.project_name or "")
+        # Duplicate normalized titles → skip auto-TECH; keep existing skills.
+        if own_key and own_key in ambiguous_title_keys:
+            new_projects.append(project)
+            continue
         existing = {
             (rel.code or "").strip()
             for rel in (project.skills or [])
