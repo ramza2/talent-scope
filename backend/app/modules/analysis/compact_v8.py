@@ -1280,6 +1280,230 @@ def backfill_semantic_core_expertise_evidence(
     return candidate.model_copy(update={"expertise": new_expertise})
 
 
+# v21 CORE/root JOB evidence: only OPS-SYS / PM / PL may remain at root.
+_CORE_JOB_EVIDENCE_CODES = frozenset(
+    {"JOB-OPS-SYS", "JOB-MGT-PM", "JOB-MGT-PL"}
+)
+_CORE_EXP_SUPPLEMENT_CODES: tuple[str, ...] = (
+    "EXP-INFRA",
+    "EXP-MGT",
+    "EXP-SEC-OPS",
+    "EXP-SEC-BUILD",
+)
+
+
+def _quote_supports_semantic_core_job(code: str, quote: str) -> bool:
+    """True when quote text itself supports a v21 root JOB code."""
+    text = (quote or "").strip()
+    if not text:
+        return False
+    if code == "JOB-OPS-SYS":
+        return _quote_supports_semantic_exp("EXP-INFRA", text)
+    pattern = _PM_PL_LITERAL_JOB_PATTERNS.get(code)
+    if pattern is None:
+        return False
+    return pattern.search(text) is not None
+
+
+def _semantic_core_exp_span_page_match(
+    code: str,
+    *,
+    page_texts: dict[tuple[str, int], str],
+    allowed_documents: dict[str, set[int]],
+) -> SourceRef | None:
+    """Strongest page match whose quote span itself supports the EXP code."""
+    patterns = _EXP_SEMANTIC_PATTERNS.get(code)
+    if not patterns:
+        return None
+    best: tuple[int, str, int, str] | None = None
+    for doc_id, page_no in sorted(page_texts.keys()):
+        if doc_id not in allowed_documents:
+            continue
+        pages = allowed_documents[doc_id]
+        if pages and page_no not in pages:
+            continue
+        page_text = page_texts.get((doc_id, page_no)) or ""
+        if not page_text:
+            continue
+        quote = _extract_semantic_exp_quote(code, page_text)
+        if not quote:
+            continue
+        # Prefer higher-strength pattern family via phrase presence.
+        strength = 0
+        for s, phrase, companions in patterns:
+            if phrase not in page_text:
+                continue
+            if companions and not any(req in page_text for req in companions):
+                continue
+            strength = max(strength, s)
+        if strength <= 0:
+            continue
+        key = (-strength, doc_id, page_no, quote)
+        if best is None or key < best:
+            best = key
+    if best is None:
+        return None
+    _, doc_id, page_no, quote = best
+    return SourceRef(document_id=doc_id, page_no=page_no, quote_text=quote)
+
+
+def _semantic_core_job_page_match(
+    code: str,
+    *,
+    page_texts: dict[tuple[str, int], str],
+    allowed_documents: dict[str, set[int]],
+) -> SourceRef | None:
+    """Page match for a supported root JOB; quote must support the code."""
+    if code == "JOB-OPS-SYS":
+        return _semantic_core_exp_span_page_match(
+            "EXP-INFRA",
+            page_texts=page_texts,
+            allowed_documents=allowed_documents,
+        )
+    pattern = _PM_PL_LITERAL_JOB_PATTERNS.get(code)
+    if pattern is None:
+        return None
+    best: tuple[str, int, str] | None = None
+    for doc_id, page_no in sorted(page_texts.keys()):
+        if doc_id not in allowed_documents:
+            continue
+        pages = allowed_documents[doc_id]
+        if pages and page_no not in pages:
+            continue
+        page_text = page_texts.get((doc_id, page_no)) or ""
+        if not page_text:
+            continue
+        match = pattern.search(page_text)
+        if match is None:
+            continue
+        quote = page_text[match.start() : match.end()]
+        key = (doc_id, page_no, quote)
+        if best is None or key < best:
+            best = key
+    if best is None:
+        return None
+    doc_id, page_no, quote = best
+    return SourceRef(document_id=doc_id, page_no=page_no, quote_text=quote)
+
+
+def supplement_semantic_core_expertise_from_source(
+    candidate: ProfileCandidateDocument,
+    *,
+    page_texts: dict[tuple[str, int], str] | None,
+    allowed_documents: dict[str, set[int]],
+) -> ProfileCandidateDocument:
+    """v21: append missing known root EXP codes evidenced in source pages.
+
+    Does not overwrite existing expertise items. Uses actual matched quote as
+    raw_value and source_refs. Duplicate codes are never added.
+    """
+    if not page_texts:
+        return candidate
+    existing = {
+        (exp.code or "").strip()
+        for exp in candidate.expertise
+        if (exp.code or "").strip()
+    }
+    added: list[ExpertiseCandidate] = []
+    for code in _CORE_EXP_SUPPLEMENT_CODES:
+        if code in existing:
+            continue
+        match = _semantic_core_exp_span_page_match(
+            code,
+            page_texts=page_texts,
+            allowed_documents=allowed_documents,
+        )
+        if match is None:
+            continue
+        quote = (match.quote_text or "").strip()
+        if not quote:
+            continue
+        added.append(
+            ExpertiseCandidate(
+                code=code,
+                raw_value=quote,
+                evidence_type="EXPLICIT",
+                source_refs=[match],
+            )
+        )
+        existing.add(code)
+    if not added:
+        return candidate
+    return candidate.model_copy(
+        update={"expertise": list(candidate.expertise) + added}
+    )
+
+
+def backfill_semantic_core_job_evidence(
+    candidate: ProfileCandidateDocument,
+    *,
+    page_texts: dict[tuple[str, int], str] | None,
+    allowed_documents: dict[str, set[int]],
+) -> ProfileCandidateDocument:
+    """v21: fill empty root JOB source_refs for OPS-SYS / PM / PL only.
+
+    Never invents quotes. Never modifies project jobs. Leaves unsupported
+    coded jobs untouched here (dropped by require guard).
+    """
+    if not page_texts:
+        return candidate
+    changed = False
+    new_jobs: list[JobCandidate] = []
+    for job in candidate.jobs:
+        if _refs_nonempty(job.source_refs):
+            new_jobs.append(job)
+            continue
+        code = (job.code or "").strip()
+        if code not in _CORE_JOB_EVIDENCE_CODES:
+            new_jobs.append(job)
+            continue
+        match = _semantic_core_job_page_match(
+            code,
+            page_texts=page_texts,
+            allowed_documents=allowed_documents,
+        )
+        if match is None:
+            new_jobs.append(job)
+            continue
+        changed = True
+        new_jobs.append(job.model_copy(update={"source_refs": [match]}))
+    if not changed:
+        return candidate
+    return candidate.model_copy(update={"jobs": new_jobs})
+
+
+def drop_root_jobs_without_semantic_evidence(
+    candidate: ProfileCandidateDocument,
+) -> ProfileCandidateDocument:
+    """v21: drop coded root JOBs lacking quote evidence for supported codes.
+
+    Keeps only JOB-OPS-SYS / JOB-MGT-PM / JOB-MGT-PL when at least one
+    source_ref quote supports that code. TA/SA/AA/PMO/generic MGT and other
+    coded root jobs are removed. Project jobs are never touched. Uncoded
+    root jobs are left unchanged.
+    """
+    changed = False
+    kept: list[JobCandidate] = []
+    for job in candidate.jobs:
+        code = (job.code or "").strip()
+        if not code:
+            kept.append(job)
+            continue
+        if code not in _CORE_JOB_EVIDENCE_CODES:
+            changed = True
+            continue
+        if any(
+            _quote_supports_semantic_core_job(code, ref.quote_text or "")
+            for ref in (job.source_refs or [])
+        ):
+            kept.append(job)
+            continue
+        changed = True
+    if not changed:
+        return candidate
+    return candidate.model_copy(update={"jobs": kept})
+
+
 def backfill_exact_core_evidence(
     candidate: ProfileCandidateDocument,
     *,

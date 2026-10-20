@@ -59,9 +59,12 @@ from app.modules.analysis.compact_v8 import (
     backfill_project_dates_from_root_evidence,
     build_document_alias_view,
     backfill_semantic_core_expertise_evidence,
+    backfill_semantic_core_job_evidence,
     clear_education_status_without_literal_evidence,
     drop_core_skills_without_quote_evidence,
     drop_generic_activity_core_skills,
+    drop_root_jobs_without_semantic_evidence,
+    supplement_semantic_core_expertise_from_source,
     backfill_project_biz_evidence,
     backfill_semantic_project_expertise_evidence,
     backfill_semantic_project_job_evidence,
@@ -1688,6 +1691,23 @@ class AnalysisService:
                     page_texts=page_texts,
                     allowed_documents=allowed_documents,
                 )
+            # v21: append missing known root EXP codes evidenced in source.
+            if prompt.supplement_semantic_core_exp_from_source:
+                doc = supplement_semantic_core_expertise_from_source(
+                    doc,
+                    page_texts=page_texts,
+                    allowed_documents=allowed_documents,
+                )
+            # v21: fill empty root JOB refs for OPS-SYS / PM / PL, then drop
+            # coded root JOBs lacking supporting quote evidence.
+            if prompt.backfill_semantic_core_job_evidence:
+                doc = backfill_semantic_core_job_evidence(
+                    doc,
+                    page_texts=page_texts,
+                    allowed_documents=allowed_documents,
+                )
+            if prompt.require_semantic_core_job_evidence:
+                doc = drop_root_jobs_without_semantic_evidence(doc)
             return doc
 
         def _normalize_projects(raw: dict[str, Any]) -> ProfileCandidateDocument:
