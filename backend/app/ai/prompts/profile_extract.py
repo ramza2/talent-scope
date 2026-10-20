@@ -27,10 +27,12 @@ from app.ai.prompts import (
     profile_extract_v18,
     profile_extract_v19,
     profile_extract_v20,
+    profile_extract_v21,
+    profile_extract_v22,
 )
 from app.ai.providers.errors import AIProviderError
 
-CURRENT_PROFILE_PROMPT_VERSION = "profile-extract-v20"
+CURRENT_PROFILE_PROMPT_VERSION = "profile-extract-v22"
 
 ExtractionMode = Literal["single", "staged"]
 
@@ -76,6 +78,10 @@ class ProfilePromptSpec:
     require_semantic_project_job_evidence: bool = False
     recover_project_recall_second_pass: bool = False
     backfill_literal_core_tech_from_source: bool = False
+    backfill_semantic_core_job_evidence: bool = False
+    require_semantic_core_job_evidence: bool = False
+    supplement_semantic_core_exp_from_source: bool = False
+    supplement_semantic_project_relations_from_source: bool = False
 
 
 def _spec_from_module(module) -> ProfilePromptSpec:
@@ -175,6 +181,20 @@ def _spec_from_staged_module(module) -> ProfilePromptSpec:
         backfill_literal_core_tech_from_source=bool(
             getattr(module, "BACKFILL_LITERAL_CORE_TECH_FROM_SOURCE", False)
         ),
+        backfill_semantic_core_job_evidence=bool(
+            getattr(module, "BACKFILL_SEMANTIC_CORE_JOB_EVIDENCE", False)
+        ),
+        require_semantic_core_job_evidence=bool(
+            getattr(module, "REQUIRE_SEMANTIC_CORE_JOB_EVIDENCE", False)
+        ),
+        supplement_semantic_core_exp_from_source=bool(
+            getattr(module, "SUPPLEMENT_SEMANTIC_CORE_EXP_FROM_SOURCE", False)
+        ),
+        supplement_semantic_project_relations_from_source=bool(
+            getattr(
+                module, "SUPPLEMENT_SEMANTIC_PROJECT_RELATIONS_FROM_SOURCE", False
+            )
+        ),
     )
 
 
@@ -199,6 +219,8 @@ _REGISTRY: dict[str, ProfilePromptSpec] = {
     profile_extract_v18.PROMPT_VERSION: _spec_from_staged_module(profile_extract_v18),
     profile_extract_v19.PROMPT_VERSION: _spec_from_staged_module(profile_extract_v19),
     profile_extract_v20.PROMPT_VERSION: _spec_from_staged_module(profile_extract_v20),
+    profile_extract_v21.PROMPT_VERSION: _spec_from_staged_module(profile_extract_v21),
+    profile_extract_v22.PROMPT_VERSION: _spec_from_staged_module(profile_extract_v22),
 }
 
 

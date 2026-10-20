@@ -19,17 +19,12 @@ _BASE_SHA = "84d46de14f1ebcdcce437e45393e217567364f26"
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-def test_profile_extract_registry_current_is_v20() -> None:
+def test_profile_extract_registry_v20_resolves() -> None:
     from app.ai.prompts import profile_extract_v19 as v19
     from app.ai.prompts import profile_extract_v20 as v20
-    from app.ai.prompts.profile_extract import (
-        CURRENT_PROFILE_PROMPT_VERSION,
-        current_profile_prompt,
-        resolve_profile_prompt,
-    )
+    from app.ai.prompts.profile_extract import resolve_profile_prompt
 
-    assert CURRENT_PROFILE_PROMPT_VERSION == "profile-extract-v20"
-    cur = current_profile_prompt()
+    cur = resolve_profile_prompt("profile-extract-v20")
     assert cur.prompt_version == "profile-extract-v20"
     assert cur.drop_generic_activity_core_tech is True
     assert v20.DROP_GENERIC_ACTIVITY_CORE_TECH is True
@@ -63,8 +58,17 @@ def test_profile_extract_registry_current_is_v20() -> None:
     assert v20.RECOVER_PROJECT_RECALL_SECOND_PASS is True
     assert cur.backfill_literal_core_tech_from_source is True
     assert v20.BACKFILL_LITERAL_CORE_TECH_FROM_SOURCE is True
+    assert cur.supplement_semantic_project_relations_from_source is False
+    assert v20.SUPPLEMENT_SEMANTIC_PROJECT_RELATIONS_FROM_SOURCE is False
     assert cur.repair_whitespace_project_evidence is True
     assert cur.strict_relation_evidence is True
+    # v21-only flags stay false on v20.
+    assert cur.backfill_semantic_core_job_evidence is False
+    assert cur.require_semantic_core_job_evidence is False
+    assert cur.supplement_semantic_core_exp_from_source is False
+    assert not hasattr(v20, "BACKFILL_SEMANTIC_CORE_JOB_EVIDENCE")
+    assert not hasattr(v20, "REQUIRE_SEMANTIC_CORE_JOB_EVIDENCE")
+    assert not hasattr(v20, "SUPPLEMENT_SEMANTIC_CORE_EXP_FROM_SOURCE")
 
     v19_spec = resolve_profile_prompt("profile-extract-v19")
     assert v19_spec.drop_generic_activity_core_tech is False
@@ -83,7 +87,12 @@ def test_profile_extract_registry_current_is_v20() -> None:
     assert v19_spec.require_semantic_project_job_evidence is False
     assert v19_spec.recover_project_recall_second_pass is False
     assert v19_spec.backfill_literal_core_tech_from_source is False
+    assert v19_spec.backfill_semantic_core_job_evidence is False
+    assert v19_spec.require_semantic_core_job_evidence is False
+    assert v19_spec.supplement_semantic_core_exp_from_source is False
+    assert v19_spec.supplement_semantic_project_relations_from_source is False
     assert not hasattr(v19, "DROP_GENERIC_ACTIVITY_CORE_TECH")
+    assert not hasattr(v19, "SUPPLEMENT_SEMANTIC_PROJECT_RELATIONS_FROM_SOURCE")
     assert not hasattr(v19, "REQUIRE_CORE_TECH_QUOTE_EVIDENCE")
     assert not hasattr(v19, "BACKFILL_PROJECT_DATES_FROM_ROOT_EVIDENCE")
     assert not hasattr(v19, "REQUIRE_LITERAL_PM_PL_PROJECT_JOB_EVIDENCE")
