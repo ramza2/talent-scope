@@ -188,68 +188,77 @@ def test_same_project_missing_job_exp_supplemented() -> None:
     assert ops.source_refs[0].document_id == _DOC
 
 
-def test_gangsangwon_pptx_row_structure_relations() -> None:
-    """강상원-style name|overview|period|duty|customer rows."""
-    page_texts = {
-        (_DOC, 1): (
-            "2022 정보시스템1군 운영 | 통합운영 | 2022.01~2022.12 | "
-            "정보시스템1군 운영 | 행정안전부 "
-            "2019 정보시스템1군 운영 | 통합운영 | 2019.01~2019.12 | "
-            "정보시스템1군 운영 | 행정안전부 "
-            "2018 정보시스템1군 운영 | 통합운영 | 2018.01~2018.12 | "
-            "정보시스템1군 운영 | 행정안전부 "
-            "정보보호 강화(HW) | 보안구축 | 2015.03~2015.12 | "
-            "사업관리 정보보호 강화(HW)+구축 | 행정안전부 "
-            "현대/기아 정보보안시스템 운영 | 보안운영 | 2016.01~2016.12 | "
-            "PL 정보보안시스템 운영 | 현대자동차"
-        )
-    }
-    projects = [
+_GANGSANGWON_LIVE_ROWS = (
+    "2022년 국가정보자원 관리원 광주센터 정보시스템1군 운영 | 운영 | "
+    "2022.01~2023.01 | 운영 | 국가정보자원 관리원(광주) "
+    "2019년 국가정보자원 관리원 광주센터 정보시스템1군 운영 | 운영 | "
+    "2019.01~2020.01 | 운영 | 국가정보자원 관리원(광주) "
+    "2018년 국가정보자원 관리원 광주센터 정보시스템1군 운영 | 운영 | "
+    "2018.01~2019.01 | 운영 | 국가정보자원 관리원(광주) "
+    "광주통합전산센터 2015년 정보보호 강화(HW) | 구축 | "
+    "2015.07~2015.12 | 구축, 사업관리 | 국가정보자원 관리원(광주) "
+    "현대/기아자동차 정보보안시스템 운영 | 운영 | "
+    "2012.07~2015.02 | PL 운영 | 현대오토에버"
+)
+
+
+def _gangsangwon_live_projects(*, with_bad_quotes: bool):
+    """Exact 강상원 PPTX project identities used in live career rows."""
+    bad = "업무분석" if with_bad_quotes else None
+    return [
         _project(
-            name="2022 정보시스템1군 운영",
-            customer="행정안전부",
+            name="2022년 국가정보자원 관리원 광주센터 정보시스템1군 운영",
+            customer="국가정보자원 관리원(광주)",
             start="2022.01",
-            end="2022.12",
-            jobs=[("JOB-OPS-SYS", "업무분석")],
-            expertise=[("EXP-INFRA", "업무분석")],
+            end="2023.01",
+            jobs=[("JOB-OPS-SYS", bad)] if with_bad_quotes else None,
+            expertise=[("EXP-INFRA", bad)] if with_bad_quotes else None,
         ),
         _project(
-            name="2019 정보시스템1군 운영",
-            customer="행정안전부",
+            name="2019년 국가정보자원 관리원 광주센터 정보시스템1군 운영",
+            customer="국가정보자원 관리원(광주)",
             start="2019.01",
-            end="2019.12",
-            jobs=[("JOB-OPS-SYS", "업무분석")],
-            expertise=[("EXP-INFRA", "업무분석")],
+            end="2020.01",
+            jobs=[("JOB-OPS-SYS", bad)] if with_bad_quotes else None,
+            expertise=[("EXP-INFRA", bad)] if with_bad_quotes else None,
         ),
         _project(
-            name="2018 정보시스템1군 운영",
-            customer="행정안전부",
+            name="2018년 국가정보자원 관리원 광주센터 정보시스템1군 운영",
+            customer="국가정보자원 관리원(광주)",
             start="2018.01",
-            end="2018.12",
-            jobs=[("JOB-OPS-SYS", "업무분석")],
-            expertise=[("EXP-INFRA", "업무분석")],
+            end="2019.01",
+            jobs=[("JOB-OPS-SYS", bad)] if with_bad_quotes else None,
+            expertise=[("EXP-INFRA", bad)] if with_bad_quotes else None,
         ),
         _project(
-            name="정보보호 강화(HW)",
-            customer="행정안전부",
-            start="2015.03",
+            name="광주통합전산센터 2015년 정보보호 강화(HW)",
+            customer="국가정보자원 관리원(광주)",
+            start="2015.07",
             end="2015.12",
-            jobs=[("JOB-MGT", "유지관리")],
-            expertise=[
-                ("EXP-MGT", "유지관리"),
-                ("EXP-SEC-BUILD", "유지관리"),
-            ],
+            jobs=[("JOB-MGT", bad)] if with_bad_quotes else None,
+            expertise=(
+                [("EXP-MGT", bad), ("EXP-SEC-BUILD", bad)]
+                if with_bad_quotes
+                else None
+            ),
         ),
         _project(
-            name="현대/기아 정보보안시스템 운영",
-            customer="현대자동차",
-            start="2016.01",
-            end="2016.12",
-            jobs=[("JOB-MGT-PL", "PL")],
-            expertise=[("EXP-SEC-OPS", "운영")],
+            name="현대/기아자동차 정보보안시스템 운영",
+            customer="현대오토에버",
+            start="2012.07",
+            end="2015.02",
+            jobs=[("JOB-MGT-PL", bad)] if with_bad_quotes else None,
+            expertise=[("EXP-SEC-OPS", bad)] if with_bad_quotes else None,
         ),
     ]
-    out = _run_backfill(projects, page_texts)
+
+
+def test_gangsangwon_live_pptx_title_duty_backfill() -> None:
+    """Exact live rows: title phrase + duty token recovers PROJECT JOB/EXP."""
+    page_texts = {(_DOC, 1): _GANGSANGWON_LIVE_ROWS}
+    out = _run_backfill(
+        _gangsangwon_live_projects(with_bad_quotes=True), page_texts
+    )
 
     for idx in (0, 1, 2):
         assert {j.code for j in out.projects[idx].jobs} == {"JOB-OPS-SYS"}
@@ -266,10 +275,13 @@ def test_gangsangwon_pptx_row_structure_relations() -> None:
     assert {x.code for x in p2015.expertise} == {"EXP-MGT", "EXP-SEC-BUILD"}
     assert any(
         "정보보호 강화" in (x.source_refs[0].quote_text or "")
+        and "구축" in (x.source_refs[0].quote_text or "")
         for x in p2015.expertise
         if x.code == "EXP-SEC-BUILD"
     )
-    # Next project title must not own prior project's codes.
+    assert next(
+        x for x in p2015.expertise if x.code == "EXP-MGT"
+    ).source_refs[0].quote_text == "사업관리"
     assert "JOB-OPS-SYS" not in {j.code for j in p2015.jobs}
     assert "EXP-INFRA" not in {x.code for x in p2015.expertise}
 
@@ -279,6 +291,95 @@ def test_gangsangwon_pptx_row_structure_relations() -> None:
     assert {x.code for x in p_sec.expertise} == {"EXP-SEC-OPS"}
     assert p_sec.expertise[0].source_refs[0].quote_text == "정보보안시스템 운영"
     assert "EXP-INFRA" not in {x.code for x in p_sec.expertise}
+
+
+def test_gangsangwon_live_pptx_title_duty_supplement() -> None:
+    """Missing relations are appended from title+duty on exact live rows."""
+    page_texts = {(_DOC, 1): _GANGSANGWON_LIVE_ROWS}
+    out = _run_supplement(
+        _gangsangwon_live_projects(with_bad_quotes=False), page_texts
+    )
+
+    for idx in (0, 1, 2):
+        assert {j.code for j in out.projects[idx].jobs} == {"JOB-OPS-SYS"}
+        assert {x.code for x in out.projects[idx].expertise} == {"EXP-INFRA"}
+
+    p2015 = out.projects[3]
+    assert {j.code for j in p2015.jobs} == {"JOB-MGT"}
+    assert {x.code for x in p2015.expertise} == {"EXP-MGT", "EXP-SEC-BUILD"}
+
+    p_sec = out.projects[4]
+    assert {j.code for j in p_sec.jobs} == {"JOB-MGT-PL"}
+    assert {x.code for x in p_sec.expertise} == {"EXP-SEC-OPS"}
+    assert p_sec.jobs[0].source_refs[0].quote_text == "PL"
+
+
+def test_title_phrase_without_duty_corroboration_no_relation() -> None:
+    """Title/overview 운영 alone must not create OPS/INFRA without duty support."""
+    page_texts = {
+        (_DOC, 1): (
+            "2022년 국가정보자원 관리원 광주센터 정보시스템1군 운영 | 운영 | "
+            "2022.01~2023.01 | 유지관리 | 국가정보자원 관리원(광주)"
+        )
+    }
+    projects = [
+        _project(
+            name="2022년 국가정보자원 관리원 광주센터 정보시스템1군 운영",
+            customer="국가정보자원 관리원(광주)",
+            start="2022.01",
+            end="2023.01",
+        )
+    ]
+    supplemented = _run_supplement(projects, page_texts)
+    assert supplemented.projects[0].jobs == []
+    assert supplemented.projects[0].expertise == []
+
+    repaired = _run_backfill(
+        [
+            _project(
+                name="2022년 국가정보자원 관리원 광주센터 정보시스템1군 운영",
+                customer="국가정보자원 관리원(광주)",
+                start="2022.01",
+                end="2023.01",
+                jobs=[("JOB-OPS-SYS", "업무분석")],
+                expertise=[("EXP-INFRA", "업무분석")],
+            )
+        ],
+        page_texts,
+    )
+    assert repaired.projects[0].jobs == []
+    assert repaired.projects[0].expertise == []
+
+
+def test_backfill_only_path_preserves_duty_local_v20_behavior() -> None:
+    """Supplement off: duty-local phrases still backfill via shared find_unique."""
+    page_texts = {
+        (_DOC, 1): (
+            "정보시스템1군 운영사업 | 개요 | 2017.03~2017.12 | "
+            "정보시스템1군 운영 | 행정안전부"
+        )
+    }
+    out = _run_backfill(
+        [
+            _project(
+                name="정보시스템1군 운영사업",
+                customer="행정안전부",
+                start="2017.03",
+                end="2017.12",
+                jobs=[("JOB-OPS-SYS", "업무분석")],
+                expertise=[("EXP-INFRA", "업무분석")],
+            )
+        ],
+        page_texts,
+    )
+    assert {j.code for j in out.projects[0].jobs} == {"JOB-OPS-SYS"}
+    assert {x.code for x in out.projects[0].expertise} == {"EXP-INFRA"}
+    assert out.projects[0].jobs[0].source_refs[0].quote_text == (
+        "정보시스템1군 운영"
+    )
+    assert out.projects[0].expertise[0].source_refs[0].quote_text == (
+        "정보시스템1군 운영"
+    )
 
 
 def test_bad_existing_exp_quote_repaired_or_dropped() -> None:

@@ -2534,20 +2534,137 @@ def _candidate_sibling_project_names(
     )
 
 
-def _project_duty_evidence_text(span: str) -> str:
-    """Duty/customer text after the period range inside an owned span.
+# When a distinctive phrase appears only in title/overview, the duty column
+# must corroborate with one of these activity tokens (title-alone never wins).
+_PROJECT_TITLE_PHRASE_DUTY_TOKENS: dict[str, tuple[str, ...]] = {
+    "정보시스템1군 운영": ("운영",),
+    "정보시스템 운영": ("운영",),
+    "시스템 운영": ("운영",),
+    "정보보안시스템 운영": ("운영",),
+    "정보보호 강화": ("구축",),
+}
 
-    Prevents project titles such as ``정보시스템1군 운영사업`` from counting
-    as EXP/JOB duty evidence by themselves.
+
+def _split_project_owned_span(span: str) -> tuple[str, str, str]:
+    """Split owned span into (pre_period, period, post_period)."""
+    text = (span or "").strip()
+    if not text:
+        return "", "", ""
+    match = _PROJECT_FULL_RANGE_RE.search(text)
+    if match is None:
+        return text, "", ""
+    return (
+        text[: match.start()].strip(),
+        match.group(0),
+        text[match.end() :].strip(),
+    )
+
+
+def _project_row_title_and_duty(span: str) -> tuple[str, str]:
+    """Return (title+overview, duty) from an owned PPTX project span.
+
+    Preferred shape: ``프로젝트명 | 사업개요 | YYYY.MM~YYYY.MM | 담당업무 | 고객사``.
+    Falls back to pre/post period text when pipes are absent.
     """
     text = (span or "").strip()
     if not text:
-        return ""
-    match = _PROJECT_FULL_RANGE_RE.search(text)
+        return "", ""
+    if "|" in text:
+        parts = [p.strip() for p in text.split("|")]
+        period_idxs = [
+            i
+            for i, part in enumerate(parts)
+            if _PROJECT_FULL_RANGE_RE.search(part)
+            or (
+                _PROJECT_ROW_RANGE_MARK_RE.search(part)
+                and _LINE_DATE_YM_RE.search(part)
+            )
+        ]
+        if len(period_idxs) == 1:
+            idx = period_idxs[0]
+            head = " | ".join(p for p in parts[:idx] if p).strip()
+            duty = parts[idx + 1].strip() if idx + 1 < len(parts) else ""
+            return head, duty
+    pre, _period, post = _split_project_owned_span(text)
+    return pre, post
+
+
+def _project_row_supports_semantic_exp(code: str, span: str) -> bool:
+    """PROJECT EXP support from title/overview + duty within one owned row.
+
+    - Full phrase evidence in the duty column alone still counts (legacy rows).
+    - Distinctive title/overview phrases require a corroborating duty token
+      (e.g. 정보시스템1군 운영 + 담당업무 운영). Title-alone never counts.
+    """
+    head, duty = _project_row_title_and_duty(span)
+    if _quote_supports_semantic_project_exp(code, duty):
+        return True
+    patterns = _PROJECT_EXP_SEMANTIC_PATTERNS.get(code)
+    if not patterns or not head:
+        return False
+    for _strength, phrase, companions in patterns:
+        if not _text_has_semantic_phrase(head, phrase):
+            continue
+        if companions:
+            # Companion may sit in overview (head) or duty (e.g. 구축).
+            if not any(req in head or req in duty for req in companions):
+                continue
+        if _text_has_semantic_phrase(duty, phrase):
+            return True
+        corr = _PROJECT_TITLE_PHRASE_DUTY_TOKENS.get(phrase)
+        if corr and any(tok in duty for tok in corr):
+            return True
+        # Companion-only corroboration for phrases like 정보보호 강화 + 구축.
+        if companions and any(req in duty for req in companions):
+            return True
+    return False
+
+
+def _extract_project_row_semantic_exp_quote(code: str, span: str) -> str | None:
+    """Actual source substring supporting PROJECT EXP within an owned row."""
+    if not _project_row_supports_semantic_exp(code, span):
+        return None
+    head, duty = _project_row_title_and_duty(span)
+    # Prefer duty-local quote when the duty column itself supports the code.
+    if _quote_supports_semantic_project_exp(code, duty):
+        quote = _extract_semantic_project_exp_quote(code, duty)
+        if quote:
+            return quote
+    # Title/overview phrase (with duty corroboration already validated).
+    quote = _extract_semantic_project_exp_quote(code, head)
+    if quote:
+        return quote
+    # Fallback: shortest supporting span across the owned row text.
+    return _extract_semantic_project_exp_quote(code, span)
+
+
+def _project_row_supports_semantic_job(code: str, span: str) -> bool:
+    """PROJECT JOB support using owned-row title/overview + duty rules."""
+    exp_alias = _JOB_SEMANTIC_EXP_ALIAS.get(code)
+    if exp_alias is not None:
+        return _project_row_supports_semantic_exp(exp_alias, span)
+    pattern = _JOB_LITERAL_TOKEN_PATTERNS.get(code)
+    if pattern is None:
+        return False
+    _head, duty = _project_row_title_and_duty(span)
+    # PM/PL/TA literals must appear in the duty column, not only a title.
+    return bool(duty and pattern.search(duty))
+
+
+def _extract_project_row_semantic_job_quote(code: str, span: str) -> str | None:
+    if not _project_row_supports_semantic_job(code, span):
+        return None
+    exp_alias = _JOB_SEMANTIC_EXP_ALIAS.get(code)
+    if exp_alias is not None:
+        return _extract_project_row_semantic_exp_quote(exp_alias, span)
+    pattern = _JOB_LITERAL_TOKEN_PATTERNS.get(code)
+    if pattern is None:
+        return None
+    _head, duty = _project_row_title_and_duty(span)
+    match = pattern.search(duty or "")
     if match is None:
-        return text
-    after = text[match.end() :].strip()
-    return after
+        return None
+    return duty[match.start() : match.end()]
 
 
 def _find_unique_semantic_project_exp_ref(
@@ -2564,16 +2681,14 @@ def _find_unique_semantic_project_exp_ref(
         page_texts=page_texts,
         allowed_documents=allowed_documents,
         sibling_names=sibling_names,
-        line_predicate=lambda span: _quote_supports_semantic_project_exp(
-            code, _project_duty_evidence_text(span)
+        line_predicate=lambda span: _project_row_supports_semantic_exp(
+            code, span
         ),
     )
     if row is None:
         return None
     doc_id, page_no, span = row
-    quote = _extract_semantic_project_exp_quote(
-        code, _project_duty_evidence_text(span)
-    )
+    quote = _extract_project_row_semantic_exp_quote(code, span)
     if not quote:
         return None
     return SourceRef(document_id=doc_id, page_no=page_no, quote_text=quote)
@@ -2621,16 +2736,14 @@ def _find_unique_semantic_project_job_ref(
         page_texts=page_texts,
         allowed_documents=allowed_documents,
         sibling_names=sibling_names,
-        line_predicate=lambda span: _quote_supports_semantic_project_job(
-            code, _project_duty_evidence_text(span)
+        line_predicate=lambda span: _project_row_supports_semantic_job(
+            code, span
         ),
     )
     if row is None:
         return None
     doc_id, page_no, span = row
-    quote = _extract_semantic_project_job_quote(
-        code, _project_duty_evidence_text(span)
-    )
+    quote = _extract_project_row_semantic_job_quote(code, span)
     if not quote:
         return None
     return SourceRef(document_id=doc_id, page_no=page_no, quote_text=quote)
