@@ -84,6 +84,7 @@ from app.modules.analysis.compact_v8 import (
     merge_project_chunk_candidates,
     repair_whitespace_project_evidence,
     supplement_projects_from_second_pass,
+    supplement_semantic_project_relations_from_source,
 )
 from app.modules.analysis.diff_engine import DiffSpec, build_diffs
 from app.modules.analysis.normalize import normalize_candidate
@@ -1767,6 +1768,11 @@ class AnalysisService:
             )
             # Snapshot after normalize/backfill, before strict quote filter.
             pre_strict = doc
+            # Enhanced PROJECT patterns / owned-span / title+duty stay opt-in
+            # behind the same flag as relation supplement (v20 default False).
+            enhanced_project_relation_semantics = bool(
+                prompt.supplement_semantic_project_relations_from_source
+            )
             # v20: repair known PROJECT EXP refs from a unique semantic
             # project-row span before strict/semantic drop filters.
             if prompt.backfill_semantic_project_exp_evidence:
@@ -1774,6 +1780,9 @@ class AnalysisService:
                     doc,
                     page_texts=page_texts,
                     allowed_documents=allowed_documents,
+                    enhanced_project_relation_semantics=(
+                        enhanced_project_relation_semantics
+                    ),
                 )
             # v20: repair PROJECT BIZ relation provenance from unique project
             # source rows (codes unchanged; no reclassification).
@@ -1782,6 +1791,9 @@ class AnalysisService:
                     doc,
                     page_texts=page_texts,
                     allowed_documents=allowed_documents,
+                    enhanced_project_relation_semantics=(
+                        enhanced_project_relation_semantics
+                    ),
                 )
             # v20: reclassify unsupported PROJECT PM/PL → JOB-OPS-SYS when a
             # unique same-project row has strong OPS semantic evidence.
@@ -1792,6 +1804,9 @@ class AnalysisService:
                         doc,
                         page_texts=page_texts,
                         allowed_documents=allowed_documents,
+                        enhanced_project_relation_semantics=(
+                            enhanced_project_relation_semantics
+                        ),
                     )
                 )
             # v20: reclassify unsupported PROJECT JOB-MGT → JOB-OPS-SYS when a
@@ -1803,6 +1818,9 @@ class AnalysisService:
                         doc,
                         page_texts=page_texts,
                         allowed_documents=allowed_documents,
+                        enhanced_project_relation_semantics=(
+                            enhanced_project_relation_semantics
+                        ),
                     )
                 )
             # v20: repair known PROJECT JOB refs from unique semantic
@@ -1815,12 +1833,23 @@ class AnalysisService:
                     doc,
                     page_texts=page_texts,
                     allowed_documents=allowed_documents,
+                    enhanced_project_relation_semantics=(
+                        enhanced_project_relation_semantics
+                    ),
                 )
             job_semantic_backfilled_refs = max(
                 0,
                 count_project_jobs_with_quote_evidence(doc)
                 - jobs_with_quote_before_job_backfill,
             )
+            # Append missing PROJECT JOB/EXP when unique same-project semantic
+            # evidence exists (does not overwrite existing relations).
+            if prompt.supplement_semantic_project_relations_from_source:
+                doc = supplement_semantic_project_relations_from_source(
+                    doc,
+                    page_texts=page_texts,
+                    allowed_documents=allowed_documents,
+                )
             pre_strict_job_codes = count_project_job_code_distribution(doc)
             # v10+: after normalize may clear quotes / drop invalid refs, re-check
             # that projects and j/t/x still have non-empty quote_text evidence.
@@ -1828,11 +1857,21 @@ class AnalysisService:
                 doc = apply_normalized_quote_evidence(doc)
             # v20: JOB-MGT / OPS-SYS / TA need supporting semantic/literal quotes.
             if prompt.require_semantic_project_job_evidence:
-                doc = drop_project_jobs_without_semantic_evidence(doc)
+                doc = drop_project_jobs_without_semantic_evidence(
+                    doc,
+                    enhanced_project_relation_semantics=(
+                        enhanced_project_relation_semantics
+                    ),
+                )
             # v20: known PROJECT EXP codes need quote phrases that actually
             # support the EXP (e.g. 업무분석 ≠ EXP-INFRA).
             if prompt.require_semantic_project_exp_evidence:
-                doc = drop_project_expertise_without_semantic_evidence(doc)
+                doc = drop_project_expertise_without_semantic_evidence(
+                    doc,
+                    enhanced_project_relation_semantics=(
+                        enhanced_project_relation_semantics
+                    ),
+                )
             # v20: JOB-MGT-PM/PL need literal PM/PL tokens in quote_text, not
             # merely any non-empty quote (e.g. "부장" / "사업관리" alone).
             if prompt.require_literal_pm_pl_project_job_evidence:

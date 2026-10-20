@@ -80,6 +80,7 @@ class ProfilePromptSpec:
     backfill_semantic_core_job_evidence: bool = False
     require_semantic_core_job_evidence: bool = False
     supplement_semantic_core_exp_from_source: bool = False
+    supplement_semantic_project_relations_from_source: bool = False
 
 
 def _spec_from_module(module) -> ProfilePromptSpec:
@@ -187,6 +188,11 @@ def _spec_from_staged_module(module) -> ProfilePromptSpec:
         ),
         supplement_semantic_core_exp_from_source=bool(
             getattr(module, "SUPPLEMENT_SEMANTIC_CORE_EXP_FROM_SOURCE", False)
+        ),
+        supplement_semantic_project_relations_from_source=bool(
+            getattr(
+                module, "SUPPLEMENT_SEMANTIC_PROJECT_RELATIONS_FROM_SOURCE", False
+            )
         ),
     )
 
