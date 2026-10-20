@@ -80,12 +80,17 @@ def _run_supplement(projects, page_texts):
     out = supplement_semantic_project_relations_from_source(
         candidate, page_texts=page_texts, allowed_documents=allowed
     )
-    out = drop_project_jobs_without_semantic_evidence(out)
-    out = drop_project_expertise_without_semantic_evidence(out)
+    # Supplement always uses enhanced semantics; guards must match.
+    out = drop_project_jobs_without_semantic_evidence(
+        out, enhanced_project_relation_semantics=True
+    )
+    out = drop_project_expertise_without_semantic_evidence(
+        out, enhanced_project_relation_semantics=True
+    )
     return drop_project_jobs_without_literal_pm_pl_evidence(out)
 
 
-def _run_backfill(projects, page_texts):
+def _run_backfill(projects, page_texts, *, enhanced: bool = False):
     from app.ai.schemas.profile_candidate import (
         AnalysisMetaCandidate,
         ProfileCandidate,
@@ -109,13 +114,23 @@ def _run_backfill(projects, page_texts):
     )
     allowed = {_DOC: {page for (_d, page) in page_texts}}
     out = backfill_semantic_project_expertise_evidence(
-        candidate, page_texts=page_texts, allowed_documents=allowed
+        candidate,
+        page_texts=page_texts,
+        allowed_documents=allowed,
+        enhanced_project_relation_semantics=enhanced,
     )
     out = backfill_semantic_project_job_evidence(
-        out, page_texts=page_texts, allowed_documents=allowed
+        out,
+        page_texts=page_texts,
+        allowed_documents=allowed,
+        enhanced_project_relation_semantics=enhanced,
     )
-    out = drop_project_jobs_without_semantic_evidence(out)
-    out = drop_project_expertise_without_semantic_evidence(out)
+    out = drop_project_jobs_without_semantic_evidence(
+        out, enhanced_project_relation_semantics=enhanced
+    )
+    out = drop_project_expertise_without_semantic_evidence(
+        out, enhanced_project_relation_semantics=enhanced
+    )
     return drop_project_jobs_without_literal_pm_pl_evidence(out)
 
 
@@ -151,6 +166,13 @@ def test_core_exp_patterns_do_not_include_project_only_phrases() -> None:
     assert (
         _quote_supports_semantic_project_exp("EXP-INFRA", "정보시스템1군 운영")
         is True
+    )
+    # CORE keeps simple substring match (보안시스템 운영 still hits 시스템 운영).
+    assert _quote_supports_semantic_exp("EXP-INFRA", "정보보안시스템 운영") is True
+    # PROJECT-enhanced rejects INFRA for *보안시스템 운영 tails.
+    assert (
+        _quote_supports_semantic_project_exp("EXP-INFRA", "정보보안시스템 운영")
+        is False
     )
     assert _quote_supports_semantic_exp("EXP-SEC-OPS", "정보보안시스템 운영") is False
     assert (
@@ -192,9 +214,9 @@ _GANGSANGWON_LIVE_ROWS = (
     "2022년 국가정보자원 관리원 광주센터 정보시스템1군 운영 | 운영 | "
     "2022.01~2023.01 | 운영 | 국가정보자원 관리원(광주) "
     "2019년 국가정보자원 관리원 광주센터 정보시스템1군 운영 | 운영 | "
-    "2019.01~2020.01 | 운영 | 국가정보자원 관리원(광주) "
+    "2019.01~2021.12 | 운영 | 국가정보자원 관리원(광주) "
     "2018년 국가정보자원 관리원 광주센터 정보시스템1군 운영 | 운영 | "
-    "2018.01~2019.01 | 운영 | 국가정보자원 관리원(광주) "
+    "2018.01~2018.12 | 운영 | 국가정보자원 관리원(광주) "
     "광주통합전산센터 2015년 정보보호 강화(HW) | 구축 | "
     "2015.07~2015.12 | 구축, 사업관리 | 국가정보자원 관리원(광주) "
     "현대/기아자동차 정보보안시스템 운영 | 운영 | "
@@ -218,7 +240,7 @@ def _gangsangwon_live_projects(*, with_bad_quotes: bool):
             name="2019년 국가정보자원 관리원 광주센터 정보시스템1군 운영",
             customer="국가정보자원 관리원(광주)",
             start="2019.01",
-            end="2020.01",
+            end="2021.12",
             jobs=[("JOB-OPS-SYS", bad)] if with_bad_quotes else None,
             expertise=[("EXP-INFRA", bad)] if with_bad_quotes else None,
         ),
@@ -226,7 +248,7 @@ def _gangsangwon_live_projects(*, with_bad_quotes: bool):
             name="2018년 국가정보자원 관리원 광주센터 정보시스템1군 운영",
             customer="국가정보자원 관리원(광주)",
             start="2018.01",
-            end="2019.01",
+            end="2018.12",
             jobs=[("JOB-OPS-SYS", bad)] if with_bad_quotes else None,
             expertise=[("EXP-INFRA", bad)] if with_bad_quotes else None,
         ),
@@ -257,7 +279,9 @@ def test_gangsangwon_live_pptx_title_duty_backfill() -> None:
     """Exact live rows: title phrase + duty token recovers PROJECT JOB/EXP."""
     page_texts = {(_DOC, 1): _GANGSANGWON_LIVE_ROWS}
     out = _run_backfill(
-        _gangsangwon_live_projects(with_bad_quotes=True), page_texts
+        _gangsangwon_live_projects(with_bad_quotes=True),
+        page_texts,
+        enhanced=True,
     )
 
     for idx in (0, 1, 2):
@@ -346,23 +370,88 @@ def test_title_phrase_without_duty_corroboration_no_relation() -> None:
             )
         ],
         page_texts,
+        enhanced=True,
     )
     assert repaired.projects[0].jobs == []
     assert repaired.projects[0].expertise == []
 
 
-def test_backfill_only_path_preserves_duty_local_v20_behavior() -> None:
-    """Supplement off: duty-local phrases still backfill via shared find_unique."""
+def test_flag_off_keeps_v20_baseline_without_project_only_recovery() -> None:
+    """SUPPLEMENT=False: PROJECT-only phrases / title+duty stay inactive.
+
+    CORE whole-line matching may still hit weak ``시스템 운영`` inside
+    ``정보시스템1군 운영``; that is intentional baseline behavior. Assert that
+    PROJECT-only quotes/codes (정보시스템1군 / 정보보호 강화 / 정보보안시스템)
+    are not used.
+    """
+    page_texts = {(_DOC, 1): _GANGSANGWON_LIVE_ROWS}
+    out = _run_backfill(
+        _gangsangwon_live_projects(with_bad_quotes=True),
+        page_texts,
+        enhanced=False,
+    )
+    for idx in (0, 1, 2):
+        for rel in list(out.projects[idx].jobs) + list(out.projects[idx].expertise):
+            quote = (rel.source_refs[0].quote_text or "") if rel.source_refs else ""
+            assert "정보시스템1군" not in quote
+    # 정보보호 강화(+구축) is PROJECT-only; CORE has no SEC-BUILD recovery here.
+    assert "EXP-SEC-BUILD" not in {x.code for x in out.projects[3].expertise}
+    for rel in out.projects[3].expertise:
+        quote = (rel.source_refs[0].quote_text or "") if rel.source_refs else ""
+        assert "정보보호 강화" not in quote
+    # 정보보안시스템 운영 is PROJECT-only SEC-OPS.
+    assert "EXP-SEC-OPS" not in {x.code for x in out.projects[4].expertise}
+    for rel in out.projects[4].expertise:
+        quote = (rel.source_refs[0].quote_text or "") if rel.source_refs else ""
+        assert "정보보안시스템" not in quote
+
+
+def test_flag_off_no_title_duty_sec_build_on_single_row() -> None:
+    """Title 정보보호 강화 + duty 구축 must not recover SEC-BUILD when flag off."""
     page_texts = {
         (_DOC, 1): (
-            "정보시스템1군 운영사업 | 개요 | 2017.03~2017.12 | "
-            "정보시스템1군 운영 | 행정안전부"
+            "광주통합전산센터 2015년 정보보호 강화(HW) | 구축 | "
+            "2015.07~2015.12 | 구축, 사업관리 | 국가정보자원 관리원(광주)"
+        )
+    }
+    projects = [
+        _project(
+            name="광주통합전산센터 2015년 정보보호 강화(HW)",
+            customer="국가정보자원 관리원(광주)",
+            start="2015.07",
+            end="2015.12",
+            jobs=[("JOB-MGT", "업무분석")],
+            expertise=[
+                ("EXP-MGT", "업무분석"),
+                ("EXP-SEC-BUILD", "업무분석"),
+            ],
+        )
+    ]
+    off = _run_backfill(projects, page_texts, enhanced=False)
+    assert "EXP-SEC-BUILD" not in {x.code for x in off.projects[0].expertise}
+    # CORE still repairs 사업관리.
+    assert {j.code for j in off.projects[0].jobs} == {"JOB-MGT"}
+    assert {x.code for x in off.projects[0].expertise} == {"EXP-MGT"}
+
+    on = _run_backfill(projects, page_texts, enhanced=True)
+    assert {x.code for x in on.projects[0].expertise} == {
+        "EXP-MGT",
+        "EXP-SEC-BUILD",
+    }
+
+
+def test_flag_off_core_duty_local_backfill_still_works() -> None:
+    """Supplement off: CORE duty-local phrases still backfill on whole lines."""
+    page_texts = {
+        (_DOC, 1): (
+            "정보시스템 운영사업 | 개요 | 2017.03~2017.12 | "
+            "정보시스템 운영 | 행정안전부"
         )
     }
     out = _run_backfill(
         [
             _project(
-                name="정보시스템1군 운영사업",
+                name="정보시스템 운영사업",
                 customer="행정안전부",
                 start="2017.03",
                 end="2017.12",
@@ -371,14 +460,13 @@ def test_backfill_only_path_preserves_duty_local_v20_behavior() -> None:
             )
         ],
         page_texts,
+        enhanced=False,
     )
     assert {j.code for j in out.projects[0].jobs} == {"JOB-OPS-SYS"}
     assert {x.code for x in out.projects[0].expertise} == {"EXP-INFRA"}
-    assert out.projects[0].jobs[0].source_refs[0].quote_text == (
-        "정보시스템1군 운영"
-    )
+    assert out.projects[0].jobs[0].source_refs[0].quote_text == "정보시스템 운영"
     assert out.projects[0].expertise[0].source_refs[0].quote_text == (
-        "정보시스템1군 운영"
+        "정보시스템 운영"
     )
 
 
@@ -389,7 +477,7 @@ def test_bad_existing_exp_quote_repaired_or_dropped() -> None:
             "정보시스템1군 운영 | 행정안전부"
         )
     }
-    # Wrong quote on existing EXP → repaired via backfill.
+    # Wrong quote on existing EXP → repaired via enhanced backfill.
     repaired = _run_backfill(
         [
             _project(
@@ -401,6 +489,7 @@ def test_bad_existing_exp_quote_repaired_or_dropped() -> None:
             )
         ],
         page_texts,
+        enhanced=True,
     )
     assert len(repaired.projects[0].expertise) == 1
     assert repaired.projects[0].expertise[0].code == "EXP-INFRA"
@@ -420,6 +509,7 @@ def test_bad_existing_exp_quote_repaired_or_dropped() -> None:
             )
         ],
         {(_DOC, 1): "정보시스템1군 운영사업 | 개요 | 2017.03~2017.12 | 유지관리 | 행정안전부"},
+        enhanced=True,
     )
     assert dropped.projects[0].expertise == []
 

@@ -68,6 +68,8 @@ REQUIRE_SEMANTIC_PROJECT_JOB_EVIDENCE = True
 RECOVER_PROJECT_RECALL_SECOND_PASS = True
 BACKFILL_LITERAL_CORE_TECH_FROM_SOURCE = True
 # Opt-in only: keep v20 extraction contract unchanged until v21 integration.
+# When True, also enables enhanced PROJECT patterns / owned-span row matching /
+# title+duty JOB·EXP adjudication for backfill + semantic guards.
 SUPPLEMENT_SEMANTIC_PROJECT_RELATIONS_FROM_SOURCE = False
 
 CORE_SCHEMA_GUIDE = """
