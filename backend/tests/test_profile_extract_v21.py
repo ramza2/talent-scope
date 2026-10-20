@@ -316,6 +316,37 @@ def test_existing_unsupported_root_job_quote_still_dropped() -> None:
     assert out.jobs == []
 
 
+def test_unrelated_root_job_taxonomy_preserved() -> None:
+    """v21 guard must not drop unrelated catalog root JOBs."""
+    preserved = [
+        "JOB-DATA-DBA",
+        "JOB-DEV-BE",
+        "JOB-AI-LLM",
+        "JOB-SYS-SE",
+        "JOB-SEC-ENG",
+        "JOB-OPS-APP",
+        "JOB-QA-ENG",
+    ]
+    forbidden = [
+        "JOB-ARC-AA",
+        "JOB-ARC-SA",
+        "JOB-ARC-TA",
+        "JOB-MGT-PMO",
+        "JOB-MGT",
+    ]
+    doc = _core_doc(
+        jobs=[{"code": c} for c in preserved + forbidden],
+        expertise=[],
+    )
+    out = _apply_v21_core_guards(
+        doc,
+        page_texts={(_DOC, 1): "관련 없는 텍스트"},
+        allowed_documents={_DOC: {1}},
+    )
+    assert {j.code for j in out.jobs} == set(preserved)
+    assert not ({j.code for j in out.jobs} & set(forbidden))
+
+
 def test_v20_core_job_helpers_not_applied_when_flags_false() -> None:
     """v20 path leaves FP root jobs when v21 flags are off."""
     from app.modules.analysis.compact_v8 import (

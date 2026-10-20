@@ -1280,9 +1280,18 @@ def backfill_semantic_core_expertise_evidence(
     return candidate.model_copy(update={"expertise": new_expertise})
 
 
-# v21 CORE/root JOB evidence: only OPS-SYS / PM / PL may remain at root.
-_CORE_JOB_EVIDENCE_CODES = frozenset(
+# v21 targeted CORE/root JOB guards (other catalog JOB categories preserved).
+_CORE_JOB_EVIDENCE_REQUIRED_CODES = frozenset(
     {"JOB-OPS-SYS", "JOB-MGT-PM", "JOB-MGT-PL"}
+)
+_CORE_JOB_ROOT_FORBIDDEN_CODES = frozenset(
+    {
+        "JOB-MGT",
+        "JOB-MGT-PMO",
+        "JOB-ARC-AA",
+        "JOB-ARC-SA",
+        "JOB-ARC-TA",
+    }
 )
 _CORE_EXP_SUPPLEMENT_CODES: tuple[str, ...] = (
     "EXP-INFRA",
@@ -1454,7 +1463,7 @@ def backfill_semantic_core_job_evidence(
             new_jobs.append(job)
             continue
         code = (job.code or "").strip()
-        if code not in _CORE_JOB_EVIDENCE_CODES:
+        if code not in _CORE_JOB_EVIDENCE_REQUIRED_CODES:
             new_jobs.append(job)
             continue
         match = _semantic_core_job_page_match(
@@ -1475,12 +1484,12 @@ def backfill_semantic_core_job_evidence(
 def drop_root_jobs_without_semantic_evidence(
     candidate: ProfileCandidateDocument,
 ) -> ProfileCandidateDocument:
-    """v21: drop coded root JOBs lacking quote evidence for supported codes.
+    """v21: targeted root JOB fail-closed guard (not whole-taxonomy).
 
-    Keeps only JOB-OPS-SYS / JOB-MGT-PM / JOB-MGT-PL when at least one
-    source_ref quote supports that code. TA/SA/AA/PMO/generic MGT and other
-    coded root jobs are removed. Project jobs are never touched. Uncoded
-    root jobs are left unchanged.
+    - Forbidden project-role codes (MGT/PMO/AA/SA/TA) → drop at root
+    - Evidence-required (OPS-SYS/PM/PL) → drop when no supporting quote
+    - All other coded root JOBs → preserve unchanged
+    Project jobs are never touched. Uncoded root jobs are left unchanged.
     """
     changed = False
     kept: list[JobCandidate] = []
@@ -1489,16 +1498,19 @@ def drop_root_jobs_without_semantic_evidence(
         if not code:
             kept.append(job)
             continue
-        if code not in _CORE_JOB_EVIDENCE_CODES:
+        if code in _CORE_JOB_ROOT_FORBIDDEN_CODES:
             changed = True
             continue
-        if any(
-            _quote_supports_semantic_core_job(code, ref.quote_text or "")
-            for ref in (job.source_refs or [])
-        ):
-            kept.append(job)
+        if code in _CORE_JOB_EVIDENCE_REQUIRED_CODES:
+            if any(
+                _quote_supports_semantic_core_job(code, ref.quote_text or "")
+                for ref in (job.source_refs or [])
+            ):
+                kept.append(job)
+            else:
+                changed = True
             continue
-        changed = True
+        kept.append(job)
     if not changed:
         return candidate
     return candidate.model_copy(update={"jobs": kept})
