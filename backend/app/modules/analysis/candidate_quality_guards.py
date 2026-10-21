@@ -53,6 +53,8 @@ def _no_independent_project_details(project: ProjectCandidate) -> bool:
 
 def apply_candidate_quality_guards(
     candidate: ProfileCandidateDocument,
+    *,
+    confirmed_person_name: str | None = None,
 ) -> ProfileCandidateDocument:
     """Drop unambiguous field leakage and header/customer-only pseudo-projects.
 
@@ -84,11 +86,11 @@ def apply_candidate_quality_guards(
         }
         profile = profile.model_copy(update=updates)
 
-    person_key = (
-        person_name_match_key(profile.name)
-        if is_korean_person_name(profile.name)
-        else None
-    )
+    person_keys = {
+        person_name_match_key(name)
+        for name in (profile.name, confirmed_person_name)
+        if is_korean_person_name(name)
+    }
     customer_keys = {
         key
         for project in candidate.projects
@@ -99,9 +101,9 @@ def apply_candidate_quality_guards(
         name = project.project_name
         # Person's own name is a document/header identity, not a project.
         if (
-            person_key
+            person_keys
             and is_korean_person_name(name)
-            and person_name_match_key(name) == person_key
+            and person_name_match_key(name) in person_keys
         ):
             continue
 
