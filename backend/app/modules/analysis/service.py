@@ -87,6 +87,7 @@ from app.modules.analysis.compact_v8 import (
     supplement_projects_from_second_pass,
     supplement_semantic_project_relations_from_source,
 )
+from app.modules.analysis.candidate_quality_guards import apply_candidate_quality_guards
 from app.modules.analysis.diff_engine import DiffSpec, build_diffs
 from app.modules.analysis.normalize import normalize_candidate
 from app.modules.analysis.repository import AnalysisRepository
@@ -907,6 +908,27 @@ class AnalysisService:
                     self.db.commit()
                 return "FAILED"
 
+            # Post-merge quality guard for staged and single-pass extraction.
+            # Confirmed name is read-only and helps identify header-only projects
+            # even when CORE omitted the person's name.
+            base_profile = base_snap.get("profile") if isinstance(base_snap, dict) else None
+            confirmed_name = (
+                base_profile.get("name") if isinstance(base_profile, dict) else None
+            )
+            original_candidate = candidate
+            candidate = apply_candidate_quality_guards(
+                candidate, confirmed_person_name=confirmed_name
+            )
+            logger.info(
+                "analysis candidate field guards run_id=%s "
+                "email_cleared=%s employment_type_cleared=%s projects_dropped=%s",
+                run_id,
+                original_candidate.profile.email is not None
+                and candidate.profile.email is None,
+                original_candidate.profile.employment_type is not None
+                and candidate.profile.employment_type is None,
+                len(original_candidate.projects) - len(candidate.projects),
+            )
             specs = build_diffs(candidate, base_snap)
             return self._persist_reviewing(
                 run_id,
