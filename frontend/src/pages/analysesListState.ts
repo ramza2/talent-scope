@@ -73,9 +73,9 @@ export function toAnalysesListSearchParams(
   filters: AnalysesListFilters,
 ): URLSearchParams {
   const params = new URLSearchParams()
-  if (filters.status) {
-    params.set('status', filters.status)
-  }
+  // Always emit status so ``status=`` (all) is distinct from a missing
+  // param (page defaults, e.g. REVIEWING on ``/analyses``).
+  params.set('status', filters.status)
   params.set('page', String(filters.page))
   params.set('page_size', String(filters.page_size))
   return params
