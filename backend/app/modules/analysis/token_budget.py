@@ -173,18 +173,17 @@ def split_page_block_text(
     return [f"{header}{page_marker}{piece}" for piece in pieces]
 
 
-def plan_project_source_chunks(
+def plan_phase_source_chunks(
     document_blocks: str,
     *,
     budget_for_blocks,
 ) -> list[str]:
-    """Plan PROJECT chunks down to document/page level only.
+    """Plan CORE/PROJECT chunks down to document/page level only.
 
     ``budget_for_blocks(blocks) -> PromptChatBudget`` must use /v1/token-count
     for fit. Over-budget pages are returned as-is so the extract path can
-    deepen body subchunks under ``analysis_project_split_max_depth`` /
-    ``analysis_project_split_max_calls`` — the planner must not recursively
-    fan out unbounded token-count calls.
+    deepen body subchunks under phase split depth/call caps — the planner
+    must not recursively fan out unbounded token-count calls.
     """
     root_budget = budget_for_blocks(document_blocks)
     if root_budget.fits:
@@ -204,3 +203,7 @@ def plan_project_source_chunks(
         # Page is the planner leaf; body deepening is extract-bounded.
         chunks.extend(page_chunks)
     return chunks or [document_blocks]
+
+
+# Backward-compatible alias used by the PROJECT adaptive path.
+plan_project_source_chunks = plan_phase_source_chunks

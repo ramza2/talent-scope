@@ -81,6 +81,7 @@ from app.modules.analysis.compact_v8 import (
     is_valid_compact_projects_root,
     project_relation_diagnostic_counts,
     promote_exact_root_catalog_codes,
+    merge_core_chunk_candidates,
     merge_project_chunk_candidates,
     repair_whitespace_project_evidence,
     supplement_literal_project_tech_from_source,
@@ -94,6 +95,7 @@ from app.modules.analysis.repository import AnalysisRepository
 from app.modules.analysis.token_budget import (
     PromptChatBudget,
     compute_prompt_chat_budget,
+    plan_phase_source_chunks,
     plan_project_source_chunks,
     split_block_by_pages,
     split_document_blocks,
@@ -164,6 +166,10 @@ class InsufficientCandidateError(Exception):
 
 class ProjectPromptOverBudgetError(AIProviderError):
     """PROJECT prompt exceeds verified token budget (eligible for adaptive split)."""
+
+
+class CorePromptOverBudgetError(AIProviderError):
+    """CORE prompt exceeds verified token budget (eligible for adaptive split)."""
 
 
 _RAW_TOP_LEVEL_KEYS_LOG_LIMIT = 30
@@ -1329,8 +1335,10 @@ class AnalysisService:
         call_count = 0
         recovery_budget = 1
         project_split_calls = 0
+        core_split_calls = 0
         token_count_calls = 0
         used_project_adaptive_split = False
+        used_core_adaptive_split = False
         capabilities: ModelCapabilities | None = None
         last_token_count: TokenCountResult | None = None
 
@@ -1456,11 +1464,12 @@ class AnalysisService:
             max_completion_tokens: int | None = None,
             count_toward_staged_budget: bool = True,
             count_toward_project_split: bool = False,
+            count_toward_core_split: bool = False,
             split_depth: int = 0,
             chunk_index: int | None = None,
             precounted_budget: PromptChatBudget | None = None,
         ) -> dict[str, Any]:
-            nonlocal call_count, project_split_calls, last_token_count
+            nonlocal call_count, project_split_calls, core_split_calls, last_token_count
             if count_toward_staged_budget and call_count >= 3:
                 raise AIProviderError("staged extraction exceeded LLM call budget")
             if count_toward_project_split:
@@ -1471,6 +1480,14 @@ class AnalysisService:
                         "project adaptive split exceeded LLM call budget"
                     )
                 project_split_calls += 1
+            if count_toward_core_split:
+                if core_split_calls >= int(
+                    self.settings.analysis_core_split_max_calls
+                ):
+                    raise AIProviderError(
+                        "core adaptive split exceeded LLM call budget"
+                    )
+                core_split_calls += 1
             if count_toward_staged_budget:
                 call_count += 1
             blocks_for_prompt = (
@@ -1502,6 +1519,23 @@ class AnalysisService:
                 if not budget.fits:
                     raise ProjectPromptOverBudgetError(
                         "project prompt exceeds token budget before chat"
+                    )
+                max_completion_tokens = budget.max_completion_tokens
+            elif phase == "core":
+                _refresh_capabilities(reason="core_pre_chat")
+                last_token_count = None
+                budget = _count_prompt_budget(
+                    phase=phase,
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    output_reserve_ratio=self.settings.analysis_core_output_ratio,
+                    split_depth=split_depth,
+                    chunk_index=chunk_index,
+                    force_recount=True,
+                )
+                if not budget.fits:
+                    raise CorePromptOverBudgetError(
+                        "core prompt exceeds token budget before chat"
                     )
                 max_completion_tokens = budget.max_completion_tokens
 
@@ -2051,22 +2085,289 @@ class AnalysisService:
                 return False
             return _documents_are_rich_profile_type(documents)
 
-        # CORE: keep historical complete_json (no explicit completion cap).
-        # PROJECT-only exact token-count budgeting applies below.
-        core = _run_phase(
-            phase="core",
-            system_prompt=prompt.core_system_prompt,
-            build_user_prompt=prompt.build_core_user_prompt,
-            code_catalog_text=core_catalog,
-            normalize_raw=_normalize_core,
-            needs_retry=_core_needs_retry,
-            fail_closed_if_bad=True,
-        )
+        def _subsplit_phase_chunk(blocks: str) -> list[str]:
+            docs = split_document_blocks(blocks)
+            if len(docs) > 1:
+                return docs
+            pages = split_block_by_pages(blocks)
+            if len(pages) > 1:
+                return pages
+            return split_page_block_text(
+                blocks, max_body_chars=max(256, len(blocks) // 2)
+            )
+
+        def _core_budget_for_blocks(
+            blocks: str,
+            *,
+            recovery_retry: bool = False,
+            split_depth: int = 0,
+            chunk_index: int | None = None,
+            force_recount: bool = False,
+        ) -> PromptChatBudget:
+            user_prompt = prompt.build_core_user_prompt(
+                code_catalog=core_catalog,
+                document_blocks=blocks,
+                recovery_retry=recovery_retry,
+            )
+            return _count_prompt_budget(
+                phase="core",
+                system_prompt=prompt.core_system_prompt or "",
+                user_prompt=user_prompt,
+                output_reserve_ratio=self.settings.analysis_core_output_ratio,
+                split_depth=split_depth,
+                chunk_index=chunk_index,
+                force_recount=force_recount,
+            )
+
+        def _extract_core_chunk(
+            blocks: str,
+            *,
+            split_depth: int,
+            chunk_index: int,
+            recovery_retry: bool,
+        ) -> ProfileCandidateDocument:
+            """Extract one CORE chunk; shrink only on oversize/length."""
+            nonlocal last_token_count
+
+            def _shrink_and_retry(cause: Exception) -> ProfileCandidateDocument:
+                max_depth = int(self.settings.analysis_core_split_max_depth)
+                if split_depth >= max_depth:
+                    raise InsufficientCandidateError() from cause
+                parts = _subsplit_phase_chunk(blocks)
+                if len(parts) <= 1:
+                    raise InsufficientCandidateError() from cause
+                nested: list[ProfileCandidateDocument] = []
+                for sub_i, part in enumerate(parts):
+                    nested.append(
+                        _extract_core_chunk(
+                            part,
+                            split_depth=split_depth + 1,
+                            chunk_index=sub_i,
+                            recovery_retry=recovery_retry,
+                        )
+                    )
+                return merge_core_chunk_candidates(nested)
+
+            try:
+                budget = _core_budget_for_blocks(
+                    blocks,
+                    recovery_retry=recovery_retry,
+                    split_depth=split_depth,
+                    chunk_index=chunk_index,
+                    force_recount=True,
+                )
+            except AIProviderError as exc:
+                # Token-count 422/429/503/timeout/route-drift — not a size issue.
+                raise InsufficientCandidateError() from exc
+
+            if not budget.fits:
+                logger.info(
+                    "analysis core chunk over budget analysis_run_id=%s "
+                    "split_depth=%s chunk_index=%s prompt_tokens=%s "
+                    "context_window=%s",
+                    base_log.get("analysis_run_id"),
+                    split_depth,
+                    chunk_index,
+                    budget.prompt_tokens,
+                    budget.context_window,
+                )
+                return _shrink_and_retry(
+                    CorePromptOverBudgetError("core chunk exceeds token budget")
+                )
+
+            try:
+                raw = _phase_call(
+                    phase="core",
+                    system_prompt=prompt.core_system_prompt,
+                    build_user_prompt=prompt.build_core_user_prompt,
+                    code_catalog_text=core_catalog,
+                    recovery_retry=recovery_retry,
+                    document_blocks_override=blocks,
+                    count_toward_staged_budget=False,
+                    count_toward_core_split=True,
+                    split_depth=split_depth,
+                    chunk_index=chunk_index,
+                    precounted_budget=budget,
+                )
+                return _normalize_core(raw)
+            except AIResponseTruncatedError as trunc_exc:
+                last_token_count = None
+                logger.info(
+                    "analysis core chunk truncated analysis_run_id=%s "
+                    "split_depth=%s chunk_index=%s finish_reason=%s "
+                    "deployment_id=%s route_id=%s routing_version=%s "
+                    "context_window=%s",
+                    base_log.get("analysis_run_id"),
+                    split_depth,
+                    chunk_index,
+                    (trunc_exc.meta or {}).get("finish_reason"),
+                    budget.deployment_id,
+                    budget.route_id,
+                    budget.routing_version,
+                    budget.context_window,
+                )
+                return _shrink_and_retry(trunc_exc)
+            except CorePromptOverBudgetError as over_exc:
+                # count→chat race: recount observed over-budget → shrink.
+                last_token_count = None
+                return _shrink_and_retry(over_exc)
+            except AIProviderError as prov_exc:
+                # Generic timeout/5xx — fail closed, do not fan-out chunks.
+                last_token_count = None
+                raise InsufficientCandidateError() from prov_exc
+
+        def _run_core_split_path(
+            *,
+            root_budget: PromptChatBudget,
+            reason: str,
+            force_structural_split: bool = False,
+        ) -> ProfileCandidateDocument:
+            """Document/page(+bounded body) adaptive CORE path."""
+            nonlocal used_core_adaptive_split
+            used_core_adaptive_split = True
+            logger.info(
+                "analysis core adaptive split enter analysis_run_id=%s "
+                "reason=%s context_window=%s prompt_tokens=%s "
+                "force_structural_split=%s",
+                base_log.get("analysis_run_id"),
+                reason,
+                root_budget.context_window,
+                root_budget.prompt_tokens,
+                force_structural_split,
+            )
+            try:
+                planned = plan_phase_source_chunks(
+                    aliased_blocks,
+                    budget_for_blocks=lambda blocks: _core_budget_for_blocks(
+                        blocks, recovery_retry=False, force_recount=True
+                    ),
+                )
+            except AIProviderError as exc:
+                # Token-count outage while planning — fail closed, no fan-out.
+                raise InsufficientCandidateError() from exc
+            # length-driven escalate may still "fit" by token-count; force
+            # document/page partition so we do not re-chat the same full source.
+            if force_structural_split and len(planned) <= 1:
+                docs = split_document_blocks(aliased_blocks)
+                if len(docs) > 1:
+                    planned = docs
+                else:
+                    pages = split_block_by_pages(aliased_blocks)
+                    if len(pages) > 1:
+                        planned = pages
+            logger.info(
+                "analysis core adaptive split analysis_run_id=%s "
+                "chunk_count=%s context_window=%s prompt_tokens=%s "
+                "requested_output_tokens=%s",
+                base_log.get("analysis_run_id"),
+                len(planned),
+                root_budget.context_window,
+                root_budget.prompt_tokens,
+                root_budget.output_reserve_tokens,
+            )
+            chunk_docs: list[ProfileCandidateDocument] = []
+            for idx, chunk_blocks in enumerate(planned):
+                chunk_docs.append(
+                    _extract_core_chunk(
+                        chunk_blocks,
+                        split_depth=0,
+                        chunk_index=idx,
+                        recovery_retry=False,
+                    )
+                )
+            return merge_core_chunk_candidates(chunk_docs)
+
+        def _run_core_adaptive() -> ProfileCandidateDocument:
+            nonlocal used_core_adaptive_split, recovery_budget
+            _refresh_capabilities(reason="core_phase")
+            try:
+                root_budget = _core_budget_for_blocks(
+                    aliased_blocks, recovery_retry=False, force_recount=True
+                )
+            except AIProviderError as exc:
+                raise InsufficientCandidateError() from exc
+            # Budget-fit → try single CORE first pass. length / pre-chat
+            # over-budget escalate to adaptive split (no full-source recovery).
+            # Sparse/validation recovery semantics remain for non-length cases.
+            if root_budget.fits:
+                try:
+                    raw = _phase_call(
+                        phase="core",
+                        system_prompt=prompt.core_system_prompt,
+                        build_user_prompt=prompt.build_core_user_prompt,
+                        code_catalog_text=core_catalog,
+                        recovery_retry=False,
+                        max_completion_tokens=root_budget.max_completion_tokens,
+                    )
+                    candidate = _normalize_core(raw)
+                except AIResponseTruncatedError as trunc_exc:
+                    logger.info(
+                        "analysis core single-path truncated → adaptive "
+                        "analysis_run_id=%s finish_reason=%s",
+                        base_log.get("analysis_run_id"),
+                        (trunc_exc.meta or {}).get("finish_reason"),
+                    )
+                    return _run_core_split_path(
+                        root_budget=root_budget,
+                        reason="single_path_length",
+                        force_structural_split=True,
+                    )
+                except CorePromptOverBudgetError:
+                    logger.info(
+                        "analysis core single-path pre-chat over-budget → "
+                        "adaptive analysis_run_id=%s",
+                        base_log.get("analysis_run_id"),
+                    )
+                    return _run_core_split_path(
+                        root_budget=root_budget,
+                        reason="single_path_pre_chat_over_budget",
+                    )
+
+                if _core_needs_retry(candidate) and recovery_budget > 0:
+                    recovery_budget -= 1
+                    try:
+                        raw = _phase_call(
+                            phase="core",
+                            system_prompt=prompt.core_system_prompt,
+                            build_user_prompt=prompt.build_core_user_prompt,
+                            code_catalog_text=core_catalog,
+                            recovery_retry=True,
+                            max_completion_tokens=root_budget.max_completion_tokens,
+                        )
+                        candidate = _normalize_core(raw)
+                    except AIResponseTruncatedError as trunc_exc:
+                        logger.info(
+                            "analysis core sparse-recovery truncated → "
+                            "adaptive analysis_run_id=%s finish_reason=%s",
+                            base_log.get("analysis_run_id"),
+                            (trunc_exc.meta or {}).get("finish_reason"),
+                        )
+                        return _run_core_split_path(
+                            root_budget=root_budget,
+                            reason="sparse_recovery_length",
+                            force_structural_split=True,
+                        )
+                    except CorePromptOverBudgetError:
+                        return _run_core_split_path(
+                            root_budget=root_budget,
+                            reason="sparse_recovery_pre_chat_over_budget",
+                        )
+                used_core_adaptive_split = False
+                return candidate
+
+            return _run_core_split_path(
+                root_budget=root_budget, reason="root_over_budget"
+            )
+
+        core = _run_core_adaptive()
+        if _core_needs_retry(core):
+            raise InsufficientCandidateError()
         logger.info(
             "analysis candidate quality run_id=%s phase=core compact_protocol=%s "
             "document_count=%s vlm_pages=%s empty=%s sparse=%s quality_score=%s "
             "skills=%s expertise=%s jobs=%s employment=%s education=%s "
-            "certifications=%s projects=%s",
+            "certifications=%s projects=%s core_split_calls=%s "
+            "used_adaptive_split=%s token_count_calls=%s",
             base_log.get("analysis_run_id"),
             compact_tag,
             base_log.get("document_count"),
@@ -2083,18 +2384,13 @@ class AnalysisService:
             len(core.education),
             len(core.certifications),
             len(core.projects),
+            core_split_calls,
+            used_core_adaptive_split,
+            token_count_calls,
         )
 
         def _subsplit_project_chunk(blocks: str) -> list[str]:
-            docs = split_document_blocks(blocks)
-            if len(docs) > 1:
-                return docs
-            pages = split_block_by_pages(blocks)
-            if len(pages) > 1:
-                return pages
-            return split_page_block_text(
-                blocks, max_body_chars=max(256, len(blocks) // 2)
-            )
+            return _subsplit_phase_chunk(blocks)
 
         def _project_budget_for_blocks(
             blocks: str,

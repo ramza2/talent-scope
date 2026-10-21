@@ -9,14 +9,19 @@ from typing import Any
 from app.ai.schemas.profile_candidate import (
     PROFILE_SCALAR_FIELD_NAMES,
     SCHEMA_VERSION,
+    AnalysisMetaCandidate,
+    CertificationCandidate,
     CodeRefCandidate,
     EducationCandidate,
+    EmploymentCandidate,
     ExpertiseCandidate,
     JobCandidate,
+    ProfileCandidate,
     ProfileCandidateDocument,
     ProjectCandidate,
     SkillCandidate,
     SourceRef,
+    SummaryCandidate,
 )
 
 _DOCUMENT_BLOCK_RE = re.compile(
@@ -5371,3 +5376,392 @@ def merge_project_chunk_candidates(
     merged.sort(key=_chunk_project_sort_key)
     base = chunks[0]
     return base.model_copy(update={"projects": merged})
+
+
+def _core_merge_source_refs(
+    left: list[SourceRef], right: list[SourceRef]
+) -> list[SourceRef]:
+    seen: set[tuple[str, int | None, str]] = set()
+    out: list[SourceRef] = []
+    for ref in [*(left or []), *(right or [])]:
+        key = (
+            (ref.document_id or "").strip(),
+            ref.page_no,
+            (ref.quote_text or "").strip(),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(ref)
+    return out
+
+
+def _core_prefer_date(a: str | None, b: str | None) -> str | None:
+    """Keep the more precise non-empty date; never invent values."""
+    na = (a or "").strip() or None
+    nb = (b or "").strip() or None
+    if na is None:
+        return nb
+    if nb is None:
+        return na
+    if na == nb:
+        return na
+    # Prefer the token with more precision markers (digits / separators).
+    score_a = sum(ch.isdigit() for ch in na) + na.count("-") + na.count(".")
+    score_b = sum(ch.isdigit() for ch in nb) + nb.count("-") + nb.count(".")
+    if score_b > score_a:
+        return nb
+    return na
+
+
+def _core_code_ref_key(item: Any) -> str | None:
+    code = (getattr(item, "code", None) or "").strip()
+    if code:
+        return f"c:{code}"
+    raw = (getattr(item, "raw_value", None) or "").strip()
+    if raw:
+        return f"r:{_fold_ws_text(raw).casefold()}"
+    return None
+
+
+def _merge_core_job_lists(chunks: list[ProfileCandidateDocument]) -> list[JobCandidate]:
+    by_key: dict[str, JobCandidate] = {}
+    for chunk in chunks:
+        for job in chunk.jobs or []:
+            key = _core_code_ref_key(job)
+            if key is None:
+                continue
+            prev = by_key.get(key)
+            if prev is None:
+                by_key[key] = job
+                continue
+            by_key[key] = prev.model_copy(
+                update={
+                    "source_refs": _core_merge_source_refs(
+                        prev.source_refs, job.source_refs
+                    ),
+                    "confidence": max(
+                        prev.confidence or 0.0, job.confidence or 0.0
+                    )
+                    or prev.confidence
+                    or job.confidence,
+                    "job_type": prev.job_type or job.job_type,
+                    "code": prev.code or job.code,
+                    "raw_value": prev.raw_value or job.raw_value,
+                }
+            )
+    return list(by_key.values())
+
+
+def _merge_core_skill_lists(
+    chunks: list[ProfileCandidateDocument],
+) -> list[SkillCandidate]:
+    by_key: dict[str, SkillCandidate] = {}
+    for chunk in chunks:
+        for skill in chunk.skills or []:
+            key = _core_code_ref_key(skill)
+            if key is None:
+                continue
+            prev = by_key.get(key)
+            if prev is None:
+                by_key[key] = skill
+                continue
+            by_key[key] = prev.model_copy(
+                update={
+                    "source_refs": _core_merge_source_refs(
+                        prev.source_refs, skill.source_refs
+                    ),
+                    "confidence": max(
+                        prev.confidence or 0.0, skill.confidence or 0.0
+                    )
+                    or prev.confidence
+                    or skill.confidence,
+                    "code": prev.code or skill.code,
+                    "raw_value": prev.raw_value or skill.raw_value,
+                    "last_used_year": prev.last_used_year or skill.last_used_year,
+                    "experience_months": prev.experience_months
+                    or skill.experience_months,
+                    "is_representative": bool(
+                        prev.is_representative or skill.is_representative
+                    ),
+                }
+            )
+    return list(by_key.values())
+
+
+def _merge_core_expertise_lists(
+    chunks: list[ProfileCandidateDocument],
+) -> list[ExpertiseCandidate]:
+    by_key: dict[str, ExpertiseCandidate] = {}
+    for chunk in chunks:
+        for exp in chunk.expertise or []:
+            key = _core_code_ref_key(exp)
+            if key is None:
+                continue
+            prev = by_key.get(key)
+            if prev is None:
+                by_key[key] = exp
+                continue
+            by_key[key] = prev.model_copy(
+                update={
+                    "source_refs": _core_merge_source_refs(
+                        prev.source_refs, exp.source_refs
+                    ),
+                    "confidence": max(
+                        prev.confidence or 0.0, exp.confidence or 0.0
+                    )
+                    or prev.confidence
+                    or exp.confidence,
+                    "code": prev.code or exp.code,
+                    "raw_value": prev.raw_value or exp.raw_value,
+                    "evidence_type": prev.evidence_type or exp.evidence_type,
+                }
+            )
+    return list(by_key.values())
+
+
+_ONGOING_END_TOKENS = frozenset(
+    {
+        "현재",
+        "재직중",
+        "재직 중",
+        "present",
+        "current",
+        "now",
+        "ongoing",
+    }
+)
+
+
+def _is_ongoing_end_token(value: str | None) -> bool:
+    text = (value or "").strip()
+    return bool(text) and text.casefold() in _ONGOING_END_TOKENS
+
+
+def _employment_identity_key(
+    row: EmploymentCandidate,
+) -> tuple[str, str] | None:
+    """Identity is company+start; end dates merge via precision preference."""
+    company = _fold_ws_text(row.company_name or "")
+    if not company:
+        return None
+    start = _fold_ws_text(row.start_date or "")
+    return (company, start)
+
+
+def _merge_employment_end(a: str | None, b: str | None) -> str | None:
+    """Prefer concrete dates over ongoing markers; otherwise more precise token."""
+    if a in (None, "") and b in (None, ""):
+        return None
+    if a in (None, ""):
+        return b
+    if b in (None, ""):
+        return a
+    if a == b:
+        return a
+    a_ongoing = _is_ongoing_end_token(a)
+    b_ongoing = _is_ongoing_end_token(b)
+    if a_ongoing and not b_ongoing:
+        return b
+    if b_ongoing and not a_ongoing:
+        return a
+    if a_ongoing and b_ongoing:
+        return a
+    return _core_prefer_date(a, b)
+
+
+def _merge_employment_pair(
+    left: EmploymentCandidate, right: EmploymentCandidate
+) -> EmploymentCandidate:
+    return left.model_copy(
+        update={
+            "department": left.department or right.department,
+            "title": left.title or right.title,
+            "start_date": _core_prefer_date(left.start_date, right.start_date),
+            "end_date": _merge_employment_end(left.end_date, right.end_date),
+            "responsibilities": left.responsibilities or right.responsibilities,
+            "confidence": max(left.confidence or 0.0, right.confidence or 0.0)
+            or left.confidence
+            or right.confidence,
+            "source_refs": _core_merge_source_refs(
+                left.source_refs, right.source_refs
+            ),
+        }
+    )
+
+
+def _merge_core_employment(
+    chunks: list[ProfileCandidateDocument],
+) -> list[EmploymentCandidate]:
+    groups: dict[tuple[str, str], EmploymentCandidate] = {}
+    singles: list[EmploymentCandidate] = []
+    for chunk in chunks:
+        for row in chunk.employment_history or []:
+            key = _employment_identity_key(row)
+            if key is None:
+                singles.append(row)
+                continue
+            prev = groups.get(key)
+            groups[key] = row if prev is None else _merge_employment_pair(prev, row)
+    return list(groups.values()) + singles
+
+
+def _education_identity_key(
+    row: EducationCandidate,
+) -> tuple[str, str, str] | None:
+    school = _fold_ws_text(row.school_name or "")
+    if not school:
+        return None
+    degree = _fold_ws_text(row.degree or "")
+    start = _fold_ws_text(row.start_date or "")
+    return (school, degree, start)
+
+
+def _merge_core_education(
+    chunks: list[ProfileCandidateDocument],
+) -> list[EducationCandidate]:
+    groups: dict[tuple[str, str, str], EducationCandidate] = {}
+    singles: list[EducationCandidate] = []
+    for chunk in chunks:
+        for row in chunk.education or []:
+            key = _education_identity_key(row)
+            if key is None:
+                singles.append(row)
+                continue
+            prev = groups.get(key)
+            if prev is None:
+                groups[key] = row
+                continue
+            groups[key] = prev.model_copy(
+                update={
+                    "major": prev.major or row.major,
+                    "end_date": _core_prefer_date(prev.end_date, row.end_date),
+                    "status": prev.status or row.status,
+                    "confidence": max(prev.confidence or 0.0, row.confidence or 0.0)
+                    or prev.confidence
+                    or row.confidence,
+                    "source_refs": _core_merge_source_refs(
+                        prev.source_refs, row.source_refs
+                    ),
+                }
+            )
+    return list(groups.values()) + singles
+
+
+def _cert_identity_key(
+    row: CertificationCandidate,
+) -> tuple[str, str, str] | None:
+    name = _fold_ws_text(row.certification_name or "")
+    if not name:
+        return None
+    issuer = _fold_ws_text(row.issuer or "")
+    acquired = _fold_ws_text(row.acquired_date or "")
+    return (name, issuer, acquired)
+
+
+def _merge_core_certifications(
+    chunks: list[ProfileCandidateDocument],
+) -> list[CertificationCandidate]:
+    groups: dict[tuple[str, str, str], CertificationCandidate] = {}
+    singles: list[CertificationCandidate] = []
+    for chunk in chunks:
+        for row in chunk.certifications or []:
+            key = _cert_identity_key(row)
+            if key is None:
+                singles.append(row)
+                continue
+            prev = groups.get(key)
+            if prev is None:
+                groups[key] = row
+                continue
+            groups[key] = prev.model_copy(
+                update={
+                    "expiry_date": _core_prefer_date(
+                        prev.expiry_date, row.expiry_date
+                    ),
+                    "confidence": max(prev.confidence or 0.0, row.confidence or 0.0)
+                    or prev.confidence
+                    or row.confidence,
+                    "source_refs": _core_merge_source_refs(
+                        prev.source_refs, row.source_refs
+                    ),
+                }
+            )
+    return list(groups.values()) + singles
+
+
+def _merge_core_profile(chunks: list[ProfileCandidateDocument]) -> ProfileCandidate:
+    """Conservative scalar merge: fill empties; never overwrite conflicts."""
+    base = ProfileCandidate()
+    refs: dict[str, list[SourceRef]] = {}
+    for chunk in chunks:
+        profile = chunk.profile or ProfileCandidate()
+        updates: dict[str, Any] = {}
+        for field in PROFILE_SCALAR_FIELD_NAMES:
+            current = getattr(base, field, None)
+            incoming = getattr(profile, field, None)
+            if incoming is None or incoming == "":
+                continue
+            if current is None or current == "":
+                updates[field] = incoming
+            # Conflict: keep first filled value (no arbitrary overwrite).
+        if updates:
+            base = base.model_copy(update=updates)
+        for field, field_refs in (profile.source_refs or {}).items():
+            refs[field] = _core_merge_source_refs(refs.get(field, []), field_refs)
+    if refs:
+        base = base.model_copy(update={"source_refs": refs})
+    return base
+
+
+def merge_core_chunk_candidates(
+    chunks: list[ProfileCandidateDocument],
+) -> ProfileCandidateDocument:
+    """Deterministic CORE-phase chunk merge (profile + structured entities).
+
+    Union jobs/skills/expertise/employment/education/certifications by
+    conservative identity keys. Preserve source_refs and prefer more precise
+    dates. Conflicting profile scalars keep the first non-empty value.
+    Individual sparse chunks are allowed — callers evaluate the merged result.
+    """
+    if not chunks:
+        return ProfileCandidateDocument(schema_version=SCHEMA_VERSION)
+    non_empty = [c for c in chunks if c is not None]
+    if not non_empty:
+        return ProfileCandidateDocument(schema_version=SCHEMA_VERSION)
+
+    summary_text = None
+    for chunk in non_empty:
+        text = (chunk.summary.text if chunk.summary else None) or None
+        if text and (summary_text is None or len(text) > len(summary_text)):
+            summary_text = text
+
+    overall = None
+    notes_parts: list[str] = []
+    for chunk in non_empty:
+        meta = chunk.analysis or AnalysisMetaCandidate()
+        if meta.overall_confidence is not None:
+            overall = (
+                meta.overall_confidence
+                if overall is None
+                else max(overall, meta.overall_confidence)
+            )
+        if meta.notes and meta.notes.strip():
+            notes_parts.append(meta.notes.strip())
+
+    return ProfileCandidateDocument(
+        schema_version=non_empty[0].schema_version or SCHEMA_VERSION,
+        profile=_merge_core_profile(non_empty),
+        jobs=_merge_core_job_lists(non_empty),
+        skills=_merge_core_skill_lists(non_empty),
+        expertise=_merge_core_expertise_lists(non_empty),
+        employment_history=_merge_core_employment(non_empty),
+        education=_merge_core_education(non_empty),
+        certifications=_merge_core_certifications(non_empty),
+        projects=[],
+        summary=SummaryCandidate(text=summary_text),
+        analysis=AnalysisMetaCandidate(
+            overall_confidence=overall,
+            notes="; ".join(notes_parts) if notes_parts else None,
+        ),
+    )
