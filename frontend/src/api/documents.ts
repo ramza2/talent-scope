@@ -88,6 +88,34 @@ export function getUploadSession(sessionId: string) {
   return apiFetch<{ data: UploadSession }>(`/upload-sessions/${sessionId}`)
 }
 
+/** Safe parse for upload responses (nginx may return HTML on 413). */
+export function parseUploadResponseBody(text: string): unknown {
+  const trimmed = text.trim()
+  if (!trimmed) return null
+  try {
+    return JSON.parse(trimmed) as unknown
+  } catch {
+    return { detail: trimmed.slice(0, 200) }
+  }
+}
+
+export const UPLOAD_PAYLOAD_TOO_LARGE_MESSAGE =
+  '업로드 용량이 서버 허용 한도를 초과했습니다. 개별 파일은 최대 50MB이며, 여러 파일을 한 번에 올리면 전체 요청 크기가 커질 수 있습니다. 파일 수를 줄이거나 용량을 줄인 뒤 다시 시도해 주세요.'
+
+export function buildUploadSessionFilesError(
+  status: number,
+  text: string,
+): ApiError {
+  if (status === 413) {
+    return new ApiError(`API ${status}`, status, {
+      detail: UPLOAD_PAYLOAD_TOO_LARGE_MESSAGE,
+      code: 'UPLOAD_PAYLOAD_TOO_LARGE',
+    })
+  }
+  const body = parseUploadResponseBody(text)
+  return new ApiError(`API ${status}`, status, body)
+}
+
 export async function uploadSessionFiles(sessionId: string, files: File[]) {
   const form = new FormData()
   for (const file of files) {
@@ -104,10 +132,10 @@ export async function uploadSessionFiles(sessionId: string, files: File[]) {
     return { data: [] as TempFileItem[] }
   }
   const text = await response.text()
-  const body = text ? JSON.parse(text) : null
   if (!response.ok) {
-    throw new ApiError(`API ${response.status}`, response.status, body)
+    throw buildUploadSessionFilesError(response.status, text)
   }
+  const body = parseUploadResponseBody(text)
   return body as { data: TempFileItem[] }
 }
 
