@@ -87,6 +87,7 @@ from app.modules.analysis.compact_v8 import (
     supplement_projects_from_second_pass,
     supplement_semantic_project_relations_from_source,
 )
+from app.modules.analysis.candidate_quality_guards import apply_candidate_quality_guards
 from app.modules.analysis.diff_engine import DiffSpec, build_diffs
 from app.modules.analysis.normalize import normalize_candidate
 from app.modules.analysis.repository import AnalysisRepository
@@ -884,6 +885,10 @@ class AnalysisService:
                     base_log=base_log,
                     vlm_pages=bundle.total_vlm_pages,
                 )
+
+            # Final CORE+PROJECTS candidate: reject obvious field/header leakage
+            # before Diff generation. Also covers historical single-pass runs.
+            candidate = apply_candidate_quality_guards(candidate)
 
             if claimed.base_profile_version is None:
                 raise AIProviderError("missing base_profile_version")
