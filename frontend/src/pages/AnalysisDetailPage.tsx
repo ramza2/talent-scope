@@ -14,13 +14,14 @@ import {
   message,
 } from 'antd'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { useNavigate, useParams } from 'react-router-dom'
+import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import type { ColumnsType } from 'antd/es/table'
 import type { Key } from 'react'
 
 import { apiErrorCode, apiErrorMessage } from '@/api/errors'
 import { documentPreviewUrl } from '@/api/documents'
 import { getEvidence, type EvidenceDetail } from '@/api/evidence'
+import { readAnalysesReturnTo } from '@/pages/analysesListState'
 import {
   bulkReviewDiffs,
   buildDefaultModifiedDecision,
@@ -123,6 +124,8 @@ function reviewStatusTag(status: ReviewStatus) {
 export function AnalysisDetailPage() {
   const { analysisId = '' } = useParams()
   const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
+  const returnTo = readAnalysesReturnTo(searchParams)
   const queryClient = useQueryClient()
 
   const [filterTab, setFilterTab] = useState<DiffFilterTab>('all')
@@ -554,7 +557,7 @@ export function AnalysisDetailPage() {
 
   return (
     <div>
-      <Button type="link" onClick={() => navigate('/analyses')} style={{ paddingLeft: 0 }}>
+      <Button type="link" onClick={() => navigate(returnTo)} style={{ paddingLeft: 0 }}>
         ← 검토 목록
       </Button>
 

@@ -1,8 +1,8 @@
-import { useState } from 'react'
+import { useMemo } from 'react'
 import { Button, Select, Space, Table, Tag, Tooltip, Typography, message } from 'antd'
 import { ReloadOutlined } from '@ant-design/icons'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { useNavigate } from 'react-router-dom'
+import { useLocation, useNavigate, useSearchParams } from 'react-router-dom'
 import type { ColumnsType } from 'antd/es/table'
 
 import { apiErrorMessage } from '@/api/errors'
@@ -13,12 +13,14 @@ import {
   type AnalysisListItem,
   type AnalysisStatus,
 } from '@/api/analyses'
-
-type Filters = {
-  status: AnalysisStatus | ''
-  page: number
-  page_size: number
-}
+import {
+  ADMIN_ANALYSES_DEFAULTS,
+  buildAnalysisDetailPath,
+  listLocationToReturnTo,
+  parseAnalysesListFilters,
+  toAnalysesListSearchParams,
+  type AnalysesListFilters,
+} from '@/pages/analysesListState'
 
 const STATUS_OPTIONS: Array<{ value: AnalysisStatus | ''; label: string }> = [
   { value: '', label: '상태 전체' },
@@ -62,12 +64,19 @@ function statusTag(status: AnalysisStatus, errorMessage?: string | null) {
 
 export function AdminAnalysesPage() {
   const navigate = useNavigate()
+  const location = useLocation()
   const queryClient = useQueryClient()
-  const [filters, setFilters] = useState<Filters>({
-    status: '',
-    page: 1,
-    page_size: 20,
-  })
+  const [searchParams, setSearchParams] = useSearchParams()
+
+  const filters = useMemo(
+    () => parseAnalysesListFilters(searchParams, ADMIN_ANALYSES_DEFAULTS),
+    [searchParams],
+  )
+
+  const setFilters = (patch: Partial<AnalysesListFilters>) => {
+    const next = { ...filters, ...patch }
+    setSearchParams(toAnalysesListSearchParams(next))
+  }
 
   const queryKey = ['analyses', 'admin', filters] as const
   const { data, isLoading, isFetching } = useQuery({
@@ -211,7 +220,7 @@ export function AdminAnalysesPage() {
         <Select
           style={{ width: 180 }}
           value={filters.status}
-          onChange={(value) => setFilters((prev) => ({ ...prev, status: value, page: 1 }))}
+          onChange={(value) => setFilters({ status: value, page: 1 })}
           options={STATUS_OPTIONS}
         />
       </Space>
@@ -223,7 +232,13 @@ export function AdminAnalysesPage() {
         dataSource={data?.data ?? []}
         size="middle"
         onRow={(row) => ({
-          onClick: () => navigate(`/analyses/${row.analysis_id}`),
+          onClick: () =>
+            navigate(
+              buildAnalysisDetailPath(
+                row.analysis_id,
+                listLocationToReturnTo(location.pathname, location.search),
+              ),
+            ),
           style: { cursor: 'pointer' },
         })}
         pagination={{
@@ -232,7 +247,7 @@ export function AdminAnalysesPage() {
           total: data?.meta.total ?? 0,
           showSizeChanger: true,
           onChange: (page, pageSize) =>
-            setFilters((prev) => ({ ...prev, page, page_size: pageSize })),
+            setFilters({ page, page_size: pageSize }),
         }}
       />
     </div>
