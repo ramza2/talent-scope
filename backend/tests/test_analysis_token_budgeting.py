@@ -872,6 +872,54 @@ def test_merge_core_keeps_single_primary_job() -> None:
     assert secondaries[0].code == "JOB-MGT-PL"
 
 
+def test_merge_core_ambiguous_identity_keeps_distinct_rows() -> None:
+    """Undated employments/certificates and distinct majors must not collapse."""
+    from app.ai.schemas.profile_candidate import (
+        CertificationCandidate,
+        EducationCandidate,
+        EmploymentCandidate,
+        ProfileCandidateDocument,
+    )
+    from app.modules.analysis.compact_v8 import merge_core_chunk_candidates
+
+    a = ProfileCandidateDocument(
+        employment_history=[
+            EmploymentCandidate(company_name="ABC테크", end_date="2020-12")
+        ],
+        education=[
+            EducationCandidate(
+                school_name="한국대", degree="학사",
+                major="컴퓨터공학", start_date="2010-03"
+            )
+        ],
+        certifications=[
+            CertificationCandidate(certification_name="정보처리기사", issuer="발급기관")
+        ],
+    )
+    b = ProfileCandidateDocument(
+        employment_history=[
+            EmploymentCandidate(company_name="ABC테크", end_date="2024-12")
+        ],
+        education=[
+            EducationCandidate(
+                school_name="한국대", degree="학사",
+                major="경영학", start_date="2010-03"
+            )
+        ],
+        certifications=[
+            CertificationCandidate(certification_name="정보처리기사", issuer="발급기관")
+        ],
+    )
+    result = merge_core_chunk_candidates([a, b])
+    assert len(result.employment_history) == 2
+    assert {x.end_date for x in result.employment_history} == {
+        "2020-12", "2024-12"
+    }
+    assert len(result.education) == 2
+    assert {x.major for x in result.education} == {"컴퓨터공학", "경영학"}
+    assert len(result.certifications) == 2
+
+
 def test_length_finish_reason_still_raises_truncated(monkeypatch) -> None:
     import pytest
     from app.ai.providers.errors import AIResponseTruncatedError
