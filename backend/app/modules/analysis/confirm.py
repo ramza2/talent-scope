@@ -288,14 +288,123 @@ def _is_entity_root(diff: AnalysisDiffItem) -> bool:
     return bool(_ENTITY_ROOT_RE.fullmatch(path))
 
 
-def _normalize_field_date(field_name: str, value: Any) -> Any:
+def _normalize_field_date(
+    field_name: str,
+    value: Any,
+    *,
+    entity_type: str | None = None,
+) -> Any:
     bound = _DATE_BOUNDS.get(field_name)
     if bound is None:
         return value
+    treat_ongoing = (
+        entity_type == "EMPLOYMENT"
+        and field_name == "end_date"
+        and bound == "end"
+    )
     try:
-        return normalize_confirmed_date(value, bound=bound)  # type: ignore[arg-type]
+        return normalize_confirmed_date(
+            value,
+            bound=bound,  # type: ignore[arg-type]
+            treat_ongoing_end_as_null=treat_ongoing,
+        )
     except ValueError as exc:
         raise ConfirmValidationError(str(exc)) from exc
+
+
+def _date_fields_for_entity(entity_type: str) -> tuple[str, ...]:
+    if entity_type == "EMPLOYMENT":
+        return ("start_date", "end_date")
+    if entity_type == "EDUCATION":
+        return ("start_date", "end_date")
+    if entity_type == "CERTIFICATION":
+        return ("acquired_date", "expiry_date")
+    if entity_type == "PROJECT":
+        return ("start_date", "end_date")
+    if entity_type == "PROFILE":
+        return ("career_start_date",)
+    return ()
+
+
+def _prevalidate_confirm_dates(diffs: list[AnalysisDiffItem]) -> None:
+    """Fail closed on invalid applied dates before any Confirmed mutation."""
+    errors: list[str] = []
+    for diff in diffs:
+        status = diff.review_status
+        if status in {"REJECTED", "SAME", "PENDING"}:
+            continue
+        try:
+            value = _applied_value(diff)
+        except ConfirmValidationError as exc:
+            errors.append(f"{diff.entity_type} {diff.candidate_path}: {exc}")
+            continue
+        if value is None:
+            continue
+
+        entity = diff.entity_type
+        path = diff.candidate_path or "(unknown)"
+        field = diff.field_name
+
+        if field and field in _DATE_BOUNDS:
+            try:
+                _normalize_field_date(field, value, entity_type=entity)
+            except ConfirmValidationError as exc:
+                errors.append(f"{entity} {path} field={field}: {exc}")
+            continue
+
+        if not isinstance(value, dict):
+            continue
+
+        try:
+            data = _strip_metadata(_as_dict(value))
+        except ConfirmValidationError as exc:
+            errors.append(f"{entity} {path}: {exc}")
+            continue
+
+        date_fields = _date_fields_for_entity(entity)
+        if not date_fields:
+            continue
+
+        normalized: dict[str, Any] = {}
+        field_error = False
+        for key in date_fields:
+            if key not in data:
+                continue
+            raw = data.get(key)
+            if raw is None or raw == "":
+                normalized[key] = None
+                continue
+            try:
+                normalized[key] = _normalize_field_date(
+                    key, raw, entity_type=entity
+                )
+            except ConfirmValidationError as exc:
+                errors.append(f"{entity} {path} field={key}: {exc}")
+                field_error = True
+
+        if field_error or not any(k in normalized for k in date_fields):
+            continue
+        try:
+            if entity == "CERTIFICATION":
+                assert_date_order(
+                    normalized.get("acquired_date"),
+                    normalized.get("expiry_date"),
+                    label="certification",
+                )
+            elif entity in {"EMPLOYMENT", "EDUCATION", "PROJECT"}:
+                assert_date_order(
+                    normalized.get("start_date"),
+                    normalized.get("end_date"),
+                    label="period" if entity != "PROJECT" else "project",
+                )
+        except ValueError as exc:
+            errors.append(f"{entity} {path}: {exc}")
+
+    if errors:
+        raise ConfirmValidationError(
+            "확정 전 날짜 검증에 실패했습니다:\n"
+            + "\n".join(f"- {item}" for item in errors)
+        )
 
 
 def _require_active_code(
@@ -433,6 +542,8 @@ def confirm_analysis_run(
     diffs = analysis_repo.list_diffs(run.id)
     _assert_review_complete(diffs)
     _assert_project_parent_consistency(diffs)
+    # B2. Date validity on applied values (ACCEPTED/MODIFIED) before mutations.
+    _prevalidate_confirm_dates(diffs)
 
     # C. Pre-lock existing mutation targets BEFORE Person/Profile
     #    (matches manual Project/Career: Entity → Person/Profile).
@@ -1195,7 +1306,12 @@ class _ConfirmContext:
                 f"{diff.existing_target_id}"
             )
         # Field UPDATE/CONFLICT: apply that field only; preserve source_type
-        coerced = _normalize_field_date(field, value) if field in _DATE_BOUNDS else value
+        entity_type = self._career_entity_type(fields)
+        coerced = (
+            _normalize_field_date(field, value, entity_type=entity_type)
+            if field in _DATE_BOUNDS
+            else value
+        )
         if isinstance(coerced, str) and field not in _DATE_BOUNDS:
             coerced = coerced.strip() or None
         limits = _CAREER_STRING_LIMITS_BY_FIELDS.get(fields, {})
@@ -1212,10 +1328,18 @@ class _ConfirmContext:
         )
         self._register(diff, target_type, row.id, field)
 
+    def _career_entity_type(self, fields: frozenset[str]) -> str:
+        if "company_name" in fields:
+            return "EMPLOYMENT"
+        if "school_name" in fields:
+            return "EDUCATION"
+        return "CERTIFICATION"
+
     def _career_create_payload(
         self, data: dict[str, Any], *, fields: frozenset[str]
     ) -> dict[str, Any]:
         limits = _CAREER_STRING_LIMITS_BY_FIELDS.get(fields, {})
+        entity_type = self._career_entity_type(fields)
         out: dict[str, Any] = {}
         for key in fields:
             if key not in data:
@@ -1224,7 +1348,9 @@ class _ConfirmContext:
             if val is None or val == "":
                 continue
             if key in _DATE_BOUNDS:
-                out[key] = _normalize_field_date(key, val)
+                out[key] = _normalize_field_date(
+                    key, val, entity_type=entity_type
+                )
             elif isinstance(val, str):
                 limited = _limit_optional_str(key, val, limits)
                 if limited is not None:
@@ -1233,12 +1359,14 @@ class _ConfirmContext:
                 limited = _limit_optional_str(key, val, limits)
                 out[key] = limited if key in limits else val
         self._assert_date_pair(out)
+        # Ongoing employment end → null must remain absent from create payload.
         return {k: v for k, v in out.items() if v is not None}
 
     def _null_fill_career(
         self, row: Any, data: dict[str, Any], *, fields: frozenset[str]
     ) -> None:
         limits = _CAREER_STRING_LIMITS_BY_FIELDS.get(fields, {})
+        entity_type = self._career_entity_type(fields)
         for key in fields:
             if key not in data:
                 continue
@@ -1249,7 +1377,7 @@ class _ConfirmContext:
             if val is None or val == "":
                 continue
             if key in _DATE_BOUNDS:
-                val = _normalize_field_date(key, val)
+                val = _normalize_field_date(key, val, entity_type=entity_type)
             elif isinstance(val, str):
                 val = _limit_optional_str(key, val.strip() or None, limits)
             else:
@@ -1262,11 +1390,12 @@ class _ConfirmContext:
         self, row: Any, data: dict[str, Any], *, fields: frozenset[str]
     ) -> None:
         limits = _CAREER_STRING_LIMITS_BY_FIELDS.get(fields, {})
+        entity_type = self._career_entity_type(fields)
         for key, val in data.items():
             if key not in fields:
                 continue
             if key in _DATE_BOUNDS:
-                val = _normalize_field_date(key, val)
+                val = _normalize_field_date(key, val, entity_type=entity_type)
             elif isinstance(val, str):
                 val = _limit_optional_str(key, val.strip() or None, limits)
             else:

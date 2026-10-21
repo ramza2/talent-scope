@@ -3228,6 +3228,122 @@ def test_confirm_dates_and_version_base_lock(client: TestClient, db_session):
     _cleanup_person(db_session, person.id, admin.id)
 
 
+def test_confirm_employment_ongoing_end_and_prevalidate_invalid(
+    client: TestClient, db_session
+):
+    """Existing REVIEWING runs: ongoing end→null; invalid end fails prevalidation."""
+    from datetime import date
+
+    from app.db.models.analysis import AnalysisDiffItem, AnalysisRun
+    from app.db.models.person import EmploymentHistory, PersonProfile
+
+    admin = _create_user(
+        db_session, login_id=f"og_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    csrf = _login(client, admin.login_id, "Passw0rd!")
+    person, document = _seed_person_with_ready_doc(db_session, admin.id)
+    analysis_id = client.post(
+        "/api/v1/analyses",
+        headers={"X-CSRF-Token": csrf},
+        json={
+            "person_id": str(person.id),
+            "document_ids": [str(document.id)],
+            "analysis_type": "PROFILE",
+        },
+    ).json()["data"]["analysis_id"]
+
+    run = db_session.execute(
+        select(AnalysisRun).where(AnalysisRun.id == uuid.UUID(analysis_id))
+    ).scalar_one()
+    run.status = "REVIEWING"
+    run.base_profile_version = 1
+
+    bad = AnalysisDiffItem(
+        analysis_run_id=run.id,
+        entity_type="EMPLOYMENT",
+        candidate_path="employment_history[0]",
+        change_type="NEW",
+        new_value={
+            "company_name": "BadDateCo",
+            "start_date": "2019.01",
+            "end_date": "현재아님",
+            "title": "Dev",
+        },
+        review_status="ACCEPTED",
+    )
+    db_session.add(bad)
+    db_session.commit()
+
+    resp = client.post(
+        f"/api/v1/analyses/{analysis_id}/confirm",
+        headers={"X-CSRF-Token": csrf},
+        json={"expected_profile_version": 1},
+    )
+    assert resp.status_code == 400
+    body = resp.json()
+    assert body["code"] == "CONFIRM_VALIDATION_ERROR"
+    assert "employment_history[0]" in body["detail"]
+    assert "end_date" in body["detail"]
+    db_session.refresh(run)
+    assert run.status == "REVIEWING"
+    profile = db_session.execute(
+        select(PersonProfile).where(PersonProfile.person_id == person.id)
+    ).scalar_one()
+    assert profile.profile_version == 1
+
+    # MODIFIED decided_value clears invalid end; AI new_value kept.
+    bad.review_status = "MODIFIED"
+    bad.decided_value = {
+        "company_name": "BadDateCo",
+        "start_date": "2019.01",
+        "end_date": None,
+        "title": "Dev",
+    }
+    db_session.add(bad)
+    db_session.add(
+        AnalysisDiffItem(
+            analysis_run_id=run.id,
+            entity_type="EMPLOYMENT",
+            candidate_path="employment_history[1]",
+            change_type="NEW",
+            new_value={
+                "company_name": "OngoingCo",
+                "start_date": "2021.03",
+                "end_date": "현재",
+                "title": "Eng",
+            },
+            review_status="ACCEPTED",
+        )
+    )
+    db_session.commit()
+
+    ok = client.post(
+        f"/api/v1/analyses/{analysis_id}/confirm",
+        headers={"X-CSRF-Token": csrf},
+        json={"expected_profile_version": 1},
+    )
+    assert ok.status_code == 200, ok.text
+
+    rows = list(
+        db_session.execute(
+            select(EmploymentHistory).where(EmploymentHistory.person_id == person.id)
+        ).scalars()
+    )
+    bad_row = next(r for r in rows if r.company_name == "BadDateCo")
+    assert bad_row.start_date == date(2019, 1, 1)
+    assert bad_row.end_date is None
+    ongoing = next(r for r in rows if r.company_name == "OngoingCo")
+    assert ongoing.start_date == date(2021, 3, 1)
+    assert ongoing.end_date is None
+
+    db_session.refresh(bad)
+    assert bad.new_value.get("end_date") == "현재아님"
+    assert bad.decided_value.get("end_date") is None
+    assert bad.review_status == "MODIFIED"
+
+    _cleanup_person(db_session, person.id, admin.id)
+
+
 def test_confirm_rejects_unmapped_code_accept(client: TestClient, db_session):
     from app.db.models.analysis import AnalysisDiffItem, AnalysisRun
     from app.db.models.person import PersonProfile
