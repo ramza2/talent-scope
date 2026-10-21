@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import calendar
 import re
+import unicodedata
 from datetime import date
 from typing import Any, Literal
 
@@ -17,6 +18,35 @@ _KOREAN_DATE_RE = re.compile(
     r"(?:\s*(?P<m>\d{1,2})\s*월"
     r"(?:\s*(?P<d>\d{1,2})\s*일)?)?\s*\.?$"
 )
+
+# Employment end markers that mean "still employed" → Confirmed end_date null.
+# Keep this list narrow; ambiguous phrases stay invalid and must be REVIEW'd.
+_ONGOING_END_MARKERS = frozenset(
+    {
+        "현재",
+        "재직중",
+        "재직 중",
+        "재직",
+        "present",
+        "current",
+        "now",
+        "ongoing",
+        "재직중임",
+    }
+)
+
+
+def _norm_date_token(value: Any) -> str:
+    text = unicodedata.normalize("NFKC", str(value or "")).strip()
+    return " ".join(text.split())
+
+
+def is_ongoing_end_marker(value: Any) -> bool:
+    """True when value clearly means ongoing employment (not a calendar date)."""
+    text = _norm_date_token(value)
+    if not text:
+        return False
+    return text.casefold() in {m.casefold() for m in _ONGOING_END_MARKERS}
 
 
 def parse_partial_date(value: Any) -> tuple[int, int | None, int | None] | None:
@@ -60,8 +90,23 @@ def parse_partial_date(value: Any) -> tuple[int, int | None, int | None] | None:
     return (year, month, day)
 
 
-def normalize_confirmed_date(value: Any, *, bound: BoundKind) -> date | None:
-    """Convert partial date string to Confirmed Date using start/end bound rules."""
+def normalize_confirmed_date(
+    value: Any,
+    *,
+    bound: BoundKind,
+    treat_ongoing_end_as_null: bool = False,
+) -> date | None:
+    """Convert partial date string to Confirmed Date using start/end bound rules.
+
+    When ``treat_ongoing_end_as_null`` is True (employment end_date only),
+    clear ongoing markers such as ``현재`` / ``Present`` become null.
+    """
+    if (
+        treat_ongoing_end_as_null
+        and bound == "end"
+        and is_ongoing_end_marker(value)
+    ):
+        return None
     parts = parse_partial_date(value)
     if parts is None:
         return None

@@ -16,6 +16,11 @@ from app.modules.analysis.career_document_months import (
     normalize_career_document_value_text,
     parse_career_document_months,
 )
+from app.modules.analysis.confirm_dates import (
+    is_ongoing_end_marker,
+    normalize_confirmed_date,
+    parse_partial_date,
+)
 
 EMPLOYMENT_FIELDS: tuple[str, ...] = (
     "company_name",
@@ -164,10 +169,13 @@ def build_diffs(
             natural_key=lambda r: (
                 _norm_str(r.get("company_name") if isinstance(r, dict) else r.company_name),
                 _norm_str(r.get("start_date") if isinstance(r, dict) else r.start_date),
-                _norm_str(r.get("end_date") if isinstance(r, dict) else r.end_date),
+                _employment_end_key(
+                    r.get("end_date") if isinstance(r, dict) else r.end_date
+                ),
             ),
             dump_row=_dump_model,
             similar_match=_employment_similar,
+            new_requires_review=employment_candidate_dates_need_review,
         )
     )
     specs.extend(
@@ -565,6 +573,9 @@ def dates_compatible(a: Any, b: Any) -> bool:
     - both None → True (no conflicting date signal)
     - one None → True (missing precision / omitted end)
     - both present → True only if year matches and more-precise parts agree
+
+    Ongoing employment markers (``현재`` etc.) are NOT handled here — use
+    ``_employment_end_dates_compatible`` for EMPLOYMENT.end_date only.
     """
     if a is None or a == "":
         return True
@@ -586,6 +597,67 @@ def dates_compatible(a: Any, b: Any) -> bool:
     return True
 
 
+def _employment_end_key(value: Any) -> str | None:
+    """Natural-key helper: ongoing end markers collapse to null."""
+    if is_ongoing_end_marker(value):
+        return None
+    return _norm_str(value)
+
+
+def _employment_end_dates_compatible(a: Any, b: Any) -> bool:
+    """EMPLOYMENT.end_date similarity: ongoing markers act like omitted end."""
+    if is_ongoing_end_marker(a) or is_ongoing_end_marker(b):
+        return True
+    return dates_compatible(a, b)
+
+
+def _employment_date_confirm_parseable(value: Any) -> bool:
+    """Match Confirm parse rules (dots / Korean partial dates), not diff-only parser."""
+    try:
+        parse_partial_date(value)
+        return True
+    except ValueError:
+        return False
+
+
+def _employment_start_after_end(start: Any, end: Any) -> bool:
+    """True when both sides parse and start bound is after end bound."""
+    if is_ongoing_end_marker(end):
+        return False
+    try:
+        start_d = normalize_confirmed_date(start, bound="start")
+        end_d = normalize_confirmed_date(end, bound="end")
+    except ValueError:
+        return False
+    if start_d is None or end_d is None:
+        return False
+    return end_d < start_d
+
+
+def employment_candidate_dates_need_review(cand: Any) -> bool:
+    """True when employment dates are present but not confirm-safe.
+
+    Ongoing end markers (``현재`` / ``Present``) are allowed (confirm → null).
+    Other unparseable date tokens or start>end must not be auto-NEW.
+    """
+    start = _field(cand, "start_date")
+    end = _field(cand, "end_date")
+    start_text = _norm_str(start)
+    if start_text is not None:
+        if is_ongoing_end_marker(start_text):
+            return True
+        if not _employment_date_confirm_parseable(start_text):
+            return True
+    end_text = _norm_str(end)
+    if end_text is not None and not is_ongoing_end_marker(end_text):
+        if not _employment_date_confirm_parseable(end_text):
+            return True
+    if start_text is not None and end_text is not None:
+        if _employment_start_after_end(start_text, end_text):
+            return True
+    return False
+
+
 def _optional_str_compatible(a: Any, b: Any) -> bool:
     na = _norm_str(a)
     nb = _norm_str(b)
@@ -604,7 +676,9 @@ def _employment_similar(cand: Any, existing_rows: list[dict[str, Any]]) -> list[
             continue
         if not dates_compatible(_field(cand, "start_date"), row.get("start_date")):
             continue
-        if not dates_compatible(_field(cand, "end_date"), row.get("end_date")):
+        if not _employment_end_dates_compatible(
+            _field(cand, "end_date"), row.get("end_date")
+        ):
             continue
         out.append(row)
     return out
@@ -656,6 +730,7 @@ def _diff_keyed_records(
     natural_key,
     dump_row,
     similar_match=None,
+    new_requires_review=None,
 ) -> list[DiffSpec]:
     specs: list[DiffSpec] = []
     grouped: dict[tuple, list[dict[str, Any]]] = {}
@@ -699,6 +774,19 @@ def _diff_keyed_records(
         if not matches:
             similar = similar_match(cand, existing_rows) if similar_match else []
             if not similar:
+                # Invalid/ambiguous employment dates → REVIEW (not auto-NEW).
+                if new_requires_review and new_requires_review(cand):
+                    specs.append(
+                        DiffSpec(
+                            entity_type=entity_type,
+                            candidate_path=path,
+                            change_type="REVIEW",
+                            new_value=dump,
+                            confidence=getattr(cand, "confidence", None),
+                            source_refs=refs,
+                        )
+                    )
+                    continue
                 specs.append(
                     DiffSpec(
                         entity_type=entity_type,

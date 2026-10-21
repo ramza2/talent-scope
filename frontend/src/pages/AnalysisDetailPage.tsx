@@ -21,6 +21,10 @@ import type { Key } from 'react'
 import { apiErrorCode, apiErrorMessage } from '@/api/errors'
 import { documentPreviewUrl } from '@/api/documents'
 import { getEvidence, type EvidenceDetail } from '@/api/evidence'
+import {
+  formatDiffValueSummary,
+  formatValue,
+} from '@/api/diffValueDisplay'
 import { readAnalysesReturnTo } from '@/pages/analysesListState'
 import {
   bulkReviewDiffs,
@@ -66,15 +70,33 @@ function formatDate(value?: string | null) {
   }
 }
 
-function formatValue(value: unknown): string {
-  if (value === null || value === undefined || value === '') return '—'
-  if (typeof value === 'string') return value
-  if (typeof value === 'number' || typeof value === 'boolean') return String(value)
-  try {
-    return JSON.stringify(value, null, 2)
-  } catch {
-    return String(value)
-  }
+function DiffValueCell({ value }: { value: unknown }) {
+  const summary = formatDiffValueSummary(value)
+  const full = formatValue(value)
+  const showFullJson =
+    value !== null &&
+    typeof value === 'object' &&
+    !Array.isArray(value) &&
+    summary !== full
+  return (
+    <div>
+      <Typography.Paragraph
+        ellipsis={{ rows: 4, expandable: true, symbol: '더보기' }}
+        style={{ marginBottom: showFullJson ? 4 : 0, whiteSpace: 'pre-wrap' }}
+      >
+        {summary}
+      </Typography.Paragraph>
+      {showFullJson ? (
+        <Typography.Paragraph
+          type="secondary"
+          ellipsis={{ rows: 2, expandable: true, symbol: 'JSON' }}
+          style={{ marginBottom: 0, whiteSpace: 'pre-wrap', fontSize: 12 }}
+        >
+          {full}
+        </Typography.Paragraph>
+      ) : null}
+    </div>
+  )
 }
 
 function statusTag(status: AnalysisStatus) {
@@ -263,6 +285,21 @@ export function AnalysisDetailPage() {
         )
         return
       }
+      if (apiErrorCode(error) === 'CONFIRM_VALIDATION_ERROR') {
+        Modal.error({
+          title: '확정 전 검증 실패',
+          width: 560,
+          content: (
+            <Typography.Paragraph style={{ whiteSpace: 'pre-wrap', marginBottom: 0 }}>
+              {apiErrorMessage(
+                error,
+                '날짜 등 검토 값에 오류가 있어 확정할 수 없습니다.',
+              )}
+            </Typography.Paragraph>
+          ),
+        })
+        return
+      }
       message.error(apiErrorMessage(error, '최종 확정에 실패했습니다.'))
     },
   })
@@ -291,7 +328,15 @@ export function AnalysisDetailPage() {
 
   const openModify = (diff: DiffItem) => {
     setEditingDiff(diff)
-    editForm.setFieldsValue({ decided_value: buildDefaultModifiedDecision(diff) })
+    const seed =
+      diff.review_status === 'MODIFIED' && diff.decided_value != null
+        ? isProfileScalarDiff(diff) &&
+          (typeof diff.decided_value === 'string' ||
+            typeof diff.decided_value === 'number')
+          ? String(diff.decided_value)
+          : JSON.stringify(diff.decided_value, null, 2)
+        : buildDefaultModifiedDecision(diff)
+    editForm.setFieldsValue({ decided_value: seed })
     setEditOpen(true)
   }
 
@@ -389,28 +434,53 @@ export function AnalysisDetailPage() {
     {
       title: '기존값',
       dataIndex: 'old_value',
-      width: 180,
-      render: (v) => (
-        <Typography.Paragraph
-          ellipsis={{ rows: 3, expandable: true, symbol: '더보기' }}
-          style={{ marginBottom: 0, whiteSpace: 'pre-wrap' }}
-        >
-          {formatValue(v)}
-        </Typography.Paragraph>
-      ),
+      width: 160,
+      render: (v) => <DiffValueCell value={v} />,
     },
     {
       title: 'AI후보',
       dataIndex: 'new_value',
       width: 180,
-      render: (v) => (
-        <Typography.Paragraph
-          ellipsis={{ rows: 3, expandable: true, symbol: '더보기' }}
-          style={{ marginBottom: 0, whiteSpace: 'pre-wrap' }}
-        >
-          {formatValue(v)}
-        </Typography.Paragraph>
-      ),
+      render: (v) => <DiffValueCell value={v} />,
+    },
+    {
+      title: '적용값',
+      key: 'applied_value',
+      width: 180,
+      render: (_, row) => {
+        if (row.review_status === 'MODIFIED') {
+          return (
+            <div>
+              <Tag color="processing" style={{ marginBottom: 4 }}>
+                MODIFIED
+              </Tag>
+              <DiffValueCell value={row.decided_value} />
+            </div>
+          )
+        }
+        if (row.review_status === 'ACCEPTED') {
+          return (
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              AI후보와 동일
+            </Typography.Text>
+          )
+        }
+        if (row.review_status === 'REJECTED') {
+          return (
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              반영 제외
+            </Typography.Text>
+          )
+        }
+        if (row.review_status === 'MERGED') {
+          return (
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              병합 적용
+            </Typography.Text>
+          )
+        }
+        return <Typography.Text type="secondary">—</Typography.Text>
+      },
     },
     {
       title: '문서 근거',
