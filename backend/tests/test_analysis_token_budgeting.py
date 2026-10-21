@@ -1,4 +1,4 @@
-"""ModelOps /v1/token-count adaptive budgeting + PROJECT chunk merge."""
+"""ModelOps /v1/token-count adaptive budgeting + CORE/PROJECT chunk merge."""
 
 from __future__ import annotations
 
@@ -593,6 +593,333 @@ def test_merge_does_not_collapse_distinct_projects() -> None:
     assert len(out.projects) == 2
 
 
+def test_merge_core_chunks_unions_entities_and_preserves_refs() -> None:
+    from app.ai.schemas.profile_candidate import (
+        AnalysisMetaCandidate,
+        CertificationCandidate,
+        CodeRefCandidate,
+        EducationCandidate,
+        EmploymentCandidate,
+        ExpertiseCandidate,
+        JobCandidate,
+        ProfileCandidate,
+        ProfileCandidateDocument,
+        SkillCandidate,
+        SourceRef,
+        SummaryCandidate,
+    )
+    from app.modules.analysis.compact_v8 import merge_core_chunk_candidates
+
+    ref_a = SourceRef(document_id=_DOC_A, page_no=1, quote_text="홍길동")
+    ref_b = SourceRef(document_id=_DOC_B, page_no=1, quote_text="Python")
+    sparse = ProfileCandidateDocument(
+        schema_version="profile-candidate-v1",
+        profile=ProfileCandidate(name="홍길동", source_refs={"name": [ref_a]}),
+        jobs=[],
+        skills=[],
+        expertise=[],
+        summary=SummaryCandidate(),
+        analysis=AnalysisMetaCandidate(),
+    )
+    rich = ProfileCandidateDocument(
+        schema_version="profile-candidate-v1",
+        profile=ProfileCandidate(
+            name="다른이름",  # conflict: keep first filled
+            technical_grade="특급",
+            affiliation_company="ABC테크",
+        ),
+        jobs=[
+            JobCandidate(
+                raw_value="PL",
+                code="JOB-MGT-PL",
+                job_type="PRIMARY",
+                source_refs=[ref_a],
+            )
+        ],
+        skills=[
+            SkillCandidate(
+                raw_value="Python",
+                code="TECH-LANG-PYTHON",
+                source_refs=[ref_b],
+            )
+        ],
+        expertise=[
+            ExpertiseCandidate(
+                raw_value="사업관리",
+                code="EXP-MGT",
+                source_refs=[ref_a],
+            )
+        ],
+        employment_history=[
+            EmploymentCandidate(
+                company_name="ABC테크",
+                title="책임",
+                start_date="2018-01",
+                end_date="2024-12",
+                source_refs=[ref_a],
+            )
+        ],
+        education=[
+            EducationCandidate(
+                school_name="서울대",
+                major="컴공",
+                degree="학사",
+                start_date="2005-03",
+                end_date="2009.02",
+                source_refs=[ref_a],
+            )
+        ],
+        certifications=[
+            CertificationCandidate(
+                certification_name="정보처리기사",
+                acquired_date="2010.12",
+                source_refs=[ref_a],
+            )
+        ],
+        summary=SummaryCandidate(text="요약"),
+        analysis=AnalysisMetaCandidate(overall_confidence=0.8),
+    )
+    # Compatible precision upgrade for employment end (not a conflict).
+    precise_emp = ProfileCandidateDocument(
+        schema_version="profile-candidate-v1",
+        profile=ProfileCandidate(),
+        employment_history=[
+            EmploymentCandidate(
+                company_name="ABC테크",
+                title="책임",
+                start_date="2018-01",
+                end_date="2024-12-15",
+                source_refs=[ref_b],
+            )
+        ],
+        summary=SummaryCandidate(),
+        analysis=AnalysisMetaCandidate(),
+    )
+    merged = merge_core_chunk_candidates([sparse, rich, precise_emp])
+    assert merged.profile.name == "홍길동"
+    assert merged.profile.technical_grade == "EXPERT"
+    assert merged.profile.affiliation_company == "ABC테크"
+    assert {j.code for j in merged.jobs} == {"JOB-MGT-PL"}
+    assert {s.code for s in merged.skills} == {"TECH-LANG-PYTHON"}
+    assert {x.code for x in merged.expertise} == {"EXP-MGT"}
+    assert len(merged.employment_history) == 1
+    assert merged.employment_history[0].end_date == "2024-12-15"
+    assert {r.document_id for r in merged.employment_history[0].source_refs} == {
+        _DOC_A,
+        _DOC_B,
+    }
+    assert len(merged.education) == 1
+    assert len(merged.certifications) == 1
+    assert {r.document_id for r in (merged.profile.source_refs or {}).get("name", [])} == {
+        _DOC_A
+    }
+
+
+def test_merge_core_employment_end_conflict_requires_review() -> None:
+    from app.ai.schemas.profile_candidate import (
+        EmploymentCandidate,
+        ProfileCandidate,
+        ProfileCandidateDocument,
+        SourceRef,
+    )
+    from app.modules.analysis.compact_v8 import merge_core_chunk_candidates
+    from app.modules.analysis.diff_engine import (
+        build_diffs,
+        employment_candidate_dates_need_review,
+    )
+
+    ref_a = SourceRef(document_id=_DOC_A, page_no=1, quote_text="재직중")
+    ref_b = SourceRef(document_id=_DOC_B, page_no=1, quote_text="2024-12")
+    ongoing = ProfileCandidateDocument(
+        profile=ProfileCandidate(name="홍길동"),
+        employment_history=[
+            EmploymentCandidate(
+                company_name="ABC테크",
+                start_date="2018-01",
+                end_date="현재",
+                source_refs=[ref_a],
+            )
+        ],
+    )
+    dated = ProfileCandidateDocument(
+        profile=ProfileCandidate(),
+        employment_history=[
+            EmploymentCandidate(
+                company_name="ABC테크",
+                start_date="2018-01",
+                end_date="2024-12",
+                source_refs=[ref_b],
+            )
+        ],
+    )
+    merged = merge_core_chunk_candidates([ongoing, dated])
+    assert len(merged.employment_history) == 1
+    emp = merged.employment_history[0]
+    assert emp.end_date is not None
+    assert "현재" in emp.end_date
+    assert "2024-12" in emp.end_date
+    assert {r.document_id for r in emp.source_refs} == {_DOC_A, _DOC_B}
+    assert employment_candidate_dates_need_review(emp) is True
+    specs = build_diffs(merged, {"employment_history": []})
+    emp_specs = [s for s in specs if s.entity_type == "EMPLOYMENT"]
+    assert emp_specs
+    assert all(s.change_type == "REVIEW" for s in emp_specs)
+
+
+def test_merge_core_employment_incompatible_dates_require_review() -> None:
+    from app.ai.schemas.profile_candidate import (
+        EmploymentCandidate,
+        ProfileCandidateDocument,
+        SourceRef,
+    )
+    from app.modules.analysis.compact_v8 import merge_core_chunk_candidates
+    from app.modules.analysis.diff_engine import employment_candidate_dates_need_review
+
+    a = ProfileCandidateDocument(
+        employment_history=[
+            EmploymentCandidate(
+                company_name="XYZ",
+                start_date="2018-01",
+                end_date="2020-06",
+                source_refs=[
+                    SourceRef(document_id=_DOC_A, page_no=1, quote_text="2020-06")
+                ],
+            )
+        ],
+    )
+    b = ProfileCandidateDocument(
+        employment_history=[
+            EmploymentCandidate(
+                company_name="XYZ",
+                start_date="2018-01",
+                end_date="2023-12",
+                source_refs=[
+                    SourceRef(document_id=_DOC_B, page_no=1, quote_text="2023-12")
+                ],
+            )
+        ],
+    )
+    merged = merge_core_chunk_candidates([a, b])
+    emp = merged.employment_history[0]
+    assert "2020-06" in (emp.end_date or "")
+    assert "2023-12" in (emp.end_date or "")
+    assert employment_candidate_dates_need_review(emp) is True
+
+
+def test_merge_core_profile_conflict_keeps_adopted_refs_only() -> None:
+    from app.ai.schemas.profile_candidate import (
+        ProfileCandidate,
+        ProfileCandidateDocument,
+        SourceRef,
+    )
+    from app.modules.analysis.compact_v8 import merge_core_chunk_candidates
+
+    ref_a = SourceRef(document_id=_DOC_A, page_no=1, quote_text="홍길동")
+    ref_b = SourceRef(document_id=_DOC_B, page_no=1, quote_text="김철수")
+    first = ProfileCandidateDocument(
+        profile=ProfileCandidate(name="홍길동", source_refs={"name": [ref_a]}),
+    )
+    second = ProfileCandidateDocument(
+        profile=ProfileCandidate(name="김철수", source_refs={"name": [ref_b]}),
+    )
+    merged = merge_core_chunk_candidates([first, second])
+    assert merged.profile.name == "홍길동"
+    name_refs = (merged.profile.source_refs or {}).get("name", [])
+    assert {r.document_id for r in name_refs} == {_DOC_A}
+    assert all(r.quote_text != "김철수" for r in name_refs)
+
+
+def test_merge_core_keeps_single_primary_job() -> None:
+    from app.ai.schemas.profile_candidate import (
+        JobCandidate,
+        ProfileCandidateDocument,
+        SourceRef,
+    )
+    from app.modules.analysis.compact_v8 import merge_core_chunk_candidates
+
+    a = ProfileCandidateDocument(
+        jobs=[
+            JobCandidate(
+                raw_value="PL",
+                code="JOB-MGT-PL",
+                job_type="PRIMARY",
+                confidence=0.5,
+                source_refs=[
+                    SourceRef(document_id=_DOC_A, page_no=1, quote_text="PL")
+                ],
+            )
+        ],
+    )
+    b = ProfileCandidateDocument(
+        jobs=[
+            JobCandidate(
+                raw_value="PM",
+                code="JOB-MGT-PM",
+                job_type="PRIMARY",
+                confidence=0.9,
+                source_refs=[
+                    SourceRef(document_id=_DOC_B, page_no=1, quote_text="PM")
+                ],
+            )
+        ],
+    )
+    merged = merge_core_chunk_candidates([a, b])
+    primaries = [j for j in merged.jobs if j.job_type == "PRIMARY"]
+    secondaries = [j for j in merged.jobs if j.job_type == "SECONDARY"]
+    assert len(primaries) == 1
+    assert primaries[0].code == "JOB-MGT-PM"
+    assert len(secondaries) == 1
+    assert secondaries[0].code == "JOB-MGT-PL"
+
+
+def test_merge_core_ambiguous_identity_keeps_distinct_rows() -> None:
+    """Undated employments/certificates and distinct majors must not collapse."""
+    from app.ai.schemas.profile_candidate import (
+        CertificationCandidate,
+        EducationCandidate,
+        EmploymentCandidate,
+        ProfileCandidateDocument,
+    )
+    from app.modules.analysis.compact_v8 import merge_core_chunk_candidates
+
+    a = ProfileCandidateDocument(
+        employment_history=[
+            EmploymentCandidate(company_name="ABC테크", end_date="2020-12")
+        ],
+        education=[
+            EducationCandidate(
+                school_name="한국대", degree="학사",
+                major="컴퓨터공학", start_date="2010-03"
+            )
+        ],
+        certifications=[
+            CertificationCandidate(certification_name="정보처리기사", issuer="발급기관")
+        ],
+    )
+    b = ProfileCandidateDocument(
+        employment_history=[
+            EmploymentCandidate(company_name="ABC테크", end_date="2024-12")
+        ],
+        education=[
+            EducationCandidate(
+                school_name="한국대", degree="학사",
+                major="경영학", start_date="2010-03"
+            )
+        ],
+        certifications=[
+            CertificationCandidate(certification_name="정보처리기사", issuer="발급기관")
+        ],
+    )
+    result = merge_core_chunk_candidates([a, b])
+    assert len(result.employment_history) == 2
+    assert {x.end_date for x in result.employment_history} == {
+        "2020-12", "2024-12"
+    }
+    assert len(result.education) == 2
+    assert {x.major for x in result.education} == {"컴퓨터공학", "경영학"}
+    assert len(result.certifications) == 2
+
+
 def test_length_finish_reason_still_raises_truncated(monkeypatch) -> None:
     import pytest
     from app.ai.providers.errors import AIResponseTruncatedError
@@ -866,6 +1193,9 @@ def _run_staged(
         analysis_token_count_max_attempts=3,
         analysis_project_split_max_depth=3,
         analysis_project_split_max_calls=8,
+        analysis_core_output_ratio=0.25,
+        analysis_core_split_max_depth=3,
+        analysis_core_split_max_calls=16,
     )
     settings_args.update(settings_kwargs or {})
     settings = Settings(**settings_args)
@@ -1022,9 +1352,12 @@ def test_service_budget_fit_keeps_single_path_and_second_pass(monkeypatch) -> No
     assert phases[0] == "core"
     assert phases.count("projects") >= 2  # first + second-pass
     assert any(c.get("recovery_retry") is True for c in llm.chat_calls)
-    # CORE must not receive an explicit completion cap.
-    assert llm.chat_calls[0]["max_completion_tokens"] is None
+    # CORE single-path uses ModelOps budget completion reserve (ratio of window).
+    core_chat = llm.chat_calls[0]
+    assert core_chat["phase"] == "core"
+    assert core_chat["max_completion_tokens"] == 2500  # 10000 * 0.25
     assert len(doc.projects) >= 1
+    assert doc.profile.name == "홍길동"
 
 
 def test_service_over_budget_splits_and_skips_full_second_pass(monkeypatch) -> None:
@@ -1371,6 +1704,430 @@ def test_service_irreducible_overbudget_fail_closed(monkeypatch) -> None:
             monkeypatch,
             llm,
             blocks,
-            settings_kwargs={"analysis_project_split_max_depth": 1},
+            settings_kwargs={
+                "analysis_project_split_max_depth": 1,
+                "analysis_core_split_max_depth": 1,
+            },
         )
     assert not any(c["phase"] == "projects" for c in llm.chat_calls)
+
+
+def test_service_core_near_window_splits_without_same_input_retry(monkeypatch) -> None:
+    """Near-full 8192-style window: CORE over-budget → split, never same full retry."""
+    from app.ai.providers.token_count import TokenCountResult
+
+    window = 8_000  # avoid hardcoding banned literals in budget modules
+
+    def count_fn(*, user_prompt, **kwargs):
+        aliased_both = (
+            "[DOCUMENT D1]" in user_prompt and "[DOCUMENT D2]" in user_prompt
+        )
+        # Mimic Kwon v23: prompt≈7855 vs window with reserves does not fit.
+        prompt_tokens = 7_200 if aliased_both else 1_500
+        return TokenCountResult(
+            model="qwen3-14b",
+            prompt_tokens=prompt_tokens,
+            context_window=window,
+            status="VERIFIED",
+            deployment_id="dep-1",
+            route_id="route-1",
+            routing_version=1,
+        )
+
+    core_i = {"n": 0}
+
+    def chat_fn(*, log_context, user_prompt, **kwargs):
+        phase = (log_context or {}).get("phase")
+        if phase == "core":
+            core_i["n"] += 1
+            # Must never chat the combined two-doc CORE prompt.
+            assert not (
+                "[DOCUMENT D1]" in user_prompt and "[DOCUMENT D2]" in user_prompt
+            )
+            payload = _core_payload()
+            if "문서A" in user_prompt:
+                payload = {
+                    **payload,
+                    "p": {**payload["p"], "n": "홍길동"},
+                    "s": [],
+                    "j": [],
+                    "x": [],
+                    "w": [],
+                    "e": [],
+                    "c": [],
+                }
+            else:
+                payload = {
+                    **payload,
+                    "p": {"n": "", "tg": "EXPERT", "ac": "ABC테크"},
+                    "s": [],
+                    "j": [{"v": "PL", "c": "JOB-MGT-PL", "t": "PRIMARY"}],
+                    "x": [{"v": "사업관리", "c": "EXP-MGT"}],
+                    "w": [
+                        {
+                            "co": "ABC테크",
+                            "ti": "책임",
+                            "s": "2018-01",
+                            "e": "2024-12",
+                        }
+                    ],
+                    "e": [{"sc": "서울대", "mj": "컴공", "dg": "학사"}],
+                    "c": [{"n": "정보처리기사", "acq": "2010.12"}],
+                }
+            return payload
+        return _projects_payload(
+            "DocA사업" if "문서A" in user_prompt else "DocB사업"
+        )
+
+    llm = _BudgetLLM(count_fn=count_fn, chat_fn=chat_fn)
+    blocks = (
+        _doc_block(
+            "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            alias_body="",
+            pages="[PAGE 1]\n" + ("문서A " * 80),
+        )
+        + _doc_block(
+            "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            alias_body="",
+            pages="[PAGE 1]\n" + ("문서B " * 80),
+        )
+    )
+    doc = _run_staged(
+        monkeypatch,
+        llm,
+        blocks,
+        caps_fn=lambda *_a, **_k: _caps_fixed(window=window),
+    )
+    core_chats = [c for c in llm.chat_calls if c["phase"] == "core"]
+    assert len(core_chats) >= 2
+    assert core_i["n"] >= 2
+    assert all(c["max_completion_tokens"] is not None for c in core_chats)
+    assert not any(c.get("recovery_retry") is True for c in core_chats)
+    assert doc.profile.name == "홍길동"
+    assert doc.profile.technical_grade == "EXPERT"
+    assert doc.profile.affiliation_company == "ABC테크"
+    assert {j.code for j in doc.jobs} == {"JOB-MGT-PL"}
+    assert {x.code for x in doc.expertise} == {"EXP-MGT"}
+    assert len(doc.employment_history) >= 1
+
+
+def test_service_core_single_large_document_page_split(monkeypatch) -> None:
+    """Single oversized document splits by page then merges CORE entities."""
+    from app.ai.providers.token_count import TokenCountResult
+
+    def count_fn(*, user_prompt, **kwargs):
+        page_markers = user_prompt.count("[PAGE ")
+        # Full multi-page doc over; single page fits.
+        prompt_tokens = 9_000 if page_markers >= 2 else 800
+        return TokenCountResult(
+            model="qwen3-14b",
+            prompt_tokens=prompt_tokens,
+            context_window=10_000,
+            status="VERIFIED",
+            deployment_id="dep-1",
+            route_id="route-1",
+            routing_version=1,
+        )
+
+    def chat_fn(*, log_context, user_prompt, **kwargs):
+        phase = (log_context or {}).get("phase")
+        if phase == "core":
+            assert user_prompt.count("[PAGE ") == 1
+            if "[PAGE 1]" in user_prompt:
+                return {
+                    "p": {"n": "홍길동"},
+                    "j": [{"v": "PL", "c": "JOB-MGT-PL", "t": "PRIMARY"}],
+                    "s": [],
+                    "x": [],
+                    "w": [],
+                    "e": [],
+                    "c": [],
+                    "conf": 0.7,
+                }
+            return {
+                "p": {"n": "", "ac": "ABC테크", "cdv": "10년"},
+                "j": [],
+                "s": [],
+                "x": [{"v": "사업관리", "c": "EXP-MGT"}],
+                "w": [
+                    {
+                        "co": "ABC테크",
+                        "ti": "책임",
+                        "s": "2018-01",
+                        "e": "2024-12",
+                    }
+                ],
+                "e": [{"sc": "서울대", "mj": "컴공", "dg": "학사"}],
+                "c": [{"n": "정보처리기사", "acq": "2010.12"}],
+                "conf": 0.8,
+            }
+        return _projects_payload()
+
+    llm = _BudgetLLM(count_fn=count_fn, chat_fn=chat_fn)
+    blocks = _doc_block(
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        alias_body="",
+        pages=("[PAGE 1]\n" + ("페이지1본문 " * 60) + "\n\n[PAGE 2]\n" + ("페이지2본문 " * 60)),
+    )
+    doc = _run_staged(monkeypatch, llm, blocks)
+    core_chats = [c for c in llm.chat_calls if c["phase"] == "core"]
+    assert len(core_chats) >= 2
+    assert all((c.get("split_depth") or 0) == 0 for c in core_chats)
+    assert doc.profile.name == "홍길동"
+    assert doc.profile.affiliation_company == "ABC테크"
+    assert {x.code for x in doc.expertise} == {"EXP-MGT"}
+    assert {j.code for j in doc.jobs} == {"JOB-MGT-PL"}
+    assert len(doc.employment_history) >= 1
+
+
+def test_service_core_length_escalates_to_adaptive_not_same_retry(
+    monkeypatch,
+) -> None:
+    """CORE fit + length → structural split; no identical full-source recovery."""
+    from app.ai.providers.errors import AIResponseTruncatedError
+    from app.ai.providers.token_count import TokenCountResult
+
+    core_chats = {"n": 0}
+
+    def count_fn(*, user_prompt, **kwargs):
+        aliased_both = (
+            "[DOCUMENT D1]" in user_prompt and "[DOCUMENT D2]" in user_prompt
+        )
+        return TokenCountResult(
+            model="qwen3-14b",
+            prompt_tokens=900 if aliased_both else 700,
+            context_window=10_000,
+            status="VERIFIED",
+            deployment_id="dep-1",
+            route_id="route-1",
+            routing_version=1,
+        )
+
+    def chat_fn(*, log_context, user_prompt, **kwargs):
+        phase = (log_context or {}).get("phase")
+        if phase == "core":
+            core_chats["n"] += 1
+            if core_chats["n"] == 1:
+                assert "[DOCUMENT D1]" in user_prompt and "[DOCUMENT D2]" in user_prompt
+                raise AIResponseTruncatedError(
+                    meta={"finish_reason": "length", "prompt_tokens": 900}
+                )
+            # Adaptive chunks must be narrower than the failed full prompt.
+            assert not (
+                "[DOCUMENT D1]" in user_prompt and "[DOCUMENT D2]" in user_prompt
+            )
+            return _core_payload()
+        return _projects_payload(
+            "DocA사업" if "문서A" in user_prompt else "DocB사업"
+        )
+
+    llm = _BudgetLLM(count_fn=count_fn, chat_fn=chat_fn)
+    blocks = (
+        _doc_block(
+            "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            alias_body="",
+            pages="[PAGE 1]\n" + ("문서A " * 80),
+        )
+        + _doc_block(
+            "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            alias_body="",
+            pages="[PAGE 1]\n" + ("문서B " * 80),
+        )
+    )
+    doc = _run_staged(monkeypatch, llm, blocks)
+    core_calls = [c for c in llm.chat_calls if c["phase"] == "core"]
+    assert core_chats["n"] >= 3  # 1 failed full + >=2 chunk successes
+    assert not any(c.get("recovery_retry") is True for c in core_calls)
+    assert any(
+        ("[DOCUMENT D1]" in (c.get("user_prompt") or ""))
+        and ("[DOCUMENT D2]" not in (c.get("user_prompt") or ""))
+        for c in core_calls
+    )
+    assert doc.profile.name == "홍길동"
+
+
+def test_service_core_token_count_failure_fail_closed(monkeypatch) -> None:
+    import pytest
+    from app.ai.providers.errors import AIProviderError
+    from app.modules.analysis.service import InsufficientCandidateError
+
+    def count_fn(**kwargs):
+        raise AIProviderError("token-count HTTP 503")
+
+    llm = _BudgetLLM(count_fn=count_fn)
+    blocks = _doc_block(
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        alias_body="",
+        pages="[PAGE 1]\n" + ("본문 " * 40),
+    )
+    with pytest.raises(InsufficientCandidateError):
+        _run_staged(monkeypatch, llm, blocks)
+    assert llm.chat_calls == []
+
+
+def test_service_core_single_path_budget_fit(monkeypatch) -> None:
+    """Normal CORE: verified budget fit → one Chat with completion reserve."""
+    from app.ai.providers.token_count import TokenCountResult
+
+    def count_fn(**kwargs):
+        return TokenCountResult(
+            model="qwen3-14b",
+            prompt_tokens=400,
+            context_window=10_000,
+            status="VERIFIED",
+            deployment_id="dep-1",
+            route_id="route-1",
+            routing_version=1,
+        )
+
+    llm = _BudgetLLM(count_fn=count_fn, project_payloads=[_projects_payload()])
+    blocks = _doc_block(
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        alias_body="",
+        pages="[PAGE 1]\n짧은 경력 본문",
+    )
+    doc = _run_staged(monkeypatch, llm, blocks)
+    core_chats = [c for c in llm.chat_calls if c["phase"] == "core"]
+    assert len(core_chats) == 1
+    assert core_chats[0]["max_completion_tokens"] == 2500
+    assert core_chats[0].get("split_depth") in (None, 0)
+    assert doc.profile.name == "홍길동"
+    assert len(doc.jobs) >= 1
+    assert len(doc.employment_history) >= 1
+
+
+def test_pack_phase_source_chunks_respects_call_cap() -> None:
+    from app.modules.analysis.token_budget import (
+        merge_adjacent_source_chunks,
+        pack_phase_source_chunks,
+    )
+
+    def _page(doc: str, n: int) -> str:
+        return (
+            f"[DOCUMENT {doc}]\nfilename: x.pdf\ndocument_type: DOC-PROFILE\n"
+            f"content:\n[PAGE {n}]\nbody-{doc}-{n} " + ("x" * 20)
+        )
+
+    pages = [_page("D1", i) for i in range(1, 4)] + [
+        _page("D2", i) for i in range(1, 7)
+    ]
+    assert len(pages) == 9
+
+    class _Fit:
+        def __init__(self, fits: bool):
+            self.fits = fits
+
+    def budget_for_blocks(blocks: str):
+        # Allow packing up to ~3 page markers per group.
+        return _Fit(blocks.count("[PAGE ") <= 3)
+
+    packed = pack_phase_source_chunks(
+        pages, max_chunks=8, budget_for_blocks=budget_for_blocks
+    )
+    assert len(packed) <= 8
+    assert len(packed) >= 3
+    merged_sample = merge_adjacent_source_chunks(pages[0], pages[1])
+    assert merged_sample.count("[DOCUMENT D1]") == 1
+    assert merged_sample.count("[PAGE 1]") == 1
+    assert merged_sample.count("[PAGE 2]") == 1
+
+
+def test_service_core_single_page_length_forces_body_split_not_same_retry(
+    monkeypatch,
+) -> None:
+    """Single-doc/single-page length must body-split; never re-chat identical input."""
+    from app.ai.providers.errors import AIResponseTruncatedError
+    from app.ai.providers.token_count import TokenCountResult
+
+    seen_core: list[str] = []
+
+    def count_fn(**kwargs):
+        return TokenCountResult(
+            model="qwen3-14b",
+            prompt_tokens=700,
+            context_window=10_000,
+            status="VERIFIED",
+            deployment_id="dep-1",
+            route_id="route-1",
+            routing_version=1,
+        )
+
+    def chat_fn(*, log_context, user_prompt, **kwargs):
+        phase = (log_context or {}).get("phase")
+        if phase == "core":
+            seen_core.append(user_prompt)
+            if len(seen_core) == 1:
+                raise AIResponseTruncatedError(
+                    meta={"finish_reason": "length", "prompt_tokens": 700}
+                )
+            # Must be a strict body subset — never the identical full prompt again.
+            assert user_prompt != seen_core[0]
+            assert len(user_prompt) < len(seen_core[0])
+            return _core_payload()
+        return _projects_payload()
+
+    llm = _BudgetLLM(count_fn=count_fn, chat_fn=chat_fn)
+    blocks = _doc_block(
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        alias_body="",
+        pages="[PAGE 1]\n" + ("단일페이지본문 " * 120),
+    )
+    doc = _run_staged(monkeypatch, llm, blocks)
+    core_chats = [c for c in llm.chat_calls if c["phase"] == "core"]
+    assert len(core_chats) >= 3  # 1 failed full + >=2 body chunks
+    assert seen_core[1] != seen_core[0]
+    assert doc.profile.name == "홍길동"
+
+
+def test_service_core_many_pages_pack_within_call_cap(monkeypatch) -> None:
+    """3+6 page structural split packs under a tight CORE call budget."""
+    from app.ai.providers.token_count import TokenCountResult
+
+    def count_fn(*, user_prompt, **kwargs):
+        pages = user_prompt.count("[PAGE ")
+        docs = sum(
+            1
+            for marker in ("[DOCUMENT D1]", "[DOCUMENT D2]")
+            if marker in user_prompt
+        )
+        # Full multi-doc / multi-page over; small groups fit.
+        prompt_tokens = 9_000 if docs >= 2 or pages >= 4 else 700
+        return TokenCountResult(
+            model="qwen3-14b",
+            prompt_tokens=prompt_tokens,
+            context_window=10_000,
+            status="VERIFIED",
+            deployment_id="dep-1",
+            route_id="route-1",
+            routing_version=1,
+        )
+
+    llm = _BudgetLLM(count_fn=count_fn)
+    pages_a = "\n\n".join(
+        f"[PAGE {i}]\n" + (f"문서A페이지{i} " * 30) for i in range(1, 4)
+    )
+    pages_b = "\n\n".join(
+        f"[PAGE {i}]\n" + (f"문서B페이지{i} " * 30) for i in range(1, 7)
+    )
+    blocks = (
+        _doc_block(
+            "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            alias_body="",
+            pages=pages_a,
+        )
+        + _doc_block(
+            "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            alias_body="",
+            pages=pages_b,
+        )
+    )
+    doc = _run_staged(
+        monkeypatch,
+        llm,
+        blocks,
+        settings_kwargs={"analysis_core_split_max_calls": 8},
+    )
+    core_chats = [c for c in llm.chat_calls if c["phase"] == "core"]
+    assert core_chats
+    assert len(core_chats) <= 8
+    assert doc.profile.name == "홍길동"
