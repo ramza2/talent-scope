@@ -5546,11 +5546,13 @@ _EMPLOYMENT_END_CONFLICT_SEP = " / "
 def _employment_identity_key(
     row: EmploymentCandidate,
 ) -> tuple[str, str] | None:
-    """Identity is company+start; end dates resolve conservatively."""
+    """Only merge employment when company AND start date identify a row."""
     company = _fold_ws_text(row.company_name or "")
-    if not company:
-        return None
     start = _fold_ws_text(row.start_date or "")
+    if not company or not start:
+        # Same employer may have multiple distinct employments; missing
+        # start must not collapse them into one invented period.
+        return None
     return (company, start)
 
 
@@ -5646,19 +5648,21 @@ def _merge_core_employment(
 
 def _education_identity_key(
     row: EducationCandidate,
-) -> tuple[str, str, str] | None:
+) -> tuple[str, str, str, str] | None:
     school = _fold_ws_text(row.school_name or "")
-    if not school:
-        return None
     degree = _fold_ws_text(row.degree or "")
     start = _fold_ws_text(row.start_date or "")
-    return (school, degree, start)
+    major = _fold_ws_text(row.major or "")
+    if not school or not start:
+        return None
+    # Same school / degree / start can still refer to distinct majors.
+    return (school, degree, start, major)
 
 
 def _merge_core_education(
     chunks: list[ProfileCandidateDocument],
 ) -> list[EducationCandidate]:
-    groups: dict[tuple[str, str, str], EducationCandidate] = {}
+    groups: dict[tuple[str, str, str, str], EducationCandidate] = {}
     singles: list[EducationCandidate] = []
     for chunk in chunks:
         for row in chunk.education or []:
@@ -5690,10 +5694,11 @@ def _cert_identity_key(
     row: CertificationCandidate,
 ) -> tuple[str, str, str] | None:
     name = _fold_ws_text(row.certification_name or "")
-    if not name:
-        return None
     issuer = _fold_ws_text(row.issuer or "")
     acquired = _fold_ws_text(row.acquired_date or "")
+    if not name or not acquired:
+        # Different renewals of an undated credential are ambiguous.
+        return None
     return (name, issuer, acquired)
 
 
