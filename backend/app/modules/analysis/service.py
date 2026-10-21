@@ -1465,6 +1465,7 @@ class AnalysisService:
             max_completion_tokens: int | None = None,
             count_toward_staged_budget: bool = True,
             count_toward_project_split: bool = False,
+            project_use_residual_output: bool = False,
             count_toward_core_split: bool = False,
             split_depth: int = 0,
             chunk_index: int | None = None,
@@ -1521,7 +1522,16 @@ class AnalysisService:
                     raise ProjectPromptOverBudgetError(
                         "project prompt exceeds token budget before chat"
                     )
-                max_completion_tokens = budget.max_completion_tokens
+                # A PROJECT leaf that still hits the output cap may use the
+                # measured context residual once. Normal requests keep the
+                # configured ratio reserve; never exceed verified safety margin.
+                max_completion_tokens = (
+                    budget.context_window
+                    - budget.prompt_tokens
+                    - budget.safety_margin_tokens
+                    if project_use_residual_output
+                    else budget.max_completion_tokens
+                )
             elif phase == "core":
                 _refresh_capabilities(reason="core_pre_chat")
                 last_token_count = None
@@ -2461,6 +2471,48 @@ class AnalysisService:
                     raise InsufficientCandidateError() from cause
                 parts = _subsplit_project_chunk(blocks)
                 if len(parts) <= 1:
+                    # An output-cap truncation is not an input-context overflow.
+                    # When the body cannot be split further, permit ONE request
+                    # with the extra verified context headroom, then fail closed.
+                    # Never retry a generic provider failure or over-budget input.
+                    residual = (
+                        budget.context_window
+                        - budget.prompt_tokens
+                        - budget.safety_margin_tokens
+                    )
+                    if (
+                        isinstance(cause, AIResponseTruncatedError)
+                        and residual > budget.max_completion_tokens
+                    ):
+                        logger.info(
+                            "analysis project output headroom retry "
+                            "analysis_run_id=%s split_depth=%s chunk_index=%s "
+                            "prior_output_tokens=%s residual_output_tokens=%s",
+                            base_log.get("analysis_run_id"),
+                            split_depth,
+                            chunk_index,
+                            budget.max_completion_tokens,
+                            residual,
+                        )
+                        try:
+                            raw = _phase_call(
+                                phase="projects",
+                                system_prompt=prompt.projects_system_prompt,
+                                build_user_prompt=prompt.build_projects_user_prompt,
+                                code_catalog_text=projects_catalog,
+                                recovery_retry=recovery_retry,
+                                document_blocks_override=blocks,
+                                count_toward_staged_budget=False,
+                                count_toward_project_split=True,
+                                project_use_residual_output=True,
+                                split_depth=split_depth,
+                                chunk_index=chunk_index,
+                            )
+                            if recovery_retry and prompt.validate_projects_recovery_root:
+                                _validate_projects_recovery_raw(raw)
+                            return _normalize_projects(raw)
+                        except (AIResponseTruncatedError, AIProviderError) as retry_exc:
+                            raise InsufficientCandidateError() from retry_exc
                     raise InsufficientCandidateError() from cause
                 nested: list[ProfileCandidateDocument] = []
                 for sub_i, part in enumerate(parts):

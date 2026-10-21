@@ -2226,3 +2226,100 @@ def test_service_projects_nine_planned_chunks_fail_before_chat_when_cap_eight(
             settings_kwargs={"analysis_project_split_max_calls": 8},
         )
     assert not any(c["phase"] == "projects" for c in llm.chat_calls)
+
+
+def _irreducible_project_length_case(monkeypatch, *, always_truncate: bool):
+    """Two documents; PROJECT D1 is a small leaf with output-cap length."""
+    from app.ai.providers.errors import AIResponseTruncatedError
+    from app.ai.providers.token_count import TokenCountResult
+
+    project_calls = []
+
+    def count_fn(*, user_prompt, **_kwargs):
+        both = (
+            "[DOCUMENT D1]" in user_prompt
+            and "[DOCUMENT D2]" in user_prompt
+        )
+        return TokenCountResult(
+            model="qwen3-14b",
+            prompt_tokens=7855 if both else 2831,
+            context_window=8192,
+            status="VERIFIED",
+            deployment_id="dep-1",
+            route_id="route-1",
+            routing_version=1,
+        )
+
+    def chat_fn(*, log_context, user_prompt, max_completion_tokens, **_kwargs):
+        if (log_context or {}).get("phase") == "core":
+            return _core_payload()
+        project_calls.append((user_prompt, max_completion_tokens))
+        if "[DOCUMENT D1]" in user_prompt and (
+            always_truncate or max_completion_tokens < 4000
+        ):
+            raise AIResponseTruncatedError(
+                meta={
+                    "finish_reason": "length",
+                    "prompt_tokens": 2831,
+                    "completion_tokens": max_completion_tokens,
+                }
+            )
+        return {"pr": []}
+
+    llm = _BudgetLLM(count_fn=count_fn, chat_fn=chat_fn)
+    blocks = (
+        _doc_block(
+            "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            alias_body="",
+            pages="[PAGE 1]\n복구프로젝트-1",
+        )
+        + "\n\n"
+        + _doc_block(
+            "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            alias_body="",
+            pages="[PAGE 1]\n기타 기술 경력",
+        )
+    )
+    def run():
+        return _run_staged(
+            monkeypatch,
+            llm,
+            blocks,
+            caps_fn=lambda *_a, **_k: _caps_fixed(window=8192),
+            settings_kwargs={"analysis_project_split_max_calls": 16},
+        )
+    return run, project_calls
+
+
+def test_irreducible_project_length_uses_verified_output_headroom_once(
+    monkeypatch,
+) -> None:
+    """2867 output cap with 2831 prompt has 4706 safe room; retry once."""
+    run, calls = _irreducible_project_length_case(
+        monkeypatch, always_truncate=False
+    )
+    candidate = run()
+    assert candidate.profile.name == "홍길동"
+    assert len(calls) == 3  # D1 default + D1 headroom + D2 default
+    first, second, third = calls
+    assert first[0] == second[0]  # only allowed for output-bound leaf
+    assert first[1] == 2867
+    assert second[1] == 4706  # context 8192 - 2831 prompt - 655 margin
+    assert third[1] == 2867
+
+
+def test_irreducible_project_length_after_headroom_fails_closed(
+    monkeypatch,
+) -> None:
+    """A second length at full safe residual is terminal, not an infinite retry."""
+    import pytest
+    from app.modules.analysis.service import InsufficientCandidateError
+
+    run, calls = _irreducible_project_length_case(
+        monkeypatch, always_truncate=True
+    )
+    with pytest.raises(InsufficientCandidateError):
+        run()
+    assert len(calls) == 2
+    assert calls[0][0] == calls[1][0]
+    assert [c[1] for c in calls] == [2867, 4706]
