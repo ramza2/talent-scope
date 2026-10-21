@@ -75,7 +75,8 @@ class Settings(BaseSettings):
     analysis_project_split_max_calls: int = 8
     analysis_core_output_ratio: float = 0.25
     analysis_core_split_max_depth: int = 3
-    analysis_core_split_max_calls: int = 8
+    # Page-heavy multi-doc CORE splits (e.g. 3+6 pages) need headroom above 8.
+    analysis_core_split_max_calls: int = 16
     analysis_token_count_max_attempts: int = 2
 
     embedding_base_url: str = "https://gateway.example.test"

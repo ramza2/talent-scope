@@ -23,6 +23,8 @@ from app.ai.schemas.profile_candidate import (
     SourceRef,
     SummaryCandidate,
 )
+from app.modules.analysis.confirm_dates import is_ongoing_end_marker
+from app.modules.analysis.diff_engine import dates_compatible
 
 _DOCUMENT_BLOCK_RE = re.compile(
     r"\[DOCUMENT\]\n"
@@ -5424,6 +5426,24 @@ def _core_code_ref_key(item: Any) -> str | None:
     return None
 
 
+def _core_ensure_single_primary_job(jobs: list[JobCandidate]) -> list[JobCandidate]:
+    """Keep at most one PRIMARY after CORE chunk merge (extras → SECONDARY)."""
+    primary_indices = [i for i, job in enumerate(jobs) if job.job_type == "PRIMARY"]
+    if len(primary_indices) <= 1:
+        return jobs
+
+    def _confidence_key(index: int) -> float:
+        value = jobs[index].confidence
+        return value if value is not None else float("-inf")
+
+    keep_index = max(primary_indices, key=_confidence_key)
+    demote = set(primary_indices) - {keep_index}
+    return [
+        job.model_copy(update={"job_type": "SECONDARY"}) if i in demote else job
+        for i, job in enumerate(jobs)
+    ]
+
+
 def _merge_core_job_lists(chunks: list[ProfileCandidateDocument]) -> list[JobCandidate]:
     by_key: dict[str, JobCandidate] = {}
     for chunk in chunks:
@@ -5450,7 +5470,7 @@ def _merge_core_job_lists(chunks: list[ProfileCandidateDocument]) -> list[JobCan
                     "raw_value": prev.raw_value or job.raw_value,
                 }
             )
-    return list(by_key.values())
+    return _core_ensure_single_primary_job(list(by_key.values()))
 
 
 def _merge_core_skill_lists(
@@ -5520,28 +5540,13 @@ def _merge_core_expertise_lists(
     return list(by_key.values())
 
 
-_ONGOING_END_TOKENS = frozenset(
-    {
-        "현재",
-        "재직중",
-        "재직 중",
-        "present",
-        "current",
-        "now",
-        "ongoing",
-    }
-)
-
-
-def _is_ongoing_end_token(value: str | None) -> bool:
-    text = (value or "").strip()
-    return bool(text) and text.casefold() in _ONGOING_END_TOKENS
+_EMPLOYMENT_END_CONFLICT_SEP = " / "
 
 
 def _employment_identity_key(
     row: EmploymentCandidate,
 ) -> tuple[str, str] | None:
-    """Identity is company+start; end dates merge via precision preference."""
+    """Identity is company+start; end dates resolve conservatively."""
     company = _fold_ws_text(row.company_name or "")
     if not company:
         return None
@@ -5549,8 +5554,38 @@ def _employment_identity_key(
     return (company, start)
 
 
-def _merge_employment_end(a: str | None, b: str | None) -> str | None:
-    """Prefer concrete dates over ongoing markers; otherwise more precise token."""
+def _employment_end_is_conflict_token(value: str | None) -> bool:
+    text = (value or "").strip()
+    return bool(text) and _EMPLOYMENT_END_CONFLICT_SEP in text
+
+
+def _employment_end_conflict_token(a: str, b: str) -> str:
+    """Unparseable multi-value token → diff REVIEW; preserves both ends."""
+    parts: list[str] = []
+    for raw in (a, b):
+        text = (raw or "").strip()
+        if not text:
+            continue
+        if _EMPLOYMENT_END_CONFLICT_SEP in text:
+            parts.extend(
+                p.strip()
+                for p in text.split(_EMPLOYMENT_END_CONFLICT_SEP)
+                if p.strip()
+            )
+        else:
+            parts.append(text)
+    # Stable unique order; do not invent or drop alternatives.
+    unique = sorted(dict.fromkeys(parts), key=lambda s: s.casefold())
+    return _EMPLOYMENT_END_CONFLICT_SEP.join(unique)
+
+
+def _resolve_employment_end(a: str | None, b: str | None) -> str | None:
+    """Resolve employment ends without arbitrary conflict winners.
+
+    Compatible precision upgrades keep the more precise token. Ongoing vs
+    concrete calendar end, or incompatible calendar ends, become a REVIEW
+    conflict token (unparseable → not auto-NEW / not auto-confirm).
+    """
     if a in (None, "") and b in (None, ""):
         return None
     if a in (None, ""):
@@ -5559,15 +5594,18 @@ def _merge_employment_end(a: str | None, b: str | None) -> str | None:
         return a
     if a == b:
         return a
-    a_ongoing = _is_ongoing_end_token(a)
-    b_ongoing = _is_ongoing_end_token(b)
-    if a_ongoing and not b_ongoing:
-        return b
-    if b_ongoing and not a_ongoing:
-        return a
+    if _employment_end_is_conflict_token(a) or _employment_end_is_conflict_token(b):
+        return _employment_end_conflict_token(a, b)
+    a_ongoing = is_ongoing_end_marker(a)
+    b_ongoing = is_ongoing_end_marker(b)
     if a_ongoing and b_ongoing:
         return a
-    return _core_prefer_date(a, b)
+    if a_ongoing or b_ongoing:
+        # 현재 vs dated end — do not silently prefer either side.
+        return _employment_end_conflict_token(a, b)
+    if dates_compatible(a, b):
+        return _core_prefer_date(a, b)
+    return _employment_end_conflict_token(a, b)
 
 
 def _merge_employment_pair(
@@ -5578,7 +5616,7 @@ def _merge_employment_pair(
             "department": left.department or right.department,
             "title": left.title or right.title,
             "start_date": _core_prefer_date(left.start_date, right.start_date),
-            "end_date": _merge_employment_end(left.end_date, right.end_date),
+            "end_date": _resolve_employment_end(left.end_date, right.end_date),
             "responsibilities": left.responsibilities or right.responsibilities,
             "confidence": max(left.confidence or 0.0, right.confidence or 0.0)
             or left.confidence
@@ -5691,7 +5729,11 @@ def _merge_core_certifications(
 
 
 def _merge_core_profile(chunks: list[ProfileCandidateDocument]) -> ProfileCandidate:
-    """Conservative scalar merge: fill empties; never overwrite conflicts."""
+    """Conservative scalar merge: fill empties; never overwrite conflicts.
+
+    On scalar conflict, keep the first non-empty value and do not attach
+    source_refs from the rejected competing value.
+    """
     base = ProfileCandidate()
     refs: dict[str, list[SourceRef]] = {}
     for chunk in chunks:
@@ -5708,6 +5750,15 @@ def _merge_core_profile(chunks: list[ProfileCandidateDocument]) -> ProfileCandid
         if updates:
             base = base.model_copy(update=updates)
         for field, field_refs in (profile.source_refs or {}).items():
+            if field not in PROFILE_SCALAR_FIELD_NAMES:
+                continue
+            incoming_val = getattr(profile, field, None)
+            if incoming_val is None or incoming_val == "":
+                continue
+            adopted_val = getattr(base, field, None)
+            if adopted_val != incoming_val:
+                # Rejected competing scalar — do not merge its provenance.
+                continue
             refs[field] = _core_merge_source_refs(refs.get(field, []), field_refs)
     if refs:
         base = base.model_copy(update={"source_refs": refs})
@@ -5720,8 +5771,10 @@ def merge_core_chunk_candidates(
     """Deterministic CORE-phase chunk merge (profile + structured entities).
 
     Union jobs/skills/expertise/employment/education/certifications by
-    conservative identity keys. Preserve source_refs and prefer more precise
-    dates. Conflicting profile scalars keep the first non-empty value.
+    conservative identity keys. Preserve source_refs. Compatible employment
+    end precision may upgrade; conflicting ends become REVIEW tokens.
+    Conflicting profile scalars keep the first non-empty value without
+    adopting rejected refs. At most one PRIMARY job remains after merge.
     Individual sparse chunks are allowed — callers evaluate the merged result.
     """
     if not chunks:

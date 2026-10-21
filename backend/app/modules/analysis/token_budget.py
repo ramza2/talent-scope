@@ -205,5 +205,78 @@ def plan_phase_source_chunks(
     return chunks or [document_blocks]
 
 
+def merge_adjacent_source_chunks(left: str, right: str) -> str:
+    """Merge adjacent prompt blocks, collapsing same-document page headers."""
+    a = left or ""
+    b = right or ""
+    if not a.strip():
+        return b
+    if not b.strip():
+        return a
+    marker = "content:\n"
+    ai = a.find(marker)
+    bi = b.find(marker)
+    if ai >= 0 and bi >= 0:
+        header_a = a[: ai + len(marker)]
+        header_b = b[: bi + len(marker)]
+        if header_a == header_b:
+            body_b = b[bi + len(marker) :]
+            sep = "" if a.endswith("\n") or body_b.startswith("\n") else "\n"
+            return f"{a}{sep}{body_b}"
+    sep = "" if a.endswith("\n") or b.startswith("\n") else "\n"
+    return f"{a}{sep}{b}"
+
+
+def pack_phase_source_chunks(
+    chunks: list[str],
+    *,
+    max_chunks: int,
+    budget_for_blocks,
+) -> list[str]:
+    """Pack adjacent chunks so count ≤ max_chunks when token budget allows.
+
+    Used by CORE adaptive planning so page-heavy splits cannot exceed the
+    LLM call cap. Over-budget packed groups are still emitted as one chunk
+    (extract path deepens); packing never invents content.
+    """
+    if max_chunks <= 0:
+        return list(chunks) if chunks else []
+    items = [c for c in chunks if c and str(c).strip()]
+    if len(items) <= max_chunks:
+        return items
+
+    out: list[str] = []
+    i = 0
+    n = len(items)
+    while i < n:
+        slots_left = max_chunks - len(out)
+        items_left = n - i
+        if slots_left <= 0:
+            break
+        # Ensure remaining items can fit into remaining slots after this group.
+        min_take = max(1, items_left - (slots_left - 1))
+        take = min_take
+        combined = items[i]
+        for k in range(1, take):
+            combined = merge_adjacent_source_chunks(combined, items[i + k])
+        # Grow while still fitting and while we do not starve later slots.
+        while take < items_left:
+            # Keep at least one slot per remaining item after this group.
+            if slots_left > 1 and (items_left - (take + 1)) > (slots_left - 1):
+                break
+            trial = merge_adjacent_source_chunks(combined, items[i + take])
+            try:
+                fits = bool(budget_for_blocks(trial).fits)
+            except Exception:
+                fits = False
+            if not fits:
+                break
+            combined = trial
+            take += 1
+        out.append(combined)
+        i += take
+    return out or items
+
+
 # Backward-compatible alias used by the PROJECT adaptive path.
 plan_project_source_chunks = plan_phase_source_chunks

@@ -95,6 +95,7 @@ from app.modules.analysis.repository import AnalysisRepository
 from app.modules.analysis.token_budget import (
     PromptChatBudget,
     compute_prompt_chat_budget,
+    pack_phase_source_chunks,
     plan_phase_source_chunks,
     plan_project_source_chunks,
     split_block_by_pages,
@@ -2085,6 +2086,13 @@ class AnalysisService:
                 return False
             return _documents_are_rich_profile_type(documents)
 
+        def _phase_body_char_len(blocks: str) -> int:
+            marker = "content:\n"
+            idx = (blocks or "").find(marker)
+            if idx < 0:
+                return len(blocks or "")
+            return len(blocks[idx + len(marker) :])
+
         def _subsplit_phase_chunk(blocks: str) -> list[str]:
             docs = split_document_blocks(blocks)
             if len(docs) > 1:
@@ -2092,8 +2100,13 @@ class AnalysisService:
             pages = split_block_by_pages(blocks)
             if len(pages) > 1:
                 return pages
+            # Force smaller body pieces (header-aware). Using full-block length
+            # can leave a single-page body unsplit and re-chat the same input.
+            body_len = _phase_body_char_len(blocks)
+            if body_len <= 256:
+                return [blocks]
             return split_page_block_text(
-                blocks, max_body_chars=max(256, len(blocks) // 2)
+                blocks, max_body_chars=max(256, body_len // 2)
             )
 
         def _core_budget_for_blocks(
@@ -2235,18 +2248,21 @@ class AnalysisService:
                 root_budget.prompt_tokens,
                 force_structural_split,
             )
+            def _core_plan_budget(blocks: str) -> PromptChatBudget:
+                return _core_budget_for_blocks(
+                    blocks, recovery_retry=False, force_recount=True
+                )
+
             try:
                 planned = plan_phase_source_chunks(
                     aliased_blocks,
-                    budget_for_blocks=lambda blocks: _core_budget_for_blocks(
-                        blocks, recovery_retry=False, force_recount=True
-                    ),
+                    budget_for_blocks=_core_plan_budget,
                 )
             except AIProviderError as exc:
                 # Token-count outage while planning — fail closed, no fan-out.
                 raise InsufficientCandidateError() from exc
             # length-driven escalate may still "fit" by token-count; force
-            # document/page partition so we do not re-chat the same full source.
+            # document/page/body partition so we do not re-chat the same source.
             if force_structural_split and len(planned) <= 1:
                 docs = split_document_blocks(aliased_blocks)
                 if len(docs) > 1:
@@ -2255,6 +2271,20 @@ class AnalysisService:
                     pages = split_block_by_pages(aliased_blocks)
                     if len(pages) > 1:
                         planned = pages
+                    else:
+                        body_parts = _subsplit_phase_chunk(aliased_blocks)
+                        if len(body_parts) > 1:
+                            planned = body_parts
+            max_calls = int(self.settings.analysis_core_split_max_calls)
+            if len(planned) > max_calls:
+                try:
+                    planned = pack_phase_source_chunks(
+                        planned,
+                        max_chunks=max_calls,
+                        budget_for_blocks=_core_plan_budget,
+                    )
+                except AIProviderError as exc:
+                    raise InsufficientCandidateError() from exc
             logger.info(
                 "analysis core adaptive split analysis_run_id=%s "
                 "chunk_count=%s context_window=%s prompt_tokens=%s "
