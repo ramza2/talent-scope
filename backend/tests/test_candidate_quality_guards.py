@@ -94,6 +94,24 @@ def test_customer_only_duplicate_is_not_project_and_dated_row_survives() -> None
     ]
 
 
+def test_confirmed_person_name_filters_project_when_core_name_missing() -> None:
+    candidate = ProfileCandidateDocument(
+        projects=[
+            ProjectCandidate(project_name="홍 길 동"),
+            ProjectCandidate(
+                project_name="정보시스템 운영 및 유지보수",
+                start_date="2020.01",
+            ),
+        ],
+    )
+    result = apply_candidate_quality_guards(
+        candidate, confirmed_person_name="홍길동"
+    )
+    assert [project.project_name for project in result.projects] == [
+        "정보시스템 운영 및 유지보수"
+    ]
+
+
 def test_no_known_person_or_customer_identity_does_not_drop_projects() -> None:
     candidate = ProfileCandidateDocument(
         projects=[
