@@ -72,7 +72,8 @@ class Settings(BaseSettings):
     analysis_token_safety_ratio: float = 0.08
     analysis_project_output_ratio: float = 0.35
     analysis_project_split_max_depth: int = 3
-    analysis_project_split_max_calls: int = 8
+    # Multi-page resumes/KOSA may plan 9+ PROJECT chunks before length recovery.
+    analysis_project_split_max_calls: int = 16
     analysis_core_output_ratio: float = 0.25
     analysis_core_split_max_depth: int = 3
     # Page-heavy multi-doc CORE splits (e.g. 3+6 pages) need headroom above 8.

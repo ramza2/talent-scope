@@ -2131,3 +2131,98 @@ def test_service_core_many_pages_pack_within_call_cap(monkeypatch) -> None:
     assert core_chats
     assert len(core_chats) <= 8
     assert doc.profile.name == "홍길동"
+
+
+def _nine_page_kosa_resume_blocks() -> str:
+    """3-page KOSA + 6-page resume; each page can be split independently."""
+    def doc_pages(label: str, count: int) -> str:
+        return "\n\n".join(
+            f"[PAGE {i}]\n" + (f"{label} 프로젝트 경력 {i} 내용 " * 36)
+            for i in range(1, count + 1)
+        )
+
+    return (
+        _doc_block(
+            "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            alias_body="",
+            pages=doc_pages("KOSA", 3),
+        )
+        + "\n\n"
+        + _doc_block(
+            "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            alias_body="",
+            pages=doc_pages("이력서", 6),
+        )
+    )
+
+
+def _nine_page_token_count(*, user_prompt, **_kwargs):
+    from app.ai.providers.token_count import TokenCountResult
+
+    # Full/two-page phase prompts cannot fit output reserve; single page fits.
+    prompt_tokens = 7_200 if user_prompt.count("[PAGE ") >= 2 else 900
+    return TokenCountResult(
+        model="qwen3-14b",
+        prompt_tokens=prompt_tokens,
+        context_window=8192,
+        status="VERIFIED",
+        deployment_id="dep-1",
+        route_id="route-1",
+        routing_version=1,
+    )
+
+
+def test_service_projects_nine_pages_and_length_fit_bounded_16_calls(
+    monkeypatch,
+) -> None:
+    """Reproduce 9 initial PROJECT chunks + a length-triggered child split."""
+    from app.ai.providers.errors import AIResponseTruncatedError
+
+    project_attempts = 0
+
+    def chat_fn(*, log_context, **_kwargs):
+        nonlocal project_attempts
+        if (log_context or {}).get("phase") == "core":
+            return _core_payload()
+        project_attempts += 1
+        if project_attempts == 1:
+            raise AIResponseTruncatedError(
+                meta={"finish_reason": "length", "prompt_tokens": 900}
+            )
+        # No fabricated projects: empty JSON is valid for individual pages.
+        return {"pr": []}
+
+    llm = _BudgetLLM(count_fn=_nine_page_token_count, chat_fn=chat_fn)
+    doc = _run_staged(
+        monkeypatch,
+        llm,
+        _nine_page_kosa_resume_blocks(),
+        caps_fn=lambda *_a, **_k: _caps_fixed(window=8192),
+        settings_kwargs={"analysis_project_split_max_calls": 16},
+    )
+    calls = [c for c in llm.chat_calls if c["phase"] == "projects"]
+    assert 10 <= len(calls) <= 16
+    assert any((c["split_depth"] or 0) >= 1 for c in calls)
+    assert all(c["max_completion_tokens"] is not None for c in calls)
+    # Recovery subdivides the failed page, never replays its identical body.
+    assert not any(c["user_prompt"] == calls[0]["user_prompt"] for c in calls[1:])
+    assert doc.profile.name == "홍길동"
+
+
+def test_service_projects_nine_planned_chunks_fail_before_chat_when_cap_eight(
+    monkeypatch,
+) -> None:
+    """A known-impossible 9-chunk plan must fail before 8 costly chat calls."""
+    import pytest
+    from app.modules.analysis.service import InsufficientCandidateError
+
+    llm = _BudgetLLM(count_fn=_nine_page_token_count)
+    with pytest.raises(InsufficientCandidateError):
+        _run_staged(
+            monkeypatch,
+            llm,
+            _nine_page_kosa_resume_blocks(),
+            caps_fn=lambda *_a, **_k: _caps_fixed(window=8192),
+            settings_kwargs={"analysis_project_split_max_calls": 8},
+        )
+    assert not any(c["phase"] == "projects" for c in llm.chat_calls)

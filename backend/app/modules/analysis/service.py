@@ -2587,6 +2587,18 @@ class AnalysisService:
                     pages = split_block_by_pages(aliased_blocks)
                     if len(pages) > 1:
                         planned = pages
+            # A planner with more chunks than the call cap cannot complete.
+            # Fail before making expensive partial PROJECT LLM calls.
+            max_calls = int(self.settings.analysis_project_split_max_calls)
+            if len(planned) > max_calls:
+                logger.warning(
+                    "analysis project planned chunks exceed call cap "
+                    "analysis_run_id=%s planned_chunks=%s max_calls=%s",
+                    base_log.get("analysis_run_id"),
+                    len(planned),
+                    max_calls,
+                )
+                raise InsufficientCandidateError()
             logger.info(
                 "analysis project adaptive split analysis_run_id=%s "
                 "chunk_count=%s context_window=%s prompt_tokens=%s "
