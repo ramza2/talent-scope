@@ -29,7 +29,11 @@ export function formatValue(value: unknown): string {
   }
 }
 
-/** Prefer key career/date fields; keep full JSON available separately. */
+/** Prefer key career/date fields; keep full JSON available separately.
+ *
+ * Explicit ``null`` / ``""`` on priority keys (e.g. MODIFIED ``end_date: null``)
+ * render as ``미지정`` so cleared fields stay visible. Missing keys are omitted.
+ */
 export function formatDiffValueSummary(value: unknown): string {
   if (value === null || value === undefined || value === '') return '—'
   if (typeof value !== 'object' || Array.isArray(value)) {
@@ -38,8 +42,13 @@ export function formatDiffValueSummary(value: unknown): string {
   const row = value as Record<string, unknown>
   const parts: string[] = []
   for (const key of DIFF_VALUE_PRIORITY_KEYS) {
+    if (!Object.prototype.hasOwnProperty.call(row, key)) continue
     const raw = row[key]
-    if (raw === null || raw === undefined || raw === '') continue
+    if (raw === undefined) continue
+    if (raw === null || raw === '') {
+      parts.push(`${key}: 미지정`)
+      continue
+    }
     if (typeof raw === 'object') continue
     parts.push(`${key}: ${String(raw)}`)
   }

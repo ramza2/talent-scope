@@ -28,4 +28,17 @@ assert(formatValue(employment).includes('source_refs'), 'full JSON keeps refs')
 assert(formatDiffValueSummary(null) === '—', 'null')
 assert(formatDiffValueSummary('현재') === '현재', 'scalar')
 
+const modified = {
+  company_name: 'Alpha',
+  start_date: '2020.07',
+  end_date: null,
+  title: 'Dev',
+  department: null,
+}
+const modifiedSummary = formatDiffValueSummary(modified)
+assert(modifiedSummary.includes('end_date: 미지정'), 'null end_date visible')
+assert(modifiedSummary.includes('department: 미지정'), 'null department visible')
+assert(modifiedSummary.includes('company_name: Alpha'), 'non-null kept')
+assert(!modifiedSummary.includes('major:'), 'missing keys omitted')
+
 console.log('diffValueDisplay checks: OK')
