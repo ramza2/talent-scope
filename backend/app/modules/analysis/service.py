@@ -886,10 +886,6 @@ class AnalysisService:
                     vlm_pages=bundle.total_vlm_pages,
                 )
 
-            # Final CORE+PROJECTS candidate: reject obvious field/header leakage
-            # before Diff generation. Also covers historical single-pass runs.
-            candidate = apply_candidate_quality_guards(candidate)
-
             if claimed.base_profile_version is None:
                 raise AIProviderError("missing base_profile_version")
 
@@ -912,6 +908,27 @@ class AnalysisService:
                     self.db.commit()
                 return "FAILED"
 
+            # Post-merge quality guard for staged and single-pass extraction.
+            # Confirmed name is read-only and helps identify header-only projects
+            # even when CORE omitted the person's name.
+            base_profile = base_snap.get("profile") if isinstance(base_snap, dict) else None
+            confirmed_name = (
+                base_profile.get("name") if isinstance(base_profile, dict) else None
+            )
+            original_candidate = candidate
+            candidate = apply_candidate_quality_guards(
+                candidate, confirmed_person_name=confirmed_name
+            )
+            logger.info(
+                "analysis candidate field guards run_id=%s "
+                "email_cleared=%s employment_type_cleared=%s projects_dropped=%s",
+                run_id,
+                original_candidate.profile.email is not None
+                and candidate.profile.email is None,
+                original_candidate.profile.employment_type is not None
+                and candidate.profile.employment_type is None,
+                len(original_candidate.projects) - len(candidate.projects),
+            )
             specs = build_diffs(candidate, base_snap)
             return self._persist_reviewing(
                 run_id,
