@@ -2376,7 +2376,7 @@ def test_service_project_short_leaf_length_splits_before_headroom(
         _doc_block(
             "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
             alias_body="",
-            pages="[PAGE 1]\n" + ("프로젝트 경력 수행 " * 40),
+            pages="[PAGE 1]\n" + ("복구프로젝트-1 경력 수행 " * 32),
         )
         + "\n\n"
         + _doc_block(
