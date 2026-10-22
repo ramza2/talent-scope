@@ -475,3 +475,97 @@ def test_employment_guard_does_not_alter_unrelated_core_or_projects() -> None:
     assert result.profile.affiliation_company == "정상회사"
     assert [p.project_name for p in result.projects] == ["사업X"]
     assert [e.company_name for e in result.employment_history] == ["정상회사"]
+
+
+
+def test_short_company_name_does_not_match_other_employer_name() -> None:
+    """KT in a customer row must not be validated by an SKT employer row."""
+    page_texts = {
+        (_DOCX, 1): (
+            "근무경력\n"
+            "회사명 기간 직위\n"
+            "SKT 2010.01 ~ 2012.12 대리\n"
+        ),
+        (_DOCX, 2): (
+            "프로젝트 수행내역\n"
+            "사업명 고객사 기간\n"
+            "데이터 사업 KT 2020.01 ~ 2021.01\n"
+        ),
+    }
+    candidate = ProfileCandidateDocument(
+        employment_history=[
+            EmploymentCandidate(company_name="SKT", start_date="2010.01", end_date="2012.12"),
+            EmploymentCandidate(company_name="KT", start_date="2020.01", end_date="2021.01"),
+        ],
+        projects=[
+            ProjectCandidate(
+                project_name="데이터 사업", customer_name="KT",
+                start_date="2020.01", end_date="2021.01",
+            )
+        ],
+    )
+    result = apply_candidate_quality_guards(
+        candidate, page_texts=page_texts, document_type_by_id={_DOCX: "DOC-RESUME"}
+    )
+    assert [row.company_name for row in result.employment_history] == ["SKT"]
+
+
+def test_flattened_mixed_employer_project_line_keeps_candidate() -> None:
+    """Flattened OCR with both row types is ambiguous, not project-only."""
+    page_texts = {
+        (_KOSA, 1): (
+            "회사명 기간 직위 피엔드티컨설팅(주) 2012.12 ~ 2014.09 수석 "
+            "프로젝트 수행내역 사업명 고객사 피엔드티컨설팅(주) "
+            "2016.01 ~ 2016.12\n"
+        )
+    }
+    candidate = ProfileCandidateDocument(
+        employment_history=[
+            EmploymentCandidate(
+                company_name="피엔드티컨설팅(주)",
+                start_date="2012.12", end_date="2014.09",
+            )
+        ],
+        projects=[
+            ProjectCandidate(
+                project_name="시스템 고도화", customer_name="피엔드티컨설팅(주)",
+                start_date="2016.01", end_date="2016.12",
+            )
+        ],
+    )
+    result = apply_candidate_quality_guards(
+        candidate, page_texts=page_texts, document_type_by_id={_KOSA: "DOC-KOSA"}
+    )
+    assert len(result.employment_history) == 1
+    assert result.employment_history[0].end_date == "2014.09"
+
+
+def test_ambiguous_employer_mention_prevents_project_only_auto_drop() -> None:
+    """Do not discard a candidate if independent context is inconclusive."""
+    page_texts = {
+        (_DOCX, 1): "이력 관련 참고\n에이비씨테크 2010.01 ~ 2012.12\n",
+        (_DOCX, 2): (
+            "프로젝트 수행내역\n"
+            "사업명 고객사 기간\n"
+            "고객 분석 에이비씨테크 2020.01 ~ 2021.12\n"
+        ),
+    }
+    candidate = ProfileCandidateDocument(
+        employment_history=[
+            EmploymentCandidate(
+                company_name="에이비씨테크",
+                start_date="2010.01", end_date="2012.12",
+            )
+        ],
+        projects=[
+            ProjectCandidate(
+                project_name="고객 분석", customer_name="에이비씨테크",
+                start_date="2020.01", end_date="2021.12",
+            )
+        ],
+    )
+    result = apply_candidate_quality_guards(
+        candidate, page_texts=page_texts, document_type_by_id={_DOCX: "DOC-RESUME"}
+    )
+    assert len(result.employment_history) == 1
+    assert result.employment_history[0].company_name == "에이비씨테크"
