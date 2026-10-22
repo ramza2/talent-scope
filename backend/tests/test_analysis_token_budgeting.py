@@ -2323,3 +2323,81 @@ def test_irreducible_project_length_after_headroom_fails_closed(
     assert len(calls) == 2
     assert calls[0][0] == calls[1][0]
     assert [c[1] for c in calls] == [2867, 4706]
+
+
+def test_service_project_short_leaf_length_splits_before_headroom(
+    monkeypatch,
+) -> None:
+    """A 161–256-char PROJECT leaf must split, not replay a length response."""
+    from app.ai.providers.errors import AIResponseTruncatedError
+    from app.ai.providers.token_count import TokenCountResult
+
+    def count_fn(*, user_prompt, **_kwargs):
+        both = (
+            "[DOCUMENT D1]" in user_prompt
+            and "[DOCUMENT D2]" in user_prompt
+        )
+        return TokenCountResult(
+            model="qwen3-14b",
+            prompt_tokens=7855 if both else 900,
+            context_window=8192,
+            status="VERIFIED",
+            deployment_id="dep-1",
+            route_id="route-1",
+            routing_version=1,
+        )
+
+    d1_calls = []
+
+    def chat_fn(*, log_context, user_prompt, max_completion_tokens, **_kwargs):
+        phase = (log_context or {}).get("phase")
+        if phase == "core":
+            return _core_payload()
+        if "[DOCUMENT D1]" not in user_prompt:
+            return {"pr": []}
+        body = user_prompt.split("content:\n", 1)[1]
+        body = body.split("===== END UNTRUSTED DOCUMENT DATA", 1)[0]
+        body = body.split("\n", 1)[1] if body.startswith("[PAGE ") else body
+        body = body.strip()
+        d1_calls.append(
+            (body, max_completion_tokens, (log_context or {}).get("split_depth"))
+        )
+        if len(body) > 140:
+            raise AIResponseTruncatedError(
+                meta={
+                    "finish_reason": "length",
+                    "completion_tokens": max_completion_tokens,
+                }
+            )
+        return _projects_payload("복구프로젝트-1")
+
+    llm = _BudgetLLM(count_fn=count_fn, chat_fn=chat_fn)
+    blocks = (
+        _doc_block(
+            "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            alias_body="",
+            pages="[PAGE 1]\n" + ("프로젝트 경력 수행 " * 40),
+        )
+        + "\n\n"
+        + _doc_block(
+            "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            alias_body="",
+            pages="[PAGE 1]\n단순 경력",
+        )
+    )
+    doc = _run_staged(
+        monkeypatch,
+        llm,
+        blocks,
+        caps_fn=lambda *_a, **_k: _caps_fixed(window=8192),
+        settings_kwargs={"analysis_project_split_max_calls": 16},
+    )
+    assert doc.profile.name == "홍길동"
+    # Previously a <=256-char leaf would be replayed once at a higher cap
+    # and fail. The finer PROJECT-only split now succeeds at depth >=2.
+    assert any(depth is not None and depth >= 2 for _, _, depth in d1_calls)
+    assert all(
+        not (a[0] == b[0] and b[1] > a[1])
+        for a, b in zip(d1_calls, d1_calls[1:])
+    )
+    assert len([c for c in llm.chat_calls if c["phase"] == "projects"]) <= 16
