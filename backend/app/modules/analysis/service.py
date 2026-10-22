@@ -2429,8 +2429,76 @@ class AnalysisService:
             token_count_calls,
         )
 
+        def _split_project_body_prefer_boundaries(
+            blocks: str, *, max_body_chars: int
+        ) -> list[str]:
+            """PROJECT-only body split: prefer newline/space over mid-token cuts."""
+            text = blocks or ""
+            marker = "content:\n"
+            idx = text.find(marker)
+            if idx < 0:
+                return split_page_block_text(text, max_body_chars=max_body_chars)
+            header = text[: idx + len(marker)]
+            body = text[idx + len(marker) :]
+            page_marker = ""
+            if body.startswith("[PAGE "):
+                page_line, sep, rest = body.partition("\n")
+                if sep:
+                    page_marker = f"{page_line}\n"
+                    body = rest
+            if len(body) <= max_body_chars:
+                return [text]
+            pieces: list[str] = []
+            start = 0
+            n = len(body)
+            while start < n:
+                end = min(start + max_body_chars, n)
+                if end < n:
+                    window = body[start:end]
+                    cut = window.rfind("\n")
+                    if cut < max(32, max_body_chars // 4):
+                        cut = max(window.rfind(" "), window.rfind("\t"))
+                    if cut >= max(32, max_body_chars // 4):
+                        end = start + cut + 1
+                piece = body[start:end]
+                if piece:
+                    pieces.append(piece)
+                start = end if end > start else start + max_body_chars
+            if len(pieces) <= 1:
+                return split_page_block_text(text, max_body_chars=max_body_chars)
+            return [f"{header}{page_marker}{piece}" for piece in pieces]
+
         def _subsplit_project_chunk(blocks: str) -> list[str]:
-            return _subsplit_phase_chunk(blocks)
+            parts = _subsplit_phase_chunk(blocks)
+            if len(parts) > 1:
+                return parts
+            # PROJECTS may overflow its output reserve even with a short page.
+            # The shared CORE splitter stops at 256 body characters, causing
+            # PROJECTS to replay the same leaf with a larger output cap.
+            # Make one smaller PROJECT-only split before that last resort.
+            marker = "content:\n"
+            idx = (blocks or "").find(marker)
+            if idx < 0:
+                return parts
+            body = blocks[idx + len(marker) :]
+            if body.startswith("[PAGE "):
+                _page, _sep, body = body.partition("\n")
+            if len(body) <= 160:
+                return parts
+            max_body = max(96, (len(body) + 1) // 2)
+            finer = _split_project_body_prefer_boundaries(
+                blocks, max_body_chars=max_body
+            )
+            if len(finer) > 1:
+                logger.info(
+                    "analysis project small leaf split analysis_run_id=%s "
+                    "body_chars=%s chunk_count=%s",
+                    base_log.get("analysis_run_id"),
+                    len(body),
+                    len(finer),
+                )
+                return finer
+            return parts
 
         def _project_budget_for_blocks(
             blocks: str,
@@ -2511,7 +2579,24 @@ class AnalysisService:
                             if recovery_retry and prompt.validate_projects_recovery_root:
                                 _validate_projects_recovery_raw(raw)
                             return _normalize_projects(raw)
-                        except (AIResponseTruncatedError, AIProviderError) as retry_exc:
+                        except AIProviderError as retry_exc:
+                            meta = (
+                                retry_exc.meta
+                                if isinstance(retry_exc, AIResponseTruncatedError)
+                                else {}
+                            )
+                            logger.warning(
+                                "analysis project output headroom failed "
+                                "analysis_run_id=%s split_depth=%s chunk_index=%s "
+                                "error_type=%s finish_reason=%s "
+                                "completion_tokens=%s",
+                                base_log.get("analysis_run_id"),
+                                split_depth,
+                                chunk_index,
+                                type(retry_exc).__name__,
+                                meta.get("finish_reason"),
+                                meta.get("completion_tokens"),
+                            )
                             raise InsufficientCandidateError() from retry_exc
                     raise InsufficientCandidateError() from cause
                 nested: list[ProfileCandidateDocument] = []
