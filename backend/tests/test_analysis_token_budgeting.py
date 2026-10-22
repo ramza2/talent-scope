@@ -2396,8 +2396,18 @@ def test_service_project_short_leaf_length_splits_before_headroom(
     # Previously a <=256-char leaf would be replayed once at a higher cap
     # and fail. The finer PROJECT-only split now succeeds at depth >=2.
     assert any(depth is not None and depth >= 2 for _, _, depth in d1_calls)
+    assert max(depth or 0 for _, _, depth in d1_calls) <= 3
     assert all(
         not (a[0] == b[0] and b[1] > a[1])
         for a, b in zip(d1_calls, d1_calls[1:])
     )
-    assert len([c for c in llm.chat_calls if c["phase"] == "projects"]) <= 16
+    project_chats = [c for c in llm.chat_calls if c["phase"] == "projects"]
+    assert len(project_chats) <= 16
+    # Evidence preserved through finer split + merge (quote present in source).
+    assert len(doc.projects) >= 1
+    recovered = next(p for p in doc.projects if p.project_name == "복구프로젝트-1")
+    assert any(
+        (ref.quote_text or "").strip() == "복구프로젝트-1"
+        and str(ref.document_id) == "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        for ref in (recovered.source_refs or [])
+    )
