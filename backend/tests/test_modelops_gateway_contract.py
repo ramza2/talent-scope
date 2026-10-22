@@ -5,6 +5,7 @@ from __future__ import annotations
 from unittest.mock import patch
 
 import httpx
+import pytest
 
 from app.ai.providers.llm import OpenAICompatibleLLMProvider
 from app.ai.providers.openai_compat import (
@@ -139,3 +140,112 @@ def test_embedding_gateway_keeps_alias_and_1024_dimensions(
     assert captured["payload"]["model"] == "embedding-alias"
     assert captured["payload"]["input"] == ["gateway compatibility"]
     assert len(data["data"][0]["embedding"]) == 1024
+
+
+@pytest.mark.parametrize(
+    ("client_key", "expected"),
+    [
+        (None, None),
+        ("", None),
+        ("   ", None),
+        ("  test-talent-scope  ", "test-talent-scope"),
+    ],
+)
+def test_modelops_client_identity_header_covers_all_gateway_endpoints(
+    monkeypatch: pytest.MonkeyPatch,
+    client_key: str | None,
+    expected: str | None,
+) -> None:
+    """Same optional ID on Chat (LLM/VLM), Embedding, count, capabilities."""
+    from app.ai.providers.model_capabilities import fetch_model_capabilities
+    from app.ai.providers.token_count import count_chat_prompt_tokens
+
+    if client_key is None:
+        monkeypatch.delenv("MODELOPS_CLIENT_KEY", raising=False)
+    else:
+        monkeypatch.setenv("MODELOPS_CLIENT_KEY", client_key)
+
+    calls: list[tuple[str, dict[str, str], str | None]] = []
+
+    def fake_post(self, url, *, headers=None, json=None, **kwargs):
+        headers_copy = dict(headers or {})
+        model = json.get("model") if isinstance(json, dict) else None
+        calls.append((url, headers_copy, model))
+        if url.endswith("/token-count"):
+            return httpx.Response(
+                200,
+                json={
+                    "status": "VERIFIED",
+                    "model": model,
+                    "prompt_tokens": 42,
+                    "context_window": 8192,
+                },
+            )
+        if url.endswith("/embeddings"):
+            return httpx.Response(200, json={"data": []})
+        content = "visible text" if model == "vlm-alias" else '{"status":"ok"}'
+        return httpx.Response(
+            200,
+            json={"choices": [{"finish_reason": "stop", "message": {"content": content}}]},
+        )
+
+    def fake_get(self, url, *, headers=None, **kwargs):
+        calls.append((url, dict(headers or {}), None))
+        return httpx.Response(
+            200,
+            json={"status": "VERIFIED", "id": "llm-alias", "context_window": 8192},
+        )
+
+    monkeypatch.setattr(httpx.Client, "post", fake_post)
+    monkeypatch.setattr(httpx.Client, "get", fake_get)
+
+    settings = Settings(
+        llm_base_url=_GATEWAY,
+        llm_api_key="api-auth",
+        llm_model="llm-alias",
+        vlm_base_url=_GATEWAY,
+        vlm_api_key="api-auth",
+        vlm_model="vlm-alias",
+    )
+
+    assert OpenAICompatibleLLMProvider(settings).complete_json(
+        system_prompt="system", user_prompt="user"
+    ) == {"status": "ok"}
+    assert OpenAICompatibleVLMProvider(settings).transcribe_image(
+        image_bytes=b"fake-image"
+    ) == "visible text"
+    assert post_embeddings(
+        base_url=_GATEWAY,
+        api_key="api-auth",
+        payload={"model": "bge-m3", "input": ["text"]},
+        timeout_seconds=1,
+    ) == {"data": []}
+    count = count_chat_prompt_tokens(
+        settings,
+        system_prompt="system",
+        user_prompt="user",
+        enable_thinking=False,
+    )
+    assert count.prompt_tokens == 42
+    caps = fetch_model_capabilities(settings)
+    assert caps.context_window == 8192
+
+    assert len(calls) == 5
+    assert {url for url, _, _ in calls} == {
+        _GATEWAY + "/v1/chat/completions",
+        _GATEWAY + "/v1/embeddings",
+        _GATEWAY + "/v1/token-count",
+        _GATEWAY + "/v1/models/llm-alias/capabilities",
+    }
+    assert {model for _, _, model in calls if model} == {
+        "llm-alias",
+        "vlm-alias",
+        "bge-m3",
+    }
+    for _url, headers, _model in calls:
+        assert headers["Content-Type"] == "application/json"
+        assert headers["Authorization"] == "Bearer api-auth"
+        if expected is None:
+            assert "X-AI-Client" not in headers
+        else:
+            assert headers["X-AI-Client"] == expected
