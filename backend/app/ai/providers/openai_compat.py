@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import Any
 from urllib.parse import urlparse
@@ -25,6 +26,11 @@ def _json_headers(api_key: str) -> dict[str, str]:
     key = (api_key or "").strip()
     if key and key != "change-me":
         headers["Authorization"] = f"Bearer {key}"
+    # Optional ModelOps caller identity (not an authentication token).
+    # This shared header builder also covers token-count and capabilities.
+    client_key = os.getenv("MODELOPS_CLIENT_KEY", "").strip()
+    if client_key:
+        headers["X-AI-Client"] = client_key
     return headers
 
 
