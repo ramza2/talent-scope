@@ -319,6 +319,116 @@ def test_kosa_docx_conflicting_employment_periods_kept_for_review() -> None:
     assert employment_candidate_dates_need_review(emp) is True
 
 
+def test_kosa_project_customer_only_dropped_real_employer_kept() -> None:
+    """KOSA doc type alone is not employment evidence; project customers drop."""
+    page_texts = {
+        (_KOSA, 1): (
+            "경력증명서\n"
+            "근무처 피엔드티컨설팅(주) 2010.03 ~ 2014.09 과장\n"
+            "\n"
+            "프로젝트 수행내역\n"
+            "사업명 고객사 기간\n"
+            "농지전산 고도화 한국농어촌공사 2020.01 ~ 2022.06\n"
+        ),
+    }
+    candidate = ProfileCandidateDocument(
+        employment_history=[
+            EmploymentCandidate(
+                company_name="피엔드티컨설팅(주)",
+                start_date="2010.03",
+                end_date="2014.09",
+                title="과장",
+            ),
+            EmploymentCandidate(
+                company_name="한국농어촌공사",
+                start_date="2020.01",
+                end_date="2022.06",
+            ),
+        ],
+        projects=[
+            ProjectCandidate(
+                project_name="농지전산 고도화",
+                customer_name="한국농어촌공사",
+                start_date="2020.01",
+                end_date="2022.06",
+            )
+        ],
+    )
+    result = apply_candidate_quality_guards(
+        candidate,
+        page_texts=page_texts,
+        document_type_by_id={_KOSA: "DOC-KOSA"},
+    )
+    assert [e.company_name for e in result.employment_history] == [
+        "피엔드티컨설팅(주)"
+    ]
+    assert result.employment_history[0].end_date == "2014.09"
+
+
+def test_same_company_distinct_employment_periods_not_false_conflict() -> None:
+    page_texts = {
+        (_DOCX, 1): (
+            "근무경력\n"
+            "회사명 기간 직위\n"
+            "에이비씨테크 2010.01 ~ 2012.12 사원\n"
+            "에이비씨테크 2015.01 ~ 2018.06 대리\n"
+        ),
+    }
+    candidate = ProfileCandidateDocument(
+        employment_history=[
+            EmploymentCandidate(
+                company_name="에이비씨테크",
+                start_date="2010.01",
+                end_date="2012.12",
+            ),
+            EmploymentCandidate(
+                company_name="에이비씨테크",
+                start_date="2015.01",
+                end_date="2018.06",
+            ),
+        ],
+    )
+    result = apply_candidate_quality_guards(
+        candidate,
+        page_texts=page_texts,
+        document_type_by_id={_DOCX: "DOC-PROFILE"},
+    )
+    assert len(result.employment_history) == 2
+    by_start = {e.start_date: e.end_date for e in result.employment_history}
+    assert by_start == {"2010.01": "2012.12", "2015.01": "2018.06"}
+
+
+def test_customer_name_without_project_row_evidence_is_kept() -> None:
+    """Insufficient structure must not false-delete a possible real employer."""
+    page_texts = {
+        (_DOCX, 1): "기타 메모\n한국농어촌공사\n",
+    }
+    candidate = ProfileCandidateDocument(
+        employment_history=[
+            EmploymentCandidate(
+                company_name="한국농어촌공사",
+                start_date="2020.01",
+                end_date="2022.06",
+            )
+        ],
+        projects=[
+            ProjectCandidate(
+                project_name="농지전산",
+                customer_name="한국농어촌공사",
+                start_date="2020.01",
+            )
+        ],
+    )
+    result = apply_candidate_quality_guards(
+        candidate,
+        page_texts=page_texts,
+        document_type_by_id={_DOCX: "DOC-PROFILE"},
+    )
+    assert [e.company_name for e in result.employment_history] == [
+        "한국농어촌공사"
+    ]
+
+
 def test_employment_guard_does_not_alter_unrelated_core_or_projects() -> None:
     page_texts = {
         (_DOCX, 1): "근무경력\n정상회사 2010.01 ~ 2012.12 사원\n",

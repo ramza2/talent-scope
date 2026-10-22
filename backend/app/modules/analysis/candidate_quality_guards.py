@@ -32,7 +32,7 @@ _CAREER_DURATION_RE = re.compile(
 )
 
 _EMPLOYMENT_SECTION_RE = re.compile(
-    r"근무경력|재직기간|경력사항|직장명|"
+    r"근무경력|재직기간|경력사항|직장명|근무처|"
     r"회사명\s*기간\s*직위|최종직급|입사\s*일|퇴사\s*일"
 )
 _PROJECT_SECTION_RE = re.compile(
@@ -44,7 +44,7 @@ _PROJECT_ROW_RE = re.compile(
     r"BIA|BCP|이전통합"
 )
 _EMPLOYMENT_ROW_RE = re.compile(
-    r"근무경력|재직기간|직장명|회사명|최종직급|담당업무|직위|재직"
+    r"근무경력|재직기간|직장명|근무처|회사명|최종직급|담당업무|직위|재직"
 )
 _DATE_TOKEN_RE = re.compile(
     r"(?:19|20)\d{2}[./\-]\d{1,2}(?:[./\-]\d{1,2})?"
@@ -56,7 +56,7 @@ _DATE_RANGE_RE = re.compile(
     re.IGNORECASE,
 )
 _EMPLOYMENT_END_CONFLICT_SEP = " / "
-_KOSA_DOC_TYPES = frozenset({"DOC-KOSA"})
+_ONGOING_END_KEYS = frozenset({"현재", "재직중", "present"})
 
 
 def _key(value: str | None) -> str | None:
@@ -142,23 +142,20 @@ def _extract_range_dates(line: str) -> list[tuple[str | None, str | None]]:
     return out
 
 
-def _classify_line_context(
-    line: str,
-    *,
-    section: str,
-    doc_type: str | None,
-) -> str:
-    """Return employment | project | ambiguous for a company-bearing line."""
-    if doc_type and doc_type.strip().upper() in _KOSA_DOC_TYPES:
-        return "employment"
-    if _EMPLOYMENT_SECTION_RE.search(line) or _EMPLOYMENT_ROW_RE.search(line):
-        return "employment"
-    if section == "employment" and not _PROJECT_ROW_RE.search(line):
-        return "employment"
+def _classify_line_context(line: str, *, section: str) -> str:
+    """Return employment | project | ambiguous for a company-bearing line.
+
+    Document type (including DOC-KOSA) is never enough by itself — KOSA
+    project-performance customer rows must stay project context.
+    """
     if _PROJECT_SECTION_RE.search(line) or _PROJECT_ROW_RE.search(line):
         return "project"
     if section == "project":
         return "project"
+    if _EMPLOYMENT_SECTION_RE.search(line) or _EMPLOYMENT_ROW_RE.search(line):
+        return "employment"
+    if section == "employment":
+        return "employment"
     # Company + period without project markers → employment-table shaped.
     if _DATE_TOKEN_RE.search(line) and not _PROJECT_ROW_RE.search(line):
         return "employment"
@@ -186,15 +183,93 @@ def _iter_context_lines(
             yield str(doc_id), int(page_no), section, line, doc_type
 
 
+def _is_ongoing_end(value: str | None) -> bool:
+    text = (value or "").strip().casefold().replace(" ", "")
+    return text in _ONGOING_END_KEYS
+
+
+def _linked_source_ends(
+    emp_dates: list[tuple[str | None, str | None]],
+    *,
+    candidate_start: str | None,
+) -> list[str]:
+    """Ends from employer-table ranges whose start matches the candidate start.
+
+    Distinct employments at the same company (different starts) are ignored.
+    """
+    start = (candidate_start or "").strip()
+    if not start:
+        return []
+    ends: list[str] = []
+    for src_start, src_end in emp_dates:
+        if not src_start or not src_end or _is_ongoing_end(src_end):
+            continue
+        if not dates_compatible(start, src_start):
+            continue
+        ends.append(src_end)
+    return ends
+
+
+def _unique_incompatible_ends(ends: list[str]) -> list[str]:
+    """Collapse precision-compatible ends; return mutually incompatible set."""
+    unique: list[str] = []
+    for end in ends:
+        matched = False
+        for i, kept in enumerate(unique):
+            if dates_compatible(end, kept):
+                # Keep the more precise token when compatible.
+                score_new = sum(ch.isdigit() for ch in end) + end.count(".")
+                score_old = sum(ch.isdigit() for ch in kept) + kept.count(".")
+                if score_new > score_old:
+                    unique[i] = end
+                matched = True
+                break
+        if not matched:
+            unique.append(end)
+    return unique
+
+
+def _resolve_end_date_for_review(
+    *,
+    candidate_end: str | None,
+    linked_ends: list[str],
+) -> str | None:
+    """Return REVIEW conflict token when ends disagree; never pick a winner."""
+    cand_end = (candidate_end or "").strip()
+    if cand_end and _EMPLOYMENT_END_CONFLICT_SEP in cand_end:
+        return cand_end
+    unique_ends = _unique_incompatible_ends(linked_ends)
+    if not unique_ends:
+        return None
+    if len(unique_ends) > 1:
+        # Multiple incompatible source ends for the same start — ambiguous.
+        token = unique_ends[0]
+        for extra in unique_ends[1:]:
+            token = _employment_end_conflict_token(token, extra)
+        if cand_end and all(
+            not dates_compatible(cand_end, src) for src in unique_ends
+        ):
+            token = _employment_end_conflict_token(token, cand_end)
+        return token
+    source_end = unique_ends[0]
+    if not cand_end:
+        return None
+    if dates_compatible(cand_end, source_end):
+        return None
+    return _employment_end_conflict_token(cand_end, source_end)
+
+
 def _guard_employment_history(
     candidate: ProfileCandidateDocument,
     *,
     page_texts: dict[tuple[str, int], str] | None,
     document_type_by_id: dict[str, str] | None,
 ) -> list[EmploymentCandidate]:
-    """Drop project-customer-only employers; REVIEW conflicting employment ends.
+    """Drop clear project-customer-only employers; REVIEW start-linked end conflicts.
 
-    Never deletes KOSA-evidenced employment rows. Does not invent employers.
+    Conservative: insufficient/ambiguous row structure never deletes a row.
+    KOSA employer-table rows are preserved; KOSA project customers are not
+    treated as employment evidence.
     """
     rows = list(candidate.employment_history or [])
     if not rows:
@@ -221,70 +296,38 @@ def _guard_employment_history(
 
         emp_dates: list[tuple[str | None, str | None]] = []
         has_employment_evidence = False
-        has_kosa_evidence = False
-        has_project_only_evidence = False
+        has_project_evidence = False
 
-        for doc_id, _page_no, section, line, doc_type in context_lines:
+        for _doc_id, _page_no, section, line, _doc_type in context_lines:
             if not _line_has_company(line, company):
                 continue
-            kind = _classify_line_context(
-                line, section=section, doc_type=doc_type
-            )
+            kind = _classify_line_context(line, section=section)
             if kind == "employment":
                 has_employment_evidence = True
-                if doc_type and doc_type.strip().upper() in _KOSA_DOC_TYPES:
-                    has_kosa_evidence = True
                 emp_dates.extend(_extract_range_dates(line))
             elif kind == "project":
-                has_project_only_evidence = True
-            elif doc_type and doc_type.strip().upper() in _KOSA_DOC_TYPES:
-                has_kosa_evidence = True
-                has_employment_evidence = True
-                emp_dates.extend(_extract_range_dates(line))
+                has_project_evidence = True
+            # ambiguous hits are ignored for drop decisions (fail open).
 
         is_customer_name = company_key in customer_keys
+        # Drop only when project-customer mix-in is positively evidenced and
+        # no employer-table evidence exists. Ambiguous/missing structure → keep.
         if (
             is_customer_name
+            and has_project_evidence
             and not has_employment_evidence
-            and not has_kosa_evidence
-        ):
-            # Project customer label alone must not become an employer.
-            continue
-        if (
-            has_project_only_evidence
-            and not has_employment_evidence
-            and not has_kosa_evidence
-            and is_customer_name
         ):
             continue
 
         updated = row
-        # Prefer employer-table end dates for conflict detection only.
-        source_ends = [
-            end
-            for _start, end in emp_dates
-            if end and end.casefold() not in {"현재", "재직중", "present"}
-        ]
-        cand_end = (row.end_date or "").strip()
-        if (
-            source_ends
-            and cand_end
-            and _EMPLOYMENT_END_CONFLICT_SEP not in cand_end
-        ):
-            incompatible = [
-                src
-                for src in source_ends
-                if not dates_compatible(cand_end, src)
-            ]
-            if incompatible:
-                # Do not pick AI or source — force REVIEW via unparseable token.
-                updated = row.model_copy(
-                    update={
-                        "end_date": _employment_end_conflict_token(
-                            cand_end, incompatible[0]
-                        )
-                    }
-                )
+        linked_ends = _linked_source_ends(
+            emp_dates, candidate_start=row.start_date
+        )
+        review_end = _resolve_end_date_for_review(
+            candidate_end=row.end_date, linked_ends=linked_ends
+        )
+        if review_end is not None:
+            updated = row.model_copy(update={"end_date": review_end})
         kept.append(updated)
 
     return kept
