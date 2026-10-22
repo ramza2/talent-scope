@@ -2430,7 +2430,35 @@ class AnalysisService:
         )
 
         def _subsplit_project_chunk(blocks: str) -> list[str]:
-            return _subsplit_phase_chunk(blocks)
+            parts = _subsplit_phase_chunk(blocks)
+            if len(parts) > 1:
+                return parts
+            # PROJECTS may overflow its output reserve even with a short page.
+            # The shared CORE splitter stops at 256 body characters, causing
+            # PROJECTS to replay the same leaf with a larger output cap.
+            # Make one smaller PROJECT-only split before that last resort.
+            marker = "content:\n"
+            idx = (blocks or "").find(marker)
+            if idx < 0:
+                return parts
+            body = blocks[idx + len(marker) :]
+            if body.startswith("[PAGE "):
+                _page, _sep, body = body.partition("\n")
+            if len(body) <= 160:
+                return parts
+            finer = split_page_block_text(
+                blocks, max_body_chars=max(96, (len(body) + 1) // 2)
+            )
+            if len(finer) > 1:
+                logger.info(
+                    "analysis project small leaf split analysis_run_id=%s "
+                    "body_chars=%s chunk_count=%s",
+                    base_log.get("analysis_run_id"),
+                    len(body),
+                    len(finer),
+                )
+                return finer
+            return parts
 
         def _project_budget_for_blocks(
             blocks: str,
@@ -2511,7 +2539,24 @@ class AnalysisService:
                             if recovery_retry and prompt.validate_projects_recovery_root:
                                 _validate_projects_recovery_raw(raw)
                             return _normalize_projects(raw)
-                        except (AIResponseTruncatedError, AIProviderError) as retry_exc:
+                        except AIProviderError as retry_exc:
+                            meta = (
+                                retry_exc.meta
+                                if isinstance(retry_exc, AIResponseTruncatedError)
+                                else {}
+                            )
+                            logger.warning(
+                                "analysis project output headroom failed "
+                                "analysis_run_id=%s split_depth=%s chunk_index=%s "
+                                "error_type=%s finish_reason=%s "
+                                "completion_tokens=%s",
+                                base_log.get("analysis_run_id"),
+                                split_depth,
+                                chunk_index,
+                                type(retry_exc).__name__,
+                                meta.get("finish_reason"),
+                                meta.get("completion_tokens"),
+                            )
                             raise InsufficientCandidateError() from retry_exc
                     raise InsufficientCandidateError() from cause
                 nested: list[ProfileCandidateDocument] = []
