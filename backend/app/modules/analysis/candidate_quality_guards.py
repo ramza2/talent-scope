@@ -322,6 +322,7 @@ def _guard_employment_history(
         emp_dates: list[tuple[str | None, str | None]] = []
         has_employment_evidence = False
         has_project_evidence = False
+        has_ambiguous_evidence = False
 
         for _doc_id, _page_no, section, line, _doc_type in context_lines:
             if not _line_has_company(line, company):
@@ -332,7 +333,8 @@ def _guard_employment_history(
                 emp_dates.extend(_extract_range_dates(line))
             elif kind == "project":
                 has_project_evidence = True
-            # ambiguous hits are ignored for drop decisions (fail open).
+            else:
+                has_ambiguous_evidence = True
 
         is_customer_name = company_key in customer_keys
         # Drop only when project-customer mix-in is positively evidenced and
@@ -341,6 +343,7 @@ def _guard_employment_history(
             is_customer_name
             and has_project_evidence
             and not has_employment_evidence
+            and not has_ambiguous_evidence
         ):
             continue
 
