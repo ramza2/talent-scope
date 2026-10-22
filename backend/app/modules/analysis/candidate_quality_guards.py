@@ -124,10 +124,26 @@ def _employment_end_conflict_token(a: str, b: str) -> str:
 
 
 def _line_has_company(line: str, company: str) -> bool:
+    """Match company text without treating short ASCII names as substrings.
+
+    E.g. "KT" must not match "SKT" or "KTNetworks" on a separate employer
+    row. OCR whitespace variance is tolerated for the text comparison.
+    """
     needle = _fold(company.strip())
     if not needle:
         return False
-    return needle in _fold(line)
+    haystack = _fold(line)
+    for match in re.finditer(re.escape(needle), haystack, flags=re.IGNORECASE):
+        before = haystack[match.start() - 1] if match.start() else ""
+        after = haystack[match.end()] if match.end() < len(haystack) else ""
+        if (needle[0].isascii() and needle[0].isalnum()
+                and before.isascii() and before.isalnum()):
+            continue
+        if (needle[-1].isascii() and needle[-1].isalnum()
+                and after.isascii() and after.isalnum()):
+            continue
+        return True
+    return False
 
 
 def _extract_range_dates(line: str) -> list[tuple[str | None, str | None]]:
@@ -148,17 +164,26 @@ def _classify_line_context(line: str, *, section: str) -> str:
     Document type (including DOC-KOSA) is never enough by itself — KOSA
     project-performance customer rows must stay project context.
     """
-    if _PROJECT_SECTION_RE.search(line) or _PROJECT_ROW_RE.search(line):
+    is_project_row = bool(
+        _PROJECT_SECTION_RE.search(line) or _PROJECT_ROW_RE.search(line)
+    )
+    is_employment_row = bool(
+        _EMPLOYMENT_SECTION_RE.search(line) or _EMPLOYMENT_ROW_RE.search(line)
+    )
+    # Flattened PDF/OCR text may place employer and project data on one line.
+    # Such mixed evidence is not enough to remove an employment candidate.
+    if is_project_row and is_employment_row:
+        return "ambiguous"
+    if is_project_row:
         return "project"
+    if is_employment_row:
+        return "employment"
     if section == "project":
         return "project"
-    if _EMPLOYMENT_SECTION_RE.search(line) or _EMPLOYMENT_ROW_RE.search(line):
-        return "employment"
     if section == "employment":
         return "employment"
-    # Company + period without project markers → employment-table shaped.
-    if _DATE_TOKEN_RE.search(line) and not _PROJECT_ROW_RE.search(line):
-        return "employment"
+    # A company and a date alone occur frequently in project tables and do
+    # not establish an employment relationship.
     return "ambiguous"
 
 
