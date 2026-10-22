@@ -132,15 +132,25 @@ def _line_has_company(line: str, company: str) -> bool:
     needle = _fold(company.strip())
     if not needle:
         return False
-    haystack = _fold(line)
-    for match in re.finditer(re.escape(needle), haystack, flags=re.IGNORECASE):
-        before = haystack[match.start() - 1] if match.start() else ""
-        after = haystack[match.end()] if match.end() < len(haystack) else ""
-        if (needle[0].isascii() and needle[0].isalnum()
-                and before.isascii() and before.isalnum()):
+    # Permit OCR whitespace inside company names, but preserve spaces around
+    # each match so "KT 2020.01" is not mistaken for "KT2020.01".
+    pattern = r"\\s*".join(re.escape(ch) for ch in needle)
+    for match in re.finditer(pattern, line, flags=re.IGNORECASE):
+        before = line[match.start() - 1] if match.start() else ""
+        after = line[match.end()] if match.end() < len(line) else ""
+        if (
+            needle[0].isascii()
+            and needle[0].isalnum()
+            and before.isascii()
+            and before.isalnum()
+        ):
             continue
-        if (needle[-1].isascii() and needle[-1].isalnum()
-                and after.isascii() and after.isalnum()):
+        if (
+            needle[-1].isascii()
+            and needle[-1].isalnum()
+            and after.isascii()
+            and after.isalnum()
+        ):
             continue
         return True
     return False
