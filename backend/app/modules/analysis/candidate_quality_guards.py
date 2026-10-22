@@ -134,7 +134,7 @@ def _line_has_company(line: str, company: str) -> bool:
         return False
     # Permit OCR whitespace inside company names, but preserve spaces around
     # each match so "KT 2020.01" is not mistaken for "KT2020.01".
-    pattern = r"\\s*".join(re.escape(ch) for ch in needle)
+    pattern = r"\s*".join(re.escape(ch) for ch in needle)
     for match in re.finditer(pattern, line, flags=re.IGNORECASE):
         before = line[match.start() - 1] if match.start() else ""
         after = line[match.end()] if match.end() < len(line) else ""
