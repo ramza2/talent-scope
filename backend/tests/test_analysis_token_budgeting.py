@@ -1068,7 +1068,7 @@ def _core_payload() -> dict:
     }
 
 
-def _projects_payload(name: str = "복구프로젝트-1") -> dict:
+def _projects_payload(name: str = "복구프로젝트-1", *, doc_alias: str = "D1") -> dict:
     return {
         "pr": [
             {
@@ -1077,7 +1077,7 @@ def _projects_payload(name: str = "복구프로젝트-1") -> dict:
                 "s": "2020-01",
                 "e": "2021-12",
                 "resp": "PL 운영",
-                "r": [{"d": "D1", "p": 1, "q": name}],
+                "r": [{"d": doc_alias, "p": 1, "q": name}],
             }
         ]
     }
@@ -1174,6 +1174,7 @@ def _run_staged(
     *,
     settings_kwargs=None,
     caps_fn=None,
+    prompt_version: str = "profile-extract-v20",
 ):
     import uuid
     from types import SimpleNamespace
@@ -1310,7 +1311,7 @@ def _run_staged(
         "TECH-LANG-PYTHON": ("TECH", True),
         "EXP-MGT": ("EXP", True),
     }
-    prompt = resolve_profile_prompt("profile-extract-v20")
+    prompt = resolve_profile_prompt(prompt_version)
     return service._extract_staged_compact_candidate(
         prompt=prompt,
         document_blocks=document_blocks,
@@ -2411,3 +2412,116 @@ def test_service_project_short_leaf_length_splits_before_headroom(
         and str(ref.document_id) == "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
         for ref in (recovered.source_refs or [])
     )
+
+
+def test_service_project_short_leaf_v23_ops_path_preserves_sibling(
+    monkeypatch,
+) -> None:
+    """Ops v23: PROJECT length → short-body split → success; sibling kept."""
+    from app.ai.providers.errors import AIResponseTruncatedError
+    from app.ai.providers.token_count import TokenCountResult
+
+    window = 8192
+    d1_calls: list[tuple[str, int | None, int | None]] = []
+
+    def count_fn(*, user_prompt, **_kwargs):
+        both = (
+            "[DOCUMENT D1]" in user_prompt
+            and "[DOCUMENT D2]" in user_prompt
+        )
+        return TokenCountResult(
+            model="qwen3-14b",
+            prompt_tokens=7855 if both else 900,
+            context_window=window,
+            status="VERIFIED",
+            deployment_id="dep-1",
+            route_id="route-1",
+            routing_version=1,
+        )
+
+    def chat_fn(*, log_context, user_prompt, max_completion_tokens, **_kwargs):
+        phase = (log_context or {}).get("phase")
+        if phase == "core":
+            return _core_payload()
+        # Sibling leaf succeeds without length; must survive D1 recovery.
+        if "[DOCUMENT D2]" in user_prompt and "[DOCUMENT D1]" not in user_prompt:
+            return _projects_payload("DocB사업", doc_alias="D2")
+        if "[DOCUMENT D1]" not in user_prompt:
+            return {"pr": []}
+        body = user_prompt.split("content:\n", 1)[1]
+        body = body.split("===== END UNTRUSTED DOCUMENT DATA", 1)[0]
+        body = body.split("\n", 1)[1] if body.startswith("[PAGE ") else body
+        body = body.strip()
+        d1_calls.append(
+            (body, max_completion_tokens, (log_context or {}).get("split_depth"))
+        )
+        if len(body) > 140:
+            raise AIResponseTruncatedError(
+                meta={
+                    "finish_reason": "length",
+                    "completion_tokens": max_completion_tokens,
+                }
+            )
+        return _projects_payload("복구프로젝트-1", doc_alias="D1")
+
+    llm = _BudgetLLM(count_fn=count_fn, chat_fn=chat_fn)
+    # Newline-separated rows: PROJECT finer split prefers row boundaries.
+    d1_rows = "\n".join(["복구프로젝트-1 경력 수행 고객-1"] * 18)
+    blocks = (
+        _doc_block(
+            "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            alias_body="",
+            pages=f"[PAGE 1]\n{d1_rows}",
+        )
+        + "\n\n"
+        + _doc_block(
+            "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            alias_body="",
+            pages="[PAGE 1]\nDocB사업 단순 경력",
+        )
+    )
+    doc = _run_staged(
+        monkeypatch,
+        llm,
+        blocks,
+        caps_fn=lambda *_a, **_k: _caps_fixed(window=window),
+        settings_kwargs={"analysis_project_split_max_calls": 16},
+        prompt_version="profile-extract-v23",
+    )
+
+    assert doc.profile.name == "홍길동"
+    assert d1_calls
+    assert any(depth is not None and depth >= 2 for _, _, depth in d1_calls)
+    assert max(depth or 0 for _, _, depth in d1_calls) <= 3
+    # No same-body replay with a larger completion reserve (headroom shortcut).
+    assert all(
+        not (a[0] == b[0] and b[1] is not None and a[1] is not None and b[1] > a[1])
+        for a, b in zip(d1_calls, d1_calls[1:])
+    )
+    project_chats = [c for c in llm.chat_calls if c["phase"] == "projects"]
+    assert len(project_chats) <= 16
+    # context_window=8192 → project output reserve floor(8192 * 0.35) = 2867
+    assert any(c["max_completion_tokens"] == 2867 for c in project_chats)
+    # D1 must not escalate to residual headroom (e.g. 4706) on the same leaf.
+    assert all(tok is None or tok <= 2867 for _, tok, _ in d1_calls)
+
+    names = {p.project_name for p in doc.projects}
+    assert "복구프로젝트-1" in names
+    assert "DocB사업" in names  # failed D1 chunks must not drop sibling success
+    recovered = next(p for p in doc.projects if p.project_name == "복구프로젝트-1")
+    assert any(
+        (ref.quote_text or "").strip() == "복구프로젝트-1"
+        and str(ref.document_id) == "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        for ref in (recovered.source_refs or [])
+    )
+    sibling = next(p for p in doc.projects if p.project_name == "DocB사업")
+    assert any(
+        (ref.quote_text or "").strip() == "DocB사업"
+        and str(ref.document_id) == "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+        for ref in (sibling.source_refs or [])
+    )
+    # Finer PROJECT leaves that succeeded should keep row-sized bodies when
+    # source used newlines (no mid-token orphan under the 140-char success band).
+    success_bodies = [body for body, _, _ in d1_calls if len(body) <= 140]
+    assert success_bodies
+    assert all("복구프로젝트-1" in body for body in success_bodies)

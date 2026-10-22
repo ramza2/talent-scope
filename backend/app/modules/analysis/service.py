@@ -2429,6 +2429,45 @@ class AnalysisService:
             token_count_calls,
         )
 
+        def _split_project_body_prefer_boundaries(
+            blocks: str, *, max_body_chars: int
+        ) -> list[str]:
+            """PROJECT-only body split: prefer newline/space over mid-token cuts."""
+            text = blocks or ""
+            marker = "content:\n"
+            idx = text.find(marker)
+            if idx < 0:
+                return split_page_block_text(text, max_body_chars=max_body_chars)
+            header = text[: idx + len(marker)]
+            body = text[idx + len(marker) :]
+            page_marker = ""
+            if body.startswith("[PAGE "):
+                page_line, sep, rest = body.partition("\n")
+                if sep:
+                    page_marker = f"{page_line}\n"
+                    body = rest
+            if len(body) <= max_body_chars:
+                return [text]
+            pieces: list[str] = []
+            start = 0
+            n = len(body)
+            while start < n:
+                end = min(start + max_body_chars, n)
+                if end < n:
+                    window = body[start:end]
+                    cut = window.rfind("\n")
+                    if cut < max(32, max_body_chars // 4):
+                        cut = max(window.rfind(" "), window.rfind("\t"))
+                    if cut >= max(32, max_body_chars // 4):
+                        end = start + cut + 1
+                piece = body[start:end]
+                if piece:
+                    pieces.append(piece)
+                start = end if end > start else start + max_body_chars
+            if len(pieces) <= 1:
+                return split_page_block_text(text, max_body_chars=max_body_chars)
+            return [f"{header}{page_marker}{piece}" for piece in pieces]
+
         def _subsplit_project_chunk(blocks: str) -> list[str]:
             parts = _subsplit_phase_chunk(blocks)
             if len(parts) > 1:
@@ -2446,8 +2485,9 @@ class AnalysisService:
                 _page, _sep, body = body.partition("\n")
             if len(body) <= 160:
                 return parts
-            finer = split_page_block_text(
-                blocks, max_body_chars=max(96, (len(body) + 1) // 2)
+            max_body = max(96, (len(body) + 1) // 2)
+            finer = _split_project_body_prefer_boundaries(
+                blocks, max_body_chars=max_body
             )
             if len(finer) > 1:
                 logger.info(
