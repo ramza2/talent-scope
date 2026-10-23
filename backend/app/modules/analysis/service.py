@@ -923,18 +923,34 @@ class AnalysisService:
                 base_profile.get("name") if isinstance(base_profile, dict) else None
             )
             original_candidate = candidate
+            document_type_by_id = {
+                str(doc.id): str(doc.document_type_code).strip()
+                for doc in claimed.documents
+                if getattr(doc, "document_type_code", None)
+            }
             candidate = apply_candidate_quality_guards(
-                candidate, confirmed_person_name=confirmed_name
+                candidate,
+                confirmed_person_name=confirmed_name,
+                page_texts=prompt_source.page_texts,
+                document_type_by_id=document_type_by_id,
             )
             logger.info(
                 "analysis candidate field guards run_id=%s "
-                "email_cleared=%s employment_type_cleared=%s projects_dropped=%s",
+                "email_cleared=%s employment_type_cleared=%s projects_dropped=%s "
+                "employment_dropped=%s employment_end_review=%s",
                 run_id,
                 original_candidate.profile.email is not None
                 and candidate.profile.email is None,
                 original_candidate.profile.employment_type is not None
                 and candidate.profile.employment_type is None,
                 len(original_candidate.projects) - len(candidate.projects),
+                len(original_candidate.employment_history)
+                - len(candidate.employment_history),
+                sum(
+                    1
+                    for row in candidate.employment_history
+                    if row.end_date and " / " in row.end_date
+                ),
             )
             specs = build_diffs(candidate, base_snap)
             return self._persist_reviewing(
