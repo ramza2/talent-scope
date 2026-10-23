@@ -893,15 +893,36 @@ def _line_is_cert_name_only(line: str) -> bool:
     return len(text) <= 40
 
 
+def _pair_local_adjacent_cert_cells(
+    cells: list[str],
+) -> list[tuple[str, str]]:
+    """Collect clear Name→next-Date adjacent pairs inside a mixed cell block.
+
+    Only the immediate next cell may supply the acquired date. A date whose
+    previous cell is not a cert-title cell is ignored (no neighbor/prev-cert
+    borrowing, no education-date attachment).
+    """
+    pairs: list[tuple[str, str]] = []
+    for index in range(len(cells) - 1):
+        name_cell = cells[index]
+        date_token = _line_is_single_date(cells[index + 1])
+        if not date_token or not _line_is_cert_name_only(name_cell):
+            continue
+        pairs.append((name_cell, date_token))
+    return pairs
+
+
 def _pair_cert_names_and_dates_in_block(
     lines: list[str],
 ) -> list[tuple[str, str]] | None:
     """Pair cert-name cells to acquired dates inside one certification block.
 
-    Supports only two unambiguous DOCX table dumps:
-    - interleaved: Name, Date, Name, Date, ...
-    - columnar: Name×N then Date×N
-    Returns None when the block shape is ambiguous.
+    Recognition order:
+    - interleaved: Name, Date, Name, Date, ... (entire block)
+    - columnar: Name×N then Date×N (entire block)
+    - local adjacent: Name cell immediately followed by a date cell, even when
+      the surrounding DOCX certification table mixes other values
+    Returns None when no unambiguous pairs exist.
     """
     cells = [
         line.strip()
@@ -944,7 +965,9 @@ def _pair_cert_names_and_dates_in_block(
         )
     ):
         return list(zip(names, date_tokens, strict=True))
-    return None
+
+    local = _pair_local_adjacent_cert_cells(cells)
+    return local or None
 
 
 def _cert_name_bound_in_cert_block(
