@@ -635,3 +635,174 @@ def test_docx_mixed_table_interleaved_name_date_cells() -> None:
         document_type_by_id={_DOCX: "DOC-PROFILE", _KOSA: "DOC-KOSA"},
     )
     assert len(result.certifications) == 2
+
+
+def _docx_mixed_60_cell_cert_table() -> str:
+    """Reproduce DOCX p1 certification dump with ~60 mixed cells.
+
+    Real layout places cert titles immediately before acquired-date cells
+    among many unrelated values (lines ~29/30 and ~32/33).
+    """
+    cells: list[str] = ["자격증"]
+    # Leading noise (labels / empty-ish placeholders / other table values).
+    for index in range(27):
+        cells.append(f"셀{index}")
+    cells.extend(
+        [
+            "정보처리기사",  # ~line 29
+            "2006.12.18",  # ~line 30
+            "비고",
+            "전자계산기조직응용기사",  # ~line 32
+            "2008.06.02",  # ~line 33
+        ]
+    )
+    # Trailing noise including standalone education-like dates (not after a cert).
+    cells.extend(["1994.03.02", "1999.02.20"])
+    while len(cells) < 60:
+        cells.append(f"기타{len(cells)}")
+    assert len(cells) == 60
+    return (
+        "학력\n"
+        "한림대학교 유전공학 1994.03.02 ~ 1999.02.20 학사\n"
+        + "\n".join(cells)
+        + "\n"
+    )
+
+
+def test_docx_60_cell_local_adjacent_pairs_merge_ocr() -> None:
+    """Mixed 60-cell DOCX block + KOSA OCR → certifications 4→2."""
+    from app.modules.analysis.candidate_quality_guards import (
+        _cert_row_evidence,
+        _iter_certification_blocks,
+        _pair_cert_names_and_dates_in_block,
+    )
+
+    page_texts = {
+        (_DOCX, 1): _docx_mixed_60_cell_cert_table(),
+        (_KOSA, 1): (
+            "학력\n"
+            "한림대학교 / 유전공학 / 1994.03.02~1999.02.20 / 학사\n"
+            "자격증\n"
+            "경보처리기사 2006.12.18\n"
+            "전자계산기조작용용기사 2008.06.02\n"
+            "발급기관 한국산업입력공단\n"
+        ),
+    }
+    docx_blocks = list(
+        _iter_certification_blocks({(_DOCX, 1): page_texts[(_DOCX, 1)]})
+    )
+    assert docx_blocks
+    pairs = _pair_cert_names_and_dates_in_block(docx_blocks[0])
+    assert pairs is not None
+    assert ("정보처리기사", "2006.12.18") in pairs
+    assert ("전자계산기조직응용기사", "2008.06.02") in pairs
+
+    assert _cert_row_evidence(
+        page_texts, name="정보처리기사", acquired="2006.12.18"
+    )
+    assert _cert_row_evidence(
+        page_texts, name="전자계산기조직응용기사", acquired="2008.06.02"
+    )
+    assert _cert_row_evidence(
+        page_texts, name="경보처리기사", acquired="2006.12.18"
+    )
+    assert _cert_row_evidence(
+        page_texts, name="전자계산기조작용용기사", acquired="2008.06.02"
+    )
+    # Neighbor / education dates must not bind.
+    assert not _cert_row_evidence(
+        page_texts, name="정보처리기사", acquired="2008.06.02"
+    )
+    assert not _cert_row_evidence(
+        page_texts, name="정보처리기사", acquired="1994.03.02"
+    )
+    assert not _cert_row_evidence(
+        page_texts, name="전자계산기조직응용기사", acquired="1999.02.20"
+    )
+
+    candidate = ProfileCandidateDocument(
+        education=[
+            EducationCandidate(school_name="한림대학교", degree="학사"),
+            EducationCandidate(
+                school_name="한림대학교",
+                major="유전공학",
+                degree="학사",
+                start_date="1994.03.02",
+                end_date="1999.02.20",
+            ),
+        ],
+        certifications=[
+            CertificationCandidate(
+                certification_name="정보처리기사",
+                acquired_date="2006.12.18",
+                issuer="한림대학교",
+            ),
+            CertificationCandidate(
+                certification_name="경보처리기사",
+                acquired_date="2006.12.18",
+            ),
+            CertificationCandidate(
+                certification_name="전자계산기조직응용기사",
+                acquired_date="2008.06.02",
+            ),
+            CertificationCandidate(
+                certification_name="전자계산기조작용용기사",
+                acquired_date="2008.06.02",
+            ),
+        ],
+        employment_history=[
+            EmploymentCandidate(
+                company_name=f"회사{i}",
+                start_date="2010.01",
+                end_date="2011.01",
+            )
+            for i in range(7)
+        ],
+        projects=[
+            ProjectCandidate(project_name=f"사업{i}", start_date="2020.01")
+            for i in range(70)
+        ],
+    )
+    result = apply_candidate_quality_guards(
+        candidate,
+        page_texts=page_texts,
+        document_type_by_id={_DOCX: "DOC-PROFILE", _KOSA: "DOC-KOSA"},
+    )
+    assert len(result.education) == 1
+    assert len(result.certifications) == 2
+    assert len(result.employment_history) == 7
+    assert len(result.projects) == 70
+    assert sorted(c.certification_name or "" for c in result.certifications) == [
+        "전자계산기조직응용기사",
+        "정보처리기사",
+    ]
+    # Do not invent / auto-correct issuer (KOSA OCR 입력공단 stays out).
+    assert all(
+        c.issuer not in {"한림대학교", "한국산업인력공단", "한국산업입력공단"}
+        for c in result.certifications
+    )
+    again = apply_candidate_quality_guards(
+        result,
+        page_texts=page_texts,
+        document_type_by_id={_DOCX: "DOC-PROFILE", _KOSA: "DOC-KOSA"},
+    )
+    assert again == result
+
+
+def test_local_adjacent_pair_requires_immediate_cert_name_cell() -> None:
+    from app.modules.analysis.candidate_quality_guards import (
+        _pair_cert_names_and_dates_in_block,
+    )
+
+    # Date preceded by non-cert cell → no pair.
+    assert (
+        _pair_cert_names_and_dates_in_block(
+            ["자격증", "비고", "2006.12.18", "정보처리기사"]
+        )
+        is None
+    )
+    # Name then non-date then date → not immediate → no pair for that name.
+    pairs = _pair_cert_names_and_dates_in_block(
+        ["자격증", "정보처리기사", "비고", "2006.12.18"]
+    )
+    assert pairs is None or ("정보처리기사", "2006.12.18") not in pairs
