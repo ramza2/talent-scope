@@ -828,21 +828,50 @@ def _cert_literal_name_in_line(line: str, name: str | None) -> bool:
     return _line_has_company(line, name.strip())
 
 
+def _cert_name_bound_to_acquired_on_line(
+    line: str, *, name: str, acquired: str
+) -> bool:
+    """True when literal name owns a compatible acquired date on this line.
+
+    Collapsed KOSA rows often pack ``NameA DateA NameB DateB`` into one line.
+    Each date is bound only to the text segment since the previous date, so
+    NameA cannot claim DateB.
+    """
+    target = _normalize_date_token(acquired)
+    if not target or not name.strip():
+        return False
+    date_matches = list(_DATE_TOKEN_RE.finditer(line))
+    if not date_matches:
+        return False
+    prev_end = 0
+    bound_hits = 0
+    for match in date_matches:
+        prefix = line[prev_end : match.start()]
+        token = _normalize_date_token(match.group(0))
+        prev_end = match.end()
+        if not token or not dates_compatible(target, token):
+            continue
+        if _cert_literal_name_in_line(prefix, name):
+            bound_hits += 1
+    # Ambiguous: same name appears with multiple distinct owning dates.
+    return bound_hits == 1
+
+
 def _cert_row_evidence(
     page_texts: dict[tuple[str, int], str] | None,
     *,
     name: str | None,
     acquired: str | None,
 ) -> bool:
-    """True when a non-education line carries this exact name + same-row date."""
+    """True when a non-education line binds this exact name to its acquired date."""
     if not page_texts or not name or not acquired:
         return False
     for section, line in _iter_edu_cert_section_lines(page_texts):
         if section in {"education", "other"}:
             continue
-        if not _cert_literal_name_in_line(line, name):
-            continue
-        if _line_has_compatible_date(line, acquired):
+        if _cert_name_bound_to_acquired_on_line(
+            line, name=name, acquired=acquired
+        ):
             return True
     return False
 

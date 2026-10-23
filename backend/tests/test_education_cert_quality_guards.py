@@ -377,6 +377,93 @@ def test_kosa_collapsed_edu_cert_line_keeps_sections_separate() -> None:
     assert all("경보처리기사" not in text for text in edu_spans)
 
 
+def test_collapsed_kosa_certs_do_not_claim_neighbor_dates() -> None:
+    """Multi-cert one-liner: each name binds only to its own acquired date."""
+    page_texts = {
+        (_KOSA, 1): (
+            "자격증 "
+            "경보처리기사 2006.12.18 "
+            "전자계산기조작용용기사 2008.06.02\n"
+        ),
+        (_DOCX, 1): (
+            "자격증\n"
+            "정보처리기사 2006.12.18\n"
+            "전자계산기조직응용기사 2008.06.02\n"
+        ),
+    }
+    # Cross-wired dates must not get OCR-merged via neighbor dates on the
+    # collapsed KOSA line.
+    candidate = ProfileCandidateDocument(
+        certifications=[
+            CertificationCandidate(
+                certification_name="경보처리기사",
+                acquired_date="2008.06.02",  # neighbor's date
+            ),
+            CertificationCandidate(
+                certification_name="정보처리기사",
+                acquired_date="2008.06.02",
+            ),
+            CertificationCandidate(
+                certification_name="전자계산기조작용용기사",
+                acquired_date="2006.12.18",  # neighbor's date
+            ),
+            CertificationCandidate(
+                certification_name="전자계산기조직응용기사",
+                acquired_date="2006.12.18",
+            ),
+        ]
+    )
+    result = apply_candidate_quality_guards(
+        candidate,
+        page_texts=page_texts,
+        document_type_by_id={_DOCX: "DOC-PROFILE", _KOSA: "DOC-KOSA"},
+    )
+    assert len(result.certifications) == 4
+
+
+def test_collapsed_kosa_correct_date_binding_still_ocr_merges() -> None:
+    """Same collapsed line still merges when each OCR name owns its date."""
+    page_texts = {
+        (_KOSA, 1): (
+            "자격증 "
+            "경보처리기사 2006.12.18 "
+            "전자계산기조작용용기사 2008.06.02\n"
+        ),
+        (_DOCX, 1): (
+            "자격증\n"
+            "정보처리기사 2006.12.18\n"
+            "전자계산기조직응용기사 2008.06.02\n"
+        ),
+    }
+    candidate = ProfileCandidateDocument(
+        certifications=[
+            CertificationCandidate(
+                certification_name="정보처리기사",
+                acquired_date="2006.12.18",
+            ),
+            CertificationCandidate(
+                certification_name="경보처리기사",
+                acquired_date="2006.12.18",
+            ),
+            CertificationCandidate(
+                certification_name="전자계산기조직응용기사",
+                acquired_date="2008.06.02",
+            ),
+            CertificationCandidate(
+                certification_name="전자계산기조작용용기사",
+                acquired_date="2008.06.02",
+            ),
+        ]
+    )
+    result = apply_candidate_quality_guards(
+        candidate,
+        page_texts=page_texts,
+        document_type_by_id={_DOCX: "DOC-PROFILE", _KOSA: "DOC-KOSA"},
+    )
+    names = sorted(c.certification_name or "" for c in result.certifications)
+    assert names == ["전자계산기조직응용기사", "정보처리기사"]
+
+
 def test_education_major_not_absorbed_from_cert_residue() -> None:
     page_texts = {
         (_KOSA, 1): (
