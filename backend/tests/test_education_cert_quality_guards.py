@@ -481,3 +481,157 @@ def test_education_major_not_absorbed_from_cert_residue() -> None:
     assert result.education[0].major == "유전공학"
     assert "자격" not in (result.education[0].major or "")
     assert "정보처리" not in (result.education[0].major or "")
+
+
+def _docx_mixed_columnar_cert_table() -> str:
+    """DOCX p1 dump: cert names and acquired dates on separate cells/lines."""
+    return (
+        "학력\n"
+        "한림대학교 유전공학 1994.03.02 ~ 1999.02.20 학사\n"
+        "자격증\n"
+        "정보처리기사\n"
+        "전자계산기조직응용기사\n"
+        "2006.12.18\n"
+        "2008.06.02\n"
+    )
+
+
+def test_docx_mixed_table_columnar_cert_binding_merges_ocr() -> None:
+    """DOCX name/date cells + KOSA OCR rows → 2 certifications."""
+    page_texts = {
+        (_DOCX, 1): _docx_mixed_columnar_cert_table(),
+        (_KOSA, 1): (
+            "학력\n"
+            "한림대학교 / 유전공학 / 1994.03.02~1999.02.20 / 학사\n"
+            "자격증\n"
+            "경보처리기사 2006.12.18\n"
+            "전자계산기조작용용기사 2008.06.02\n"
+        ),
+    }
+    candidate = ProfileCandidateDocument(
+        education=[
+            EducationCandidate(school_name="한림대학교", degree="학사"),
+            EducationCandidate(
+                school_name="한림대학교",
+                major="유전공학",
+                degree="학사",
+                start_date="1994.03.02",
+                end_date="1999.02.20",
+            ),
+        ],
+        certifications=[
+            CertificationCandidate(
+                certification_name="정보처리기사",
+                acquired_date="2006.12.18",
+                issuer="한림대학교",
+            ),
+            CertificationCandidate(
+                certification_name="경보처리기사",
+                acquired_date="2006.12.18",
+            ),
+            CertificationCandidate(
+                certification_name="전자계산기조직응용기사",
+                acquired_date="2008.06.02",
+            ),
+            CertificationCandidate(
+                certification_name="전자계산기조작용용기사",
+                acquired_date="2008.06.02",
+            ),
+        ],
+        employment_history=[
+            EmploymentCandidate(
+                company_name=f"회사{i}",
+                start_date="2010.01",
+                end_date="2011.01",
+            )
+            for i in range(7)
+        ],
+        projects=[
+            ProjectCandidate(project_name=f"사업{i}", start_date="2020.01")
+            for i in range(70)
+        ],
+    )
+    result = apply_candidate_quality_guards(
+        candidate,
+        page_texts=page_texts,
+        document_type_by_id={_DOCX: "DOC-PROFILE", _KOSA: "DOC-KOSA"},
+    )
+    assert len(result.education) == 1
+    assert len(result.certifications) == 2
+    assert len(result.employment_history) == 7
+    assert len(result.projects) == 70
+    names = sorted(c.certification_name or "" for c in result.certifications)
+    assert names == ["전자계산기조직응용기사", "정보처리기사"]
+    assert all(c.issuer != "한림대학교" for c in result.certifications)
+    again = apply_candidate_quality_guards(
+        result,
+        page_texts=page_texts,
+        document_type_by_id={_DOCX: "DOC-PROFILE", _KOSA: "DOC-KOSA"},
+    )
+    assert again == result
+
+
+def test_docx_mixed_table_does_not_bind_neighbor_or_education_dates() -> None:
+    from app.modules.analysis.candidate_quality_guards import _cert_row_evidence
+
+    page_texts = {(_DOCX, 1): _docx_mixed_columnar_cert_table()}
+    assert _cert_row_evidence(
+        page_texts, name="정보처리기사", acquired="2006.12.18"
+    )
+    assert _cert_row_evidence(
+        page_texts, name="전자계산기조직응용기사", acquired="2008.06.02"
+    )
+    # Neighbor cert date
+    assert not _cert_row_evidence(
+        page_texts, name="정보처리기사", acquired="2008.06.02"
+    )
+    # Education admission / graduation dates
+    assert not _cert_row_evidence(
+        page_texts, name="정보처리기사", acquired="1994.03.02"
+    )
+    assert not _cert_row_evidence(
+        page_texts, name="정보처리기사", acquired="1999.02.20"
+    )
+
+
+def test_docx_mixed_table_interleaved_name_date_cells() -> None:
+    page_texts = {
+        (_DOCX, 1): (
+            "자격증\n"
+            "정보처리기사\n"
+            "2006.12.18\n"
+            "전자계산기조직응용기사\n"
+            "2008.06.02\n"
+        ),
+        (_KOSA, 1): (
+            "자격증\n"
+            "경보처리기사 2006.12.18\n"
+            "전자계산기조작용용기사 2008.06.02\n"
+        ),
+    }
+    candidate = ProfileCandidateDocument(
+        certifications=[
+            CertificationCandidate(
+                certification_name="정보처리기사",
+                acquired_date="2006.12.18",
+            ),
+            CertificationCandidate(
+                certification_name="경보처리기사",
+                acquired_date="2006.12.18",
+            ),
+            CertificationCandidate(
+                certification_name="전자계산기조직응용기사",
+                acquired_date="2008.06.02",
+            ),
+            CertificationCandidate(
+                certification_name="전자계산기조작용용기사",
+                acquired_date="2008.06.02",
+            ),
+        ]
+    )
+    result = apply_candidate_quality_guards(
+        candidate,
+        page_texts=page_texts,
+        document_type_by_id={_DOCX: "DOC-PROFILE", _KOSA: "DOC-KOSA"},
+    )
+    assert len(result.certifications) == 2
