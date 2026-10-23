@@ -194,14 +194,8 @@ def _classify_span(text: str, *, section: str) -> str:
     if has_emp_row or section == "employment":
         # Dates / employer-table rows inside an employer section count.
         return "employment"
-    # Unknown section: dated company lines without project cues are weak
-    # employment-shaped, but only when page prior is not project.
-    if (
-        section == "unknown"
-        and _DATE_TOKEN_RE.search(text)
-        and not has_proj_row
-    ):
-        return "employment"
+    # Unknown + date alone is never employment evidence (KOSA p2~3 project
+    # rows often lack headers; treating dates as employers causes mix-ins).
     return "ambiguous"
 
 
@@ -223,6 +217,9 @@ def _default_page_section(doc_type: str | None, page_no: int) -> str:
     if dtype in _PROFILE_LIKE_DOC_TYPES:
         # Typical career DOCX: p1 employer table, later pages project history.
         return "employment" if page_no <= 1 else "project"
+    if dtype == "DOC-KOSA":
+        # KOSA p2+ continues 수행내역 even when the header is omitted.
+        return "unknown" if page_no <= 1 else "project"
     return "unknown"
 
 
@@ -261,10 +258,21 @@ def _iter_context_spans(
     if not page_texts:
         return
     type_map = document_type_by_id or {}
-    for (doc_id, page_no), text in page_texts.items():
-        doc_type = type_map.get(str(doc_id))
+    # Carry explicit section sticky across later unknown pages of the same doc
+    # (e.g. KOSA p1 ends in 수행내역 → headerless p2/p3 stay project).
+    sticky_by_doc: dict[str, str] = {}
+    ordered = sorted(
+        page_texts.items(),
+        key=lambda item: (str(item[0][0]), int(item[0][1])),
+    )
+    for (doc_id, page_no), text in ordered:
+        doc_key = str(doc_id)
+        doc_type = type_map.get(doc_key)
         page_section = _default_page_section(doc_type, int(page_no))
-        sticky = page_section
+        if page_section == "unknown":
+            sticky = sticky_by_doc.get(doc_key, "unknown")
+        else:
+            sticky = page_section
         raw_text = str(text or "")
         lines = raw_text.splitlines() or ([raw_text] if raw_text.strip() else [])
         for raw_line in lines:
@@ -283,12 +291,14 @@ def _iter_context_spans(
                 else:
                     section = section_hint if section_hint != "unknown" else sticky
                 yield _ContextSpan(
-                    doc_id=str(doc_id),
+                    doc_id=doc_key,
                     page_no=int(page_no),
                     section=section,
                     text=span_text,
                     doc_type=doc_type,
                 )
+        if sticky != "unknown":
+            sticky_by_doc[doc_key] = sticky
 
 
 def _is_ongoing_end(value: str | None) -> bool:
