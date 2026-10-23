@@ -61,6 +61,13 @@ _EDUCATION_SECTION_RE = re.compile(
 _CERT_SECTION_RE = re.compile(
     r"자격증|자격면허|자격\s*사항|자격명|취득일|발급기관|면허"
 )
+# Shape cue for certification titles (not used as fuzzy match / distance).
+_CERT_NAME_SHAPE_RE = re.compile(
+    r"(기사|기술사|산업기사|기능사|프로그래머|관리사|감리사)"
+)
+_CERT_HEADER_ONLY_RE = re.compile(
+    r"^(자격증|자격면허|자격\s*사항|자격명|취득일|발급기관|면허)$"
+)
 _DATE_TOKEN_RE = re.compile(
     r"(?:19|20)\d{2}[./\-]\d{1,2}(?:[./\-]\d{1,2})?"
 )
@@ -857,17 +864,164 @@ def _cert_name_bound_to_acquired_on_line(
     return bound_hits == 1
 
 
+def _line_is_cert_header_only(line: str) -> bool:
+    return bool(_CERT_HEADER_ONLY_RE.match(line.strip()))
+
+
+def _line_is_single_date(line: str) -> str | None:
+    """Return normalized date when the line is exactly one date token."""
+    text = line.strip()
+    matches = list(_DATE_TOKEN_RE.finditer(text))
+    if len(matches) != 1:
+        return None
+    residual = _DATE_TOKEN_RE.sub("", text)
+    residual = re.sub(r"[\s./\-~\—–·•|/]+", "", residual)
+    if residual:
+        return None
+    return _normalize_date_token(matches[0].group(0))
+
+
+def _line_is_cert_name_only(line: str) -> bool:
+    """True for a cert-title-only cell (no dates / section headers)."""
+    text = line.strip()
+    if not text or _line_is_cert_header_only(text):
+        return False
+    if _DATE_TOKEN_RE.search(text) or _DATE_RANGE_RE.search(text):
+        return False
+    if not _CERT_NAME_SHAPE_RE.search(text):
+        return False
+    return len(text) <= 40
+
+
+def _pair_cert_names_and_dates_in_block(
+    lines: list[str],
+) -> list[tuple[str, str]] | None:
+    """Pair cert-name cells to acquired dates inside one certification block.
+
+    Supports only two unambiguous DOCX table dumps:
+    - interleaved: Name, Date, Name, Date, ...
+    - columnar: Name×N then Date×N
+    Returns None when the block shape is ambiguous.
+    """
+    cells = [
+        line.strip()
+        for line in lines
+        if line.strip() and not _line_is_cert_header_only(line)
+    ]
+    if not cells:
+        return None
+
+    # Interleaved Name/Date pairs.
+    interleaved: list[tuple[str, str]] = []
+    index = 0
+    interleaved_ok = True
+    while index < len(cells):
+        if index + 1 >= len(cells):
+            interleaved_ok = False
+            break
+        name_cell = cells[index]
+        date_cell = cells[index + 1]
+        date_token = _line_is_single_date(date_cell)
+        if not (_line_is_cert_name_only(name_cell) and date_token):
+            interleaved_ok = False
+            break
+        interleaved.append((name_cell, date_token))
+        index += 2
+    if interleaved_ok and interleaved and index == len(cells):
+        return interleaved
+
+    # Columnar dump: all names, then the same number of dates.
+    names = [cell for cell in cells if _line_is_cert_name_only(cell)]
+    dates = [_line_is_single_date(cell) for cell in cells]
+    date_tokens = [token for token in dates if token is not None]
+    if (
+        names
+        and len(names) == len(date_tokens)
+        and len(names) + len(date_tokens) == len(cells)
+        and all(_line_is_cert_name_only(cell) for cell in cells[: len(names)])
+        and all(
+            _line_is_single_date(cell) for cell in cells[len(names) :]
+        )
+    ):
+        return list(zip(names, date_tokens, strict=True))
+    return None
+
+
+def _cert_name_bound_in_cert_block(
+    lines: list[str], *, name: str, acquired: str
+) -> bool:
+    """True when block pairing uniquely binds literal name to acquired date."""
+    target = _normalize_date_token(acquired)
+    if not target or not name.strip():
+        return False
+    pairs = _pair_cert_names_and_dates_in_block(lines)
+    if not pairs:
+        return False
+    hits = 0
+    for pair_name, pair_date in pairs:
+        if not _cert_literal_name_in_line(pair_name, name):
+            continue
+        if dates_compatible(target, pair_date):
+            hits += 1
+    return hits == 1
+
+
+def _iter_certification_blocks(
+    page_texts: dict[tuple[str, int], str] | None,
+) -> Iterable[list[str]]:
+    """Yield certification-section line blocks; never join across documents."""
+    if not page_texts:
+        return
+    by_doc: dict[str, dict[tuple[str, int], str]] = {}
+    for (doc_id, page_no), text in page_texts.items():
+        by_doc.setdefault(str(doc_id), {})[(str(doc_id), int(page_no))] = text
+    for doc_key in sorted(by_doc):
+        block: list[str] = []
+        for section, line in _iter_edu_cert_section_lines(by_doc[doc_key]):
+            if section == "certification":
+                block.append(line)
+                continue
+            if block:
+                yield block
+                block = []
+        if block:
+            yield block
+
+
 def _cert_row_evidence(
     page_texts: dict[tuple[str, int], str] | None,
     *,
     name: str | None,
     acquired: str | None,
 ) -> bool:
-    """True when a non-education line binds this exact name to its acquired date."""
+    """True when source text binds this exact name to its acquired date.
+
+    Prefer same-line ownership (KOSA collapsed rows). For DOCX mixed tables,
+    certification-section cells may place names and dates on separate lines;
+    those are paired only via unambiguous interleaved/columnar block shape.
+    Education admission/graduation dates are never paired across lines.
+    """
     if not page_texts or not name or not acquired:
         return False
+
+    for block in _iter_certification_blocks(page_texts):
+        for line in block:
+            if _cert_name_bound_to_acquired_on_line(
+                line, name=name, acquired=acquired
+            ):
+                return True
+        if _cert_name_bound_in_cert_block(
+            block, name=name, acquired=acquired
+        ):
+            return True
+
+    # Same-line only outside certification sticky: cert rows sometimes remain
+    # under education/unknown when a 자격증 header was not extracted. Never
+    # multi-line pair here (avoids school period dates).
+    if not _CERT_NAME_SHAPE_RE.search(name):
+        return False
     for section, line in _iter_edu_cert_section_lines(page_texts):
-        if section in {"education", "other"}:
+        if section in {"certification", "other"}:
             continue
         if _cert_name_bound_to_acquired_on_line(
             line, name=name, acquired=acquired
