@@ -303,3 +303,94 @@ def test_employment_and_project_guards_unchanged_with_edu_cert() -> None:
         "피엔드티컨설팅(주)"
     ]
     assert [p.project_name for p in result.projects] == ["농지전산 고도화"]
+
+
+def test_ocr_alias_not_used_for_page_evidence() -> None:
+    """DOCX-only literal spelling must not evidence a missing KOSA OCR name."""
+    page_texts = {
+        (_DOCX, 1): (
+            "자격증\n"
+            "정보처리기사 2006.12.18\n"
+        ),
+    }
+    candidate = ProfileCandidateDocument(
+        certifications=[
+            CertificationCandidate(
+                certification_name="정보처리기사",
+                acquired_date="2006.12.18",
+            ),
+            CertificationCandidate(
+                certification_name="경보처리기사",
+                acquired_date="2006.12.18",
+            ),
+        ]
+    )
+    result = apply_candidate_quality_guards(candidate, page_texts=page_texts)
+    assert len(result.certifications) == 2
+
+
+def test_undated_same_name_certs_not_merged_without_pages() -> None:
+    candidate = ProfileCandidateDocument(
+        certifications=[
+            CertificationCandidate(certification_name="정보처리기사"),
+            CertificationCandidate(
+                certification_name="정보처리기사", issuer="한림대학교"
+            ),
+        ]
+    )
+    result = apply_candidate_quality_guards(candidate)
+    assert len(result.certifications) == 2
+
+
+def test_edu_cert_sticky_does_not_cross_documents() -> None:
+    from app.modules.analysis.candidate_quality_guards import (
+        _iter_edu_cert_section_lines,
+    )
+
+    page_texts = {
+        (_DOCX, 1): "자격증\n정보처리기사 2006.12.18\n",
+        # No header — must not inherit DOCX certification sticky.
+        (_KOSA, 1): "한림대학교 / 유전공학 / 1994.03.02~1999.02.20 / 학사\n",
+    }
+    sections = list(_iter_edu_cert_section_lines(page_texts))
+    kosa_sections = [sec for sec, line in sections if "한림대학교" in line]
+    assert kosa_sections == ["unknown"]
+
+
+def test_kosa_collapsed_edu_cert_line_keeps_sections_separate() -> None:
+    from app.modules.analysis.candidate_quality_guards import (
+        _iter_edu_cert_section_lines,
+    )
+
+    page_texts = {
+        (_KOSA, 1): (
+            "학력 한림대학교 / 유전공학 / 1994.03.02~1999.02.20 / 학사 "
+            "자격증 경보처리기사 2006.12.18 "
+            "전자계산기조작용용기사 2008.06.02\n"
+        ),
+    }
+    spans = list(_iter_edu_cert_section_lines(page_texts))
+    edu_spans = [text for sec, text in spans if sec == "education"]
+    cert_spans = [text for sec, text in spans if sec == "certification"]
+    assert any("한림대학교" in text and "유전공학" in text for text in edu_spans)
+    assert any("경보처리기사" in text for text in cert_spans)
+    assert all("경보처리기사" not in text for text in edu_spans)
+
+
+def test_education_major_not_absorbed_from_cert_residue() -> None:
+    page_texts = {
+        (_KOSA, 1): (
+            "학력 한림대학교 / 유전공학 / 1994.03.02~1999.02.20 / 학사 "
+            "자격증 정보처리기사 2006.12.18\n"
+        ),
+    }
+    candidate = ProfileCandidateDocument(
+        education=[
+            EducationCandidate(school_name="한림대학교", degree="학사")
+        ]
+    )
+    result = apply_candidate_quality_guards(candidate, page_texts=page_texts)
+    assert len(result.education) == 1
+    assert result.education[0].major == "유전공학"
+    assert "자격" not in (result.education[0].major or "")
+    assert "정보처리" not in (result.education[0].major or "")
