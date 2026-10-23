@@ -7,6 +7,7 @@ Confirmed data or existing analysis runs, and never infers missing facts.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from typing import Iterable
 
 from app.ai.schemas.profile_candidate import (
@@ -32,19 +33,23 @@ _CAREER_DURATION_RE = re.compile(
 )
 
 _EMPLOYMENT_SECTION_RE = re.compile(
-    r"근무경력|재직기간|경력사항|직장명|근무처|"
+    r"근무경력|재직기간|경력사항|직장명|근무처|소속회사|근무기관|재직회사|"
     r"회사명\s*기간\s*직위|최종직급|입사\s*일|퇴사\s*일"
 )
 _PROJECT_SECTION_RE = re.compile(
-    r"수행내역|참여사업|수행사업|프로젝트\s*경력|경력기술|"
-    r"발주처|고객사|사업명|수행역할|업무내용"
+    r"프로젝트\s*수행내역|프로젝트\s*경력|수행내역|참여사업|수행사업|"
+    r"경력기술서|경력기술|발주처|발주기관|고객사|사업명|수행역할|업무내용|"
+    r"수행\s*프로젝트"
 )
 _PROJECT_ROW_RE = re.compile(
-    r"발주처|고객사|사업명|프로젝트|수행내역|정보화|시스템\s*구축|"
-    r"BIA|BCP|이전통합"
+    r"발주처|발주기관|고객사|사업명|프로젝트\s*수행|수행내역|정보화|"
+    r"시스템\s*구축|BIA|BCP|이전통합"
 )
+# Bare "프로젝트" alone is too weak for row classification — it often appears
+# as the start of a following section header on collapsed KOSA lines.
 _EMPLOYMENT_ROW_RE = re.compile(
-    r"근무경력|재직기간|직장명|근무처|회사명|최종직급|담당업무|직위|재직"
+    r"근무경력|재직기간|직장명|근무처|소속회사|근무기관|재직회사|"
+    r"회사명|최종직급|담당업무|직위|재직"
 )
 _DATE_TOKEN_RE = re.compile(
     r"(?:19|20)\d{2}[./\-]\d{1,2}(?:[./\-]\d{1,2})?"
@@ -55,8 +60,22 @@ _DATE_RANGE_RE = re.compile(
     rf"(?P<end>현재|재직\s*중|재직중|Present|PRESENT|{_DATE_TOKEN_RE.pattern})",
     re.IGNORECASE,
 )
+# Unparseable multi-value end_date → diff REVIEW. Both alternatives stay visible
+# for humans; we never overwrite with a chosen calendar date.
 _EMPLOYMENT_END_CONFLICT_SEP = " / "
 _ONGOING_END_KEYS = frozenset({"현재", "재직중", "present"})
+_PROFILE_LIKE_DOC_TYPES = frozenset(
+    {"DOC-PROFILE", "DOC-RESUME", "DOC-CAREER"}
+)
+
+
+@dataclass(frozen=True)
+class _ContextSpan:
+    doc_id: str
+    page_no: int
+    section: str
+    text: str
+    doc_type: str | None
 
 
 def _key(value: str | None) -> str | None:
@@ -123,37 +142,61 @@ def _employment_end_conflict_token(a: str, b: str) -> str:
     return _EMPLOYMENT_END_CONFLICT_SEP.join(unique)
 
 
-def _line_has_company(line: str, company: str) -> bool:
-    """Match company text without treating short ASCII names as substrings.
+def _is_company_continue_char(ch: str) -> bool:
+    """Letter/Hangul that can extend a company token (digits/punct do not)."""
+    if "가" <= ch <= "힣":
+        return True
+    return ch.isalpha()
 
-    E.g. "KT" must not match "SKT" or "KTNetworks" on a separate employer
-    row. OCR whitespace variance is tolerated for the text comparison.
+
+def _line_has_company(line: str, company: str) -> bool:
+    """True when company appears as a bounded token (KT ⊄ SKT).
+
+    Folded matching ignores whitespace so `피엔드티컨설팅(주) 2010.03` still
+    hits; digits/punctuation after the name are valid boundaries (dates).
     """
     needle = _fold(company.strip())
     if not needle:
         return False
-    # Permit OCR whitespace inside company names, but preserve spaces around
-    # each match so "KT 2020.01" is not mistaken for "KT2020.01".
-    pattern = r"\s*".join(re.escape(ch) for ch in needle)
-    for match in re.finditer(pattern, line, flags=re.IGNORECASE):
-        before = line[match.start() - 1] if match.start() else ""
-        after = line[match.end()] if match.end() < len(line) else ""
-        if (
-            needle[0].isascii()
-            and needle[0].isalnum()
-            and before.isascii()
-            and before.isalnum()
-        ):
-            continue
-        if (
-            needle[-1].isascii()
-            and needle[-1].isalnum()
-            and after.isascii()
-            and after.isalnum()
-        ):
-            continue
-        return True
-    return False
+    hay = _fold(line)
+    start = 0
+    while True:
+        idx = hay.find(needle, start)
+        if idx < 0:
+            return False
+        before_ok = idx == 0 or not _is_company_continue_char(hay[idx - 1])
+        after_idx = idx + len(needle)
+        after_ok = (
+            after_idx >= len(hay)
+            or not _is_company_continue_char(hay[after_idx])
+        )
+        if before_ok and after_ok:
+            return True
+        start = idx + 1
+
+
+def _classify_span(text: str, *, section: str) -> str:
+    """Classify a span using sticky section context; never doc-type alone."""
+    has_emp_section = bool(_EMPLOYMENT_SECTION_RE.search(text))
+    has_proj_section = bool(_PROJECT_SECTION_RE.search(text))
+    has_emp_row = bool(_EMPLOYMENT_ROW_RE.search(text))
+    has_proj_row = bool(_PROJECT_ROW_RE.search(text))
+
+    # Explicit section headers win; mixed supply of both stays sticky-driven.
+    if has_proj_section and not has_emp_section:
+        return "project"
+    if has_emp_section and not has_proj_section:
+        return "employment"
+    if section == "project":
+        return "project"
+    if has_proj_row and not has_emp_row and not has_emp_section:
+        return "project"
+    if has_emp_row or section == "employment":
+        # Dates / employer-table rows inside an employer section count.
+        return "employment"
+    # Unknown + date alone is never employment evidence (KOSA p2~3 project
+    # rows often lack headers; treating dates as employers causes mix-ins).
+    return "ambiguous"
 
 
 def _extract_range_dates(line: str) -> list[tuple[str | None, str | None]]:
@@ -168,54 +211,94 @@ def _extract_range_dates(line: str) -> list[tuple[str | None, str | None]]:
     return out
 
 
-def _classify_line_context(line: str, *, section: str) -> str:
-    """Return employment | project | ambiguous for a company-bearing line.
-
-    Document type (including DOC-KOSA) is never enough by itself — KOSA
-    project-performance customer rows must stay project context.
-    """
-    is_project_row = bool(
-        _PROJECT_SECTION_RE.search(line) or _PROJECT_ROW_RE.search(line)
-    )
-    is_employment_row = bool(
-        _EMPLOYMENT_SECTION_RE.search(line) or _EMPLOYMENT_ROW_RE.search(line)
-    )
-    # Flattened PDF/OCR text may place employer and project data on one line.
-    # Such mixed evidence is not enough to remove an employment candidate.
-    if is_project_row and is_employment_row:
-        return "ambiguous"
-    if is_project_row:
-        return "project"
-    if is_employment_row:
-        return "employment"
-    if section == "project":
-        return "project"
-    if section == "employment":
-        return "employment"
-    # A company and a date alone occur frequently in project tables and do
-    # not establish an employment relationship.
-    return "ambiguous"
+def _default_page_section(doc_type: str | None, page_no: int) -> str:
+    """Document/page prior when explicit section headers are absent."""
+    dtype = (doc_type or "").strip().upper()
+    if dtype in _PROFILE_LIKE_DOC_TYPES:
+        # Typical career DOCX: p1 employer table, later pages project history.
+        return "employment" if page_no <= 1 else "project"
+    if dtype == "DOC-KOSA":
+        # KOSA p2+ continues 수행내역 even when the header is omitted.
+        return "unknown" if page_no <= 1 else "project"
+    return "unknown"
 
 
-def _iter_context_lines(
+def _split_collapsed_line(line: str, *, page_section: str) -> list[tuple[str, str]]:
+    """Split KOSA-style collapsed lines into section-tagged spans."""
+    # Collect (start, end, section), keep longest-leftmost non-overlapping markers
+    # so "프로젝트 수행내역" is not chopped into a trailing bare "프로젝트" stub.
+    raw: list[tuple[int, int, str]] = []
+    for match in _EMPLOYMENT_SECTION_RE.finditer(line):
+        raw.append((match.start(), match.end(), "employment"))
+    for match in _PROJECT_SECTION_RE.finditer(line):
+        raw.append((match.start(), match.end(), "project"))
+    if not raw:
+        return [(page_section, line)]
+    raw.sort(key=lambda item: (item[0], -(item[1] - item[0])))
+    markers: list[tuple[int, int, str]] = []
+    for start, end, section in raw:
+        if markers and start < markers[-1][1]:
+            continue
+        markers.append((start, end, section))
+    spans: list[tuple[str, str]] = []
+    if markers[0][0] > 0:
+        spans.append((page_section, line[: markers[0][0]].strip()))
+    for index, (start, _end, section) in enumerate(markers):
+        cut = markers[index + 1][0] if index + 1 < len(markers) else len(line)
+        piece = line[start:cut].strip()
+        if piece:
+            spans.append((section, piece))
+    return [(section, text) for section, text in spans if text]
+
+
+def _iter_context_spans(
     page_texts: dict[tuple[str, int], str] | None,
     document_type_by_id: dict[str, str] | None,
-) -> Iterable[tuple[str, int, str, str, str | None]]:
+) -> Iterable[_ContextSpan]:
     if not page_texts:
         return
     type_map = document_type_by_id or {}
-    for (doc_id, page_no), text in page_texts.items():
-        section = "unknown"
-        doc_type = type_map.get(str(doc_id))
-        for raw_line in str(text or "").splitlines():
+    # Carry explicit section sticky across later unknown pages of the same doc
+    # (e.g. KOSA p1 ends in 수행내역 → headerless p2/p3 stay project).
+    sticky_by_doc: dict[str, str] = {}
+    ordered = sorted(
+        page_texts.items(),
+        key=lambda item: (str(item[0][0]), int(item[0][1])),
+    )
+    for (doc_id, page_no), text in ordered:
+        doc_key = str(doc_id)
+        doc_type = type_map.get(doc_key)
+        page_section = _default_page_section(doc_type, int(page_no))
+        if page_section == "unknown":
+            sticky = sticky_by_doc.get(doc_key, "unknown")
+        else:
+            sticky = page_section
+        raw_text = str(text or "")
+        lines = raw_text.splitlines() or ([raw_text] if raw_text.strip() else [])
+        for raw_line in lines:
             line = raw_line.strip()
             if not line:
                 continue
-            if _EMPLOYMENT_SECTION_RE.search(line):
-                section = "employment"
-            elif _PROJECT_SECTION_RE.search(line):
-                section = "project"
-            yield str(doc_id), int(page_no), section, line, doc_type
+            for section_hint, span_text in _split_collapsed_line(
+                line, page_section=sticky
+            ):
+                if _EMPLOYMENT_SECTION_RE.search(span_text):
+                    sticky = "employment"
+                    section = "employment"
+                elif _PROJECT_SECTION_RE.search(span_text):
+                    sticky = "project"
+                    section = "project"
+                else:
+                    section = section_hint if section_hint != "unknown" else sticky
+                yield _ContextSpan(
+                    doc_id=doc_key,
+                    page_no=int(page_no),
+                    section=section,
+                    text=span_text,
+                    doc_type=doc_type,
+                )
+        if sticky != "unknown":
+            sticky_by_doc[doc_key] = sticky
 
 
 def _is_ongoing_end(value: str | None) -> bool:
@@ -228,10 +311,7 @@ def _linked_source_ends(
     *,
     candidate_start: str | None,
 ) -> list[str]:
-    """Ends from employer-table ranges whose start matches the candidate start.
-
-    Distinct employments at the same company (different starts) are ignored.
-    """
+    """Ends from employer-table ranges whose start matches the candidate start."""
     start = (candidate_start or "").strip()
     if not start:
         return []
@@ -252,7 +332,6 @@ def _unique_incompatible_ends(ends: list[str]) -> list[str]:
         matched = False
         for i, kept in enumerate(unique):
             if dates_compatible(end, kept):
-                # Keep the more precise token when compatible.
                 score_new = sum(ch.isdigit() for ch in end) + end.count(".")
                 score_old = sum(ch.isdigit() for ch in kept) + kept.count(".")
                 if score_new > score_old:
@@ -269,7 +348,11 @@ def _resolve_end_date_for_review(
     candidate_end: str | None,
     linked_ends: list[str],
 ) -> str | None:
-    """Return REVIEW conflict token when ends disagree; never pick a winner."""
+    """Return REVIEW conflict token when ends disagree; never pick a winner.
+
+    Joined unparseable tokens keep both alternatives visible and trip the
+    existing employment date REVIEW path. We do not invent a chosen date.
+    """
     cand_end = (candidate_end or "").strip()
     if cand_end and _EMPLOYMENT_END_CONFLICT_SEP in cand_end:
         return cand_end
@@ -277,7 +360,6 @@ def _resolve_end_date_for_review(
     if not unique_ends:
         return None
     if len(unique_ends) > 1:
-        # Multiple incompatible source ends for the same start — ambiguous.
         token = unique_ends[0]
         for extra in unique_ends[1:]:
             token = _employment_end_conflict_token(token, extra)
@@ -294,32 +376,51 @@ def _resolve_end_date_for_review(
     return _employment_end_conflict_token(cand_end, source_end)
 
 
+def _matches_project_customer_period(
+    row: EmploymentCandidate,
+    projects: list[ProjectCandidate],
+) -> bool:
+    """True when employment dates mirror a project row for the same customer."""
+    company_key = _key(row.company_name)
+    if company_key is None:
+        return False
+    for project in projects:
+        if _key(project.customer_name) != company_key:
+            continue
+        if not dates_compatible(row.start_date, project.start_date):
+            continue
+        # End may be omitted on either side; compatible ends strengthen the hit.
+        if row.end_date and project.end_date:
+            if not dates_compatible(row.end_date, project.end_date):
+                continue
+        return True
+    return False
+
+
 def _guard_employment_history(
     candidate: ProfileCandidateDocument,
     *,
     page_texts: dict[tuple[str, int], str] | None,
     document_type_by_id: dict[str, str] | None,
 ) -> list[EmploymentCandidate]:
-    """Drop clear project-customer-only employers; REVIEW start-linked end conflicts.
+    """Drop certain project-customer mix-ins; REVIEW start-linked end conflicts.
 
-    Conservative: insufficient/ambiguous row structure never deletes a row.
-    KOSA employer-table rows are preserved; KOSA project customers are not
-    treated as employment evidence.
+    Uses document/page/section spans (including collapsed KOSA lines). Project
+    page dates never count as employer-table evidence. Ambiguous rows are kept.
     """
     rows = list(candidate.employment_history or [])
     if not rows:
         return rows
-    # Without page text we cannot distinguish employer tables from project
-    # customers — leave employment unchanged (fail open).
     if not page_texts:
         return rows
 
+    projects = list(candidate.projects or [])
     customer_keys = {
         key
-        for project in candidate.projects or []
+        for project in projects
         if (key := _key(project.customer_name)) is not None
     }
-    context_lines = list(_iter_context_lines(page_texts, document_type_by_id))
+    spans = list(_iter_context_spans(page_texts, document_type_by_id))
     kept: list[EmploymentCandidate] = []
 
     for row in rows:
@@ -332,28 +433,25 @@ def _guard_employment_history(
         emp_dates: list[tuple[str | None, str | None]] = []
         has_employment_evidence = False
         has_project_evidence = False
-        has_ambiguous_evidence = False
 
-        for _doc_id, _page_no, section, line, _doc_type in context_lines:
-            if not _line_has_company(line, company):
+        for span in spans:
+            if not _line_has_company(span.text, company):
                 continue
-            kind = _classify_line_context(line, section=section)
+            kind = _classify_span(span.text, section=span.section)
             if kind == "employment":
                 has_employment_evidence = True
-                emp_dates.extend(_extract_range_dates(line))
+                emp_dates.extend(_extract_range_dates(span.text))
             elif kind == "project":
                 has_project_evidence = True
-            else:
-                has_ambiguous_evidence = True
 
         is_customer_name = company_key in customer_keys
-        # Drop only when project-customer mix-in is positively evidenced and
-        # no employer-table evidence exists. Ambiguous/missing structure → keep.
+        mirrors_project = _matches_project_customer_period(row, projects)
+        # Certain mix-in only: project customer with project-page/period evidence
+        # and no employer-table / KOSA employment-section evidence.
         if (
             is_customer_name
-            and has_project_evidence
             and not has_employment_evidence
-            and not has_ambiguous_evidence
+            and (has_project_evidence or mirrors_project)
         ):
             continue
 
