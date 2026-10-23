@@ -11,9 +11,12 @@ from dataclasses import dataclass
 from typing import Iterable
 
 from app.ai.schemas.profile_candidate import (
+    CertificationCandidate,
+    EducationCandidate,
     EmploymentCandidate,
     ProfileCandidateDocument,
     ProjectCandidate,
+    SourceRef,
 )
 from app.core.person_name import is_korean_person_name, person_name_match_key
 from app.modules.analysis.diff_engine import dates_compatible, parse_date_parts
@@ -51,8 +54,20 @@ _EMPLOYMENT_ROW_RE = re.compile(
     r"근무경력|재직기간|직장명|근무처|소속회사|근무기관|재직회사|"
     r"회사명|최종직급|담당업무|직위|재직"
 )
+# Avoid bare "전공"/"학위" — they appear inside majors like 유전공학.
+_EDUCATION_SECTION_RE = re.compile(
+    r"학력사항|교육사항|학력|학교명|전공\s*명|학위\s*명|입학\s*일|졸업\s*일"
+)
+_CERT_SECTION_RE = re.compile(
+    r"자격증|자격면허|자격\s*사항|자격명|취득일|발급기관|면허"
+)
 _DATE_TOKEN_RE = re.compile(
     r"(?:19|20)\d{2}[./\-]\d{1,2}(?:[./\-]\d{1,2})?"
+)
+# Known KOSA/OCR confusions only — never general string similarity.
+_CERT_OCR_CANONICAL: tuple[tuple[str, str], ...] = (
+    ("경보처리기사", "정보처리기사"),
+    ("전자계산기조작용용기사", "전자계산기조직응용기사"),
 )
 _DATE_RANGE_RE = re.compile(
     rf"(?P<start>{_DATE_TOKEN_RE.pattern})"
@@ -152,23 +167,37 @@ def _is_company_continue_char(ch: str) -> bool:
 def _line_has_company(line: str, company: str) -> bool:
     """True when company appears as a bounded token (KT ⊄ SKT).
 
-    Folded matching ignores whitespace so `피엔드티컨설팅(주) 2010.03` still
-    hits; digits/punctuation after the name are valid boundaries (dates).
+    Boundaries are checked on the original line so section headers like
+    ``학력 한림대학교`` do not glue into one Hangul run after space-folding.
+    Digits after the name remain valid (dates). A space-folded fallback still
+    allows ``피엔드티 컨설팅`` ↔ ``피엔드티컨설팅`` when letter-bounded.
     """
-    needle = _fold(company.strip())
+    needle = company.strip()
     if not needle:
         return False
-    hay = _fold(line)
+    esc = re.escape(needle)
+    # Letter/Hangul boundaries; digits after the token are allowed (dates).
+    if re.search(rf"(?<![0-9A-Za-z가-힣]){esc}(?![A-Za-z가-힣])", line):
+        return True
+    folded_needle = _fold(needle)
+    folded_line = _fold(line)
+    if not folded_needle or folded_needle not in folded_line:
+        return False
+    # Fallback only when needle itself contains whitespace that folding removes.
+    if not any(ch.isspace() for ch in needle):
+        return False
     start = 0
     while True:
-        idx = hay.find(needle, start)
+        idx = folded_line.find(folded_needle, start)
         if idx < 0:
             return False
-        before_ok = idx == 0 or not _is_company_continue_char(hay[idx - 1])
-        after_idx = idx + len(needle)
+        before_ok = idx == 0 or not _is_company_continue_char(
+            folded_line[idx - 1]
+        )
+        after_idx = idx + len(folded_needle)
         after_ok = (
-            after_idx >= len(hay)
-            or not _is_company_continue_char(hay[after_idx])
+            after_idx >= len(folded_line)
+            or not _is_company_continue_char(folded_line[after_idx])
         )
         if before_ok and after_ok:
             return True
@@ -469,6 +498,544 @@ def _guard_employment_history(
     return kept
 
 
+def _optional_text_compatible(a: str | None, b: str | None) -> bool:
+    ka = _key(a)
+    kb = _key(b)
+    if ka is None or kb is None:
+        return True
+    return ka == kb
+
+
+def _prefer_text(a: str | None, b: str | None) -> str | None:
+    sa = (a or "").strip() or None
+    sb = (b or "").strip() or None
+    if sa is None:
+        return sb
+    if sb is None:
+        return sa
+    return sa if len(sa) >= len(sb) else sb
+
+
+def _prefer_date(a: str | None, b: str | None) -> str | None:
+    na = (a or "").strip() or None
+    nb = (b or "").strip() or None
+    if na is None:
+        return nb
+    if nb is None:
+        return na
+    if na == nb:
+        return na
+    score_a = sum(ch.isdigit() for ch in na) + na.count("-") + na.count(".")
+    score_b = sum(ch.isdigit() for ch in nb) + nb.count("-") + nb.count(".")
+    return nb if score_b > score_a else na
+
+
+def _merge_source_refs(
+    left: list[SourceRef], right: list[SourceRef]
+) -> list[SourceRef]:
+    seen: set[tuple[str, int | None, str]] = set()
+    out: list[SourceRef] = []
+    for ref in [*(left or []), *(right or [])]:
+        key = (
+            (ref.document_id or "").strip(),
+            ref.page_no,
+            (ref.quote_text or "").strip(),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(ref)
+    return out
+
+
+def _education_rows_compatible(
+    left: EducationCandidate, right: EducationCandidate
+) -> bool:
+    if not _key(left.school_name) or not _key(right.school_name):
+        return False
+    if _key(left.school_name) != _key(right.school_name):
+        return False
+    if not _optional_text_compatible(left.degree, right.degree):
+        return False
+    if not _optional_text_compatible(left.major, right.major):
+        return False
+    if not dates_compatible(left.start_date, right.start_date):
+        return False
+    if not dates_compatible(left.end_date, right.end_date):
+        return False
+    return True
+
+
+def _merge_education_pair(
+    left: EducationCandidate, right: EducationCandidate
+) -> EducationCandidate:
+    return left.model_copy(
+        update={
+            "major": left.major or right.major,
+            "degree": left.degree or right.degree,
+            "start_date": _prefer_date(left.start_date, right.start_date),
+            "end_date": _prefer_date(left.end_date, right.end_date),
+            "status": left.status or right.status,
+            "confidence": max(left.confidence or 0.0, right.confidence or 0.0)
+            or left.confidence
+            or right.confidence,
+            "source_refs": _merge_source_refs(left.source_refs, right.source_refs),
+        }
+    )
+
+
+_MAJOR_REJECT_RE = re.compile(
+    r"자격증|자격면허|발급기관|근무경력|재직|프로젝트|수행내역|고객사|"
+    r"기사$|산업인력|산업입력|회사|직장|발주"
+)
+
+
+def _split_edu_cert_collapsed(
+    line: str, *, page_section: str
+) -> list[tuple[str, str]]:
+    """Split KOSA-style mixed lines into edu/cert/other spans."""
+    raw: list[tuple[int, int, str]] = []
+    for match in _EDUCATION_SECTION_RE.finditer(line):
+        raw.append((match.start(), match.end(), "education"))
+    for match in _CERT_SECTION_RE.finditer(line):
+        raw.append((match.start(), match.end(), "certification"))
+    for match in _EMPLOYMENT_SECTION_RE.finditer(line):
+        raw.append((match.start(), match.end(), "other"))
+    for match in _PROJECT_SECTION_RE.finditer(line):
+        raw.append((match.start(), match.end(), "other"))
+    if not raw:
+        return [(page_section, line)]
+    raw.sort(key=lambda item: (item[0], -(item[1] - item[0])))
+    markers: list[tuple[int, int, str]] = []
+    for start, end, section in raw:
+        if markers and start < markers[-1][1]:
+            continue
+        markers.append((start, end, section))
+    spans: list[tuple[str, str]] = []
+    if markers[0][0] > 0:
+        spans.append((page_section, line[: markers[0][0]].strip()))
+    for index, (start, _end, section) in enumerate(markers):
+        cut = markers[index + 1][0] if index + 1 < len(markers) else len(line)
+        piece = line[start:cut].strip()
+        if piece:
+            spans.append((section, piece))
+    return [(section, text) for section, text in spans if text]
+
+
+def _iter_edu_cert_section_lines(
+    page_texts: dict[tuple[str, int], str] | None,
+) -> Iterable[tuple[str, str]]:
+    """Yield (section, line); sticky never crosses document boundaries."""
+    if not page_texts:
+        return
+    sticky = "unknown"
+    prev_doc: str | None = None
+    ordered = sorted(
+        page_texts.items(),
+        key=lambda item: (str(item[0][0]), int(item[0][1])),
+    )
+    for (doc_id, _page_no), text in ordered:
+        doc_key = str(doc_id)
+        if prev_doc != doc_key:
+            sticky = "unknown"
+            prev_doc = doc_key
+        for raw_line in str(text or "").splitlines() or [str(text or "")]:
+            line = raw_line.strip()
+            if not line:
+                continue
+            for section_hint, span_text in _split_edu_cert_collapsed(
+                line, page_section=sticky
+            ):
+                if _EDUCATION_SECTION_RE.search(span_text):
+                    sticky = "education"
+                    section = "education"
+                elif _CERT_SECTION_RE.search(span_text):
+                    sticky = "certification"
+                    section = "certification"
+                elif (
+                    _EMPLOYMENT_SECTION_RE.search(span_text)
+                    or _PROJECT_SECTION_RE.search(span_text)
+                ):
+                    sticky = "other"
+                    section = "other"
+                else:
+                    section = (
+                        section_hint if section_hint != "unknown" else sticky
+                    )
+                yield section, span_text
+
+
+def _looks_like_major(value: str) -> bool:
+    text = " ".join(value.split()).strip(" -/~\t|/·•")
+    if not text or len(text) > 30:
+        return False
+    if _DATE_TOKEN_RE.search(text) or _MAJOR_REJECT_RE.search(text):
+        return False
+    if len(text.split()) > 4:
+        return False
+    return True
+
+
+def _extract_education_fields_from_line(
+    line: str, *, school: str, allow_major: bool
+) -> dict[str, str]:
+    """Pull major/dates/degree only from a line that already contains school."""
+    if not _line_has_company(line, school):
+        return {}
+    out: dict[str, str] = {}
+    ranges = _extract_range_dates(line)
+    if ranges:
+        start, end = ranges[0]
+        if start:
+            out["start_date"] = start
+        if end and not _is_ongoing_end(end):
+            out["end_date"] = end
+    # Degree tokens commonly appear as short trailing labels.
+    for degree in ("학사", "석사", "박사", "전문학사", "고졸"):
+        if degree in line:
+            out["degree"] = degree
+            break
+    if not allow_major:
+        return out
+    # Major: token between school and first date, or after school before degree.
+    school_match = re.search(re.escape(school.strip()), line)
+    if school_match:
+        after = line[school_match.end() :]
+        after = _DATE_RANGE_RE.sub(" ", after)
+        after = _DATE_TOKEN_RE.sub(" ", after)
+        for degree in ("학사", "석사", "박사", "전문학사", "고졸"):
+            after = after.replace(degree, " ")
+        after = re.sub(r"[|/·•,，]+", " ", after)
+        major = " ".join(after.split()).strip(" -/~\t")
+        if _looks_like_major(major):
+            out["major"] = major
+    return out
+
+
+def _enrich_education_from_pages(
+    row: EducationCandidate,
+    page_texts: dict[tuple[str, int], str] | None,
+) -> EducationCandidate:
+    """Fill missing education fields only from clearly linked table lines."""
+    school = (row.school_name or "").strip()
+    if not school or not page_texts:
+        return row
+    updates: dict[str, object] = {}
+    for section, line in _iter_edu_cert_section_lines(page_texts):
+        if section in {"certification", "other"}:
+            continue
+        if not _line_has_company(line, school):
+            continue
+        # Major only from explicit education spans — never absorb cert/other
+        # table residue from unknown/mixed regions.
+        allow_major = section == "education"
+        if section != "education" and not (
+            _EDUCATION_SECTION_RE.search(line) or _DATE_RANGE_RE.search(line)
+        ):
+            continue
+        extracted = _extract_education_fields_from_line(
+            line, school=school, allow_major=allow_major
+        )
+        for field in ("major", "degree", "start_date", "end_date"):
+            current = getattr(row, field)
+            incoming = extracted.get(field)
+            if not incoming:
+                continue
+            if current is None or not str(current).strip():
+                updates[field] = incoming
+            elif field in {"start_date", "end_date"}:
+                if not dates_compatible(current, incoming):
+                    # Conflict → leave original; REVIEW happens later in diff.
+                    continue
+                updates[field] = _prefer_date(str(current), incoming)
+            elif _key(str(current)) != _key(incoming):
+                continue
+        if updates:
+            break
+    if not updates:
+        return row
+    return row.model_copy(update=updates)
+
+
+def _guard_education(
+    candidate: ProfileCandidateDocument,
+    *,
+    page_texts: dict[tuple[str, int], str] | None,
+) -> list[EducationCandidate]:
+    rows = list(candidate.education or [])
+    if not rows:
+        return rows
+    # Deduplicate clear same-school rows (missing start alone must not block).
+    merged: list[EducationCandidate] = []
+    for row in rows:
+        if not _key(row.school_name):
+            merged.append(row)
+            continue
+        placed = False
+        for index, prev in enumerate(merged):
+            if not _education_rows_compatible(prev, row):
+                continue
+            merged[index] = _merge_education_pair(prev, row)
+            placed = True
+            break
+        if not placed:
+            merged.append(row)
+    return [
+        _enrich_education_from_pages(row, page_texts) for row in merged
+    ]
+
+
+def _cert_ocr_canonical_name(name: str) -> str:
+    text = (name or "").strip()
+    for bad, good in _CERT_OCR_CANONICAL:
+        if _key(text) == _key(bad):
+            return good
+        text = text.replace(bad, good)
+    return text
+
+
+def _cert_match_key(name: str | None) -> str | None:
+    if not name or not name.strip():
+        return None
+    return _key(_cert_ocr_canonical_name(name))
+
+
+def _is_known_ocr_cert_pair(a: str | None, b: str | None) -> bool:
+    ka = _cert_match_key(a)
+    kb = _cert_match_key(b)
+    if ka is None or kb is None or ka != kb:
+        return False
+    return _key(a) != _key(b)
+
+
+def _line_has_compatible_date(line: str, acquired: str | None) -> bool:
+    if not (acquired or "").strip():
+        return False
+    target = _normalize_date_token(acquired)
+    if not target:
+        return False
+    for match in _DATE_TOKEN_RE.finditer(line):
+        token = _normalize_date_token(match.group(0))
+        if token and dates_compatible(target, token):
+            return True
+    return False
+
+
+def _cert_literal_name_in_line(line: str, name: str | None) -> bool:
+    """Literal spelling only — OCR aliases are never used for page evidence."""
+    if not name or not name.strip():
+        return False
+    return _line_has_company(line, name.strip())
+
+
+def _cert_name_bound_to_acquired_on_line(
+    line: str, *, name: str, acquired: str
+) -> bool:
+    """True when literal name owns a compatible acquired date on this line.
+
+    Collapsed KOSA rows often pack ``NameA DateA NameB DateB`` into one line.
+    Each date is bound only to the text segment since the previous date, so
+    NameA cannot claim DateB.
+    """
+    target = _normalize_date_token(acquired)
+    if not target or not name.strip():
+        return False
+    date_matches = list(_DATE_TOKEN_RE.finditer(line))
+    if not date_matches:
+        return False
+    prev_end = 0
+    bound_hits = 0
+    for match in date_matches:
+        prefix = line[prev_end : match.start()]
+        token = _normalize_date_token(match.group(0))
+        prev_end = match.end()
+        if not token or not dates_compatible(target, token):
+            continue
+        if _cert_literal_name_in_line(prefix, name):
+            bound_hits += 1
+    # Ambiguous: same name appears with multiple distinct owning dates.
+    return bound_hits == 1
+
+
+def _cert_row_evidence(
+    page_texts: dict[tuple[str, int], str] | None,
+    *,
+    name: str | None,
+    acquired: str | None,
+) -> bool:
+    """True when a non-education line binds this exact name to its acquired date."""
+    if not page_texts or not name or not acquired:
+        return False
+    for section, line in _iter_edu_cert_section_lines(page_texts):
+        if section in {"education", "other"}:
+            continue
+        if _cert_name_bound_to_acquired_on_line(
+            line, name=name, acquired=acquired
+        ):
+            return True
+    return False
+
+
+def _issuer_on_cert_row(
+    page_texts: dict[tuple[str, int], str] | None,
+    *,
+    name: str | None,
+    issuer: str | None,
+) -> bool:
+    """Issuer must share a cert-context line with the literal certification name."""
+    if not page_texts or not name or not issuer:
+        return False
+    for section, line in _iter_edu_cert_section_lines(page_texts):
+        if section == "education":
+            continue
+        if not _cert_literal_name_in_line(line, name):
+            continue
+        if not _line_has_company(line, issuer.strip()):
+            continue
+        if section == "certification" or _CERT_SECTION_RE.search(line):
+            return True
+        # Name+issuer+date on one line without a header still counts.
+        if _DATE_TOKEN_RE.search(line):
+            return True
+    return False
+
+
+def _prefer_cert_name(a: str | None, b: str | None) -> str | None:
+    sa = (a or "").strip() or None
+    sb = (b or "").strip() or None
+    if sa is None:
+        return sb
+    if sb is None:
+        return sa
+    canon_a = _cert_ocr_canonical_name(sa)
+    canon_b = _cert_ocr_canonical_name(sb)
+    # Prefer already-canonical Hangul spelling from DOCX over OCR corruption.
+    if canon_a == sa and canon_b != sb:
+        return sa
+    if canon_b == sb and canon_a != sa:
+        return sb
+    return _prefer_text(sa, sb)
+
+
+def _merge_cert_pair(
+    left: CertificationCandidate, right: CertificationCandidate
+) -> CertificationCandidate:
+    name = _prefer_cert_name(left.certification_name, right.certification_name)
+    # Do not invent issuers; prefer a non-empty value only when both agree or
+    # one side is empty. Conflicting issuers are cleared for REVIEW safety.
+    issuer_l = (left.issuer or "").strip() or None
+    issuer_r = (right.issuer or "").strip() or None
+    if issuer_l and issuer_r and _key(issuer_l) != _key(issuer_r):
+        issuer: str | None = None
+    else:
+        issuer = issuer_l or issuer_r
+    return left.model_copy(
+        update={
+            "certification_name": name,
+            "issuer": issuer,
+            "acquired_date": _prefer_date(left.acquired_date, right.acquired_date),
+            "expiry_date": _prefer_date(left.expiry_date, right.expiry_date),
+            "confidence": max(left.confidence or 0.0, right.confidence or 0.0)
+            or left.confidence
+            or right.confidence,
+            "source_refs": _merge_source_refs(left.source_refs, right.source_refs),
+        }
+    )
+
+
+def _certs_mergeable(
+    left: CertificationCandidate,
+    right: CertificationCandidate,
+    *,
+    page_texts: dict[tuple[str, int], str] | None,
+) -> bool:
+    """Merge only with dated rows + exact/OCR name rules + page evidence.
+
+    OCR aliases are used only to compare candidate names. Page evidence for
+    each side requires that side's literal spelling and acquired date on the
+    same source row. Undated certifications never auto-merge.
+    """
+    left_date = (left.acquired_date or "").strip() or None
+    right_date = (right.acquired_date or "").strip() or None
+    if not left_date or not right_date:
+        return False
+    if _cert_match_key(left.certification_name) != _cert_match_key(
+        right.certification_name
+    ):
+        return False
+    if not dates_compatible(
+        _normalize_date_token(left_date),
+        _normalize_date_token(right_date),
+    ):
+        return False
+    left_ev = _cert_row_evidence(
+        page_texts,
+        name=left.certification_name,
+        acquired=left_date,
+    )
+    right_ev = _cert_row_evidence(
+        page_texts,
+        name=right.certification_name,
+        acquired=right_date,
+    )
+    if _key(left.certification_name) == _key(right.certification_name):
+        # Exact name + both dated: merge when evidenced, or when pages are
+        # unavailable (issuer-only duplicates inside one extraction).
+        if page_texts is None:
+            return True
+        return left_ev or right_ev
+    if not _is_known_ocr_cert_pair(
+        left.certification_name, right.certification_name
+    ):
+        return False
+    # OCR pair: each spelling must appear with its date independently.
+    return left_ev and right_ev
+
+
+def _guard_certifications(
+    candidate: ProfileCandidateDocument,
+    *,
+    page_texts: dict[tuple[str, int], str] | None,
+) -> list[CertificationCandidate]:
+    rows = list(candidate.certifications or [])
+    if not rows:
+        return rows
+    school_keys = {
+        key
+        for edu in candidate.education or []
+        if (key := _key(edu.school_name)) is not None
+    }
+    merged: list[CertificationCandidate] = []
+    for row in rows:
+        placed = False
+        for index, prev in enumerate(merged):
+            if not _certs_mergeable(prev, row, page_texts=page_texts):
+                continue
+            merged[index] = _merge_cert_pair(prev, row)
+            placed = True
+            break
+        if not placed:
+            merged.append(row)
+
+    cleaned: list[CertificationCandidate] = []
+    for row in merged:
+        issuer = (row.issuer or "").strip() or None
+        if issuer and _key(issuer) in school_keys:
+            if not _issuer_on_cert_row(
+                page_texts,
+                name=row.certification_name,
+                issuer=issuer,
+            ):
+                issuer = None
+        # Never auto-generate standard issuers (e.g. 한국산업인력공단).
+        cleaned.append(
+            row
+            if issuer == ((row.issuer or "").strip() or None)
+            else row.model_copy(update={"issuer": issuer})
+        )
+    return cleaned
+
+
 def apply_candidate_quality_guards(
     candidate: ProfileCandidateDocument,
     *,
@@ -541,11 +1108,20 @@ def apply_candidate_quality_guards(
         page_texts=page_texts,
         document_type_by_id=document_type_by_id,
     )
+    kept_education = _guard_education(candidate, page_texts=page_texts)
+    # Cert guard may clear school-polluted issuers using education school names
+    # from the post-dedup education list.
+    cert_input = candidate.model_copy(update={"education": kept_education})
+    kept_certifications = _guard_certifications(
+        cert_input, page_texts=page_texts
+    )
 
     if (
         profile is candidate.profile
         and len(kept_projects) == len(candidate.projects)
         and kept_employment == list(candidate.employment_history or [])
+        and kept_education == list(candidate.education or [])
+        and kept_certifications == list(candidate.certifications or [])
     ):
         return candidate
     return candidate.model_copy(
@@ -553,5 +1129,7 @@ def apply_candidate_quality_guards(
             "profile": profile,
             "projects": kept_projects,
             "employment_history": kept_employment,
+            "education": kept_education,
+            "certifications": kept_certifications,
         }
     )

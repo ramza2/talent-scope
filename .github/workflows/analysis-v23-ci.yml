@@ -51,4 +51,5 @@ jobs:
             tests/test_openai_compat.py \
             tests/test_modelops_gateway_contract.py \
             tests/test_candidate_quality_guards.py \
+            tests/test_education_cert_quality_guards.py \
             tests/test_employment_ongoing_date_confirm.py

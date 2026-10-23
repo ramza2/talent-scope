@@ -5646,48 +5646,80 @@ def _merge_core_employment(
     return list(groups.values()) + singles
 
 
-def _education_identity_key(
-    row: EducationCandidate,
-) -> tuple[str, str, str, str] | None:
-    school = _fold_ws_text(row.school_name or "")
-    degree = _fold_ws_text(row.degree or "")
-    start = _fold_ws_text(row.start_date or "")
-    major = _fold_ws_text(row.major or "")
-    if not school or not start:
-        return None
-    # Same school / degree / start can still refer to distinct majors.
-    return (school, degree, start, major)
+def _optional_folded_compatible(a: str | None, b: str | None) -> bool:
+    """True when either side is empty or both fold to the same token."""
+    fa = _fold_ws_text(a or "")
+    fb = _fold_ws_text(b or "")
+    if not fa or not fb:
+        return True
+    return fa == fb
+
+
+def _education_rows_compatible(
+    left: EducationCandidate, right: EducationCandidate
+) -> bool:
+    """Same school with compatible degree/major/dates; missing start is OK."""
+    school_a = _fold_ws_text(left.school_name or "")
+    school_b = _fold_ws_text(right.school_name or "")
+    if not school_a or not school_b or school_a != school_b:
+        return False
+    if not _optional_folded_compatible(left.degree, right.degree):
+        return False
+    # Distinct majors must not collapse into one education row.
+    if not _optional_folded_compatible(left.major, right.major):
+        return False
+    if not dates_compatible(left.start_date, right.start_date):
+        return False
+    if not dates_compatible(left.end_date, right.end_date):
+        return False
+    return True
+
+
+def _merge_education_pair(
+    left: EducationCandidate, right: EducationCandidate
+) -> EducationCandidate:
+    return left.model_copy(
+        update={
+            "major": left.major or right.major,
+            "degree": left.degree or right.degree,
+            "start_date": _core_prefer_date(left.start_date, right.start_date),
+            "end_date": _core_prefer_date(left.end_date, right.end_date),
+            "status": left.status or right.status,
+            "confidence": max(left.confidence or 0.0, right.confidence or 0.0)
+            or left.confidence
+            or right.confidence,
+            "source_refs": _core_merge_source_refs(
+                left.source_refs, right.source_refs
+            ),
+        }
+    )
 
 
 def _merge_core_education(
     chunks: list[ProfileCandidateDocument],
 ) -> list[EducationCandidate]:
-    groups: dict[tuple[str, str, str, str], EducationCandidate] = {}
-    singles: list[EducationCandidate] = []
+    """Merge clear duplicates; never drop distinct major/degree/period rows.
+
+    Missing ``start_date`` alone must not block a same-school merge when
+    degree/major/dates are otherwise compatible.
+    """
+    merged: list[EducationCandidate] = []
     for chunk in chunks:
         for row in chunk.education or []:
-            key = _education_identity_key(row)
-            if key is None:
-                singles.append(row)
+            school = _fold_ws_text(row.school_name or "")
+            if not school:
+                merged.append(row)
                 continue
-            prev = groups.get(key)
-            if prev is None:
-                groups[key] = row
-                continue
-            groups[key] = prev.model_copy(
-                update={
-                    "major": prev.major or row.major,
-                    "end_date": _core_prefer_date(prev.end_date, row.end_date),
-                    "status": prev.status or row.status,
-                    "confidence": max(prev.confidence or 0.0, row.confidence or 0.0)
-                    or prev.confidence
-                    or row.confidence,
-                    "source_refs": _core_merge_source_refs(
-                        prev.source_refs, row.source_refs
-                    ),
-                }
-            )
-    return list(groups.values()) + singles
+            placed = False
+            for index, prev in enumerate(merged):
+                if not _education_rows_compatible(prev, row):
+                    continue
+                merged[index] = _merge_education_pair(prev, row)
+                placed = True
+                break
+            if not placed:
+                merged.append(row)
+    return merged
 
 
 def _cert_identity_key(
