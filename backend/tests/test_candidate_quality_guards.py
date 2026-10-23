@@ -569,3 +569,126 @@ def test_ambiguous_employer_mention_prevents_project_only_auto_drop() -> None:
     )
     assert len(result.employment_history) == 1
     assert result.employment_history[0].company_name == "에이비씨테크"
+
+
+def test_docx_later_page_prior_drops_customer_without_section_header() -> None:
+    """DOCX p2+ defaults to project; dated customer rows drop without headers."""
+    page_texts = {
+        (_DOCX, 1): (
+            "근무경력\n"
+            "피엔드티컨설팅(주) 2010.03 ~ 2014.09 과장\n"
+        ),
+        # No explicit 수행내역 header — page prior must still treat as project.
+        (_DOCX, 3): "한국농어촌공사 2020.01 ~ 2022.06 시스템 구축\n",
+    }
+    candidate = ProfileCandidateDocument(
+        employment_history=[
+            EmploymentCandidate(
+                company_name="피엔드티컨설팅(주)",
+                start_date="2010.03",
+                end_date="2014.09",
+            ),
+            EmploymentCandidate(
+                company_name="한국농어촌공사",
+                start_date="2020.01",
+                end_date="2022.06",
+            ),
+        ],
+        projects=[
+            ProjectCandidate(
+                project_name="시스템 구축",
+                customer_name="한국농어촌공사",
+                start_date="2020.01",
+                end_date="2022.06",
+            )
+        ],
+    )
+    result = apply_candidate_quality_guards(
+        candidate,
+        page_texts=page_texts,
+        document_type_by_id={_DOCX: "DOC-PROFILE"},
+    )
+    assert [e.company_name for e in result.employment_history] == [
+        "피엔드티컨설팅(주)"
+    ]
+
+
+def test_kosa_collapsed_line_splits_employment_from_project_customer() -> None:
+    """KOSA one-line mix: keep 근무경력 employer, drop 수행내역 customer."""
+    page_texts = {
+        (_KOSA, 3): (
+            "근무경력 피엔드티컨설팅(주) 2010.03 ~ 2014.09 과장 "
+            "수행내역 사업명 고객사 한국농어촌공사 2020.01 ~ 2022.06\n"
+        ),
+    }
+    candidate = ProfileCandidateDocument(
+        employment_history=[
+            EmploymentCandidate(
+                company_name="피엔드티컨설팅(주)",
+                start_date="2010.03",
+                end_date="2014.09",
+            ),
+            EmploymentCandidate(
+                company_name="한국농어촌공사",
+                start_date="2020.01",
+                end_date="2022.06",
+            ),
+        ],
+        projects=[
+            ProjectCandidate(
+                project_name="농지전산",
+                customer_name="한국농어촌공사",
+                start_date="2020.01",
+                end_date="2022.06",
+            )
+        ],
+    )
+    result = apply_candidate_quality_guards(
+        candidate,
+        page_texts=page_texts,
+        document_type_by_id={_KOSA: "DOC-KOSA"},
+    )
+    assert [e.company_name for e in result.employment_history] == [
+        "피엔드티컨설팅(주)"
+    ]
+    assert result.employment_history[0].end_date == "2014.09"
+
+
+def test_project_page_dates_do_not_drive_employment_end_review() -> None:
+    """Same company on a project page must not invent an end-date conflict."""
+    page_texts = {
+        (_DOCX, 1): (
+            "근무경력\n"
+            "피엔드티컨설팅(주) 2010.03 ~ 2014.09 과장\n"
+        ),
+        (_DOCX, 2): (
+            "수행내역\n"
+            "별도사업 피엔드티컨설팅(주) 2023.01 ~ 2025.09\n"
+        ),
+    }
+    candidate = ProfileCandidateDocument(
+        employment_history=[
+            EmploymentCandidate(
+                company_name="피엔드티컨설팅(주)",
+                start_date="2010.03",
+                end_date="2014.09",
+            )
+        ],
+        projects=[
+            ProjectCandidate(
+                project_name="별도사업",
+                customer_name="피엔드티컨설팅(주)",
+                start_date="2023.01",
+                end_date="2025.09",
+            )
+        ],
+    )
+    result = apply_candidate_quality_guards(
+        candidate,
+        page_texts=page_texts,
+        document_type_by_id={_DOCX: "DOC-PROFILE"},
+    )
+    assert len(result.employment_history) == 1
+    emp = result.employment_history[0]
+    assert emp.end_date == "2014.09"
+    assert employment_candidate_dates_need_review(emp) is False
