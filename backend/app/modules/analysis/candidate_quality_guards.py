@@ -90,10 +90,19 @@ _ONGOING_END_KEYS = frozenset({"현재", "재직중", "present"})
 _PROFILE_LIKE_DOC_TYPES = frozenset(
     {"DOC-PROFILE", "DOC-RESUME", "DOC-CAREER"}
 )
-# Corporate legal-form suffixes/prefixes only — never fuzzy stem truncation.
-_CORP_FORM_RE = re.compile(
-    r"(주식회사|유한책임회사|유한회사|\(주\)|㈜|\(유\)|\(사\)|"
-    r"co\.?,?\s*ltd\.?|corp\.?|inc\.?|llc\.?)",
+# Corporate legal-form markers only at name start/end (independent tokens).
+# Never strip internal Latin fragments (e.g. ``inc`` inside ``Prince``).
+_CORP_SUFFIX_RE = re.compile(
+    r"(?:"
+    r"주식회사|유한책임회사|유한회사|\(주\)|㈜|\(유\)|\(사\)|"
+    r"co\.?,?ltd\.?|corp\.?|inc\.?|llc\.?"
+    r")$",
+    re.IGNORECASE,
+)
+_CORP_PREFIX_RE = re.compile(
+    r"^(?:"
+    r"주식회사|유한책임회사|유한회사|\(주\)|㈜|\(유\)|\(사\)"
+    r")",
     re.IGNORECASE,
 )
 
@@ -441,10 +450,12 @@ def _matches_project_customer_period(
 
 
 def _company_match_key(name: str | None) -> str | None:
-    """Canonical employer key: whitespace-folded, corporate form stripped.
+    """Canonical employer key: whitespace-folded, edge corporate form stripped.
 
-    Strips only legal-form markers such as ``(주)`` / ``주식회사``. Does not
-    truncate arbitrary stems (한국농어촌공사 ↛ 한국농어촌).
+    Strips only leading/trailing legal-form markers such as ``(주)`` /
+    ``주식회사`` / ``Inc``. Does not truncate arbitrary stems
+    (한국농어촌공사 ↛ 한국농어촌) and does not touch internal ``inc`` in
+    names like ``Prince``. Empty residue after stripping is not a key.
     """
     text = _fold((name or "").strip())
     if not text:
@@ -452,9 +463,17 @@ def _company_match_key(name: str | None) -> str | None:
     previous = None
     while previous != text:
         previous = text
-        text = _CORP_FORM_RE.sub("", text)
+        text = _CORP_SUFFIX_RE.sub("", text)
+        text = _CORP_PREFIX_RE.sub("", text)
         text = text.strip(" -_/·•")
     return text.casefold() or None
+
+
+def _has_edge_corp_form_marker(name: str) -> bool:
+    folded = _fold(name.strip())
+    if not folded:
+        return False
+    return bool(_CORP_SUFFIX_RE.search(folded) or _CORP_PREFIX_RE.search(folded))
 
 
 def _prefer_company_display(a: str | None, b: str | None) -> str | None:
@@ -465,8 +484,8 @@ def _prefer_company_display(a: str | None, b: str | None) -> str | None:
     if sb is None:
         return sa
     # Prefer a form that still carries an explicit corporate marker.
-    a_marked = bool(_CORP_FORM_RE.search(sa))
-    b_marked = bool(_CORP_FORM_RE.search(sb))
+    a_marked = _has_edge_corp_form_marker(sa)
+    b_marked = _has_edge_corp_form_marker(sb)
     if a_marked and not b_marked:
         return sa
     if b_marked and not a_marked:
@@ -556,9 +575,10 @@ def _employment_duplicates_mergeable(
     spans: list[_ContextSpan],
 ) -> bool:
     """Same employer period with page employment evidence; no fuzzy names."""
-    if _company_match_key(left.company_name) != _company_match_key(
-        right.company_name
-    ):
+    left_key = _company_match_key(left.company_name)
+    right_key = _company_match_key(right.company_name)
+    # Empty keys (e.g. bare ``(주)``) must never merge.
+    if not left_key or not right_key or left_key != right_key:
         return False
     left_start = (left.start_date or "").strip() or None
     right_start = (right.start_date or "").strip() or None
