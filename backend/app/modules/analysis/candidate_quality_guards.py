@@ -19,6 +19,7 @@ from app.ai.schemas.profile_candidate import (
     SourceRef,
 )
 from app.core.person_name import is_korean_person_name, person_name_match_key
+from app.modules.analysis.confirm_dates import is_ongoing_end_marker
 from app.modules.analysis.diff_engine import dates_compatible, parse_date_parts
 
 
@@ -88,6 +89,12 @@ _EMPLOYMENT_END_CONFLICT_SEP = " / "
 _ONGOING_END_KEYS = frozenset({"현재", "재직중", "present"})
 _PROFILE_LIKE_DOC_TYPES = frozenset(
     {"DOC-PROFILE", "DOC-RESUME", "DOC-CAREER"}
+)
+# Corporate legal-form suffixes/prefixes only — never fuzzy stem truncation.
+_CORP_FORM_RE = re.compile(
+    r"(주식회사|유한책임회사|유한회사|\(주\)|㈜|\(유\)|\(사\)|"
+    r"co\.?,?\s*ltd\.?|corp\.?|inc\.?|llc\.?)",
+    re.IGNORECASE,
 )
 
 
@@ -433,6 +440,162 @@ def _matches_project_customer_period(
     return False
 
 
+def _company_match_key(name: str | None) -> str | None:
+    """Canonical employer key: whitespace-folded, corporate form stripped.
+
+    Strips only legal-form markers such as ``(주)`` / ``주식회사``. Does not
+    truncate arbitrary stems (한국농어촌공사 ↛ 한국농어촌).
+    """
+    text = _fold((name or "").strip())
+    if not text:
+        return None
+    previous = None
+    while previous != text:
+        previous = text
+        text = _CORP_FORM_RE.sub("", text)
+        text = text.strip(" -_/·•")
+    return text.casefold() or None
+
+
+def _prefer_company_display(a: str | None, b: str | None) -> str | None:
+    sa = (a or "").strip() or None
+    sb = (b or "").strip() or None
+    if sa is None:
+        return sb
+    if sb is None:
+        return sa
+    # Prefer a form that still carries an explicit corporate marker.
+    a_marked = bool(_CORP_FORM_RE.search(sa))
+    b_marked = bool(_CORP_FORM_RE.search(sb))
+    if a_marked and not b_marked:
+        return sa
+    if b_marked and not a_marked:
+        return sb
+    return sa if len(sa) >= len(sb) else sb
+
+
+def _date_for_compat(value: str | None) -> str | None:
+    """Normalize calendar tokens for dates_compatible (dash-separated)."""
+    token = _normalize_date_token(value)
+    if not token:
+        return None
+    if is_ongoing_end_marker(token):
+        return token
+    return token.replace(".", "-").replace("/", "-")
+
+
+def _resolve_employment_end_merge(a: str | None, b: str | None) -> str | None:
+    """Merge ends without choosing a conflict winner (REVIEW token on clash)."""
+    if a in (None, "") and b in (None, ""):
+        return None
+    if a in (None, ""):
+        return b
+    if b in (None, ""):
+        return a
+    if a == b:
+        return a
+    if _EMPLOYMENT_END_CONFLICT_SEP in a or _EMPLOYMENT_END_CONFLICT_SEP in b:
+        return _employment_end_conflict_token(a, b)
+    if is_ongoing_end_marker(a) and is_ongoing_end_marker(b):
+        return a
+    if is_ongoing_end_marker(a) or is_ongoing_end_marker(b):
+        return _employment_end_conflict_token(a, b)
+    if dates_compatible(_date_for_compat(a), _date_for_compat(b)):
+        return _prefer_date(a, b)
+    return _employment_end_conflict_token(a, b)
+
+
+def _has_employment_company_evidence(
+    spans: list[_ContextSpan], company: str
+) -> bool:
+    """True when an employment-section span mentions this employer spelling."""
+    raw = (company or "").strip()
+    if not raw:
+        return False
+    stem = _company_match_key(raw)
+    for span in spans:
+        kind = _classify_span(span.text, section=span.section)
+        if kind != "employment":
+            continue
+        if _line_has_company(span.text, raw):
+            return True
+        if stem and _line_has_company(span.text, stem):
+            return True
+    return False
+
+
+def _merge_employment_duplicate_pair(
+    left: EmploymentCandidate, right: EmploymentCandidate
+) -> EmploymentCandidate:
+    return left.model_copy(
+        update={
+            "company_name": _prefer_company_display(
+                left.company_name, right.company_name
+            ),
+            "department": left.department or right.department,
+            "title": left.title or right.title,
+            "start_date": _prefer_date(left.start_date, right.start_date),
+            "end_date": _resolve_employment_end_merge(
+                left.end_date, right.end_date
+            ),
+            "responsibilities": left.responsibilities or right.responsibilities,
+            "confidence": max(left.confidence or 0.0, right.confidence or 0.0)
+            or left.confidence
+            or right.confidence,
+            "source_refs": _merge_source_refs(
+                left.source_refs, right.source_refs
+            ),
+        }
+    )
+
+
+def _employment_duplicates_mergeable(
+    left: EmploymentCandidate,
+    right: EmploymentCandidate,
+    *,
+    spans: list[_ContextSpan],
+) -> bool:
+    """Same employer period with page employment evidence; no fuzzy names."""
+    if _company_match_key(left.company_name) != _company_match_key(
+        right.company_name
+    ):
+        return False
+    left_start = (left.start_date or "").strip() or None
+    right_start = (right.start_date or "").strip() or None
+    # Distinct undated periods must not collapse.
+    if not left_start or not right_start:
+        return False
+    if not dates_compatible(
+        _date_for_compat(left_start), _date_for_compat(right_start)
+    ):
+        return False
+    if not _has_employment_company_evidence(spans, left.company_name or ""):
+        return False
+    if not _has_employment_company_evidence(spans, right.company_name or ""):
+        return False
+    return True
+
+
+def _dedupe_employment_history(
+    rows: list[EmploymentCandidate],
+    *,
+    spans: list[_ContextSpan],
+) -> list[EmploymentCandidate]:
+    """Merge DOCX/KOSA employer duplicates; keep conflicting ends as REVIEW."""
+    merged: list[EmploymentCandidate] = []
+    for row in rows:
+        placed = False
+        for index, prev in enumerate(merged):
+            if not _employment_duplicates_mergeable(prev, row, spans=spans):
+                continue
+            merged[index] = _merge_employment_duplicate_pair(prev, row)
+            placed = True
+            break
+        if not placed:
+            merged.append(row)
+    return merged
+
+
 def _guard_employment_history(
     candidate: ProfileCandidateDocument,
     *,
@@ -443,6 +606,8 @@ def _guard_employment_history(
 
     Uses document/page/section spans (including collapsed KOSA lines). Project
     page dates never count as employer-table evidence. Ambiguous rows are kept.
+    After customer filtering, merge clear DOCX/KOSA employer duplicates when
+    company form + compatible start + employment-section evidence agree.
     """
     rows = list(candidate.employment_history or [])
     if not rows:
@@ -502,7 +667,7 @@ def _guard_employment_history(
             updated = row.model_copy(update={"end_date": review_end})
         kept.append(updated)
 
-    return kept
+    return _dedupe_employment_history(kept, spans=spans)
 
 
 def _optional_text_compatible(a: str | None, b: str | None) -> bool:

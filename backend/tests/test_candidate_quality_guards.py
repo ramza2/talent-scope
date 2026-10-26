@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from app.ai.schemas.profile_candidate import (
+    CertificationCandidate,
+    EducationCandidate,
     EmploymentCandidate,
     ProfileCandidate,
     ProfileCandidateDocument,
@@ -875,3 +877,205 @@ def test_employer_also_project_customer_kept() -> None:
     assert len(result.employment_history) == 1
     assert result.employment_history[0].company_name == "피엔드티컨설팅(주)"
     assert result.employment_history[0].end_date == "2014.09"
+
+
+def _employment_seven_row_page_texts() -> dict[tuple[str, int], str]:
+    """DOCX/KOSA employer tables for a 7-row employment fixture."""
+    return {
+        (_DOCX, 1): (
+            "근무경력\n"
+            "피엔드티컨설팅(주) 2010.03 ~ 2014.09 과장\n"
+            "오픈링크 2015.01 ~ 2020.12 책임연구원\n"
+            "에이비씨테크 2008.01 ~ 2009.12 사원\n"
+            "디이에프소프트 2021.01 ~ 2022.06 수석\n"
+            "지에이치시스템 2005.03 ~ 2007.12 대리\n"
+        ),
+        (_KOSA, 1): (
+            "근무경력\n"
+            "근무처 피엔드티컨설팅 주식회사 2010.03 ~ 2014.12 과장\n"
+            "근무처 오픈링크 2015.01.01 ~ 2020.12 책임연구원\n"
+        ),
+    }
+
+
+def test_employment_seven_rows_docx_kosa_dedupe_with_end_review() -> None:
+    """7 employments → merge suffix/precision duplicates; conflict ends REVIEW."""
+    page_texts = _employment_seven_row_page_texts()
+    candidate = ProfileCandidateDocument(
+        education=[
+            EducationCandidate(school_name="한림대학교", degree="학사"),
+        ],
+        certifications=[
+            CertificationCandidate(
+                certification_name="정보처리기사",
+                acquired_date="2006.12.18",
+            ),
+            CertificationCandidate(
+                certification_name="전자계산기조직응용기사",
+                acquired_date="2008.06.02",
+            ),
+        ],
+        employment_history=[
+            EmploymentCandidate(
+                company_name="피엔드티컨설팅(주)",
+                start_date="2010.03",
+                end_date="2014.09",
+                source_refs=[
+                    SourceRef(
+                        document_id=_DOCX, page_no=1, quote_text="피엔드티컨설팅(주)"
+                    )
+                ],
+            ),
+            EmploymentCandidate(
+                company_name="피엔드티컨설팅 주식회사",
+                start_date="2010.03",
+                end_date="2014.12",  # conflicts with DOCX end
+                source_refs=[
+                    SourceRef(
+                        document_id=_KOSA,
+                        page_no=1,
+                        quote_text="피엔드티컨설팅 주식회사",
+                    )
+                ],
+            ),
+            EmploymentCandidate(
+                company_name="오픈링크",
+                start_date="2015.01",
+                end_date="2020.12",
+            ),
+            EmploymentCandidate(
+                company_name="오픈링크",
+                start_date="2015.01.01",  # precision upgrade
+                end_date="2020.12",
+            ),
+            EmploymentCandidate(
+                company_name="에이비씨테크",
+                start_date="2008.01",
+                end_date="2009.12",
+            ),
+            EmploymentCandidate(
+                company_name="디이에프소프트",
+                start_date="2021.01",
+                end_date="2022.06",
+            ),
+            EmploymentCandidate(
+                company_name="지에이치시스템",
+                start_date="2005.03",
+                end_date="2007.12",
+            ),
+        ],
+        projects=[
+            ProjectCandidate(project_name=f"사업{i}", start_date="2020.01")
+            for i in range(70)
+        ],
+    )
+    # 7 rows = 2 duplicate pairs + 3 uniques → 5 after dedupe.
+    assert len(candidate.employment_history) == 7
+
+    result = apply_candidate_quality_guards(
+        candidate,
+        page_texts=page_texts,
+        document_type_by_id={_DOCX: "DOC-PROFILE", _KOSA: "DOC-KOSA"},
+    )
+    assert len(result.education) == 1
+    assert len(result.certifications) == 2
+    assert len(result.projects) == 70
+    assert len(result.employment_history) == 5
+
+    by_key = {
+        (e.company_name or "", e.start_date): e for e in result.employment_history
+    }
+    # Suffix duplicate collapsed; conflicting ends preserved as REVIEW token.
+    pnt_keys = [k for k in by_key if "피엔드티컨설팅" in k[0]]
+    assert len(pnt_keys) == 1
+    pnt = by_key[pnt_keys[0]]
+    assert pnt.end_date is not None
+    assert "2014.09" in pnt.end_date and "2014.12" in pnt.end_date
+    assert employment_candidate_dates_need_review(pnt) is True
+    assert {r.document_id for r in pnt.source_refs} == {_DOCX, _KOSA}
+
+    openlink = [
+        e for e in result.employment_history if e.company_name == "오픈링크"
+    ]
+    assert len(openlink) == 1
+    assert openlink[0].start_date == "2015.01.01"
+    assert openlink[0].end_date == "2020.12"
+
+    again = apply_candidate_quality_guards(
+        result,
+        page_texts=page_texts,
+        document_type_by_id={_DOCX: "DOC-PROFILE", _KOSA: "DOC-KOSA"},
+    )
+    assert again == result
+
+
+def test_employment_dedupe_rejects_fuzzy_and_distinct_periods() -> None:
+    page_texts = {
+        (_DOCX, 1): (
+            "근무경력\n"
+            "한국농어촌공사 2010.01 ~ 2012.12 사원\n"
+            "한국농어촌 2010.01 ~ 2012.12 사원\n"
+            "에이비씨테크 2010.01 ~ 2012.12 사원\n"
+            "에이비씨테크 2015.01 ~ 2018.06 대리\n"
+        ),
+    }
+    candidate = ProfileCandidateDocument(
+        employment_history=[
+            EmploymentCandidate(
+                company_name="한국농어촌공사",
+                start_date="2010.01",
+                end_date="2012.12",
+            ),
+            EmploymentCandidate(
+                company_name="한국농어촌",  # stem-similar, must NOT merge
+                start_date="2010.01",
+                end_date="2012.12",
+            ),
+            EmploymentCandidate(
+                company_name="에이비씨테크",
+                start_date="2010.01",
+                end_date="2012.12",
+            ),
+            EmploymentCandidate(
+                company_name="에이비씨테크",
+                start_date="2015.01",
+                end_date="2018.06",
+            ),
+        ]
+    )
+    result = apply_candidate_quality_guards(
+        candidate,
+        page_texts=page_texts,
+        document_type_by_id={_DOCX: "DOC-PROFILE"},
+    )
+    assert len(result.employment_history) == 4
+
+
+def test_employment_dedupe_without_page_evidence_keeps_both() -> None:
+    """Corporate-form variants without employment-section evidence stay separate."""
+    page_texts = {
+        (_DOCX, 2): (
+            "수행내역\n"
+            "사업X 고객Y 2020.01 ~ 2021.01\n"
+        ),
+    }
+    candidate = ProfileCandidateDocument(
+        employment_history=[
+            EmploymentCandidate(
+                company_name="피엔드티컨설팅(주)",
+                start_date="2010.03",
+                end_date="2014.09",
+            ),
+            EmploymentCandidate(
+                company_name="피엔드티컨설팅 주식회사",
+                start_date="2010.03",
+                end_date="2014.09",
+            ),
+        ]
+    )
+    result = apply_candidate_quality_guards(
+        candidate,
+        page_texts=page_texts,
+        document_type_by_id={_DOCX: "DOC-PROFILE"},
+    )
+    assert len(result.employment_history) == 2
