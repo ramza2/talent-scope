@@ -26,6 +26,7 @@ import {
   formatDiffValueSummary,
   formatValue,
 } from '@/api/diffValueDisplay'
+import { DiffEvidenceGroups } from '@/pages/analysisDiffEvidence'
 import { readAnalysesReturnTo } from '@/pages/analysesListState'
 import {
   bulkReviewDiffs,
@@ -546,44 +547,15 @@ export function AnalysisDetailPage() {
     {
       title: '문서 근거',
       key: 'evidence',
-      width: 200,
-      render: (_, row) => {
-        const items = row.evidence ?? []
-        if (!items.length) {
-          return <Typography.Text type="secondary">—</Typography.Text>
-        }
-        return (
-          <Space direction="vertical" size={2}>
-            {items.slice(0, 3).map((ev, idx) => (
-              <div key={ev.id || `${row.id}-ev-${idx}`}>
-                <Typography.Text
-                  ellipsis
-                  style={{ maxWidth: 160, display: 'inline-block' }}
-                  title={ev.quote_text || undefined}
-                >
-                  {ev.page_no != null ? `p.${ev.page_no} ` : ''}
-                  {ev.quote_text || '근거'}
-                </Typography.Text>
-                {ev.id ? (
-                  <Button type="link" size="small" onClick={() => void openEvidence(ev)}>
-                    근거 보기
-                  </Button>
-                ) : ev.document_id ? (
-                  <Button
-                    type="link"
-                    size="small"
-                    href={documentPreviewUrl(ev.document_id)}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                  >
-                    {ev.page_no != null ? `문서 보기 p.${ev.page_no}` : '문서 보기'}
-                  </Button>
-                ) : null}
-              </div>
-            ))}
-          </Space>
-        )
-      },
+      width: 280,
+      render: (_, row) => (
+        <DiffEvidenceGroups
+          evidence={row.evidence ?? []}
+          documents={analysis?.documents ?? []}
+          rowId={row.id}
+          onOpenEvidence={(ev) => void openEvidence(ev)}
+        />
+      ),
     },
     {
       title: 'Confidence',
@@ -890,7 +862,7 @@ export function AnalysisDetailPage() {
             columns={columns}
             dataSource={diffsQuery.data?.data ?? []}
             size="small"
-            scroll={{ x: 1100 }}
+            scroll={{ x: 1180 }}
             pagination={{ pageSize: 50, showSizeChanger: true }}
             rowSelection={
               canReview
