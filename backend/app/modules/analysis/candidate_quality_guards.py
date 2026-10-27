@@ -529,55 +529,137 @@ def _resolve_employment_end_merge(a: str | None, b: str | None) -> str | None:
     return _employment_end_conflict_token(a, b)
 
 
-def _source_ref_doc_pages(
-    refs: list[SourceRef] | None,
-) -> set[tuple[str, int | None]]:
-    out: set[tuple[str, int | None]] = set()
-    for ref in refs or []:
-        doc_id = (ref.document_id or "").strip()
-        if not doc_id:
-            continue
-        out.add((doc_id, ref.page_no))
-    return out
+@dataclass(frozen=True)
+class _EmploymentEvidenceHit:
+    """One original employment-section row that clearly matches company+period."""
+
+    doc_id: str
+    page_no: int
+    folded_line: str
+    quote_text: str
+    start: str | None
+    end: str | None
+
+    @property
+    def key(self) -> tuple[str, int, str]:
+        return (self.doc_id, self.page_no, self.folded_line)
 
 
-def _employment_evidence_keys(
+def _employment_period_compatible(
+    cand_start: str | None,
+    cand_end: str | None,
+    span_start: str | None,
+    span_end: str | None,
+) -> bool:
+    """True when candidate period agrees with an original row (precision OK)."""
+    if not span_start:
+        return False
+    if not dates_compatible(
+        _date_for_compat(cand_start), _date_for_compat(span_start)
+    ):
+        return False
+    if not cand_end or not span_end:
+        return True
+    if _is_ongoing_end(cand_end) or _is_ongoing_end(span_end):
+        return _is_ongoing_end(cand_end) and _is_ongoing_end(span_end)
+    return dates_compatible(
+        _date_for_compat(cand_end), _date_for_compat(span_end)
+    )
+
+
+def _hits_share_single_period(hits: list[_EmploymentEvidenceHit]) -> bool:
+    """False when hits cover mutually incompatible employer periods."""
+    for index, left in enumerate(hits):
+        for right in hits[index + 1 :]:
+            if not dates_compatible(
+                _date_for_compat(left.start), _date_for_compat(right.start)
+            ):
+                return False
+            if not left.end or not right.end:
+                continue
+            if _is_ongoing_end(left.end) or _is_ongoing_end(right.end):
+                if not (
+                    _is_ongoing_end(left.end) and _is_ongoing_end(right.end)
+                ):
+                    return False
+                continue
+            if not dates_compatible(
+                _date_for_compat(left.end), _date_for_compat(right.end)
+            ):
+                return False
+    return True
+
+
+def _clear_employment_evidence_hits(
     spans: list[_ContextSpan],
-    company: str,
     *,
-    source_refs: list[SourceRef] | None = None,
-) -> set[tuple[str, int, str]]:
-    """Employment-section evidence keys: (doc_id, page_no, folded line).
+    company: str,
+    start: str | None,
+    end: str | None,
+) -> list[_EmploymentEvidenceHit] | None:
+    """Period-clear original rows for this employer.
 
-    When ``source_refs`` are present, only spans on those document/page
-    anchors count — a single shared original line cannot independently
-    support two candidates unless each also has its own distinct key.
+    Ignores possibly wrong ``source_refs`` and matches company + period on the
+    employment-section text. Returns ``None`` when a line or the hit set is
+    ambiguous (multiple incompatible periods). Empty list means no clear row.
     """
     raw = (company or "").strip()
-    if not raw:
-        return set()
+    if not raw or not (start or "").strip():
+        return []
     stem = _company_match_key(raw)
-    ref_pages = _source_ref_doc_pages(source_refs)
-    keys: set[tuple[str, int, str]] = set()
+    hits: list[_EmploymentEvidenceHit] = []
     for span in spans:
         kind = _classify_span(span.text, section=span.section)
         if kind != "employment":
             continue
-        if ref_pages:
-            doc_ok = any(
-                doc_id == span.doc_id
-                and (page_no is None or page_no == span.page_no)
-                for doc_id, page_no in ref_pages
-            )
-            if not doc_ok:
-                continue
         if not (
             _line_has_company(span.text, raw)
             or (stem and _line_has_company(span.text, stem))
         ):
             continue
-        keys.add((span.doc_id, span.page_no, _fold(span.text)))
-    return keys
+        ranges = _extract_range_dates(span.text)
+        matched = [
+            (span_start, span_end)
+            for span_start, span_end in ranges
+            if _employment_period_compatible(start, end, span_start, span_end)
+        ]
+        if not matched:
+            continue
+        if len(matched) > 1:
+            return None
+        span_start, span_end = matched[0]
+        quote = span.text.strip()
+        if len(quote) > 500:
+            quote = quote[:500]
+        hits.append(
+            _EmploymentEvidenceHit(
+                doc_id=span.doc_id,
+                page_no=span.page_no,
+                folded_line=_fold(span.text),
+                quote_text=quote,
+                start=span_start,
+                end=span_end,
+            )
+        )
+    if not hits:
+        return []
+    if not _hits_share_single_period(hits):
+        return None
+    # Deduplicate identical keys while preserving first quote/period.
+    unique: list[_EmploymentEvidenceHit] = []
+    seen: set[tuple[str, int, str]] = set()
+    for hit in hits:
+        if hit.key in seen:
+            continue
+        seen.add(hit.key)
+        unique.append(hit)
+    return unique
+
+
+def _employment_evidence_key_set(
+    hits: list[_EmploymentEvidenceHit],
+) -> set[tuple[str, int, str]]:
+    return {hit.key for hit in hits}
 
 
 def _has_independent_employment_evidence(
@@ -586,27 +668,81 @@ def _has_independent_employment_evidence(
     *,
     spans: list[_ContextSpan],
 ) -> bool:
-    """True when each side has at least one evidence key the other lacks."""
-    left_keys = _employment_evidence_keys(
+    """True when company+period has clear, distinct original-row evidence.
+
+    Mislinked ``source_refs`` do not block discovery of a clear KOSA/DOCX row.
+    A single shared original line never counts as dual evidence. Multiple
+    incompatible period matches refuse the merge.
+    """
+    left_hits = _clear_employment_evidence_hits(
         spans,
-        left.company_name or "",
-        source_refs=left.source_refs,
+        company=left.company_name or "",
+        start=left.start_date,
+        end=left.end_date,
     )
-    right_keys = _employment_evidence_keys(
+    right_hits = _clear_employment_evidence_hits(
         spans,
-        right.company_name or "",
-        source_refs=right.source_refs,
+        company=right.company_name or "",
+        start=right.start_date,
+        end=right.end_date,
     )
-    if not left_keys or not right_keys:
+    if left_hits is None or right_hits is None:
         return False
+    if not left_hits or not right_hits:
+        return False
+    left_keys = _employment_evidence_key_set(left_hits)
+    right_keys = _employment_evidence_key_set(right_hits)
+    shared = left_keys & right_keys
+    # Same employer period evidenced on ≥2 distinct original rows.
+    if len(shared) >= 2:
+        return True
     left_unique = left_keys - right_keys
     right_unique = right_keys - left_keys
     return bool(left_unique and right_unique)
 
 
+def _verified_employment_source_refs(
+    left: EmploymentCandidate,
+    right: EmploymentCandidate,
+    *,
+    spans: list[_ContextSpan],
+) -> list[SourceRef]:
+    """Build refs only from clear original rows (never invent anchors)."""
+    left_hits = _clear_employment_evidence_hits(
+        spans,
+        company=left.company_name or "",
+        start=left.start_date,
+        end=left.end_date,
+    ) or []
+    right_hits = _clear_employment_evidence_hits(
+        spans,
+        company=right.company_name or "",
+        start=right.start_date,
+        end=right.end_date,
+    ) or []
+    refs: list[SourceRef] = []
+    seen: set[tuple[str, int, str]] = set()
+    for hit in [*left_hits, *right_hits]:
+        if hit.key in seen:
+            continue
+        seen.add(hit.key)
+        refs.append(
+            SourceRef(
+                document_id=hit.doc_id,
+                page_no=hit.page_no,
+                quote_text=hit.quote_text,
+            )
+        )
+    return refs
+
+
 def _merge_employment_duplicate_pair(
-    left: EmploymentCandidate, right: EmploymentCandidate
+    left: EmploymentCandidate,
+    right: EmploymentCandidate,
+    *,
+    spans: list[_ContextSpan],
 ) -> EmploymentCandidate:
+    verified = _verified_employment_source_refs(left, right, spans=spans)
     return left.model_copy(
         update={
             "company_name": _prefer_company_display(
@@ -623,7 +759,8 @@ def _merge_employment_duplicate_pair(
             or left.confidence
             or right.confidence,
             "source_refs": _merge_source_refs(
-                left.source_refs, right.source_refs
+                _merge_source_refs(left.source_refs, right.source_refs),
+                verified,
             ),
         }
     )
@@ -668,7 +805,9 @@ def _dedupe_employment_history(
         for index, prev in enumerate(merged):
             if not _employment_duplicates_mergeable(prev, row, spans=spans):
                 continue
-            merged[index] = _merge_employment_duplicate_pair(prev, row)
+            merged[index] = _merge_employment_duplicate_pair(
+                prev, row, spans=spans
+            )
             placed = True
             break
         if not placed:
