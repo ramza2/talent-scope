@@ -677,8 +677,10 @@ def _clear_employment_evidence_hits(
 
     Accepts:
     - same-line company + date range (KOSA-style), or
-    - company-name cell immediately followed by a single date-range cell on the
-      same document/page employment section (DOCX table cells).
+    - company-name cell whose **immediate next original span** is also
+      employment and exactly one date-range cell on the same document/page
+      (DOCX table cells). Intervening project/other/ambiguous spans block
+      pairing (do not skip via employment-only reindexing).
 
     Ignores possibly wrong ``source_refs``. Returns ``None`` when a line or the
     hit set is ambiguous (multiple incompatible periods). Empty list means no
@@ -688,13 +690,13 @@ def _clear_employment_evidence_hits(
     if not raw or not (start or "").strip():
         return []
     stem = _company_match_key(raw)
-    emp_spans = [
-        span
-        for span in spans
-        if _classify_span(span.text, section=span.section) == "employment"
-    ]
     hits: list[_EmploymentEvidenceHit] = []
-    for index, span in enumerate(emp_spans):
+    # Walk original span order — never skip project/other/ambiguous neighbors
+    # by filtering to employment-only indices first.
+    for index, span in enumerate(spans):
+        span_kind = _classify_span(span.text, section=span.section)
+        if span_kind != "employment":
+            continue
         if not _span_matches_employment_company(span.text, raw=raw, stem=stem):
             continue
         ranges = _extract_range_dates(span.text)
@@ -722,13 +724,17 @@ def _clear_employment_evidence_hits(
             )
             continue
 
-        # DOCX: company cell → immediate next single date-range cell only.
+        # DOCX: company cell → immediate next original span only, when that
+        # neighbor is also employment and exactly one date-range cell.
         if not _line_is_company_name_only_cell(span.text):
             continue
-        if index + 1 >= len(emp_spans):
+        if index + 1 >= len(spans):
             continue
-        nxt = emp_spans[index + 1]
+        nxt = spans[index + 1]
         if nxt.doc_id != span.doc_id or nxt.page_no != span.page_no:
+            continue
+        nxt_kind = _classify_span(nxt.text, section=nxt.section)
+        if nxt_kind != "employment":
             continue
         range_pair = _line_is_single_date_range(nxt.text)
         if range_pair is None:

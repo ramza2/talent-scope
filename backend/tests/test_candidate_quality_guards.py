@@ -1050,6 +1050,55 @@ def test_kwon_seven_employment_dedupe_bispro_only() -> None:
     assert again == result
 
 
+def test_employment_docx_cell_pairing_adjacent_company_period_succeeds() -> None:
+    """Immediate company→period cells on the same employment page pair."""
+    page_texts = {
+        (_DOCX, 1): (
+            "근무경력\n"
+            "비스프로컨설팅(주)\n"
+            "2011.02 ~ 2012.11\n"
+        ),
+        (_KOSA, 1): (
+            "근무경력\n"
+            "근무처 비스프로컨설팅(주) 2011.02.01 ~ 2012.11.30 과장\n"
+        ),
+    }
+    candidate = ProfileCandidateDocument(
+        employment_history=[
+            EmploymentCandidate(
+                company_name="비스프로컨설팅(주)",
+                start_date="2011.02",
+                end_date="2012.11",
+                source_refs=[
+                    SourceRef(document_id=_DOCX, page_no=1, quote_text="x")
+                ],
+            ),
+            EmploymentCandidate(
+                company_name="비스프로컨설팅(주)",
+                start_date="2011.02.01",
+                end_date="2012.11.30",
+                source_refs=[
+                    SourceRef(document_id=_DOCX, page_no=1, quote_text="x")
+                ],
+            ),
+        ]
+    )
+    result = apply_candidate_quality_guards(
+        candidate,
+        page_texts=page_texts,
+        document_type_by_id={_DOCX: "DOC-PROFILE", _KOSA: "DOC-KOSA"},
+    )
+    assert len(result.employment_history) == 1
+    emp = result.employment_history[0]
+    assert {r.document_id for r in emp.source_refs} == {_DOCX, _KOSA}
+    assert any(
+        "비스프로컨설팅(주)" in (r.quote_text or "")
+        and "2011.02 ~ 2012.11" in (r.quote_text or "")
+        for r in emp.source_refs
+        if r.document_id == _DOCX
+    )
+
+
 def test_employment_docx_cell_pairing_does_not_borrow_other_company_dates() -> None:
     """Company cell may only bind the immediate next date-range cell."""
     page_texts = {
@@ -1082,6 +1131,79 @@ def test_employment_docx_cell_pairing_does_not_borrow_other_company_dates() -> N
         document_type_by_id={_DOCX: "DOC-PROFILE"},
     )
     # No clear period match for 비스프로 at 2012.12~2014.09 → no merge.
+    assert len(result.employment_history) == 2
+
+
+def test_employment_docx_pairing_rejects_intervening_infohwa_cell() -> None:
+    """Company → 정보화 → period must not pair across the intervening cell."""
+    page_texts = {
+        (_DOCX, 1): (
+            "근무경력\n"
+            "비스프로컨설팅(주)\n"
+            "정보화\n"
+            "2011.02 ~ 2012.11\n"
+        ),
+        (_KOSA, 1): (
+            "근무경력\n"
+            "근무처 비스프로컨설팅(주) 2011.02.01 ~ 2012.11.30 과장\n"
+        ),
+    }
+    candidate = ProfileCandidateDocument(
+        employment_history=[
+            EmploymentCandidate(
+                company_name="비스프로컨설팅(주)",
+                start_date="2011.02",
+                end_date="2012.11",
+            ),
+            EmploymentCandidate(
+                company_name="비스프로컨설팅 주식회사",
+                start_date="2011.02.01",
+                end_date="2012.11.30",
+            ),
+        ]
+    )
+    result = apply_candidate_quality_guards(
+        candidate,
+        page_texts=page_texts,
+        document_type_by_id={_DOCX: "DOC-PROFILE", _KOSA: "DOC-KOSA"},
+    )
+    # DOCX pairing blocked; only KOSA one-line evidence → not independent dual.
+    assert len(result.employment_history) == 2
+
+
+def test_employment_docx_pairing_rejects_intervening_project_cell() -> None:
+    """Company → project cell → period must not pair across the project span."""
+    page_texts = {
+        (_DOCX, 1): (
+            "근무경력\n"
+            "비스프로컨설팅(주)\n"
+            "수행내역\n"
+            "2011.02 ~ 2012.11\n"
+        ),
+        (_KOSA, 1): (
+            "근무경력\n"
+            "근무처 비스프로컨설팅(주) 2011.02.01 ~ 2012.11.30 과장\n"
+        ),
+    }
+    candidate = ProfileCandidateDocument(
+        employment_history=[
+            EmploymentCandidate(
+                company_name="비스프로컨설팅(주)",
+                start_date="2011.02",
+                end_date="2012.11",
+            ),
+            EmploymentCandidate(
+                company_name="비스프로컨설팅 주식회사",
+                start_date="2011.02.01",
+                end_date="2012.11.30",
+            ),
+        ]
+    )
+    result = apply_candidate_quality_guards(
+        candidate,
+        page_texts=page_texts,
+        document_type_by_id={_DOCX: "DOC-PROFILE", _KOSA: "DOC-KOSA"},
+    )
     assert len(result.employment_history) == 2
 
 
