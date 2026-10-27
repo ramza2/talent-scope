@@ -90,20 +90,16 @@ _ONGOING_END_KEYS = frozenset({"현재", "재직중", "present"})
 _PROFILE_LIKE_DOC_TYPES = frozenset(
     {"DOC-PROFILE", "DOC-RESUME", "DOC-CAREER"}
 )
-# Corporate legal-form markers only at name start/end (independent tokens).
-# Never strip internal Latin fragments (e.g. ``inc`` inside ``Prince``).
-_CORP_SUFFIX_RE = re.compile(
-    r"(?:"
-    r"주식회사|유한책임회사|유한회사|\(주\)|㈜|\(유\)|\(사\)|"
-    r"co\.?,?ltd\.?|corp\.?|inc\.?|llc\.?"
-    r")$",
-    re.IGNORECASE,
+# Korean corporate forms: leading/trailing on folded Hangul/token text.
+_CORP_SUFFIX_KO_RE = re.compile(
+    r"(?:주식회사|유한책임회사|유한회사|\(주\)|㈜|\(유\)|\(사\))$"
 )
-_CORP_PREFIX_RE = re.compile(
-    r"^(?:"
-    r"주식회사|유한책임회사|유한회사|\(주\)|㈜|\(유\)|\(사\)"
-    r")",
-    re.IGNORECASE,
+_CORP_PREFIX_KO_RE = re.compile(
+    r"^(?:주식회사|유한책임회사|유한회사|\(주\)|㈜|\(유\)|\(사\))"
+)
+# English corporate forms: independent trailing tokens only (not Zinc→Z).
+_CORP_SUFFIX_EN_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9])(?:co\.?,?\s*ltd\.?|corp\.?|inc\.?|llc\.?)\s*$"
 )
 
 
@@ -450,30 +446,39 @@ def _matches_project_customer_period(
 
 
 def _company_match_key(name: str | None) -> str | None:
-    """Canonical employer key: whitespace-folded, edge corporate form stripped.
+    """Canonical employer key with conservative corporate-form stripping.
 
-    Strips only leading/trailing legal-form markers such as ``(주)`` /
-    ``주식회사`` / ``Inc``. Does not truncate arbitrary stems
-    (한국농어촌공사 ↛ 한국농어촌) and does not touch internal ``inc`` in
-    names like ``Prince``. Empty residue after stripping is not a key.
+    - Korean ``(주)`` / ``주식회사`` etc. strip only as leading/trailing forms
+      on the whitespace-folded token.
+    - English ``Inc`` / ``Corp`` / ``LLC`` / ``Co., Ltd`` strip only as
+      independent trailing tokens (``(?<![A-Za-z0-9])…$``), so ``Zinc`` / ``Prince``
+      / ``Pre`` stay distinct.
+    Empty residue after stripping is not a key.
     """
-    text = _fold((name or "").strip())
+    text = (name or "").strip()
     if not text:
         return None
     previous = None
     while previous != text:
         previous = text
-        text = _CORP_SUFFIX_RE.sub("", text)
-        text = _CORP_PREFIX_RE.sub("", text)
-        text = text.strip(" -_/·•")
+        text = _CORP_SUFFIX_EN_RE.sub("", text).strip(" -_/·•")
+        folded = _fold(text)
+        folded = _CORP_SUFFIX_KO_RE.sub("", folded)
+        folded = _CORP_PREFIX_KO_RE.sub("", folded)
+        text = folded.strip(" -_/·•")
     return text.casefold() or None
 
 
 def _has_edge_corp_form_marker(name: str) -> bool:
-    folded = _fold(name.strip())
-    if not folded:
+    raw = name.strip()
+    if not raw:
         return False
-    return bool(_CORP_SUFFIX_RE.search(folded) or _CORP_PREFIX_RE.search(folded))
+    if _CORP_SUFFIX_EN_RE.search(raw):
+        return True
+    folded = _fold(raw)
+    return bool(
+        _CORP_SUFFIX_KO_RE.search(folded) or _CORP_PREFIX_KO_RE.search(folded)
+    )
 
 
 def _prefer_company_display(a: str | None, b: str | None) -> str | None:
@@ -524,23 +529,79 @@ def _resolve_employment_end_merge(a: str | None, b: str | None) -> str | None:
     return _employment_end_conflict_token(a, b)
 
 
-def _has_employment_company_evidence(
-    spans: list[_ContextSpan], company: str
-) -> bool:
-    """True when an employment-section span mentions this employer spelling."""
+def _source_ref_doc_pages(
+    refs: list[SourceRef] | None,
+) -> set[tuple[str, int | None]]:
+    out: set[tuple[str, int | None]] = set()
+    for ref in refs or []:
+        doc_id = (ref.document_id or "").strip()
+        if not doc_id:
+            continue
+        out.add((doc_id, ref.page_no))
+    return out
+
+
+def _employment_evidence_keys(
+    spans: list[_ContextSpan],
+    company: str,
+    *,
+    source_refs: list[SourceRef] | None = None,
+) -> set[tuple[str, int, str]]:
+    """Employment-section evidence keys: (doc_id, page_no, folded line).
+
+    When ``source_refs`` are present, only spans on those document/page
+    anchors count — a single shared original line cannot independently
+    support two candidates unless each also has its own distinct key.
+    """
     raw = (company or "").strip()
     if not raw:
-        return False
+        return set()
     stem = _company_match_key(raw)
+    ref_pages = _source_ref_doc_pages(source_refs)
+    keys: set[tuple[str, int, str]] = set()
     for span in spans:
         kind = _classify_span(span.text, section=span.section)
         if kind != "employment":
             continue
-        if _line_has_company(span.text, raw):
-            return True
-        if stem and _line_has_company(span.text, stem):
-            return True
-    return False
+        if ref_pages:
+            doc_ok = any(
+                doc_id == span.doc_id
+                and (page_no is None or page_no == span.page_no)
+                for doc_id, page_no in ref_pages
+            )
+            if not doc_ok:
+                continue
+        if not (
+            _line_has_company(span.text, raw)
+            or (stem and _line_has_company(span.text, stem))
+        ):
+            continue
+        keys.add((span.doc_id, span.page_no, _fold(span.text)))
+    return keys
+
+
+def _has_independent_employment_evidence(
+    left: EmploymentCandidate,
+    right: EmploymentCandidate,
+    *,
+    spans: list[_ContextSpan],
+) -> bool:
+    """True when each side has at least one evidence key the other lacks."""
+    left_keys = _employment_evidence_keys(
+        spans,
+        left.company_name or "",
+        source_refs=left.source_refs,
+    )
+    right_keys = _employment_evidence_keys(
+        spans,
+        right.company_name or "",
+        source_refs=right.source_refs,
+    )
+    if not left_keys or not right_keys:
+        return False
+    left_unique = left_keys - right_keys
+    right_unique = right_keys - left_keys
+    return bool(left_unique and right_unique)
 
 
 def _merge_employment_duplicate_pair(
@@ -574,7 +635,7 @@ def _employment_duplicates_mergeable(
     *,
     spans: list[_ContextSpan],
 ) -> bool:
-    """Same employer period with page employment evidence; no fuzzy names."""
+    """Same employer period with independent page evidence; no fuzzy names."""
     left_key = _company_match_key(left.company_name)
     right_key = _company_match_key(right.company_name)
     # Empty keys (e.g. bare ``(주)``) must never merge.
@@ -589,9 +650,8 @@ def _employment_duplicates_mergeable(
         _date_for_compat(left_start), _date_for_compat(right_start)
     ):
         return False
-    if not _has_employment_company_evidence(spans, left.company_name or ""):
-        return False
-    if not _has_employment_company_evidence(spans, right.company_name or ""):
+    # Ambiguous / shared-only original lines do not count as dual evidence.
+    if not _has_independent_employment_evidence(left, right, spans=spans):
         return False
     return True
 

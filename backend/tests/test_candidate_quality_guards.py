@@ -884,11 +884,22 @@ def test_company_match_key_strips_only_edge_corp_forms() -> None:
 
     assert _company_match_key("비스프로컨설팅(주)") == "비스프로컨설팅"
     assert _company_match_key("비스프로컨설팅 주식회사") == "비스프로컨설팅"
+    assert _company_match_key("주식회사 비스프로컨설팅") == "비스프로컨설팅"
     assert _company_match_key("Prince") == "prince"
     assert _company_match_key("Pre") == "pre"
     assert _company_match_key("Prince") != _company_match_key("Pre")
     assert _company_match_key("Prince Inc") == "prince"
     assert _company_match_key("Inc Prince") == "incprince"  # Inc not a suffix here
+    # Internal Latin fragments must not collapse Zinc→Z or similar.
+    assert _company_match_key("Zinc") == "zinc"
+    assert _company_match_key("Z") == "z"
+    assert _company_match_key("Zinc") != _company_match_key("Z")
+    assert _company_match_key("Zinc Inc") == "zinc"
+    assert _company_match_key("Zinc Inc") != _company_match_key("Z")
+    assert _company_match_key("Acme Corp") == "acme"
+    assert _company_match_key("Acme LLC") == "acme"
+    assert _company_match_key("Acme Co., Ltd") == "acme"
+    assert _company_match_key("CorpAcme") == "corpacme"  # Corp not independent
     assert _company_match_key("(주)") is None
     assert _company_match_key("주식회사") is None
 
@@ -1149,3 +1160,78 @@ def test_prince_pre_not_merged_via_internal_inc() -> None:
     )
     assert len(result.employment_history) == 2
     assert {e.company_name for e in result.employment_history} == {"Prince", "Pre"}
+
+
+def test_zinc_z_not_merged_via_internal_inc() -> None:
+    page_texts = {
+        (_DOCX, 1): (
+            "근무경력\n"
+            "Zinc Inc 2010.01 ~ 2012.12 사원\n"
+            "Z 2010.01 ~ 2012.12 사원\n"
+        ),
+    }
+    candidate = ProfileCandidateDocument(
+        employment_history=[
+            EmploymentCandidate(
+                company_name="Zinc Inc",
+                start_date="2010.01",
+                end_date="2012.12",
+            ),
+            EmploymentCandidate(
+                company_name="Z",
+                start_date="2010.01",
+                end_date="2012.12",
+            ),
+        ]
+    )
+    result = apply_candidate_quality_guards(
+        candidate,
+        page_texts=page_texts,
+        document_type_by_id={_DOCX: "DOC-PROFILE"},
+    )
+    assert len(result.employment_history) == 2
+    assert {e.company_name for e in result.employment_history} == {"Zinc Inc", "Z"}
+
+
+def test_employment_dedupe_shared_source_line_not_independent_evidence() -> None:
+    """One original employer line must not dual-evidence corp-form variants."""
+    page_texts = {
+        (_DOCX, 1): (
+            "근무경력\n"
+            "비스프로컨설팅(주) 2012.01 ~ 2015.06 과장\n"
+        ),
+    }
+    candidate = ProfileCandidateDocument(
+        employment_history=[
+            EmploymentCandidate(
+                company_name="비스프로컨설팅(주)",
+                start_date="2012.01",
+                end_date="2015.06",
+                source_refs=[
+                    SourceRef(
+                        document_id=_DOCX,
+                        page_no=1,
+                        quote_text="비스프로컨설팅(주)",
+                    )
+                ],
+            ),
+            EmploymentCandidate(
+                company_name="비스프로컨설팅 주식회사",
+                start_date="2012.01",
+                end_date="2015.06",
+                source_refs=[
+                    SourceRef(
+                        document_id=_DOCX,
+                        page_no=1,
+                        quote_text="비스프로컨설팅(주)",
+                    )
+                ],
+            ),
+        ]
+    )
+    result = apply_candidate_quality_guards(
+        candidate,
+        page_texts=page_texts,
+        document_type_by_id={_DOCX: "DOC-PROFILE"},
+    )
+    assert len(result.employment_history) == 2
