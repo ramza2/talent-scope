@@ -19,6 +19,7 @@ from app.ai.schemas.profile_candidate import (
     SourceRef,
 )
 from app.core.person_name import is_korean_person_name, person_name_match_key
+from app.modules.analysis.confirm_dates import is_ongoing_end_marker
 from app.modules.analysis.diff_engine import dates_compatible, parse_date_parts
 
 
@@ -88,6 +89,17 @@ _EMPLOYMENT_END_CONFLICT_SEP = " / "
 _ONGOING_END_KEYS = frozenset({"현재", "재직중", "present"})
 _PROFILE_LIKE_DOC_TYPES = frozenset(
     {"DOC-PROFILE", "DOC-RESUME", "DOC-CAREER"}
+)
+# Korean corporate forms: leading/trailing on folded Hangul/token text.
+_CORP_SUFFIX_KO_RE = re.compile(
+    r"(?:주식회사|유한책임회사|유한회사|\(주\)|㈜|\(유\)|\(사\))$"
+)
+_CORP_PREFIX_KO_RE = re.compile(
+    r"^(?:주식회사|유한책임회사|유한회사|\(주\)|㈜|\(유\)|\(사\))"
+)
+# English corporate forms: independent trailing tokens only (not Zinc→Z).
+_CORP_SUFFIX_EN_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9])(?:co\.?,?\s*ltd\.?|corp\.?|inc\.?|llc\.?)\s*$"
 )
 
 
@@ -433,6 +445,237 @@ def _matches_project_customer_period(
     return False
 
 
+def _company_match_key(name: str | None) -> str | None:
+    """Canonical employer key with conservative corporate-form stripping.
+
+    - Korean ``(주)`` / ``주식회사`` etc. strip only as leading/trailing forms
+      on the whitespace-folded token.
+    - English ``Inc`` / ``Corp`` / ``LLC`` / ``Co., Ltd`` strip only as
+      independent trailing tokens (``(?<![A-Za-z0-9])…$``), so ``Zinc`` / ``Prince``
+      / ``Pre`` stay distinct.
+    Empty residue after stripping is not a key.
+    """
+    text = (name or "").strip()
+    if not text:
+        return None
+    previous = None
+    while previous != text:
+        previous = text
+        text = _CORP_SUFFIX_EN_RE.sub("", text).strip(" -_/·•")
+        folded = _fold(text)
+        folded = _CORP_SUFFIX_KO_RE.sub("", folded)
+        folded = _CORP_PREFIX_KO_RE.sub("", folded)
+        text = folded.strip(" -_/·•")
+    return text.casefold() or None
+
+
+def _has_edge_corp_form_marker(name: str) -> bool:
+    raw = name.strip()
+    if not raw:
+        return False
+    if _CORP_SUFFIX_EN_RE.search(raw):
+        return True
+    folded = _fold(raw)
+    return bool(
+        _CORP_SUFFIX_KO_RE.search(folded) or _CORP_PREFIX_KO_RE.search(folded)
+    )
+
+
+def _prefer_company_display(a: str | None, b: str | None) -> str | None:
+    sa = (a or "").strip() or None
+    sb = (b or "").strip() or None
+    if sa is None:
+        return sb
+    if sb is None:
+        return sa
+    # Prefer a form that still carries an explicit corporate marker.
+    a_marked = _has_edge_corp_form_marker(sa)
+    b_marked = _has_edge_corp_form_marker(sb)
+    if a_marked and not b_marked:
+        return sa
+    if b_marked and not a_marked:
+        return sb
+    return sa if len(sa) >= len(sb) else sb
+
+
+def _date_for_compat(value: str | None) -> str | None:
+    """Normalize calendar tokens for dates_compatible (dash-separated)."""
+    token = _normalize_date_token(value)
+    if not token:
+        return None
+    if is_ongoing_end_marker(token):
+        return token
+    return token.replace(".", "-").replace("/", "-")
+
+
+def _resolve_employment_end_merge(a: str | None, b: str | None) -> str | None:
+    """Merge ends without choosing a conflict winner (REVIEW token on clash)."""
+    if a in (None, "") and b in (None, ""):
+        return None
+    if a in (None, ""):
+        return b
+    if b in (None, ""):
+        return a
+    if a == b:
+        return a
+    if _EMPLOYMENT_END_CONFLICT_SEP in a or _EMPLOYMENT_END_CONFLICT_SEP in b:
+        return _employment_end_conflict_token(a, b)
+    if is_ongoing_end_marker(a) and is_ongoing_end_marker(b):
+        return a
+    if is_ongoing_end_marker(a) or is_ongoing_end_marker(b):
+        return _employment_end_conflict_token(a, b)
+    if dates_compatible(_date_for_compat(a), _date_for_compat(b)):
+        return _prefer_date(a, b)
+    return _employment_end_conflict_token(a, b)
+
+
+def _source_ref_doc_pages(
+    refs: list[SourceRef] | None,
+) -> set[tuple[str, int | None]]:
+    out: set[tuple[str, int | None]] = set()
+    for ref in refs or []:
+        doc_id = (ref.document_id or "").strip()
+        if not doc_id:
+            continue
+        out.add((doc_id, ref.page_no))
+    return out
+
+
+def _employment_evidence_keys(
+    spans: list[_ContextSpan],
+    company: str,
+    *,
+    source_refs: list[SourceRef] | None = None,
+) -> set[tuple[str, int, str]]:
+    """Employment-section evidence keys: (doc_id, page_no, folded line).
+
+    When ``source_refs`` are present, only spans on those document/page
+    anchors count — a single shared original line cannot independently
+    support two candidates unless each also has its own distinct key.
+    """
+    raw = (company or "").strip()
+    if not raw:
+        return set()
+    stem = _company_match_key(raw)
+    ref_pages = _source_ref_doc_pages(source_refs)
+    keys: set[tuple[str, int, str]] = set()
+    for span in spans:
+        kind = _classify_span(span.text, section=span.section)
+        if kind != "employment":
+            continue
+        if ref_pages:
+            doc_ok = any(
+                doc_id == span.doc_id
+                and (page_no is None or page_no == span.page_no)
+                for doc_id, page_no in ref_pages
+            )
+            if not doc_ok:
+                continue
+        if not (
+            _line_has_company(span.text, raw)
+            or (stem and _line_has_company(span.text, stem))
+        ):
+            continue
+        keys.add((span.doc_id, span.page_no, _fold(span.text)))
+    return keys
+
+
+def _has_independent_employment_evidence(
+    left: EmploymentCandidate,
+    right: EmploymentCandidate,
+    *,
+    spans: list[_ContextSpan],
+) -> bool:
+    """True when each side has at least one evidence key the other lacks."""
+    left_keys = _employment_evidence_keys(
+        spans,
+        left.company_name or "",
+        source_refs=left.source_refs,
+    )
+    right_keys = _employment_evidence_keys(
+        spans,
+        right.company_name or "",
+        source_refs=right.source_refs,
+    )
+    if not left_keys or not right_keys:
+        return False
+    left_unique = left_keys - right_keys
+    right_unique = right_keys - left_keys
+    return bool(left_unique and right_unique)
+
+
+def _merge_employment_duplicate_pair(
+    left: EmploymentCandidate, right: EmploymentCandidate
+) -> EmploymentCandidate:
+    return left.model_copy(
+        update={
+            "company_name": _prefer_company_display(
+                left.company_name, right.company_name
+            ),
+            "department": left.department or right.department,
+            "title": left.title or right.title,
+            "start_date": _prefer_date(left.start_date, right.start_date),
+            "end_date": _resolve_employment_end_merge(
+                left.end_date, right.end_date
+            ),
+            "responsibilities": left.responsibilities or right.responsibilities,
+            "confidence": max(left.confidence or 0.0, right.confidence or 0.0)
+            or left.confidence
+            or right.confidence,
+            "source_refs": _merge_source_refs(
+                left.source_refs, right.source_refs
+            ),
+        }
+    )
+
+
+def _employment_duplicates_mergeable(
+    left: EmploymentCandidate,
+    right: EmploymentCandidate,
+    *,
+    spans: list[_ContextSpan],
+) -> bool:
+    """Same employer period with independent page evidence; no fuzzy names."""
+    left_key = _company_match_key(left.company_name)
+    right_key = _company_match_key(right.company_name)
+    # Empty keys (e.g. bare ``(주)``) must never merge.
+    if not left_key or not right_key or left_key != right_key:
+        return False
+    left_start = (left.start_date or "").strip() or None
+    right_start = (right.start_date or "").strip() or None
+    # Distinct undated periods must not collapse.
+    if not left_start or not right_start:
+        return False
+    if not dates_compatible(
+        _date_for_compat(left_start), _date_for_compat(right_start)
+    ):
+        return False
+    # Ambiguous / shared-only original lines do not count as dual evidence.
+    if not _has_independent_employment_evidence(left, right, spans=spans):
+        return False
+    return True
+
+
+def _dedupe_employment_history(
+    rows: list[EmploymentCandidate],
+    *,
+    spans: list[_ContextSpan],
+) -> list[EmploymentCandidate]:
+    """Merge DOCX/KOSA employer duplicates; keep conflicting ends as REVIEW."""
+    merged: list[EmploymentCandidate] = []
+    for row in rows:
+        placed = False
+        for index, prev in enumerate(merged):
+            if not _employment_duplicates_mergeable(prev, row, spans=spans):
+                continue
+            merged[index] = _merge_employment_duplicate_pair(prev, row)
+            placed = True
+            break
+        if not placed:
+            merged.append(row)
+    return merged
+
+
 def _guard_employment_history(
     candidate: ProfileCandidateDocument,
     *,
@@ -443,6 +686,8 @@ def _guard_employment_history(
 
     Uses document/page/section spans (including collapsed KOSA lines). Project
     page dates never count as employer-table evidence. Ambiguous rows are kept.
+    After customer filtering, merge clear DOCX/KOSA employer duplicates when
+    company form + compatible start + employment-section evidence agree.
     """
     rows = list(candidate.employment_history or [])
     if not rows:
@@ -502,7 +747,7 @@ def _guard_employment_history(
             updated = row.model_copy(update={"end_date": review_end})
         kept.append(updated)
 
-    return kept
+    return _dedupe_employment_history(kept, spans=spans)
 
 
 def _optional_text_compatible(a: str | None, b: str | None) -> bool:
