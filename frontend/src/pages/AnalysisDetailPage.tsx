@@ -6,6 +6,7 @@ import {
   Form,
   Input,
   Modal,
+  Select,
   Space,
   Table,
   Tabs,
@@ -48,6 +49,7 @@ import {
   type AnalysisStatus,
   type ChangeType,
   type DiffItem,
+  type EntityType,
   type EvidenceLite,
   type ReviewStatus,
 } from '@/api/analyses'
@@ -60,6 +62,39 @@ type DiffFilterTab =
   | 'REVIEW'
   | 'pending'
   | 'reviewed'
+
+/** Empty string = 전체 항목 (no entity_type query param). */
+type EntityFilter = '' | EntityType
+
+const ENTITY_FILTER_OPTIONS: { value: EntityFilter; label: string }[] = [
+  { value: '', label: '전체 항목' },
+  { value: 'PROFILE', label: '기본정보' },
+  { value: 'JOB', label: '직무' },
+  { value: 'TECH', label: '보유기술' },
+  { value: 'EXP', label: '전문분야' },
+  { value: 'EMPLOYMENT', label: '재직 경력' },
+  { value: 'EDUCATION', label: '학력' },
+  { value: 'CERTIFICATION', label: '자격증' },
+  { value: 'PROJECT', label: '프로젝트' },
+]
+
+function countChangeTypes(diffs: DiffItem[]) {
+  const counts = {
+    same: 0,
+    new: 0,
+    update: 0,
+    conflict: 0,
+    review: 0,
+  }
+  for (const diff of diffs) {
+    if (diff.change_type === 'SAME') counts.same += 1
+    else if (diff.change_type === 'NEW') counts.new += 1
+    else if (diff.change_type === 'UPDATE') counts.update += 1
+    else if (diff.change_type === 'CONFLICT') counts.conflict += 1
+    else if (diff.change_type === 'REVIEW') counts.review += 1
+  }
+  return counts
+}
 
 function formatDate(value?: string | null) {
   if (!value) return '—'
@@ -151,6 +186,7 @@ export function AnalysisDetailPage() {
   const queryClient = useQueryClient()
 
   const [filterTab, setFilterTab] = useState<DiffFilterTab>('all')
+  const [entityFilter, setEntityFilter] = useState<EntityFilter>('')
   const [selectedKeys, setSelectedKeys] = useState<Key[]>([])
   const [editOpen, setEditOpen] = useState(false)
   const [mergeOpen, setMergeOpen] = useState(false)
@@ -166,7 +202,13 @@ export function AnalysisDetailPage() {
   }>()
 
   const detailKey = ['analyses', analysisId] as const
-  const diffsKey = ['analyses', analysisId, 'diffs', filterTab] as const
+  const diffsKey = [
+    'analyses',
+    analysisId,
+    'diffs',
+    filterTab,
+    entityFilter,
+  ] as const
 
   const detailQuery = useQuery({
     queryKey: detailKey,
@@ -187,24 +229,30 @@ export function AnalysisDetailPage() {
   const diffsQuery = useQuery({
     queryKey: diffsKey,
     queryFn: async () => {
+      const entityFilters = entityFilter
+        ? { entity_type: entityFilter as EntityType }
+        : {}
       if (filterTab === 'reviewed') {
-        const all = await listAnalysisDiffs(analysisId)
+        const scoped = await listAnalysisDiffs(analysisId, entityFilters)
         return {
-          data: all.data.filter((d) => d.review_status !== 'PENDING'),
+          data: scoped.data.filter((d) => d.review_status !== 'PENDING'),
         }
       }
       if (filterTab === 'pending') {
-        const all = await listAnalysisDiffs(analysisId)
+        const scoped = await listAnalysisDiffs(analysisId, entityFilters)
         return {
-          data: all.data.filter(
+          data: scoped.data.filter(
             (d) => d.review_status === 'PENDING' && d.change_type !== 'SAME',
           ),
         }
       }
       if (filterTab === 'all') {
-        return listAnalysisDiffs(analysisId)
+        return listAnalysisDiffs(analysisId, entityFilters)
       }
-      return listAnalysisDiffs(analysisId, { change_types: filterTab })
+      return listAnalysisDiffs(analysisId, {
+        ...entityFilters,
+        change_types: filterTab,
+      })
     },
     enabled: Boolean(analysisId) && showDiffs,
   })
@@ -215,6 +263,7 @@ export function AnalysisDetailPage() {
     enabled: Boolean(analysisId) && showDiffs,
   })
   const allDiffs = allDiffsQuery.data?.data ?? []
+  // Confirm / global pending alert ignore entity filter (full analysis scope).
   const pendingActionable = countPendingActionableDiffs(allDiffs)
   const reviewedCount = countReviewedDiffs(allDiffs)
   const canConfirm = canConfirmAnalysis({
@@ -224,6 +273,18 @@ export function AnalysisDetailPage() {
     pendingActionable,
     baseProfileVersion: analysis?.base_profile_version,
   })
+  const entityScopedDiffs = entityFilter
+    ? allDiffs.filter((d) => d.entity_type === entityFilter)
+    : allDiffs
+  const entityScopedChangeCounts = entityFilter
+    ? countChangeTypes(entityScopedDiffs)
+    : null
+  const entityScopedPending = entityFilter
+    ? countPendingActionableDiffs(entityScopedDiffs)
+    : pendingActionable
+  const entityScopedReviewed = entityFilter
+    ? countReviewedDiffs(entityScopedDiffs)
+    : reviewedCount
 
   const invalidateDetail = async () => {
     await queryClient.invalidateQueries({ queryKey: ['analyses', analysisId] })
@@ -618,7 +679,10 @@ export function AnalysisDetailPage() {
     return <Typography.Text>불러오는 중…</Typography.Text>
   }
 
-  const counts = analysis.counts
+  // Default entity=전체 keeps analysis.counts (identical to prior UI).
+  const counts = entityScopedChangeCounts ?? analysis.counts
+  const tabPendingCount = entityScopedPending
+  const tabReviewedCount = entityScopedReviewed
   const docLabels = analysis.documents.map((d) => {
     const type = d.document_type_name || d.document_type_code
     const ver = d.version_no != null ? ` v${d.version_no}` : ''
@@ -747,6 +811,26 @@ export function AnalysisDetailPage() {
             />
           ) : null}
 
+          <div style={{ marginBottom: 8, maxWidth: 320, width: '100%' }}>
+            <Typography.Text
+              type="secondary"
+              style={{ display: 'block', marginBottom: 4 }}
+            >
+              항목 유형
+            </Typography.Text>
+            <Select
+              aria-label="항목 유형"
+              value={entityFilter}
+              options={ENTITY_FILTER_OPTIONS}
+              onChange={(value) => {
+                setEntityFilter(value)
+                setSelectedKeys([])
+              }}
+              style={{ width: '100%' }}
+              popupMatchSelectWidth={false}
+            />
+          </div>
+
           <Tabs
             activeKey={filterTab}
             onChange={(key) => {
@@ -754,13 +838,16 @@ export function AnalysisDetailPage() {
               setSelectedKeys([])
             }}
             items={[
-              { key: 'all', label: `전체 (${counts.same + counts.new + counts.update + counts.conflict + counts.review})` },
+              {
+                key: 'all',
+                label: `전체 (${counts.same + counts.new + counts.update + counts.conflict + counts.review})`,
+              },
               { key: 'NEW', label: `신규 (${counts.new})` },
               { key: 'UPDATE', label: `변경 (${counts.update})` },
               { key: 'CONFLICT', label: `충돌 (${counts.conflict})` },
               { key: 'REVIEW', label: `확인필요 (${counts.review})` },
-              { key: 'pending', label: `미검토 (${pendingActionable})` },
-              { key: 'reviewed', label: `검토완료 (${reviewedCount})` },
+              { key: 'pending', label: `미검토 (${tabPendingCount})` },
+              { key: 'reviewed', label: `검토완료 (${tabReviewedCount})` },
             ]}
             style={{ marginBottom: 8 }}
           />
