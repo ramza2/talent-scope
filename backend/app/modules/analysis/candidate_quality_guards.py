@@ -90,6 +90,11 @@ _ONGOING_END_KEYS = frozenset({"현재", "재직중", "present"})
 _PROFILE_LIKE_DOC_TYPES = frozenset(
     {"DOC-PROFILE", "DOC-RESUME", "DOC-CAREER"}
 )
+# DOCX employer-table column headers (not company-name cells).
+_EMPLOYMENT_HEADER_CELL_RE = re.compile(
+    r"^(?:회사명|기간|직위|담당업무|근무처|직장명|소속회사|근무기관|재직회사|"
+    r"최종직급|입사\s*일|퇴사\s*일|근무경력|재직기간|경력사항)$"
+)
 # Korean corporate forms: leading/trailing on folded Hangul/token text.
 _CORP_SUFFIX_KO_RE = re.compile(
     r"(?:주식회사|유한책임회사|유한회사|\(주\)|㈜|\(유\)|\(사\))$"
@@ -590,6 +595,77 @@ def _hits_share_single_period(hits: list[_EmploymentEvidenceHit]) -> bool:
     return True
 
 
+def _is_employment_header_cell(line: str) -> bool:
+    return bool(_EMPLOYMENT_HEADER_CELL_RE.match(line.strip()))
+
+
+def _line_is_single_date_range(
+    line: str,
+) -> tuple[str | None, str | None] | None:
+    """Return (start, end) when the cell is exactly one employment date range."""
+    text = line.strip()
+    if not text:
+        return None
+    matches = list(_DATE_RANGE_RE.finditer(text))
+    if len(matches) != 1:
+        return None
+    residual = _DATE_RANGE_RE.sub("", text)
+    residual = re.sub(r"[\s./\-~\—–·•|/]+", "", residual)
+    if residual:
+        return None
+    match = matches[0]
+    return (
+        _normalize_date_token(match.group("start")),
+        _normalize_date_token(match.group("end")),
+    )
+
+
+def _line_is_company_name_only_cell(line: str) -> bool:
+    """True for a DOCX company-name cell (no dates / headers / section labels)."""
+    text = line.strip()
+    if not text or _is_employment_header_cell(text):
+        return False
+    if _DATE_TOKEN_RE.search(text) or _DATE_RANGE_RE.search(text):
+        return False
+    if _PROJECT_SECTION_RE.search(text) or _EDUCATION_SECTION_RE.search(text):
+        return False
+    if _CERT_SECTION_RE.search(text):
+        return False
+    if not re.search(r"[A-Za-z가-힣]", text):
+        return False
+    return len(text) <= 80
+
+
+def _span_matches_employment_company(
+    span_text: str, *, raw: str, stem: str | None
+) -> bool:
+    return bool(
+        _line_has_company(span_text, raw)
+        or (stem and _line_has_company(span_text, stem))
+    )
+
+
+def _employment_hit_from_quote(
+    *,
+    doc_id: str,
+    page_no: int,
+    quote_text: str,
+    start: str | None,
+    end: str | None,
+) -> _EmploymentEvidenceHit:
+    quote = quote_text.strip()
+    if len(quote) > 500:
+        quote = quote[:500]
+    return _EmploymentEvidenceHit(
+        doc_id=doc_id,
+        page_no=page_no,
+        folded_line=_fold(quote),
+        quote_text=quote,
+        start=start,
+        end=end,
+    )
+
+
 def _clear_employment_evidence_hits(
     spans: list[_ContextSpan],
     *,
@@ -599,43 +675,72 @@ def _clear_employment_evidence_hits(
 ) -> list[_EmploymentEvidenceHit] | None:
     """Period-clear original rows for this employer.
 
-    Ignores possibly wrong ``source_refs`` and matches company + period on the
-    employment-section text. Returns ``None`` when a line or the hit set is
-    ambiguous (multiple incompatible periods). Empty list means no clear row.
+    Accepts:
+    - same-line company + date range (KOSA-style), or
+    - company-name cell immediately followed by a single date-range cell on the
+      same document/page employment section (DOCX table cells).
+
+    Ignores possibly wrong ``source_refs``. Returns ``None`` when a line or the
+    hit set is ambiguous (multiple incompatible periods). Empty list means no
+    clear row. Never borrows project/education/other-company dates.
     """
     raw = (company or "").strip()
     if not raw or not (start or "").strip():
         return []
     stem = _company_match_key(raw)
+    emp_spans = [
+        span
+        for span in spans
+        if _classify_span(span.text, section=span.section) == "employment"
+    ]
     hits: list[_EmploymentEvidenceHit] = []
-    for span in spans:
-        kind = _classify_span(span.text, section=span.section)
-        if kind != "employment":
-            continue
-        if not (
-            _line_has_company(span.text, raw)
-            or (stem and _line_has_company(span.text, stem))
-        ):
+    for index, span in enumerate(emp_spans):
+        if not _span_matches_employment_company(span.text, raw=raw, stem=stem):
             continue
         ranges = _extract_range_dates(span.text)
-        matched = [
-            (span_start, span_end)
-            for span_start, span_end in ranges
-            if _employment_period_compatible(start, end, span_start, span_end)
-        ]
-        if not matched:
+        if ranges:
+            matched = [
+                (span_start, span_end)
+                for span_start, span_end in ranges
+                if _employment_period_compatible(
+                    start, end, span_start, span_end
+                )
+            ]
+            if not matched:
+                continue
+            if len(matched) > 1:
+                return None
+            span_start, span_end = matched[0]
+            hits.append(
+                _employment_hit_from_quote(
+                    doc_id=span.doc_id,
+                    page_no=span.page_no,
+                    quote_text=span.text,
+                    start=span_start,
+                    end=span_end,
+                )
+            )
             continue
-        if len(matched) > 1:
-            return None
-        span_start, span_end = matched[0]
-        quote = span.text.strip()
-        if len(quote) > 500:
-            quote = quote[:500]
+
+        # DOCX: company cell → immediate next single date-range cell only.
+        if not _line_is_company_name_only_cell(span.text):
+            continue
+        if index + 1 >= len(emp_spans):
+            continue
+        nxt = emp_spans[index + 1]
+        if nxt.doc_id != span.doc_id or nxt.page_no != span.page_no:
+            continue
+        range_pair = _line_is_single_date_range(nxt.text)
+        if range_pair is None:
+            continue
+        span_start, span_end = range_pair
+        if not _employment_period_compatible(start, end, span_start, span_end):
+            continue
+        quote = f"{span.text.strip()}\n{nxt.text.strip()}"
         hits.append(
-            _EmploymentEvidenceHit(
+            _employment_hit_from_quote(
                 doc_id=span.doc_id,
                 page_no=span.page_no,
-                folded_line=_fold(span.text),
                 quote_text=quote,
                 start=span_start,
                 end=span_end,
