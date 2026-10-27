@@ -21,6 +21,8 @@ from app.modules.analysis.schemas import (
     DiffDecisionRequest,
     DiffDecisionResponse,
     DiffListResponse,
+    GuardRefreshApplyResponse,
+    GuardRefreshPreviewResponse,
     RetryAnalysisResponse,
 )
 from app.modules.analysis.service import AnalysisService
@@ -130,6 +132,37 @@ def bulk_review(
 ) -> BulkDiffResponse:
     return BulkDiffResponse(
         data=service.bulk_review(analysis_id, payload, ctx.user.id)
+    )
+
+
+@router.get(
+    "/{analysis_id}/guard-refresh/preview",
+    response_model=GuardRefreshPreviewResponse,
+)
+def preview_guard_refresh(
+    analysis_id: UUID,
+    _admin: AuthenticatedContext = Depends(require_admin),
+    service: AnalysisService = Depends(get_analysis_service),
+) -> GuardRefreshPreviewResponse:
+    return GuardRefreshPreviewResponse(
+        data=service.preview_guard_refresh(analysis_id)
+    )
+
+
+@router.post(
+    "/{analysis_id}/guard-refresh/apply",
+    response_model=GuardRefreshApplyResponse,
+)
+def apply_guard_refresh(
+    analysis_id: UUID,
+    _admin: AuthenticatedContext = Depends(require_admin),
+    ctx: AuthenticatedContext = Depends(require_csrf),
+    service: AnalysisService = Depends(get_analysis_service),
+) -> GuardRefreshApplyResponse:
+    return GuardRefreshApplyResponse(
+        data=service.apply_guard_refresh(
+            analysis_id, actor_user_id=ctx.user.id
+        )
     )
 
 

@@ -115,6 +115,8 @@ from app.modules.analysis.schemas import (
     DiffItemResponse,
     DocumentBrief,
     EvidenceLite,
+    GuardRefreshEntityCounts,
+    GuardRefreshResultData,
     PageMeta,
     PersonBrief,
 )
@@ -3503,6 +3505,52 @@ class AnalysisService:
         )
         self.db.commit()
         return CreateAnalysisResponseData(analysis_id=run.id, status="CANCELLED")
+
+    def _guard_refresh_result_data(self, result: object) -> GuardRefreshResultData:
+        from app.modules.analysis.guard_refresh import GuardRefreshResult
+
+        if not isinstance(result, GuardRefreshResult):
+            raise TypeError("expected GuardRefreshResult")
+        message = None
+        if result.ui_refresh_required:
+            message = (
+                "Diff ID가 교체되었습니다. 검토 화면을 새로고침한 뒤 "
+                "다시 열어 주세요."
+            )
+        elif not result.changed:
+            message = "Guard 적용 결과가 기존 후보와 동일합니다."
+        return GuardRefreshResultData(
+            analysis_id=result.analysis_id,
+            status=result.status,  # type: ignore[arg-type]
+            changed=result.changed,
+            applied=result.applied,
+            ui_refresh_required=result.ui_refresh_required,
+            before=GuardRefreshEntityCounts(**result.before_counts.as_dict()),
+            after=GuardRefreshEntityCounts(**result.after_counts.as_dict()),
+            diff_count_before=result.diff_count_before,
+            diff_count_after=result.diff_count_after,
+            pending_diff_count_before=result.pending_diff_count_before,
+            pending_diff_count_after=result.pending_diff_count_after,
+            message=message,
+        )
+
+    def preview_guard_refresh(self, analysis_id: UUID) -> GuardRefreshResultData:
+        from app.modules.analysis.guard_refresh import preview_guard_refresh
+
+        return self._guard_refresh_result_data(
+            preview_guard_refresh(self.db, analysis_id)
+        )
+
+    def apply_guard_refresh(
+        self, analysis_id: UUID, *, actor_user_id: UUID
+    ) -> GuardRefreshResultData:
+        from app.modules.analysis.guard_refresh import apply_guard_refresh
+
+        return self._guard_refresh_result_data(
+            apply_guard_refresh(
+                self.db, analysis_id, actor_user_id=actor_user_id
+            )
+        )
 
     def confirm_analysis(
         self,

@@ -200,3 +200,33 @@ class ConfirmAnalysisResponseData(BaseModel):
 
 class ConfirmAnalysisResponse(BaseModel):
     data: ConfirmAnalysisResponseData
+
+
+class GuardRefreshEntityCounts(BaseModel):
+    education: int = 0
+    certifications: int = 0
+    employment: int = 0
+    projects: int = 0
+
+
+class GuardRefreshResultData(BaseModel):
+    analysis_id: UUID
+    status: AnalysisStatus
+    changed: bool
+    applied: bool = False
+    ui_refresh_required: bool = False
+    before: GuardRefreshEntityCounts
+    after: GuardRefreshEntityCounts
+    diff_count_before: int = 0
+    diff_count_after: int = 0
+    pending_diff_count_before: int = 0
+    pending_diff_count_after: int = 0
+    message: str | None = None
+
+
+class GuardRefreshPreviewResponse(BaseModel):
+    data: GuardRefreshResultData
+
+
+class GuardRefreshApplyResponse(BaseModel):
+    data: GuardRefreshResultData
