@@ -762,3 +762,111 @@ def test_guard_refresh_apply_rolls_back_on_persist_failure(
     assert ok.json()["data"]["applied"] is True
 
     _cleanup(db_session, person.id, admin.id)
+
+
+def test_guard_refresh_apply_lock_order_matches_confirm(
+    db_session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AnalysisRun must be locked before Person/Profile (confirm-compatible)."""
+    admin = _create_user(
+        db_session, login_id=f"grl_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    person, run, _docs = _seed_reviewing_guard_case(db_session, admin.id)
+
+    from app.modules.analysis import repository as repo_mod
+    from app.modules.analysis.guard_refresh import apply_guard_refresh
+
+    order: list[str] = []
+    original_get_run = repo_mod.AnalysisRepository.get_run
+    original_get_person = repo_mod.AnalysisRepository.get_person
+    original_get_profile = repo_mod.AnalysisRepository.get_profile
+
+    def _get_run(self, run_id, *, for_update: bool = False):  # noqa: ANN001
+        if for_update:
+            order.append("AnalysisRun")
+        return original_get_run(self, run_id, for_update=for_update)
+
+    def _get_person(self, person_id, *, for_update: bool = False):  # noqa: ANN001
+        if for_update:
+            order.append("Person")
+        return original_get_person(self, person_id, for_update=for_update)
+
+    def _get_profile(self, person_id, *, for_update: bool = False):  # noqa: ANN001
+        if for_update:
+            order.append("PersonProfile")
+        return original_get_profile(self, person_id, for_update=for_update)
+
+    monkeypatch.setattr(repo_mod.AnalysisRepository, "get_run", _get_run)
+    monkeypatch.setattr(repo_mod.AnalysisRepository, "get_person", _get_person)
+    monkeypatch.setattr(repo_mod.AnalysisRepository, "get_profile", _get_profile)
+
+    result = apply_guard_refresh(db_session, run.id, actor_user_id=admin.id)
+    assert result.applied is True
+    assert order[:3] == ["AnalysisRun", "Person", "PersonProfile"]
+    # No Person/Profile FOR UPDATE before the first AnalysisRun lock.
+    assert order.index("AnalysisRun") < order.index("Person")
+    assert order.index("Person") < order.index("PersonProfile")
+
+    _cleanup(db_session, person.id, admin.id)
+
+
+def test_guard_refresh_revalidates_eligibility_after_locks(
+    db_session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Status/diff eligibility is checked only after locks are acquired."""
+    admin = _create_user(
+        db_session, login_id=f"grv_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    person, run, _docs = _seed_reviewing_guard_case(db_session, admin.id)
+
+    from app.core.exceptions import AnalysisStateConflictError
+    from app.db.models.analysis import AnalysisDiffItem
+    from app.modules.analysis import repository as repo_mod
+    from app.modules.analysis.guard_refresh import apply_guard_refresh
+
+    order: list[str] = []
+    original_get_run = repo_mod.AnalysisRepository.get_run
+
+    def _get_run(self, run_id, *, for_update: bool = False):  # noqa: ANN001
+        row = original_get_run(self, run_id, for_update=for_update)
+        if for_update and row is not None:
+            order.append("locked_run")
+            # Simulate concurrent review decision after the run lock is held.
+            diff = self.db.execute(
+                select(AnalysisDiffItem).where(
+                    AnalysisDiffItem.analysis_run_id == row.id
+                )
+            ).scalars().first()
+            if diff is not None and diff.review_status == "PENDING":
+                diff.review_status = "ACCEPTED"
+                self.db.add(diff)
+                self.db.flush()
+                order.append("mutated_diff")
+        return row
+
+    monkeypatch.setattr(repo_mod.AnalysisRepository, "get_run", _get_run)
+
+    with pytest.raises(AnalysisStateConflictError):
+        apply_guard_refresh(db_session, run.id, actor_user_id=admin.id)
+
+    assert order[:2] == ["locked_run", "mutated_diff"]
+    # Candidate / decided diffs must remain untouched after rollback.
+    db_session.expire_all()
+    from app.db.models.analysis import AnalysisRun
+
+    stored = db_session.execute(
+        select(AnalysisRun).where(AnalysisRun.id == run.id)
+    ).scalar_one()
+    assert len(stored.candidate_json.get("employment_history") or []) == 7
+    statuses = list(
+        db_session.execute(
+            select(AnalysisDiffItem.review_status).where(
+                AnalysisDiffItem.analysis_run_id == run.id
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert statuses and all(status == "PENDING" for status in statuses)
+
+    _cleanup(db_session, person.id, admin.id)

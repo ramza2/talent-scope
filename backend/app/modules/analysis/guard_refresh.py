@@ -262,44 +262,52 @@ def apply_guard_refresh(
     *,
     actor_user_id: UUID,
 ) -> GuardRefreshResult:
-    """Apply guard refresh under row locks in a single transaction."""
+    """Apply guard refresh under row locks in a single transaction.
+
+    Lock order matches ``confirm_analysis_run`` / review paths:
+    ``AnalysisRun → Person → Profile`` (never Person/Profile before the run).
+    Eligibility is re-checked only after all three locks are held.
+    """
     repo = AnalysisRepository(db)
 
-    peek = repo.get_run(analysis_id)
-    if peek is None:
-        raise NotFoundError("분석을 찾을 수 없습니다.")
-
-    # Lock order: person → profile → analysis_run (align with confirm/review).
-    person = repo.get_person(peek.person_id, for_update=True)
-    if person is None or person.deleted_at is not None or person.status == "DELETED":
-        raise NotFoundError("인력을 찾을 수 없습니다.")
-
-    profile = repo.get_profile(peek.person_id, for_update=True)
-    run = repo.get_run(analysis_id, for_update=True)
-    if run is None:
-        raise NotFoundError("분석을 찾을 수 없습니다.")
-
-    snapshot = assert_guard_refresh_eligible(repo, run, profile)
-    computation = compute_guard_refresh(repo, run, base_snapshot=snapshot)
-
-    if not computation.changed:
-        # No candidate change — leave diffs untouched.
-        db.commit()
-        return GuardRefreshResult(
-            analysis_id=run.id,
-            status=run.status,
-            changed=False,
-            applied=False,
-            ui_refresh_required=False,
-            before_counts=computation.before_counts,
-            after_counts=computation.after_counts,
-            diff_count_before=computation.diff_count_before,
-            diff_count_after=computation.diff_count_before,
-            pending_diff_count_before=computation.pending_diff_count_before,
-            pending_diff_count_after=computation.pending_diff_count_before,
-        )
-
     try:
+        # A. AnalysisRun first — serialize with concurrent review/confirm.
+        run = repo.get_run(analysis_id, for_update=True)
+        if run is None:
+            raise NotFoundError("분석을 찾을 수 없습니다.")
+
+        # B. Person / Profile after the run lock (same relative order as confirm).
+        person = repo.get_person(run.person_id, for_update=True)
+        if (
+            person is None
+            or person.deleted_at is not None
+            or person.status == "DELETED"
+        ):
+            raise NotFoundError("인력을 찾을 수 없습니다.")
+
+        profile = repo.get_profile(run.person_id, for_update=True)
+
+        # C. Re-validate eligibility under the held locks.
+        snapshot = assert_guard_refresh_eligible(repo, run, profile)
+        computation = compute_guard_refresh(repo, run, base_snapshot=snapshot)
+
+        if not computation.changed:
+            # No candidate change — leave diffs untouched.
+            db.commit()
+            return GuardRefreshResult(
+                analysis_id=run.id,
+                status=run.status,
+                changed=False,
+                applied=False,
+                ui_refresh_required=False,
+                before_counts=computation.before_counts,
+                after_counts=computation.after_counts,
+                diff_count_before=computation.diff_count_before,
+                diff_count_after=computation.diff_count_before,
+                pending_diff_count_before=computation.pending_diff_count_before,
+                pending_diff_count_after=computation.pending_diff_count_before,
+            )
+
         repo.replace_diffs(
             run.id, [spec.to_persist_dict() for spec in computation.specs]
         )
