@@ -1632,20 +1632,36 @@ _ROOT_RELATION_EXTRA_EXP_CODES = frozenset({"EXP-DATA", "EXP-DATA-DB-TUNING"})
 _DBA_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9])DBA(?![A-Za-z0-9])", re.IGNORECASE)
 _DBA_KO_ROLE_RE = re.compile(r"데이터베이스\s*관리자|(?<![A-Za-z0-9])DB\s*관리자")
 
-# Catalog: JOB-DATA-DA / name "DA". Require DA token + data duty context, or
-# explicit KO data-role phrases. Rejects bare "데이터"/"DB"/tech names alone.
+# Catalog: JOB-DATA-DA = DA / Data Architect (docs/04_code_taxonomy.md).
+# Analyst phrases (데이터 분석가) are NOT DA evidence.
 _DA_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9])DA(?![A-Za-z0-9])", re.IGNORECASE)
-_DA_KO_ROLE_RE = re.compile(
-    r"데이터\s*분석가|데이터\s*아키텍트|데이터\s*아키텍처\s*담당"
+_DA_ARCHITECT_ROLE_RE = re.compile(
+    r"데이터\s*아키텍트|(?<![A-Za-z0-9])Data\s*Architect(?![A-Za-z0-9])|"
+    r"데이터\s*아키텍처\s*(?:담당|설계|역할)",
+    re.IGNORECASE,
 )
-_DA_DUTY_CONTEXT_RE = re.compile(
-    r"데이터\s*분석|데이터\s*모델|데이터\s*설계|데이터베이스|"
-    r"데이터\s*아키텍|DB\s*설계|DB\s*모델링"
+# DA token may combine only with architecture / design / modeling duty context.
+_DA_ARCH_DUTY_CONTEXT_RE = re.compile(
+    r"데이터\s*모델(?:링)?|데이터\s*설계|데이터베이스\s*설계|"
+    r"DB\s*설계|DB\s*모델링|데이터\s*아키텍"
 )
 
-# Catalog: JOB-DEV-GEN / name "개발자". Role token only — not bare "개발".
+# Catalog: JOB-DEV-GEN = 개발자 / Software Engineer / Programmer.
+# Specialist catalog titles (AI/BE/FE/…) must not lift GEN.
 _DEV_GEN_ROLE_RE = re.compile(
-    r"개발자|(?<![A-Za-z0-9])Developer(?![A-Za-z0-9])",
+    r"(?<![가-힣A-Za-z0-9])개발자(?![가-힣A-Za-z0-9])|"
+    r"(?<![A-Za-z0-9])(?:Software\s+Engineer|Programmer|Developer)(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
+_DEV_SPECIALIST_BLOCK_RE = re.compile(
+    r"(?:AI|인공지능)\s*개발자|"
+    r"(?:백엔드|프론트엔드|풀스택|모바일|인터페이스|서버)\s*개발자|"
+    r"(?:Android|iOS|App)\s*개발자|"
+    r"생성형\s*AI|"
+    r"(?<![A-Za-z0-9])(?:Backend|Frontend|Full[\s-]*Stack)\s+Developer"
+    r"(?![A-Za-z0-9])|"
+    r"(?<![A-Za-z0-9])AI\s+(?:Developer|Engineer)(?![A-Za-z0-9])|"
+    r"(?<![A-Za-z0-9])(?:ML|LLM|Machine\s+Learning)\s+Engineer(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
 
@@ -1674,12 +1690,17 @@ def _quote_supports_root_relation_extra_job(code: str, quote: str) -> bool:
         # Oracle/SQL/DB usage alone is insufficient.
         return bool(_DBA_TOKEN_RE.search(text) or _DBA_KO_ROLE_RE.search(text))
     if code == "JOB-DATA-DA":
-        if _DA_KO_ROLE_RE.search(text):
+        # Data Architect only — not data analyst / vague "DA 데이터 분석".
+        if _DA_ARCHITECT_ROLE_RE.search(text):
             return True
-        # DA token needs data-duty context (blocks DATA/DAY substring and bare DA).
-        return bool(_DA_TOKEN_RE.search(text) and _DA_DUTY_CONTEXT_RE.search(text))
+        return bool(
+            _DA_TOKEN_RE.search(text) and _DA_ARCH_DUTY_CONTEXT_RE.search(text)
+        )
     if code == "JOB-DEV-GEN":
-        # Project participation / bare "개발" is insufficient.
+        # Bare "개발" / project participation insufficient; specialist titles
+        # belong to JOB-AI-* / JOB-DEV-BE|FE|… and must not lift GEN.
+        if _DEV_SPECIALIST_BLOCK_RE.search(text):
+            return False
         return bool(_DEV_GEN_ROLE_RE.search(text))
     return False
 

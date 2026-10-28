@@ -590,7 +590,7 @@ def test_entity_counts_and_project_count_stable() -> None:
 def test_data_dev_codes_positive_evidence_supplements() -> None:
     page = _row(
         "데이터사업",
-        duty="DBA / DA 데이터 분석, DB 튜닝, 데이터 모델링, 응용 개발자",
+        duty="DBA / Data Architect, DB 튜닝, 데이터 모델링, 응용 개발자",
     )
     doc = _doc(
         jobs=[
@@ -609,7 +609,7 @@ def test_data_dev_codes_positive_evidence_supplements() -> None:
                     {"code": "JOB-DATA-DBA", "source_refs": [_ref("DBA")]},
                     {
                         "code": "JOB-DATA-DA",
-                        "source_refs": [_ref("DA 데이터 분석")],
+                        "source_refs": [_ref("Data Architect")],
                     },
                     {"code": "JOB-DEV-GEN", "source_refs": [_ref("응용 개발자")]},
                 ],
@@ -639,6 +639,7 @@ def test_data_dev_codes_positive_evidence_supplements() -> None:
     assert out.jobs[0].source_refs[0].quote_text == "DBA"
     assert out.jobs[0].raw_value == "DBA"
     assert out.jobs[1].job_type == "SECONDARY"
+    assert out.jobs[1].source_refs[0].quote_text == "Data Architect"
     assert out.expertise[0].confidence == 0.8
     assert len(out.projects) == 1
 
@@ -848,7 +849,7 @@ def test_data_dev_other_project_and_page_blocked() -> None:
 
 
 def test_data_dev_metadata_and_existing_refs_preserved() -> None:
-    page = _row("사업A", duty="DBA 및 데이터 분석가")
+    page = _row("사업A", duty="DBA 및 데이터 모델링")
     # metadata-only safe fill
     doc = _doc(
         jobs=[
@@ -899,3 +900,119 @@ def test_data_dev_metadata_and_existing_refs_preserved() -> None:
     assert report2["supplemented_expertise"] == []
     assert out2.expertise[0].raw_value == "기존"
     assert out2.expertise[0].source_refs[0].quote_text == "데이터 분석"
+
+
+def test_data_analyst_is_not_job_data_da() -> None:
+    """taxonomy: JOB-DATA-DA = Data Architect — not 데이터 분석가."""
+    page = _row("사업A", duty="데이터 분석가 / DA 데이터 분석")
+    doc = _doc(
+        jobs=[{"code": "JOB-DATA-DA"}],
+        projects=[
+            {
+                "project_name": "사업A",
+                "jobs": [
+                    {
+                        "code": "JOB-DATA-DA",
+                        "source_refs": [_ref("데이터 분석가")],
+                    }
+                ],
+            }
+        ],
+    )
+    out, report = _run(doc, page_texts={(_DOC, 1): page})
+    assert out.jobs[0].source_refs == []
+    assert report["unresolved_jobs"] == ["JOB-DATA-DA"]
+
+    doc2 = _doc(
+        jobs=[{"code": "JOB-DATA-DA"}],
+        projects=[
+            {
+                "project_name": "사업A",
+                "jobs": [
+                    {
+                        "code": "JOB-DATA-DA",
+                        "source_refs": [_ref("DA 데이터 분석")],
+                    }
+                ],
+            }
+        ],
+    )
+    out2, report2 = _run(doc2, page_texts={(_DOC, 1): page})
+    assert out2.jobs[0].source_refs == []
+    assert report2["unresolved_jobs"] == ["JOB-DATA-DA"]
+
+
+def test_data_architect_and_da_modeling_design_allowed() -> None:
+    page = _row(
+        "사업A",
+        duty="Data Architect / 데이터 아키텍트 / DA 데이터 모델링 / DA 데이터 설계",
+    )
+    for quote in (
+        "Data Architect",
+        "데이터 아키텍트",
+        "DA 데이터 모델링",
+        "DA 데이터 설계",
+    ):
+        doc = _doc(
+            jobs=[{"code": "JOB-DATA-DA", "raw_value": "JOB-DATA-DA"}],
+            projects=[
+                {
+                    "project_name": "사업A",
+                    "jobs": [
+                        {"code": "JOB-DATA-DA", "source_refs": [_ref(quote)]}
+                    ],
+                }
+            ],
+        )
+        out, report = _run(doc, page_texts={(_DOC, 1): page})
+        assert report["supplemented_jobs"] == ["JOB-DATA-DA"], quote
+        assert out.jobs[0].source_refs[0].quote_text == quote
+
+
+def test_dev_gen_rejects_specialist_catalog_titles() -> None:
+    """AI/Backend 등 전문 직무 코드 문구는 JOB-DEV-GEN으로 올리지 않음."""
+    cases = (
+        ("AI개발자", "AI개발자 수행"),
+        ("Backend Developer", "Backend Developer"),
+        ("백엔드 개발자", "백엔드 개발자"),
+        ("AI Developer", "AI Developer"),
+    )
+    for quote, duty in cases:
+        page = _row("사업A", duty=duty)
+        doc = _doc(
+            jobs=[{"code": "JOB-DEV-GEN"}],
+            projects=[
+                {
+                    "project_name": "사업A",
+                    "jobs": [
+                        {
+                            "code": "JOB-DEV-GEN",
+                            "source_refs": [_ref(quote)],
+                        }
+                    ],
+                }
+            ],
+        )
+        out, report = _run(doc, page_texts={(_DOC, 1): page})
+        assert out.jobs[0].source_refs == [], quote
+        assert report["unresolved_jobs"] == ["JOB-DEV-GEN"], quote
+
+    # Generic Software Engineer / 개발자 still allowed.
+    page = _row("사업A", duty="Software Engineer / 개발자")
+    for quote in ("Software Engineer", "개발자"):
+        doc = _doc(
+            jobs=[{"code": "JOB-DEV-GEN"}],
+            projects=[
+                {
+                    "project_name": "사업A",
+                    "jobs": [
+                        {
+                            "code": "JOB-DEV-GEN",
+                            "source_refs": [_ref(quote)],
+                        }
+                    ],
+                }
+            ],
+        )
+        out, report = _run(doc, page_texts={(_DOC, 1): page})
+        assert report["supplemented_jobs"] == ["JOB-DEV-GEN"], quote
