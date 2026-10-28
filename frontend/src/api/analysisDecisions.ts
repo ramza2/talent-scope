@@ -97,6 +97,17 @@ export function buildDefaultModifiedDecision(diff: DecisionDiffLike): string {
   }
 }
 
+/**
+ * Sanitize a candidate object for Confirm MODIFIED defaults.
+ * Same strip rules as {@link buildDefaultModifiedDecision}.
+ */
+export function sanitizeModifiedDecisionObject(
+  value: unknown,
+  entityType: string,
+): unknown {
+  return sanitizeModifiedDefaultValue(value, { entityType })
+}
+
 /** Merge Modal starts with empty override; candidate is shown read-only separately. */
 export function initialMergeDecidedValueText(): string {
   return ''

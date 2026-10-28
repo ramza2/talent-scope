@@ -26,7 +26,17 @@ import {
   formatDiffValueSummary,
   formatValue,
 } from '@/api/diffValueDisplay'
+import {
+  EMPLOYMENT_END_DATE_CUSTOM_VALUE,
+  buildEmploymentEndDateModifiedDecision,
+  employmentEndDateSelectionError,
+  extractEmploymentEndDateConflictCandidates,
+  isEmploymentEndDateConflictReview,
+  resolveEmploymentEndDateSelection,
+  validateChosenEmploymentEndDate,
+} from '@/api/employmentEndDateConflict'
 import { DiffEvidenceGroups } from '@/pages/analysisDiffEvidence'
+import { EmploymentEndDateConflictForm } from '@/pages/EmploymentEndDateConflictForm'
 import { readAnalysesReturnTo } from '@/pages/analysesListState'
 import {
   bulkReviewDiffs,
@@ -193,6 +203,8 @@ export function AnalysisDetailPage() {
   const [mergeOpen, setMergeOpen] = useState(false)
   const [confirmOpen, setConfirmOpen] = useState(false)
   const [editingDiff, setEditingDiff] = useState<DiffItem | null>(null)
+  const [endDateChoice, setEndDateChoice] = useState<string | null>(null)
+  const [endDateCustom, setEndDateCustom] = useState('')
   const [evidenceOpen, setEvidenceOpen] = useState(false)
   const [evidenceDetail, setEvidenceDetail] = useState<EvidenceDetail | null>(null)
   const [evidenceLoading, setEvidenceLoading] = useState(false)
@@ -310,6 +322,8 @@ export function AnalysisDetailPage() {
       setEditOpen(false)
       setMergeOpen(false)
       setEditingDiff(null)
+      setEndDateChoice(null)
+      setEndDateCustom('')
       await invalidateDetail()
     },
     onError: (error) => {
@@ -388,8 +402,47 @@ export function AnalysisDetailPage() {
     })
   }
 
+  const closeModify = () => {
+    setEditOpen(false)
+    setEditingDiff(null)
+    setEndDateChoice(null)
+    setEndDateCustom('')
+  }
+
   const openModify = (diff: DiffItem) => {
     setEditingDiff(diff)
+    if (isEmploymentEndDateConflictReview(diff)) {
+      const candidates = extractEmploymentEndDateConflictCandidates(
+        (diff.new_value as Record<string, unknown>).end_date,
+      )
+      let initialChoice: string | null = null
+      let initialCustom = ''
+      if (
+        diff.review_status === 'MODIFIED' &&
+        diff.decided_value &&
+        typeof diff.decided_value === 'object' &&
+        !Array.isArray(diff.decided_value)
+      ) {
+        const decidedEnd = (diff.decided_value as Record<string, unknown>)
+          .end_date
+        if (typeof decidedEnd === 'string' && decidedEnd.trim()) {
+          const trimmed = decidedEnd.trim()
+          if (candidates?.includes(trimmed)) {
+            initialChoice = trimmed
+          } else {
+            initialChoice = EMPLOYMENT_END_DATE_CUSTOM_VALUE
+            initialCustom = trimmed
+          }
+        }
+      }
+      setEndDateChoice(initialChoice)
+      setEndDateCustom(initialCustom)
+      editForm.resetFields()
+      setEditOpen(true)
+      return
+    }
+    setEndDateChoice(null)
+    setEndDateCustom('')
     const seed =
       diff.review_status === 'MODIFIED' && diff.decided_value != null
         ? isProfileScalarDiff(diff) &&
@@ -411,8 +464,51 @@ export function AnalysisDetailPage() {
     setMergeOpen(true)
   }
 
+  const submitEmploymentEndDateConflict = async () => {
+    if (!editingDiff || !isEmploymentEndDateConflictReview(editingDiff)) return
+    const startDate =
+      editingDiff.new_value &&
+      typeof editingDiff.new_value === 'object' &&
+      !Array.isArray(editingDiff.new_value)
+        ? (editingDiff.new_value as Record<string, unknown>).start_date
+        : undefined
+    const err = employmentEndDateSelectionError({
+      selected: endDateChoice,
+      customDate: endDateCustom,
+      startDate,
+    })
+    if (err) {
+      message.error(err)
+      return
+    }
+    const chosen = resolveEmploymentEndDateSelection({
+      selected: endDateChoice,
+      customDate: endDateCustom,
+    })
+    const validated = validateChosenEmploymentEndDate({
+      endDate: chosen,
+      startDate,
+    })
+    if (!validated.ok) {
+      message.error(validated.message)
+      return
+    }
+    const decided = buildEmploymentEndDateModifiedDecision(
+      editingDiff,
+      validated.value,
+    )
+    await decisionMutation.mutateAsync({
+      diffId: editingDiff.id,
+      body: { review_status: 'MODIFIED', decided_value: decided },
+    })
+  }
+
   const submitModify = async (values: { decided_value: string }) => {
     if (!editingDiff) return
+    if (isEmploymentEndDateConflictReview(editingDiff)) {
+      await submitEmploymentEndDateConflict()
+      return
+    }
     let decided: unknown = values.decided_value
     if (!isProfileScalarDiff(editingDiff)) {
       try {
@@ -600,9 +696,12 @@ export function AnalysisDetailPage() {
         }
 
         const needsCodeMapping = diffRequiresCodeMapping(row)
+        const needsEndDateConfirm = isEmploymentEndDateConflictReview(row)
         return (
           <Space size="small" wrap>
-            {!needsCodeMapping ? (
+            {needsEndDateConfirm ? (
+              <Typography.Text type="warning">날짜 확인 필요</Typography.Text>
+            ) : !needsCodeMapping ? (
               <Button
                 type="link"
                 size="small"
@@ -634,7 +733,11 @@ export function AnalysisDetailPage() {
               반려
             </Button>
             <Button type="link" size="small" onClick={() => openModify(row)}>
-              {needsCodeMapping ? '코드 지정/수정' : '수정'}
+              {needsEndDateConfirm
+                ? '날짜 확인/수정'
+                : needsCodeMapping
+                  ? '코드 지정/수정'
+                  : '수정'}
             </Button>
             {isProjectRootReview(row) ? (
               <Button type="link" size="small" onClick={() => openMerge(row)}>
@@ -881,35 +984,88 @@ export function AnalysisDetailPage() {
       )}
 
       <Modal
-        title="Diff 수정"
+        title={
+          editingDiff && isEmploymentEndDateConflictReview(editingDiff)
+            ? '종료일 확인/수정'
+            : 'Diff 수정'
+        }
         open={editOpen}
-        onCancel={() => {
-          setEditOpen(false)
-          setEditingDiff(null)
+        onCancel={closeModify}
+        onOk={() => {
+          if (editingDiff && isEmploymentEndDateConflictReview(editingDiff)) {
+            void submitEmploymentEndDateConflict()
+            return
+          }
+          editForm.submit()
         }}
-        onOk={() => editForm.submit()}
         confirmLoading={decisionMutation.isPending}
         destroyOnHidden
         okText="저장"
+        okButtonProps={{
+          disabled:
+            Boolean(editingDiff) &&
+            isEmploymentEndDateConflictReview(editingDiff!) &&
+            employmentEndDateSelectionError({
+              selected: endDateChoice,
+              customDate: endDateCustom,
+              startDate:
+                editingDiff?.new_value &&
+                typeof editingDiff.new_value === 'object' &&
+                !Array.isArray(editingDiff.new_value)
+                  ? (editingDiff.new_value as Record<string, unknown>).start_date
+                  : undefined,
+            }) != null,
+        }}
       >
         <Typography.Paragraph type="secondary">
           {editingDiff
             ? `${editingDiff.entity_type} · ${editingDiff.field_name || editingDiff.candidate_path || ''}`
             : null}
         </Typography.Paragraph>
-        <Form form={editForm} layout="vertical" onFinish={submitModify}>
-          <Form.Item
-            name="decided_value"
-            label="decided_value"
-            rules={[{ required: true, message: '값을 입력하세요.' }]}
-          >
-            {editingDiff && isProfileScalarDiff(editingDiff) ? (
-              <Input />
-            ) : (
-              <Input.TextArea rows={8} style={{ fontFamily: 'monospace' }} />
-            )}
-          </Form.Item>
-        </Form>
+        {editingDiff && isEmploymentEndDateConflictReview(editingDiff) ? (
+          <EmploymentEndDateConflictForm
+            candidates={
+              extractEmploymentEndDateConflictCandidates(
+                (editingDiff.new_value as Record<string, unknown>).end_date,
+              ) ?? []
+            }
+            startDate={
+              typeof (editingDiff.new_value as Record<string, unknown>)
+                .start_date === 'string'
+                ? String(
+                    (editingDiff.new_value as Record<string, unknown>).start_date,
+                  )
+                : null
+            }
+            companyName={
+              typeof (editingDiff.new_value as Record<string, unknown>)
+                .company_name === 'string'
+                ? String(
+                    (editingDiff.new_value as Record<string, unknown>)
+                      .company_name,
+                  )
+                : null
+            }
+            selected={endDateChoice}
+            customDate={endDateCustom}
+            onSelect={setEndDateChoice}
+            onCustomDateChange={setEndDateCustom}
+          />
+        ) : (
+          <Form form={editForm} layout="vertical" onFinish={submitModify}>
+            <Form.Item
+              name="decided_value"
+              label="decided_value"
+              rules={[{ required: true, message: '값을 입력하세요.' }]}
+            >
+              {editingDiff && isProfileScalarDiff(editingDiff) ? (
+                <Input />
+              ) : (
+                <Input.TextArea rows={8} style={{ fontFamily: 'monospace' }} />
+              )}
+            </Form.Item>
+          </Form>
+        )}
       </Modal>
 
       <Modal
