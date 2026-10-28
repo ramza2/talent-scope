@@ -1597,6 +1597,222 @@ def drop_root_jobs_without_semantic_evidence(
     return candidate.model_copy(update={"jobs": kept})
 
 
+def _source_ref_verified_on_allowed_page(
+    ref: SourceRef,
+    *,
+    page_texts: dict[tuple[str, int], str],
+    allowed_documents: dict[str, set[int]],
+) -> bool:
+    """True when quote_text is a real substring of an allowed document page."""
+    doc_id = (ref.document_id or "").strip()
+    quote = ref.quote_text if isinstance(ref.quote_text, str) else ""
+    quote = quote.strip()
+    if not doc_id or not quote:
+        return False
+    if doc_id not in allowed_documents:
+        return False
+    page_no = ref.page_no
+    if page_no is None:
+        return False
+    pages = allowed_documents[doc_id]
+    if pages and page_no not in pages:
+        return False
+    page_text = page_texts.get((doc_id, page_no)) or ""
+    return quote in page_text
+
+
+def _quote_supports_root_exp_from_project(code: str, quote: str) -> bool | None:
+    """CORE/PROJECT EXP semantic support. None = no rule for this code."""
+    has_core = code in _EXP_SEMANTIC_PATTERNS
+    has_project = code in _PROJECT_EXP_SEMANTIC_PATTERNS
+    if not has_core and not has_project:
+        return None
+    if has_core and _quote_supports_semantic_exp(code, quote):
+        return True
+    if has_project and _quote_supports_semantic_project_exp(code, quote):
+        return True
+    return False
+
+
+def _quote_supports_root_job_from_project(code: str, quote: str) -> bool | None:
+    """Root-applicable JOB semantic/literal support. None = no root rule."""
+    if code in _CORE_JOB_ROOT_FORBIDDEN_CODES:
+        return None
+    if code not in _CORE_JOB_EVIDENCE_REQUIRED_CODES:
+        return None
+    return _quote_supports_semantic_core_job(code, quote)
+
+
+def _iter_project_relation_refs_for_code(
+    candidate: ProfileCandidateDocument,
+    *,
+    code: str,
+    relation: str,
+) -> list[SourceRef]:
+    """Collect source_refs from project relations with the exact same code.
+
+    Order is deterministic (project order, then relation order, then refs).
+    Does not cross-combine quotes from different projects into one ref.
+    """
+    out: list[SourceRef] = []
+    for project in candidate.projects or []:
+        rels = project.jobs if relation == "jobs" else project.expertise
+        for rel in rels or []:
+            if (rel.code or "").strip() != code:
+                continue
+            for ref in rel.source_refs or []:
+                out.append(ref)
+    return out
+
+
+def _pick_supporting_project_relation_ref(
+    candidate: ProfileCandidateDocument,
+    *,
+    code: str,
+    relation: str,
+    page_texts: dict[tuple[str, int], str],
+    allowed_documents: dict[str, set[int]],
+    quote_supports,
+) -> SourceRef | None:
+    """First single project-relation ref that verifies on page and supports code."""
+    for ref in _iter_project_relation_refs_for_code(
+        candidate, code=code, relation=relation
+    ):
+        if not _source_ref_verified_on_allowed_page(
+            ref, page_texts=page_texts, allowed_documents=allowed_documents
+        ):
+            continue
+        supported = quote_supports(code, ref.quote_text or "")
+        if supported is None or supported is False:
+            continue
+        return SourceRef(
+            document_id=ref.document_id,
+            page_no=ref.page_no,
+            quote_text=ref.quote_text,
+        )
+    return None
+
+
+def _raw_value_is_code_string(raw_value: str | None, code: str) -> bool:
+    raw = (raw_value or "").strip()
+    c = (code or "").strip()
+    if not raw or not c:
+        return False
+    return raw == c or raw.upper() == c.upper()
+
+
+def supplement_root_job_exp_evidence_from_project_relations(
+    candidate: ProfileCandidateDocument,
+    *,
+    page_texts: dict[tuple[str, int], str] | None,
+    allowed_documents: dict[str, set[int]],
+) -> tuple[ProfileCandidateDocument, dict[str, list[str]]]:
+    """After staged merge: fill empty root JOB/EXP refs from same-code project rels.
+
+    Conditions (all required):
+    - Root item lacks non-empty quote source_refs
+    - Exact same code on a project jobs/expertise relation
+    - Relation ref has quote_text present on an allowed document page
+    - Quote itself supports the JOB/EXP classification via existing semantic rules
+    - Codes without semantic rules are left unresolved (never guessed)
+
+    Never overwrites existing root refs, never mutates projects, never combines
+    quotes across projects/documents into a synthetic ref.
+    """
+    report: dict[str, list[str]] = {
+        "supplemented_jobs": [],
+        "supplemented_expertise": [],
+        "unresolved_jobs": [],
+        "unresolved_expertise": [],
+    }
+    if not page_texts:
+        for job in candidate.jobs or []:
+            code = (job.code or "").strip()
+            if code and not _refs_nonempty(job.source_refs):
+                report["unresolved_jobs"].append(code)
+        for exp in candidate.expertise or []:
+            code = (exp.code or "").strip()
+            if code and not _refs_nonempty(exp.source_refs):
+                report["unresolved_expertise"].append(code)
+        return candidate, report
+
+    changed = False
+    new_jobs: list[JobCandidate] = []
+    for job in candidate.jobs or []:
+        code = (job.code or "").strip()
+        if not code or _refs_nonempty(job.source_refs):
+            new_jobs.append(job)
+            continue
+        # Detect "no rule" without relying on quote content: forbidden / unknown.
+        if code in _CORE_JOB_ROOT_FORBIDDEN_CODES or (
+            code not in _CORE_JOB_EVIDENCE_REQUIRED_CODES
+        ):
+            report["unresolved_jobs"].append(code)
+            new_jobs.append(job)
+            continue
+        match = _pick_supporting_project_relation_ref(
+            candidate,
+            code=code,
+            relation="jobs",
+            page_texts=page_texts,
+            allowed_documents=allowed_documents,
+            quote_supports=_quote_supports_root_job_from_project,
+        )
+        if match is None:
+            report["unresolved_jobs"].append(code)
+            new_jobs.append(job)
+            continue
+        updates: dict[str, Any] = {"source_refs": [match]}
+        if _raw_value_is_code_string(job.raw_value, code):
+            quote = (match.quote_text or "").strip()
+            if quote:
+                updates["raw_value"] = quote
+        changed = True
+        report["supplemented_jobs"].append(code)
+        new_jobs.append(job.model_copy(update=updates))
+
+    new_expertise: list[ExpertiseCandidate] = []
+    for exp in candidate.expertise or []:
+        code = (exp.code or "").strip()
+        if not code or _refs_nonempty(exp.source_refs):
+            new_expertise.append(exp)
+            continue
+        if (
+            code not in _EXP_SEMANTIC_PATTERNS
+            and code not in _PROJECT_EXP_SEMANTIC_PATTERNS
+        ):
+            report["unresolved_expertise"].append(code)
+            new_expertise.append(exp)
+            continue
+        match = _pick_supporting_project_relation_ref(
+            candidate,
+            code=code,
+            relation="expertise",
+            page_texts=page_texts,
+            allowed_documents=allowed_documents,
+            quote_supports=_quote_supports_root_exp_from_project,
+        )
+        if match is None:
+            report["unresolved_expertise"].append(code)
+            new_expertise.append(exp)
+            continue
+        updates = {"source_refs": [match]}
+        if _raw_value_is_code_string(exp.raw_value, code):
+            quote = (match.quote_text or "").strip()
+            if quote:
+                updates["raw_value"] = quote
+        changed = True
+        report["supplemented_expertise"].append(code)
+        new_expertise.append(exp.model_copy(update=updates))
+
+    if not changed:
+        return candidate, report
+    return (
+        candidate.model_copy(update={"jobs": new_jobs, "expertise": new_expertise}),
+        report,
+    )
+
+
 def backfill_exact_core_evidence(
     candidate: ProfileCandidateDocument,
     *,
