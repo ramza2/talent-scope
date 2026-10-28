@@ -3203,14 +3203,14 @@ class AnalysisService:
             review_status=review_status,
             entity_type=entity_type,
         )
-        evidence_map: dict[UUID, list[EvidenceLite]] | None = None
-        if run.status == "CONFIRMED" and rows:
+        linked_by_diff: dict[UUID, list[EvidenceLite]] = {}
+        if rows:
             from app.modules.evidence.repository import EvidenceRepository
 
             by_diff = EvidenceRepository(self.db).list_evidence_by_diff_ids(
                 [row.id for row in rows]
             )
-            evidence_map = {
+            linked_by_diff = {
                 diff_id: [
                     EvidenceLite(
                         id=ev.id,
@@ -3222,8 +3222,21 @@ class AnalysisService:
                 ]
                 for diff_id, evidences in by_diff.items()
             }
+
+        # CONFIRMED: materialized AnalysisDiffEvidence only (no source_refs fallback).
+        if run.status == "CONFIRMED":
+            return [
+                self._to_diff_response(row, evidence_map=linked_by_diff)
+                for row in rows
+            ]
+
+        # REVIEWING (and other non-CONFIRMED): linked Evidence + source_refs fallback.
         return [
-            self._to_diff_response(row, evidence_map=evidence_map) for row in rows
+            self._to_diff_response(
+                row,
+                linked_evidence=linked_by_diff.get(row.id, []),
+            )
+            for row in rows
         ]
 
     # ----------------------------------------------------------------- review
@@ -3282,6 +3295,11 @@ class AnalysisService:
             )
 
         # Validate all selected diffs first — no partial apply.
+        # Pass 1: existence + PENDING (prefer 409 over ACCEPTED-rule 400).
+        from app.modules.analysis.diff_evidence import (
+            is_ungrounded_root_job_or_exp_new,
+        )
+
         locked: list[AnalysisDiffItem] = []
         for diff_id in payload.diff_ids:
             diff = self.repo.get_diff(diff_id, for_update=True)
@@ -3291,14 +3309,33 @@ class AnalysisService:
                 raise AnalysisStateConflictError(
                     "이미 결정된 Diff가 포함되어 일괄 검토할 수 없습니다."
                 )
-            if payload.review_status == "ACCEPTED" and diff.change_type in {
-                "CONFLICT",
-                "REVIEW",
-            }:
-                raise ValidationAppError(
-                    "CONFLICT/REVIEW Diff는 일괄 ACCEPTED할 수 없습니다."
-                )
             locked.append(diff)
+
+        # Pass 2: ACCEPTED-only guards (still atomic — nothing applied yet).
+        if payload.review_status == "ACCEPTED":
+            from app.modules.evidence.repository import EvidenceRepository
+
+            evidence_by_diff = EvidenceRepository(self.db).list_evidence_by_diff_ids(
+                [d.id for d in locked]
+            )
+            for diff in locked:
+                if diff.change_type in {"CONFLICT", "REVIEW"}:
+                    raise ValidationAppError(
+                        "CONFLICT/REVIEW Diff는 일괄 ACCEPTED할 수 없습니다."
+                    )
+                if is_ungrounded_root_job_or_exp_new(
+                    entity_type=diff.entity_type,
+                    change_type=diff.change_type,
+                    field_name=diff.field_name,
+                    candidate_path=diff.candidate_path,
+                    new_value=diff.new_value,
+                    evidence=evidence_by_diff.get(diff.id, []),
+                ):
+                    raise ValidationAppError(
+                        "원문 근거가 없는 루트 JOB/EXP 신규 항목이 포함되어 "
+                        "일괄 승인할 수 없습니다. 해당 항목을 제외하거나 "
+                        "단건으로 검토해 주세요."
+                    )
 
         results: list[DiffItemResponse] = []
         for diff in locked:
@@ -3707,12 +3744,17 @@ class AnalysisService:
         row: AnalysisDiffItem,
         *,
         evidence_map: dict[UUID, list[EvidenceLite]] | None = None,
+        linked_evidence: list[EvidenceLite] | None = None,
     ) -> DiffItemResponse:
         if evidence_map is not None:
             # CONFIRMED: only materialized AnalysisDiffEvidence — no raw fallback.
             evidence = evidence_map.get(row.id, [])
         else:
-            evidence = _evidence_from_new_value(row.new_value)
+            # REVIEWING: preserve source_refs-derived rows and prepend DB links.
+            evidence = [
+                *(linked_evidence or []),
+                *_evidence_from_new_value(row.new_value),
+            ]
         return DiffItemResponse(
             id=row.id,
             entity_type=row.entity_type,

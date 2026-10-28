@@ -1890,6 +1890,9 @@ def test_review_modified_merged_audit(client: TestClient, db_session):
 def test_bulk_conflict_reject_and_foreign_diff(client: TestClient, db_session):
     from app.db.models.analysis import AnalysisDiffItem, AnalysisRun
 
+    _ensure_analysis_code(db_session, "JOB-DEV-GEN", "JOB", "개발자")
+    _ensure_analysis_code(db_session, "JOB-MGT-PM", "JOB", "PM")
+
     admin = _create_user(
         db_session, login_id=f"a_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
     )
@@ -1928,7 +1931,16 @@ def test_bulk_conflict_reject_and_foreign_diff(client: TestClient, db_session):
         entity_type="JOB",
         candidate_path="jobs[0]",
         change_type="NEW",
-        new_value={"code": "JOB-DEV-GEN"},
+        new_value={
+            "code": "JOB-DEV-GEN",
+            "source_refs": [
+                {
+                    "document_id": str(document.id),
+                    "page_no": 1,
+                    "quote_text": "개발 업무 담당",
+                }
+            ],
+        },
         review_status="PENDING",
     )
     d_conflict = AnalysisDiffItem(
@@ -2368,6 +2380,8 @@ def test_review_decision_is_one_shot(client: TestClient, db_session):
 def test_bulk_mixed_pending_and_decided_is_atomic_409(client: TestClient, db_session):
     from app.db.models.analysis import AnalysisDiffItem, AnalysisRun
 
+    _ensure_analysis_code(db_session, "JOB-DEV-GEN", "JOB", "개발자")
+
     admin = _create_user(
         db_session, login_id=f"a_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
     )
@@ -2392,7 +2406,16 @@ def test_bulk_mixed_pending_and_decided_is_atomic_409(client: TestClient, db_ses
         entity_type="JOB",
         candidate_path="jobs[0]",
         change_type="NEW",
-        new_value={"code": "JOB-AI-DEV"},
+        new_value={
+            "code": "JOB-DEV-GEN",
+            "source_refs": [
+                {
+                    "document_id": str(document.id),
+                    "page_no": 1,
+                    "quote_text": "AI 개발",
+                }
+            ],
+        },
         review_status="PENDING",
     )
     d_done = AnalysisDiffItem(
