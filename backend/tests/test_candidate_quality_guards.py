@@ -1490,3 +1490,368 @@ def test_employment_dedupe_end_conflict_keeps_review() -> None:
     assert "2016.12" in (emp.end_date or "")
     assert employment_candidate_dates_need_review(emp) is True
     assert {r.document_id for r in emp.source_refs} == {_DOCX, _KOSA}
+
+
+def _kosa_contiguous_pnandt_page_texts(*, reverse_order: bool = False) -> dict:
+    """Real-shaped KOSA 근무경력: two contiguous exact-day periods."""
+    first = "근무처 (주)피앤드티컨설팅 2012.12.03 ~ 2013.01.02 사원\n"
+    second = "근무처 (주)피앤드티컨설팅 2013.01.03 ~ 2014.09.30 대리\n"
+    body = (second + first) if reverse_order else (first + second)
+    return {
+        (_KOSA, 1): ("근무경력\n" + body + "프로젝트 수행내역\n"),
+        (_KOSA, 2): (
+            "수행내역\n"
+            "사업명 고객사 기간\n"
+            "ISP지원 (주)피앤드티컨설팅 2013.06.01 ~ 2013.12.31\n"
+        ),
+    }
+
+
+def test_kosa_contiguous_exact_day_periods_resolve_final_end() -> None:
+    page_texts = _kosa_contiguous_pnandt_page_texts()
+    candidate = ProfileCandidateDocument(
+        employment_history=[
+            EmploymentCandidate(
+                company_name="(주)피앤드티컨설팅",
+                start_date="2012.12.03",
+                end_date="2013.01.02",
+            )
+        ]
+    )
+    result = apply_candidate_quality_guards(
+        candidate,
+        page_texts=page_texts,
+        document_type_by_id={_KOSA: "DOC-KOSA"},
+    )
+    assert len(result.employment_history) == 1
+    emp = result.employment_history[0]
+    assert emp.start_date == "2012.12.03"
+    assert emp.end_date == "2014.09.30"
+    assert employment_candidate_dates_need_review(emp) is False
+    quotes = [r.quote_text or "" for r in emp.source_refs if r.document_id == _KOSA]
+    assert any("2012.12.03" in q and "2013.01.02" in q for q in quotes)
+    assert any("2013.01.03" in q and "2014.09.30" in q for q in quotes)
+    # Project-page dates must not appear as invented employment refs.
+    assert all("ISP지원" not in (r.quote_text or "") for r in emp.source_refs)
+
+
+def test_kosa_contiguous_conflict_token_resolves_final_end() -> None:
+    page_texts = _kosa_contiguous_pnandt_page_texts()
+    candidate = ProfileCandidateDocument(
+        employment_history=[
+            EmploymentCandidate(
+                company_name="(주)피앤드티컨설팅",
+                start_date="2012.12.03",
+                end_date="2013.01.02 / 2014.09.30",
+            )
+        ]
+    )
+    result = apply_candidate_quality_guards(
+        candidate,
+        page_texts=page_texts,
+        document_type_by_id={_KOSA: "DOC-KOSA"},
+    )
+    emp = result.employment_history[0]
+    assert emp.end_date == "2014.09.30"
+    assert " / " not in (emp.end_date or "")
+    assert employment_candidate_dates_need_review(emp) is False
+
+
+def test_kosa_contiguous_reverse_order_same_resolution() -> None:
+    page_texts = _kosa_contiguous_pnandt_page_texts(reverse_order=True)
+    candidate = ProfileCandidateDocument(
+        employment_history=[
+            EmploymentCandidate(
+                company_name="(주)피앤드티컨설팅",
+                start_date="2012.12.03",
+                end_date="2013.01.02 / 2014.09.30",
+            )
+        ]
+    )
+    result = apply_candidate_quality_guards(
+        candidate,
+        page_texts=page_texts,
+        document_type_by_id={_KOSA: "DOC-KOSA"},
+    )
+    assert result.employment_history[0].end_date == "2014.09.30"
+
+
+def test_kosa_gap_one_day_keeps_conflict_review() -> None:
+    page_texts = {
+        (_KOSA, 1): (
+            "근무경력\n"
+            "근무처 (주)피앤드티컨설팅 2012.12.03 ~ 2013.01.02 사원\n"
+            "근무처 (주)피앤드티컨설팅 2013.01.04 ~ 2014.09.30 대리\n"
+        ),
+    }
+    candidate = ProfileCandidateDocument(
+        employment_history=[
+            EmploymentCandidate(
+                company_name="(주)피앤드티컨설팅",
+                start_date="2012.12.03",
+                end_date="2013.01.02 / 2014.09.30",
+            )
+        ]
+    )
+    result = apply_candidate_quality_guards(
+        candidate,
+        page_texts=page_texts,
+        document_type_by_id={_KOSA: "DOC-KOSA"},
+    )
+    emp = result.employment_history[0]
+    assert "2013.01.02" in (emp.end_date or "")
+    assert "2014.09.30" in (emp.end_date or "")
+    assert employment_candidate_dates_need_review(emp) is True
+
+
+def test_kosa_overlapping_periods_keep_review() -> None:
+    page_texts = {
+        (_KOSA, 1): (
+            "근무경력\n"
+            "근무처 (주)피앤드티컨설팅 2012.12.03 ~ 2013.06.30 사원\n"
+            "근무처 (주)피앤드티컨설팅 2013.01.03 ~ 2014.09.30 대리\n"
+        ),
+    }
+    candidate = ProfileCandidateDocument(
+        employment_history=[
+            EmploymentCandidate(
+                company_name="(주)피앤드티컨설팅",
+                start_date="2012.12.03",
+                end_date="2013.06.30 / 2014.09.30",
+            )
+        ]
+    )
+    result = apply_candidate_quality_guards(
+        candidate,
+        page_texts=page_texts,
+        document_type_by_id={_KOSA: "DOC-KOSA"},
+    )
+    emp = result.employment_history[0]
+    assert employment_candidate_dates_need_review(emp) is True
+    assert " / " in (emp.end_date or "")
+
+
+def test_kosa_month_precision_periods_do_not_auto_resolve() -> None:
+    page_texts = {
+        (_KOSA, 1): (
+            "근무경력\n"
+            "근무처 (주)피앤드티컨설팅 2012.12 ~ 2013.01 사원\n"
+            "근무처 (주)피앤드티컨설팅 2013.02 ~ 2014.09 대리\n"
+        ),
+    }
+    candidate = ProfileCandidateDocument(
+        employment_history=[
+            EmploymentCandidate(
+                company_name="(주)피앤드티컨설팅",
+                start_date="2012.12",
+                end_date="2013.01 / 2014.09",
+            )
+        ]
+    )
+    result = apply_candidate_quality_guards(
+        candidate,
+        page_texts=page_texts,
+        document_type_by_id={_KOSA: "DOC-KOSA"},
+    )
+    emp = result.employment_history[0]
+    assert employment_candidate_dates_need_review(emp) is True
+
+
+def test_kosa_other_company_exact_day_not_merged_into_chain() -> None:
+    page_texts = {
+        (_KOSA, 1): (
+            "근무경력\n"
+            "근무처 (주)피앤드티컨설팅 2012.12.03 ~ 2013.01.02 사원\n"
+            "근무처 비스프로컨설팅(주) 2013.01.03 ~ 2014.09.30 과장\n"
+        ),
+    }
+    candidate = ProfileCandidateDocument(
+        employment_history=[
+            EmploymentCandidate(
+                company_name="(주)피앤드티컨설팅",
+                start_date="2012.12.03",
+                end_date="2013.01.02 / 2014.09.30",
+            )
+        ]
+    )
+    result = apply_candidate_quality_guards(
+        candidate,
+        page_texts=page_texts,
+        document_type_by_id={_KOSA: "DOC-KOSA"},
+    )
+    emp = result.employment_history[0]
+    assert employment_candidate_dates_need_review(emp) is True
+    assert "2013.01.02" in (emp.end_date or "")
+
+
+def test_kosa_project_section_dates_do_not_resolve_employment_end() -> None:
+    page_texts = {
+        (_KOSA, 1): (
+            "근무경력\n"
+            "근무처 (주)피앤드티컨설팅 2012.12.03 ~ 2013.01.02 사원\n"
+            "프로젝트 수행내역\n"
+            "ISP지원 (주)피앤드티컨설팅 2013.01.03 ~ 2014.09.30\n"
+        ),
+    }
+    candidate = ProfileCandidateDocument(
+        employment_history=[
+            EmploymentCandidate(
+                company_name="(주)피앤드티컨설팅",
+                start_date="2012.12.03",
+                end_date="2013.01.02 / 2014.09.30",
+            )
+        ]
+    )
+    result = apply_candidate_quality_guards(
+        candidate,
+        page_texts=page_texts,
+        document_type_by_id={_KOSA: "DOC-KOSA"},
+    )
+    emp = result.employment_history[0]
+    assert employment_candidate_dates_need_review(emp) is True
+    assert " / " in (emp.end_date or "")
+
+
+def test_docx_kosa_independent_end_keeps_review_despite_contiguous_kosa() -> None:
+    page_texts = {
+        (_DOCX, 1): (
+            "근무경력\n"
+            "(주)피앤드티컨설팅 2012.12.03 ~ 2015.06.30 과장\n"
+        ),
+        **_kosa_contiguous_pnandt_page_texts(),
+    }
+    candidate = ProfileCandidateDocument(
+        employment_history=[
+            EmploymentCandidate(
+                company_name="(주)피앤드티컨설팅",
+                start_date="2012.12.03",
+                end_date="2013.01.02 / 2014.09.30 / 2015.06.30",
+            )
+        ]
+    )
+    result = apply_candidate_quality_guards(
+        candidate,
+        page_texts=page_texts,
+        document_type_by_id={_DOCX: "DOC-PROFILE", _KOSA: "DOC-KOSA"},
+    )
+    emp = result.employment_history[0]
+    assert employment_candidate_dates_need_review(emp) is True
+    assert "2015.06.30" in (emp.end_date or "")
+
+
+def test_similar_company_names_stay_separate_for_contiguous_resolve() -> None:
+    """피엔드티 vs 피앤드티 must not auto-merge as the same employer."""
+    page_texts = {
+        (_KOSA, 1): (
+            "근무경력\n"
+            "근무처 피엔드티컨설팅 2012.12.03 ~ 2013.01.02 사원\n"
+            "근무처 피앤드티컨설팅 2013.01.03 ~ 2014.09.30 대리\n"
+        ),
+    }
+    candidate = ProfileCandidateDocument(
+        employment_history=[
+            EmploymentCandidate(
+                company_name="피앤드티컨설팅",
+                start_date="2012.12.03",
+                end_date="2013.01.02 / 2014.09.30",
+            ),
+            EmploymentCandidate(
+                company_name="피엔드티컨설팅",
+                start_date="2012.12.03",
+                end_date="2013.01.02",
+            ),
+        ]
+    )
+    result = apply_candidate_quality_guards(
+        candidate,
+        page_texts=page_texts,
+        document_type_by_id={_KOSA: "DOC-KOSA"},
+    )
+    assert len(result.employment_history) == 2
+    by_name = {e.company_name: e for e in result.employment_history}
+    assert "피앤드티컨설팅" in by_name
+    assert "피엔드티컨설팅" in by_name
+    # Different Hangul stems → no contiguous cross-company resolve.
+    assert employment_candidate_dates_need_review(by_name["피앤드티컨설팅"]) is True
+
+
+def test_kosa_contiguous_resolve_is_idempotent() -> None:
+    page_texts = _kosa_contiguous_pnandt_page_texts()
+    candidate = ProfileCandidateDocument(
+        employment_history=[
+            EmploymentCandidate(
+                company_name="(주)피앤드티컨설팅",
+                start_date="2012.12.03",
+                end_date="2013.01.02 / 2014.09.30",
+            )
+        ]
+    )
+    first = apply_candidate_quality_guards(
+        candidate,
+        page_texts=page_texts,
+        document_type_by_id={_KOSA: "DOC-KOSA"},
+    )
+    second = apply_candidate_quality_guards(
+        first,
+        page_texts=page_texts,
+        document_type_by_id={_KOSA: "DOC-KOSA"},
+    )
+    assert first.employment_history[0].end_date == "2014.09.30"
+    assert second.employment_history[0].end_date == "2014.09.30"
+    assert employment_candidate_dates_need_review(second.employment_history[0]) is False
+    # Guard-refresh style: conflict token in stored candidate is re-resolvable.
+    stored = ProfileCandidateDocument(
+        employment_history=[
+            EmploymentCandidate(
+                company_name="(주)피앤드티컨설팅",
+                start_date="2012.12.03",
+                end_date="2013.01.02 / 2014.09.30",
+                source_refs=list(first.employment_history[0].source_refs),
+            )
+        ]
+    )
+    refreshed = apply_candidate_quality_guards(
+        stored,
+        page_texts=page_texts,
+        document_type_by_id={_KOSA: "DOC-KOSA"},
+    )
+    assert refreshed.employment_history[0].end_date == "2014.09.30"
+
+
+def test_kosa_contiguous_does_not_merge_separate_candidate_rows() -> None:
+    """Single-row period fix only — do not collapse distinct candidate rows."""
+    page_texts = _kosa_contiguous_pnandt_page_texts()
+    candidate = ProfileCandidateDocument(
+        employment_history=[
+            EmploymentCandidate(
+                company_name="(주)피앤드티컨설팅",
+                start_date="2012.12.03",
+                end_date="2013.01.02 / 2014.09.30",
+            ),
+            EmploymentCandidate(
+                company_name="비스프로컨설팅(주)",
+                start_date="2011.02.01",
+                end_date="2012.11.30",
+            ),
+        ]
+    )
+    result = apply_candidate_quality_guards(
+        candidate,
+        page_texts={
+            **page_texts,
+            (_KOSA, 1): (
+                "근무경력\n"
+                "근무처 비스프로컨설팅(주) 2011.02.01 ~ 2012.11.30 과장\n"
+                "근무처 (주)피앤드티컨설팅 2012.12.03 ~ 2013.01.02 사원\n"
+                "근무처 (주)피앤드티컨설팅 2013.01.03 ~ 2014.09.30 대리\n"
+            ),
+        },
+        document_type_by_id={_KOSA: "DOC-KOSA"},
+    )
+    assert len(result.employment_history) == 2
+    pnandt = next(
+        e
+        for e in result.employment_history
+        if "피앤드티" in (e.company_name or "")
+    )
+    assert pnandt.end_date == "2014.09.30"
