@@ -3203,14 +3203,14 @@ class AnalysisService:
             review_status=review_status,
             entity_type=entity_type,
         )
-        evidence_map: dict[UUID, list[EvidenceLite]] | None = None
-        if run.status == "CONFIRMED" and rows:
+        linked_by_diff: dict[UUID, list[EvidenceLite]] = {}
+        if rows:
             from app.modules.evidence.repository import EvidenceRepository
 
             by_diff = EvidenceRepository(self.db).list_evidence_by_diff_ids(
                 [row.id for row in rows]
             )
-            evidence_map = {
+            linked_by_diff = {
                 diff_id: [
                     EvidenceLite(
                         id=ev.id,
@@ -3222,8 +3222,21 @@ class AnalysisService:
                 ]
                 for diff_id, evidences in by_diff.items()
             }
+
+        # CONFIRMED: materialized AnalysisDiffEvidence only (no source_refs fallback).
+        if run.status == "CONFIRMED":
+            return [
+                self._to_diff_response(row, evidence_map=linked_by_diff)
+                for row in rows
+            ]
+
+        # REVIEWING (and other non-CONFIRMED): linked Evidence + source_refs fallback.
         return [
-            self._to_diff_response(row, evidence_map=evidence_map) for row in rows
+            self._to_diff_response(
+                row,
+                linked_evidence=linked_by_diff.get(row.id, []),
+            )
+            for row in rows
         ]
 
     # ----------------------------------------------------------------- review
@@ -3731,12 +3744,17 @@ class AnalysisService:
         row: AnalysisDiffItem,
         *,
         evidence_map: dict[UUID, list[EvidenceLite]] | None = None,
+        linked_evidence: list[EvidenceLite] | None = None,
     ) -> DiffItemResponse:
         if evidence_map is not None:
             # CONFIRMED: only materialized AnalysisDiffEvidence — no raw fallback.
             evidence = evidence_map.get(row.id, [])
         else:
-            evidence = _evidence_from_new_value(row.new_value)
+            # REVIEWING: preserve source_refs-derived rows and prepend DB links.
+            evidence = [
+                *(linked_evidence or []),
+                *_evidence_from_new_value(row.new_value),
+            ]
         return DiffItemResponse(
             id=row.id,
             entity_type=row.entity_type,

@@ -7,6 +7,16 @@ import type { DiffItem, EvidenceLite } from '@/api/analyses'
 const ROOT_JOB_PATH_RE = /^jobs\[\d+\]$/
 const ROOT_EXP_PATH_RE = /^expertise\[\d+\]$/
 
+/** Only a non-empty string counts — numbers/objects/whitespace do not. */
+export function isNonEmptyQuoteText(value: unknown): boolean {
+  return typeof value === 'string' && Boolean(value.trim())
+}
+
+/** Only a non-empty string Evidence id counts. */
+export function isNonEmptyEvidenceId(value: unknown): boolean {
+  return typeof value === 'string' && Boolean(value.trim())
+}
+
 export function iterNewValueSourceRefs(
   newValue: unknown,
 ): Record<string, unknown>[] {
@@ -24,7 +34,7 @@ export function iterNewValueSourceRefs(
 export function sourceRefHasOriginalGrounding(
   ref: Record<string, unknown>,
 ): boolean {
-  return Boolean(String(ref.quote_text ?? '').trim())
+  return isNonEmptyQuoteText(ref.quote_text)
 }
 
 export function evidenceItemHasOriginalGrounding(
@@ -32,8 +42,8 @@ export function evidenceItemHasOriginalGrounding(
 ): boolean {
   if (!item) return false
   const row = item as Record<string, unknown>
-  if (row.id != null && String(row.id).trim()) return true
-  return Boolean(String(row.quote_text ?? '').trim())
+  if (isNonEmptyEvidenceId(row.id)) return true
+  return isNonEmptyQuoteText(row.quote_text)
 }
 
 /** True when Diff carries real 원문 grounding (refs and/or linked Evidence). */

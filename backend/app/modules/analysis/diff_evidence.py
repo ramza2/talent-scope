@@ -3,10 +3,25 @@
 from __future__ import annotations
 
 import re
+import uuid
 from typing import Any
 
 _ROOT_JOB_PATH_RE = re.compile(r"^jobs\[\d+\]$")
 _ROOT_EXP_PATH_RE = re.compile(r"^expertise\[\d+\]$")
+
+
+def is_nonempty_quote_text(value: Any) -> bool:
+    """Only a non-empty string counts — numbers/objects/whitespace do not."""
+    return isinstance(value, str) and bool(value.strip())
+
+
+def is_nonempty_evidence_id(value: Any) -> bool:
+    """Only a real UUID or non-empty string id counts."""
+    if isinstance(value, uuid.UUID):
+        return True
+    if isinstance(value, str):
+        return bool(value.strip())
+    return False
 
 
 def iter_new_value_source_refs(new_value: Any) -> list[dict[str, Any]]:
@@ -20,8 +35,7 @@ def iter_new_value_source_refs(new_value: Any) -> list[dict[str, Any]]:
 
 def source_ref_has_original_grounding(ref: dict[str, Any]) -> bool:
     """True only with real 원문 quote — bare metadata does not count."""
-    quote = str(ref.get("quote_text") or "").strip()
-    return bool(quote)
+    return is_nonempty_quote_text(ref.get("quote_text"))
 
 
 def evidence_item_has_original_grounding(item: Any) -> bool:
@@ -29,12 +43,12 @@ def evidence_item_has_original_grounding(item: Any) -> bool:
     if item is None:
         return False
     if isinstance(item, dict):
-        if item.get("id") is not None:
+        if is_nonempty_evidence_id(item.get("id")):
             return True
-        return bool(str(item.get("quote_text") or "").strip())
-    if getattr(item, "id", None) is not None:
+        return is_nonempty_quote_text(item.get("quote_text"))
+    if is_nonempty_evidence_id(getattr(item, "id", None)):
         return True
-    return bool(str(getattr(item, "quote_text", None) or "").strip())
+    return is_nonempty_quote_text(getattr(item, "quote_text", None))
 
 
 def diff_has_original_evidence(
