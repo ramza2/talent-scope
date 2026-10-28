@@ -21,6 +21,7 @@ from app.modules.analysis.diff_engine import (
 
 _DOCX = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 _KOSA = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+_KOSA_B = "cccccccc-cccc-cccc-cccc-cccccccccccc"
 
 
 def test_invalid_email_address_dropped_without_touching_real_email() -> None:
@@ -1855,3 +1856,114 @@ def test_kosa_contiguous_does_not_merge_separate_candidate_rows() -> None:
         if "피앤드티" in (e.company_name or "")
     )
     assert pnandt.end_date == "2014.09.30"
+
+
+def test_kosa_contiguous_cross_document_periods_keep_review() -> None:
+    """Doc A first segment + Doc B next segment must not auto-stitch."""
+    page_texts = {
+        (_KOSA, 1): (
+            "근무경력\n"
+            "근무처 (주)피앤드티컨설팅 2012.12.03 ~ 2013.01.02 사원\n"
+        ),
+        (_KOSA_B, 1): (
+            "근무경력\n"
+            "근무처 (주)피앤드티컨설팅 2013.01.03 ~ 2014.09.30 대리\n"
+        ),
+    }
+    candidate = ProfileCandidateDocument(
+        employment_history=[
+            EmploymentCandidate(
+                company_name="(주)피앤드티컨설팅",
+                start_date="2012.12.03",
+                end_date="2013.01.02 / 2014.09.30",
+            )
+        ]
+    )
+    result = apply_candidate_quality_guards(
+        candidate,
+        page_texts=page_texts,
+        document_type_by_id={_KOSA: "DOC-KOSA", _KOSA_B: "DOC-KOSA"},
+    )
+    emp = result.employment_history[0]
+    assert employment_candidate_dates_need_review(emp) is True
+    assert "2013.01.02" in (emp.end_date or "")
+    assert "2014.09.30" in (emp.end_date or "")
+
+
+def test_kosa_contiguous_same_doc_still_resolves() -> None:
+    page_texts = _kosa_contiguous_pnandt_page_texts()
+    candidate = ProfileCandidateDocument(
+        employment_history=[
+            EmploymentCandidate(
+                company_name="(주)피앤드티컨설팅",
+                start_date="2012.12.03",
+                end_date="2013.01.02 / 2014.09.30",
+            )
+        ]
+    )
+    result = apply_candidate_quality_guards(
+        candidate,
+        page_texts=page_texts,
+        document_type_by_id={_KOSA: "DOC-KOSA"},
+    )
+    emp = result.employment_history[0]
+    assert emp.end_date == "2014.09.30"
+    assert employment_candidate_dates_need_review(emp) is False
+    assert len([r for r in emp.source_refs if r.document_id == _KOSA]) >= 2
+
+
+def test_kosa_contiguous_with_overlapping_third_period_keeps_review() -> None:
+    page_texts = {
+        (_KOSA, 1): (
+            "근무경력\n"
+            "근무처 (주)피앤드티컨설팅 2012.12.03 ~ 2013.01.02 사원\n"
+            "근무처 (주)피앤드티컨설팅 2013.01.03 ~ 2014.09.30 대리\n"
+            "근무처 (주)피앤드티컨설팅 2013.06.01 ~ 2013.12.31 과장\n"
+        ),
+    }
+    candidate = ProfileCandidateDocument(
+        employment_history=[
+            EmploymentCandidate(
+                company_name="(주)피앤드티컨설팅",
+                start_date="2012.12.03",
+                end_date="2013.01.02 / 2014.09.30",
+            )
+        ]
+    )
+    result = apply_candidate_quality_guards(
+        candidate,
+        page_texts=page_texts,
+        document_type_by_id={_KOSA: "DOC-KOSA"},
+    )
+    emp = result.employment_history[0]
+    assert employment_candidate_dates_need_review(emp) is True
+    assert " / " in (emp.end_date or "")
+
+
+def test_kosa_contiguous_other_doc_overlapping_period_keeps_review() -> None:
+    """Same-doc contiguous chain blocked when another KOSA doc overlaps."""
+    page_texts = {
+        **_kosa_contiguous_pnandt_page_texts(),
+        (_KOSA_B, 1): (
+            "근무경력\n"
+            "근무처 (주)피앤드티컨설팅 2013.06.01 ~ 2015.01.15 과장\n"
+        ),
+    }
+    candidate = ProfileCandidateDocument(
+        employment_history=[
+            EmploymentCandidate(
+                company_name="(주)피앤드티컨설팅",
+                start_date="2012.12.03",
+                end_date="2013.01.02 / 2014.09.30",
+            )
+        ]
+    )
+    result = apply_candidate_quality_guards(
+        candidate,
+        page_texts=page_texts,
+        document_type_by_id={_KOSA: "DOC-KOSA", _KOSA_B: "DOC-KOSA"},
+    )
+    emp = result.employment_history[0]
+    assert employment_candidate_dates_need_review(emp) is True
+    assert "2013.01.02" in (emp.end_date or "")
+    assert "2014.09.30" in (emp.end_date or "")

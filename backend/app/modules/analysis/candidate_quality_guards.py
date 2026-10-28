@@ -497,11 +497,15 @@ def _contiguous_kosa_chain_from_start(
 ) -> list[_KosaExactEmploymentPeriod] | None:
     """Build a ≥2-segment day-contiguous chain that starts at candidate_start.
 
-    Contiguity requires ``prev.end + 1 day == next.start``. Gaps, overlaps, or
-    branching next segments refuse resolution.
+    All periods must share one ``doc_id`` (same KOSA document). Contiguity
+    requires ``prev.end + 1 day == next.start``. Gaps, overlaps, or branching
+    next segments refuse resolution. Cross-document linking is never allowed.
     """
     start_day = _exact_calendar_day(candidate_start)
     if start_day is None or len(periods) < 2:
+        return None
+    doc_ids = {period.doc_id for period in periods}
+    if len(doc_ids) != 1:
         return None
 
     def _sort_key(period: _KosaExactEmploymentPeriod) -> tuple[date, date]:
@@ -533,6 +537,42 @@ def _contiguous_kosa_chain_from_start(
     if len(chain) < 2:
         return None
     return chain
+
+
+def _leftover_kosa_periods_conflict_with_chain(
+    chain: list[_KosaExactEmploymentPeriod],
+    periods: list[_KosaExactEmploymentPeriod],
+) -> bool:
+    """True when a non-chain same-company period overlaps or branches the chain.
+
+    Unrelated earlier/later careers that do not touch the chain span are OK.
+    """
+    if not chain:
+        return True
+    chain_keys = {period.key for period in chain}
+    chain_start = _exact_calendar_day(chain[0].start)
+    chain_end = _exact_calendar_day(chain[-1].end)
+    if chain_start is None or chain_end is None:
+        return True
+    segment_starts = {
+        day
+        for period in chain
+        if (day := _exact_calendar_day(period.start)) is not None
+    }
+    for period in periods:
+        if period.key in chain_keys:
+            continue
+        start = _exact_calendar_day(period.start)
+        end = _exact_calendar_day(period.end)
+        if start is None or end is None:
+            continue
+        # Overlap with the resolved chain span (inclusive).
+        if start <= chain_end and end >= chain_start:
+            return True
+        # Duplicate / branch at a chain segment start.
+        if start in segment_starts:
+            return True
+    return False
 
 
 def _end_date_conflict_alternatives(
@@ -594,16 +634,35 @@ def _try_resolve_kosa_contiguous_employment_end(
 ) -> tuple[str, list[SourceRef]] | None:
     """Resolve end_date to the final contiguous KOSA period end when safe.
 
-    Only same-company, exact-day, end+1=next.start KOSA 근무경력 chains qualify.
-    Existing conflict tokens are eligible when every alternative is a chain
-    segment end. Independent unexplained ends keep REVIEW (return None).
+    Only same-document, same-company, exact-day, end+1=next.start KOSA
+    근무경력 chains qualify. Leftover same-company periods that overlap or
+    branch the chain (including other KOSA documents) keep REVIEW. Existing
+    conflict tokens are eligible when every alternative is a chain segment end.
     """
     periods = _collect_kosa_exact_day_employment_periods(spans, company=company)
-    chain = _contiguous_kosa_chain_from_start(
-        periods, candidate_start=candidate_start
-    )
-    if chain is None:
+    by_doc: dict[str, list[_KosaExactEmploymentPeriod]] = {}
+    for period in periods:
+        by_doc.setdefault(period.doc_id, []).append(period)
+
+    candidate_chains: list[list[_KosaExactEmploymentPeriod]] = []
+    for doc_periods in by_doc.values():
+        chain = _contiguous_kosa_chain_from_start(
+            doc_periods, candidate_start=candidate_start
+        )
+        if chain is None:
+            continue
+        if _leftover_kosa_periods_conflict_with_chain(chain, doc_periods):
+            continue
+        candidate_chains.append(chain)
+
+    # Exactly one same-document chain; never stitch across KOSA documents.
+    if len(candidate_chains) != 1:
         return None
+    chain = candidate_chains[0]
+    # Other-document same-company periods that overlap/branch block resolve.
+    if _leftover_kosa_periods_conflict_with_chain(chain, periods):
+        return None
+
     final_end = _normalize_date_token(chain[-1].end) or chain[-1].end
     alternatives = _end_date_conflict_alternatives(candidate_end, linked_ends)
     if alternatives:
