@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import date, timedelta
 from typing import Iterable
 
 from app.ai.schemas.profile_candidate import (
@@ -396,6 +397,303 @@ def _unique_incompatible_ends(ends: list[str]) -> list[str]:
     return unique
 
 
+@dataclass(frozen=True)
+class _KosaExactEmploymentPeriod:
+    """One exact-day KOSA employment-section period for a single employer."""
+
+    doc_id: str
+    page_no: int
+    quote_text: str
+    start: str
+    end: str
+
+    @property
+    def key(self) -> tuple[str, int, str, str, str]:
+        return (
+            self.doc_id,
+            self.page_no,
+            self.start,
+            self.end,
+            _fold(self.quote_text),
+        )
+
+
+def _exact_calendar_day(token: str | None) -> date | None:
+    """Return a calendar date only for exact YYYY.MM.DD (or -/ /) tokens."""
+    text = (token or "").strip()
+    if not text:
+        return None
+    parts = parse_date_parts(text.replace(".", "-").replace("/", "-"))
+    if parts is None:
+        return None
+    year, month, day = parts
+    if month is None or day is None:
+        return None
+    try:
+        return date(year, month, day)
+    except ValueError:
+        return None
+
+
+def _collect_kosa_exact_day_employment_periods(
+    spans: list[_ContextSpan],
+    *,
+    company: str,
+) -> list[_KosaExactEmploymentPeriod]:
+    """Independent same-company exact-day periods from KOSA 근무경력 only.
+
+    Project/수행내역 spans are never used. Ambiguous multi-range lines are
+    skipped. Company match is conservative (``_company_match_key`` / bounded).
+    """
+    raw = (company or "").strip()
+    stem = _company_match_key(raw)
+    if not raw or not stem:
+        return []
+    out: list[_KosaExactEmploymentPeriod] = []
+    seen: set[tuple[str, int, str, str, str]] = set()
+    for span in spans:
+        if (span.doc_type or "").strip().upper() != "DOC-KOSA":
+            continue
+        if _classify_span(span.text, section=span.section) != "employment":
+            continue
+        if not _span_matches_employment_company(span.text, raw=raw, stem=stem):
+            continue
+        ranges = _extract_range_dates(span.text)
+        if len(ranges) != 1:
+            continue
+        start_tok, end_tok = ranges[0]
+        if (
+            _exact_calendar_day(start_tok) is None
+            or _exact_calendar_day(end_tok) is None
+        ):
+            continue
+        assert start_tok is not None and end_tok is not None
+        start_d = _exact_calendar_day(start_tok)
+        end_d = _exact_calendar_day(end_tok)
+        assert start_d is not None and end_d is not None
+        if end_d < start_d:
+            continue
+        quote = span.text.strip()
+        if len(quote) > 500:
+            quote = quote[:500]
+        period = _KosaExactEmploymentPeriod(
+            doc_id=span.doc_id,
+            page_no=span.page_no,
+            quote_text=quote,
+            start=_normalize_date_token(start_tok) or start_tok,
+            end=_normalize_date_token(end_tok) or end_tok,
+        )
+        if period.key in seen:
+            continue
+        seen.add(period.key)
+        out.append(period)
+    return out
+
+
+def _contiguous_kosa_chain_from_start(
+    periods: list[_KosaExactEmploymentPeriod],
+    *,
+    candidate_start: str | None,
+) -> list[_KosaExactEmploymentPeriod] | None:
+    """Build a ≥2-segment day-contiguous chain that starts at candidate_start.
+
+    All periods must share one ``doc_id`` (same KOSA document). Contiguity
+    requires ``prev.end + 1 day == next.start``. Gaps, overlaps, or branching
+    next segments refuse resolution. Cross-document linking is never allowed.
+    """
+    start_day = _exact_calendar_day(candidate_start)
+    if start_day is None or len(periods) < 2:
+        return None
+    doc_ids = {period.doc_id for period in periods}
+    if len(doc_ids) != 1:
+        return None
+
+    def _sort_key(period: _KosaExactEmploymentPeriod) -> tuple[date, date]:
+        start = _exact_calendar_day(period.start)
+        end = _exact_calendar_day(period.end)
+        assert start is not None and end is not None
+        return (start, end)
+
+    ordered = sorted(periods, key=_sort_key)
+    anchors = [p for p in ordered if _exact_calendar_day(p.start) == start_day]
+    if len(anchors) != 1:
+        return None
+    chain = [anchors[0]]
+    remaining = [p for p in ordered if p.key != anchors[0].key]
+    while remaining:
+        last_end = _exact_calendar_day(chain[-1].end)
+        assert last_end is not None
+        expect = last_end + timedelta(days=1)
+        nxt_matches = [
+            p for p in remaining if _exact_calendar_day(p.start) == expect
+        ]
+        if not nxt_matches:
+            break
+        if len(nxt_matches) != 1:
+            return None
+        nxt = nxt_matches[0]
+        chain.append(nxt)
+        remaining = [p for p in remaining if p.key != nxt.key]
+    if len(chain) < 2:
+        return None
+    return chain
+
+
+def _leftover_kosa_periods_conflict_with_chain(
+    chain: list[_KosaExactEmploymentPeriod],
+    periods: list[_KosaExactEmploymentPeriod],
+) -> bool:
+    """True when a non-chain same-company period overlaps or branches the chain.
+
+    Unrelated earlier/later careers that do not touch the chain span are OK.
+    """
+    if not chain:
+        return True
+    chain_keys = {period.key for period in chain}
+    chain_start = _exact_calendar_day(chain[0].start)
+    chain_end = _exact_calendar_day(chain[-1].end)
+    if chain_start is None or chain_end is None:
+        return True
+    segment_starts = {
+        day
+        for period in chain
+        if (day := _exact_calendar_day(period.start)) is not None
+    }
+    for period in periods:
+        if period.key in chain_keys:
+            continue
+        start = _exact_calendar_day(period.start)
+        end = _exact_calendar_day(period.end)
+        if start is None or end is None:
+            continue
+        # Overlap with the resolved chain span (inclusive).
+        if start <= chain_end and end >= chain_start:
+            return True
+        # Duplicate / branch at a chain segment start.
+        if start in segment_starts:
+            return True
+    return False
+
+
+def _end_date_conflict_alternatives(
+    candidate_end: str | None,
+    linked_ends: list[str],
+) -> list[str]:
+    """Collect distinct end tokens that participate in a conflict decision."""
+    alts: list[str] = []
+    cand = (candidate_end or "").strip()
+    if cand and _EMPLOYMENT_END_CONFLICT_SEP in cand:
+        alts.extend(
+            part.strip()
+            for part in cand.split(_EMPLOYMENT_END_CONFLICT_SEP)
+            if part.strip()
+        )
+    elif cand and not _is_ongoing_end(cand):
+        alts.append(cand)
+    for raw in linked_ends:
+        text = (raw or "").strip()
+        if text and not _is_ongoing_end(text):
+            alts.append(text)
+    unique: list[str] = []
+    seen: set[str] = set()
+    for alt in alts:
+        normalized = _normalize_date_token(alt) or alt
+        key = normalized.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(normalized)
+    return unique
+
+
+def _alternatives_explained_by_kosa_chain(
+    alternatives: list[str],
+    chain: list[_KosaExactEmploymentPeriod],
+) -> bool:
+    """True when every alternative is a verified chain segment end."""
+    chain_ends = {
+        (_normalize_date_token(period.end) or period.end).casefold()
+        for period in chain
+    }
+    if not alternatives:
+        return False
+    for alt in alternatives:
+        key = (_normalize_date_token(alt) or alt).casefold()
+        if key not in chain_ends:
+            return False
+    return True
+
+
+def _try_resolve_kosa_contiguous_employment_end(
+    *,
+    company: str,
+    candidate_start: str | None,
+    candidate_end: str | None,
+    linked_ends: list[str],
+    spans: list[_ContextSpan],
+) -> tuple[str, list[SourceRef]] | None:
+    """Resolve end_date to the final contiguous KOSA period end when safe.
+
+    Only same-document, same-company, exact-day, end+1=next.start KOSA
+    근무경력 chains qualify. Leftover same-company periods that overlap or
+    branch the chain (including other KOSA documents) keep REVIEW. Existing
+    conflict tokens are eligible when every alternative is a chain segment end.
+    """
+    periods = _collect_kosa_exact_day_employment_periods(spans, company=company)
+    by_doc: dict[str, list[_KosaExactEmploymentPeriod]] = {}
+    for period in periods:
+        by_doc.setdefault(period.doc_id, []).append(period)
+
+    candidate_chains: list[list[_KosaExactEmploymentPeriod]] = []
+    for doc_periods in by_doc.values():
+        chain = _contiguous_kosa_chain_from_start(
+            doc_periods, candidate_start=candidate_start
+        )
+        if chain is None:
+            continue
+        if _leftover_kosa_periods_conflict_with_chain(chain, doc_periods):
+            continue
+        candidate_chains.append(chain)
+
+    # Exactly one same-document chain; never stitch across KOSA documents.
+    if len(candidate_chains) != 1:
+        return None
+    chain = candidate_chains[0]
+    # Other-document same-company periods that overlap/branch block resolve.
+    if _leftover_kosa_periods_conflict_with_chain(chain, periods):
+        return None
+
+    final_end = _normalize_date_token(chain[-1].end) or chain[-1].end
+    alternatives = _end_date_conflict_alternatives(candidate_end, linked_ends)
+    if alternatives:
+        if not _alternatives_explained_by_kosa_chain(alternatives, chain):
+            return None
+    else:
+        cand = (candidate_end or "").strip()
+        if cand and not _is_ongoing_end(cand):
+            cand_norm = (_normalize_date_token(cand) or cand).casefold()
+            chain_ends = {
+                (_normalize_date_token(p.end) or p.end).casefold() for p in chain
+            }
+            if cand_norm not in chain_ends and cand_norm != final_end.casefold():
+                return None
+    refs: list[SourceRef] = []
+    seen: set[tuple[str, int, str]] = set()
+    for period in chain:
+        key = (period.doc_id, period.page_no, period.quote_text)
+        if key in seen:
+            continue
+        seen.add(key)
+        refs.append(
+            SourceRef(
+                document_id=period.doc_id,
+                page_no=period.page_no,
+                quote_text=period.quote_text,
+            )
+        )
+    return final_end, refs
+
+
 def _resolve_end_date_for_review(
     *,
     candidate_end: str | None,
@@ -405,6 +703,7 @@ def _resolve_end_date_for_review(
 
     Joined unparseable tokens keep both alternatives visible and trip the
     existing employment date REVIEW path. We do not invent a chosen date.
+    Contiguous KOSA chains are resolved earlier in ``_guard_employment_history``.
     """
     cand_end = (candidate_end or "").strip()
     if cand_end and _EMPLOYMENT_END_CONFLICT_SEP in cand_end:
@@ -990,11 +1289,29 @@ def _guard_employment_history(
         linked_ends = _linked_source_ends(
             emp_dates, candidate_start=row.start_date
         )
-        review_end = _resolve_end_date_for_review(
-            candidate_end=row.end_date, linked_ends=linked_ends
+        contiguous = _try_resolve_kosa_contiguous_employment_end(
+            company=company,
+            candidate_start=row.start_date,
+            candidate_end=row.end_date,
+            linked_ends=linked_ends,
+            spans=spans,
         )
-        if review_end is not None:
-            updated = row.model_copy(update={"end_date": review_end})
+        if contiguous is not None:
+            final_end, verified_refs = contiguous
+            updated = row.model_copy(
+                update={
+                    "end_date": final_end,
+                    "source_refs": _merge_source_refs(
+                        row.source_refs, verified_refs
+                    ),
+                }
+            )
+        else:
+            review_end = _resolve_end_date_for_review(
+                candidate_end=row.end_date, linked_ends=linked_ends
+            )
+            if review_end is not None:
+                updated = row.model_copy(update={"end_date": review_end})
         kept.append(updated)
 
     return _dedupe_employment_history(kept, spans=spans)
