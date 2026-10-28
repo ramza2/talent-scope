@@ -86,6 +86,7 @@ from app.modules.analysis.compact_v8 import (
     repair_whitespace_project_evidence,
     supplement_literal_project_tech_from_source,
     supplement_projects_from_second_pass,
+    supplement_root_job_exp_evidence_from_project_relations,
     supplement_semantic_project_relations_from_source,
 )
 from app.modules.analysis.candidate_quality_guards import apply_candidate_quality_guards
@@ -1287,14 +1288,25 @@ class AnalysisService:
         )
 
         merged = core.model_copy(update={"projects": list(projects_doc.projects)})
+        merged, root_rel_report = supplement_root_job_exp_evidence_from_project_relations(
+            merged,
+            page_texts=page_texts,
+            allowed_documents=allowed_documents,
+        )
         logger.info(
             "analysis staged merge analysis_run_id=%s core_skills=%s "
-            "core_expertise=%s projects=%s llm_calls=%s",
+            "core_expertise=%s projects=%s llm_calls=%s "
+            "root_rel_supplemented_jobs=%s root_rel_supplemented_expertise=%s "
+            "root_rel_unresolved_jobs=%s root_rel_unresolved_expertise=%s",
             base_log.get("analysis_run_id"),
             len(merged.skills),
             len(merged.expertise),
             len(merged.projects),
             call_count,
+            root_rel_report.get("supplemented_jobs"),
+            root_rel_report.get("supplemented_expertise"),
+            root_rel_report.get("unresolved_jobs"),
+            root_rel_report.get("unresolved_expertise"),
         )
         if candidate_needs_llm_retry(
             merged,
@@ -2934,10 +2946,17 @@ class AnalysisService:
         )
 
         merged = core.model_copy(update={"projects": list(projects_doc.projects)})
+        merged, root_rel_report = supplement_root_job_exp_evidence_from_project_relations(
+            merged,
+            page_texts=page_texts,
+            allowed_documents=allowed_documents,
+        )
         logger.info(
             "analysis staged merge analysis_run_id=%s compact_protocol=%s "
             "core_skills=%s core_expertise=%s projects=%s llm_calls=%s "
-            "doc_alias_count=%s",
+            "doc_alias_count=%s "
+            "root_rel_supplemented_jobs=%s root_rel_supplemented_expertise=%s "
+            "root_rel_unresolved_jobs=%s root_rel_unresolved_expertise=%s",
             base_log.get("analysis_run_id"),
             compact_tag,
             len(merged.skills),
@@ -2945,6 +2964,10 @@ class AnalysisService:
             len(merged.projects),
             call_count,
             len(alias_to_id),
+            root_rel_report.get("supplemented_jobs"),
+            root_rel_report.get("supplemented_expertise"),
+            root_rel_report.get("unresolved_jobs"),
+            root_rel_report.get("unresolved_expertise"),
         )
         if candidate_needs_llm_retry(
             merged,
