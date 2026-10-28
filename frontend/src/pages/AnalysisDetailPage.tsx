@@ -26,6 +26,7 @@ import {
   formatDiffValueSummary,
   formatValue,
 } from '@/api/diffValueDisplay'
+import { isUngroundedRootJobOrExpNew } from '@/api/diffEvidence'
 import {
   EMPLOYMENT_END_DATE_CUSTOM_VALUE,
   buildEmploymentEndDateModifiedDecision,
@@ -697,8 +698,12 @@ export function AnalysisDetailPage() {
 
         const needsCodeMapping = diffRequiresCodeMapping(row)
         const needsEndDateConfirm = isEmploymentEndDateConflictReview(row)
+        const ungroundedRootJobExp = isUngroundedRootJobOrExpNew(row)
         return (
           <Space size="small" wrap>
+            {ungroundedRootJobExp ? (
+              <Typography.Text type="danger">원문 근거 없음</Typography.Text>
+            ) : null}
             {needsEndDateConfirm ? (
               <Typography.Text type="warning">날짜 확인 필요</Typography.Text>
             ) : !needsCodeMapping ? (
@@ -706,12 +711,27 @@ export function AnalysisDetailPage() {
                 type="link"
                 size="small"
                 loading={decisionMutation.isPending}
-                onClick={() =>
+                onClick={() => {
+                  if (ungroundedRootJobExp) {
+                    Modal.confirm({
+                      title: '원문 근거 없는 항목을 승인할까요?',
+                      content:
+                        '이 JOB/EXP 신규 항목에는 원문 근거가 연결되어 있지 않습니다. 실수가 아닌지 확인한 뒤 승인하세요.',
+                      okText: '승인',
+                      cancelText: '취소',
+                      onOk: () =>
+                        decisionMutation.mutateAsync({
+                          diffId: row.id,
+                          body: { review_status: 'ACCEPTED' },
+                        }),
+                    })
+                    return
+                  }
                   decisionMutation.mutate({
                     diffId: row.id,
                     body: { review_status: 'ACCEPTED' },
                   })
-                }
+                }}
               >
                 승인
               </Button>
@@ -928,33 +948,66 @@ export function AnalysisDetailPage() {
           />
 
           {canReview ? (
-            <Space style={{ marginBottom: 12 }}>
+            <Space style={{ marginBottom: 12 }} wrap>
               <Button
                 disabled={selectedKeys.length === 0}
                 loading={bulkMutation.isPending}
-                onClick={() =>
-                  bulkMutation.mutate({
-                    diff_ids: selectedKeys.map(String),
-                    review_status: 'ACCEPTED',
+                onClick={() => {
+                  const selected = (diffsQuery.data?.data ?? []).filter((d) =>
+                    selectedKeys.includes(d.id),
+                  )
+                  const acceptTargets = selected.filter(
+                    (d) => !isUngroundedRootJobOrExpNew(d),
+                  )
+                  const skipped = selected.length - acceptTargets.length
+                  if (acceptTargets.length === 0) {
+                    message.warning(
+                      '선택한 항목 중 일괄 승인 가능한 Diff가 없습니다. 원문 근거 없는 JOB/EXP는 단건으로 검토하세요.',
+                    )
+                    return
+                  }
+                  Modal.confirm({
+                    title: `선택 ${acceptTargets.length}건을 승인할까요?`,
+                    content:
+                      skipped > 0
+                        ? `원문 근거 없는 루트 JOB/EXP ${skipped}건은 승인 대상에서 제외됩니다.`
+                        : '선택한 Diff를 ACCEPTED로 저장합니다.',
+                    okText: '승인',
+                    cancelText: '취소',
+                    onOk: () =>
+                      bulkMutation.mutateAsync({
+                        diff_ids: acceptTargets.map((d) => d.id),
+                        review_status: 'ACCEPTED',
+                      }),
                   })
-                }
+                }}
               >
                 선택 승인
               </Button>
               <Button
                 disabled={selectedKeys.length === 0}
                 loading={bulkMutation.isPending}
-                onClick={() =>
-                  bulkMutation.mutate({
-                    diff_ids: selectedKeys.map(String),
-                    review_status: 'REJECTED',
+                onClick={() => {
+                  const count = selectedKeys.length
+                  Modal.confirm({
+                    title: `선택 ${count}건을 반려할까요?`,
+                    content: '선택한 Diff를 REJECTED로 저장합니다.',
+                    okText: '반려',
+                    okButtonProps: { danger: true },
+                    cancelText: '취소',
+                    onOk: () =>
+                      bulkMutation.mutateAsync({
+                        diff_ids: selectedKeys.map(String),
+                        review_status: 'REJECTED',
+                      }),
                   })
-                }
+                }}
               >
                 선택 반려
               </Button>
               <Typography.Text type="secondary">
-                CONFLICT/REVIEW는 일괄 승인할 수 없습니다.
+                CONFLICT/REVIEW 및 원문 근거 없는 루트 JOB/EXP는 일괄 승인할 수
+                없습니다.
               </Typography.Text>
             </Space>
           ) : null}

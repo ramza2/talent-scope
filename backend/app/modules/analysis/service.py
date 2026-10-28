@@ -3282,6 +3282,11 @@ class AnalysisService:
             )
 
         # Validate all selected diffs first — no partial apply.
+        # Pass 1: existence + PENDING (prefer 409 over ACCEPTED-rule 400).
+        from app.modules.analysis.diff_evidence import (
+            is_ungrounded_root_job_or_exp_new,
+        )
+
         locked: list[AnalysisDiffItem] = []
         for diff_id in payload.diff_ids:
             diff = self.repo.get_diff(diff_id, for_update=True)
@@ -3291,14 +3296,33 @@ class AnalysisService:
                 raise AnalysisStateConflictError(
                     "이미 결정된 Diff가 포함되어 일괄 검토할 수 없습니다."
                 )
-            if payload.review_status == "ACCEPTED" and diff.change_type in {
-                "CONFLICT",
-                "REVIEW",
-            }:
-                raise ValidationAppError(
-                    "CONFLICT/REVIEW Diff는 일괄 ACCEPTED할 수 없습니다."
-                )
             locked.append(diff)
+
+        # Pass 2: ACCEPTED-only guards (still atomic — nothing applied yet).
+        if payload.review_status == "ACCEPTED":
+            from app.modules.evidence.repository import EvidenceRepository
+
+            evidence_by_diff = EvidenceRepository(self.db).list_evidence_by_diff_ids(
+                [d.id for d in locked]
+            )
+            for diff in locked:
+                if diff.change_type in {"CONFLICT", "REVIEW"}:
+                    raise ValidationAppError(
+                        "CONFLICT/REVIEW Diff는 일괄 ACCEPTED할 수 없습니다."
+                    )
+                if is_ungrounded_root_job_or_exp_new(
+                    entity_type=diff.entity_type,
+                    change_type=diff.change_type,
+                    field_name=diff.field_name,
+                    candidate_path=diff.candidate_path,
+                    new_value=diff.new_value,
+                    evidence=evidence_by_diff.get(diff.id, []),
+                ):
+                    raise ValidationAppError(
+                        "원문 근거가 없는 루트 JOB/EXP 신규 항목이 포함되어 "
+                        "일괄 승인할 수 없습니다. 해당 항목을 제외하거나 "
+                        "단건으로 검토해 주세요."
+                    )
 
         results: list[DiffItemResponse] = []
         for diff in locked:
