@@ -472,7 +472,8 @@ def test_existing_quoted_root_refs_preserved_no_overwrite() -> None:
 
 
 def test_codes_without_semantic_rules_remain_unresolved() -> None:
-    page = _row("사업A", duty="AI개발자 RAG 전문")
+    """EXP-AI-RAG has no rule; weak DEV quote (no 개발자) stays unresolved."""
+    page = _row("사업A", duty="Java 개발 참여 및 RAG 전문")
     doc = _doc(
         jobs=[{"code": "JOB-DEV-GEN", "raw_value": "JOB-DEV-GEN"}],
         expertise=[{"code": "EXP-AI-RAG", "raw_value": "EXP-AI-RAG"}],
@@ -482,7 +483,7 @@ def test_codes_without_semantic_rules_remain_unresolved() -> None:
                 "jobs": [
                     {
                         "code": "JOB-DEV-GEN",
-                        "source_refs": [_ref("AI개발자")],
+                        "source_refs": [_ref("Java 개발 참여")],
                     }
                 ],
                 "expertise": [
@@ -581,3 +582,320 @@ def test_entity_counts_and_project_count_stable() -> None:
     assert "EXP-MGT" in report["supplemented_expertise"]
     assert "JOB-OPS-SYS" in report["unresolved_jobs"]
     assert "EXP-AI-RAG" in report["unresolved_expertise"]
+
+
+# --- DATA / DEV root relation evidence (PR #122) ---
+
+
+def test_data_dev_codes_positive_evidence_supplements() -> None:
+    page = _row(
+        "데이터사업",
+        duty="DBA / DA 데이터 분석, DB 튜닝, 데이터 모델링, 응용 개발자",
+    )
+    doc = _doc(
+        jobs=[
+            {"code": "JOB-DATA-DBA", "raw_value": "JOB-DATA-DBA"},
+            {"code": "JOB-DATA-DA", "raw_value": "JOB-DATA-DA", "job_type": "SECONDARY"},
+            {"code": "JOB-DEV-GEN", "raw_value": "JOB-DEV-GEN"},
+        ],
+        expertise=[
+            {"code": "EXP-DATA", "raw_value": "EXP-DATA", "confidence": 0.8},
+            {"code": "EXP-DATA-DB-TUNING", "raw_value": "EXP-DATA-DB-TUNING"},
+        ],
+        projects=[
+            {
+                "project_name": "데이터사업",
+                "jobs": [
+                    {"code": "JOB-DATA-DBA", "source_refs": [_ref("DBA")]},
+                    {
+                        "code": "JOB-DATA-DA",
+                        "source_refs": [_ref("DA 데이터 분석")],
+                    },
+                    {"code": "JOB-DEV-GEN", "source_refs": [_ref("응용 개발자")]},
+                ],
+                "expertise": [
+                    {
+                        "code": "EXP-DATA",
+                        "source_refs": [_ref("데이터 모델링")],
+                    },
+                    {
+                        "code": "EXP-DATA-DB-TUNING",
+                        "source_refs": [_ref("DB 튜닝")],
+                    },
+                ],
+            }
+        ],
+    )
+    out, report = _run(doc, page_texts={(_DOC, 1): page})
+    assert set(report["supplemented_jobs"]) == {
+        "JOB-DATA-DBA",
+        "JOB-DATA-DA",
+        "JOB-DEV-GEN",
+    }
+    assert set(report["supplemented_expertise"]) == {
+        "EXP-DATA",
+        "EXP-DATA-DB-TUNING",
+    }
+    assert out.jobs[0].source_refs[0].quote_text == "DBA"
+    assert out.jobs[0].raw_value == "DBA"
+    assert out.jobs[1].job_type == "SECONDARY"
+    assert out.expertise[0].confidence == 0.8
+    assert len(out.projects) == 1
+
+
+def test_data_dev_weak_keywords_and_tech_names_rejected() -> None:
+    page = _row(
+        "사업A",
+        duty="Oracle SQL DB 사용, 데이터 처리, 성능개선, Java 개발 참여",
+    )
+    doc = _doc(
+        jobs=[
+            {"code": "JOB-DATA-DBA"},
+            {"code": "JOB-DATA-DA"},
+            {"code": "JOB-DEV-GEN"},
+        ],
+        expertise=[
+            {"code": "EXP-DATA"},
+            {"code": "EXP-DATA-DB-TUNING"},
+        ],
+        projects=[
+            {
+                "project_name": "사업A",
+                "jobs": [
+                    {
+                        "code": "JOB-DATA-DBA",
+                        "source_refs": [_ref("Oracle SQL DB 사용")],
+                    },
+                    {
+                        "code": "JOB-DATA-DA",
+                        "source_refs": [_ref("데이터 처리")],
+                    },
+                    {
+                        "code": "JOB-DEV-GEN",
+                        "source_refs": [_ref("Java 개발 참여")],
+                    },
+                ],
+                "expertise": [
+                    {"code": "EXP-DATA", "source_refs": [_ref("데이터 처리")]},
+                    {
+                        "code": "EXP-DATA-DB-TUNING",
+                        "source_refs": [_ref("성능개선")],
+                    },
+                ],
+            }
+        ],
+    )
+    out, report = _run(doc, page_texts={(_DOC, 1): page})
+    assert report["supplemented_jobs"] == []
+    assert report["supplemented_expertise"] == []
+    assert set(report["unresolved_jobs"]) == {
+        "JOB-DATA-DBA",
+        "JOB-DATA-DA",
+        "JOB-DEV-GEN",
+    }
+    assert set(report["unresolved_expertise"]) == {
+        "EXP-DATA",
+        "EXP-DATA-DB-TUNING",
+    }
+    assert all(not j.source_refs for j in out.jobs)
+    assert all(not x.source_refs for x in out.expertise)
+
+
+def test_data_da_dba_substring_false_positives_rejected() -> None:
+    """DATA/DAY must not count as DA; DBA context alone without DA token+duty."""
+    page = _row("사업A", duty="DATA warehouse DAY batch, DATABASE 성능")
+    doc = _doc(
+        jobs=[{"code": "JOB-DATA-DA"}, {"code": "JOB-DATA-DBA"}],
+        projects=[
+            {
+                "project_name": "사업A",
+                "jobs": [
+                    {
+                        "code": "JOB-DATA-DA",
+                        "source_refs": [_ref("DATA warehouse DAY batch")],
+                    },
+                    {
+                        "code": "JOB-DATA-DBA",
+                        "source_refs": [_ref("DATABASE 성능")],
+                    },
+                ],
+            }
+        ],
+    )
+    out, report = _run(doc, page_texts={(_DOC, 1): page})
+    assert out.jobs[0].source_refs == []
+    assert out.jobs[1].source_refs == []
+    assert set(report["unresolved_jobs"]) == {"JOB-DATA-DA", "JOB-DATA-DBA"}
+
+
+def test_db_tuning_vs_generic_db_ops_distinguished() -> None:
+    page = (
+        _row("튜닝사업", period="2020.01~2020.06", duty="SQL 튜닝 수행")
+        + "\n"
+        + _row(
+            "운영사업",
+            period="2021.01~2021.12",
+            duty="DB 운영 및 백업",
+            customer="고객B",
+        )
+    )
+    doc = _doc(
+        expertise=[
+            {"code": "EXP-DATA-DB-TUNING"},
+            {"code": "EXP-DATA"},
+        ],
+        projects=[
+            {
+                "project_name": "튜닝사업",
+                "start_date": "2020.01",
+                "end_date": "2020.06",
+                "expertise": [
+                    {
+                        "code": "EXP-DATA-DB-TUNING",
+                        "source_refs": [_ref("SQL 튜닝")],
+                    }
+                ],
+            },
+            {
+                "project_name": "운영사업",
+                "start_date": "2021.01",
+                "end_date": "2021.12",
+                "customer_name": "고객B",
+                "expertise": [
+                    {
+                        "code": "EXP-DATA",
+                        # bare DB 운영 — not enough for EXP-DATA phrase rule
+                        "source_refs": [_ref("DB 운영 및 백업")],
+                    }
+                ],
+            },
+        ],
+    )
+    out, report = _run(doc, page_texts={(_DOC, 1): page})
+    assert report["supplemented_expertise"] == ["EXP-DATA-DB-TUNING"]
+    assert report["unresolved_expertise"] == ["EXP-DATA"]
+    assert out.expertise[0].source_refs[0].quote_text == "SQL 튜닝"
+    assert out.expertise[1].source_refs == []
+
+
+def test_data_dev_other_project_and_page_blocked() -> None:
+    page = (
+        _row("사업A", period="2020.01~2020.06", duty="회의 참석")
+        + "\n"
+        + _row(
+            "사업B",
+            period="2021.01~2021.12",
+            duty="DBA 및 응용 개발자",
+            customer="고객B",
+        )
+    )
+    doc = _doc(
+        jobs=[{"code": "JOB-DATA-DBA"}, {"code": "JOB-DEV-GEN"}],
+        projects=[
+            {
+                "project_name": "사업A",
+                "start_date": "2020.01",
+                "end_date": "2020.06",
+                "jobs": [
+                    {
+                        "code": "JOB-DATA-DBA",
+                        "source_refs": [_ref("DBA")],
+                    },
+                    {
+                        "code": "JOB-DEV-GEN",
+                        "source_refs": [_ref("응용 개발자")],
+                    },
+                ],
+            },
+            {
+                "project_name": "사업B",
+                "start_date": "2021.01",
+                "end_date": "2021.12",
+                "customer_name": "고객B",
+                "jobs": [],
+            },
+        ],
+    )
+    out, report = _run(doc, page_texts={(_DOC, 1): page})
+    assert out.jobs[0].source_refs == []
+    assert out.jobs[1].source_refs == []
+    assert set(report["unresolved_jobs"]) == {"JOB-DATA-DBA", "JOB-DEV-GEN"}
+
+    # Same doc, supporting quote only on page 2 while ref cites page 1.
+    doc2 = _doc(
+        jobs=[{"code": "JOB-DATA-DBA"}],
+        projects=[
+            {
+                "project_name": "사업A",
+                "jobs": [
+                    {
+                        "code": "JOB-DATA-DBA",
+                        "source_refs": [_ref("DBA", page=1)],
+                    }
+                ],
+            }
+        ],
+    )
+    out2, report2 = _run(
+        doc2,
+        page_texts={
+            (_DOC, 1): _row("사업A", duty="회의"),
+            (_DOC, 2): _row("사업A", duty="DBA 수행"),
+        },
+    )
+    assert out2.jobs[0].source_refs == []
+    assert report2["unresolved_jobs"] == ["JOB-DATA-DBA"]
+
+
+def test_data_dev_metadata_and_existing_refs_preserved() -> None:
+    page = _row("사업A", duty="DBA 및 데이터 분석가")
+    # metadata-only safe fill
+    doc = _doc(
+        jobs=[
+            {
+                "code": "JOB-DATA-DBA",
+                "source_refs": [
+                    {"document_id": _DOC, "page_no": 1, "quote_text": None}
+                ],
+            }
+        ],
+        projects=[
+            {
+                "project_name": "사업A",
+                "jobs": [
+                    {"code": "JOB-DATA-DBA", "source_refs": [_ref("DBA")]}
+                ],
+            }
+        ],
+    )
+    out, report = _run(doc, page_texts={(_DOC, 1): page})
+    assert report["supplemented_jobs"] == ["JOB-DATA-DBA"]
+    assert out.jobs[0].source_refs[0].document_id == _DOC
+    assert out.jobs[0].source_refs[0].page_no == 1
+    assert out.jobs[0].source_refs[0].quote_text == "DBA"
+
+    # existing quote preserved
+    doc2 = _doc(
+        expertise=[
+            {
+                "code": "EXP-DATA",
+                "raw_value": "기존",
+                "source_refs": [_ref("데이터 분석")],
+            }
+        ],
+        projects=[
+            {
+                "project_name": "사업A",
+                "expertise": [
+                    {
+                        "code": "EXP-DATA",
+                        "source_refs": [_ref("데이터 모델링")],
+                    }
+                ],
+            }
+        ],
+    )
+    out2, report2 = _run(doc2, page_texts={(_DOC, 1): page})
+    assert report2["supplemented_expertise"] == []
+    assert out2.expertise[0].raw_value == "기존"
+    assert out2.expertise[0].source_refs[0].quote_text == "데이터 분석"

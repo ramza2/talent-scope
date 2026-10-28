@@ -1621,6 +1621,100 @@ def _source_ref_verified_on_allowed_page(
     return quote in page_text
 
 
+# Extra root JOB/EXP codes eligible only for post-merge project-relation
+# evidence lift (does NOT enlarge v21 drop_root_jobs required set).
+_ROOT_RELATION_EXTRA_JOB_CODES = frozenset(
+    {"JOB-DATA-DA", "JOB-DATA-DBA", "JOB-DEV-GEN"}
+)
+_ROOT_RELATION_EXTRA_EXP_CODES = frozenset({"EXP-DATA", "EXP-DATA-DB-TUNING"})
+
+# Catalog: JOB-DATA-DBA / name "DBA". Word-boundary DBA or explicit KO role.
+_DBA_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9])DBA(?![A-Za-z0-9])", re.IGNORECASE)
+_DBA_KO_ROLE_RE = re.compile(r"데이터베이스\s*관리자|(?<![A-Za-z0-9])DB\s*관리자")
+
+# Catalog: JOB-DATA-DA / name "DA". Require DA token + data duty context, or
+# explicit KO data-role phrases. Rejects bare "데이터"/"DB"/tech names alone.
+_DA_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9])DA(?![A-Za-z0-9])", re.IGNORECASE)
+_DA_KO_ROLE_RE = re.compile(
+    r"데이터\s*분석가|데이터\s*아키텍트|데이터\s*아키텍처\s*담당"
+)
+_DA_DUTY_CONTEXT_RE = re.compile(
+    r"데이터\s*분석|데이터\s*모델|데이터\s*설계|데이터베이스|"
+    r"데이터\s*아키텍|DB\s*설계|DB\s*모델링"
+)
+
+# Catalog: JOB-DEV-GEN / name "개발자". Role token only — not bare "개발".
+_DEV_GEN_ROLE_RE = re.compile(
+    r"개발자|(?<![A-Za-z0-9])Developer(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
+
+# Catalog: EXP-DATA-DB-TUNING / name "DB 튜닝". Explicit tuning + DB/SQL.
+_DB_TUNING_RE = re.compile(
+    r"(?:DB|데이터베이스|SQL|쿼리)\s*튜닝|"
+    r"튜닝\s*(?:DB|데이터베이스)|"
+    r"(?:DB|database|SQL)\s*tuning",
+    re.IGNORECASE,
+)
+
+# Catalog: EXP-DATA / name "Data/DB". Multi-token data/DB expertise phrases only.
+_EXP_DATA_PHRASE_RE = re.compile(
+    r"데이터\s*분석|데이터\s*모델링|데이터\s*모델\s*설계|"
+    r"데이터베이스\s*설계|DB\s*설계|데이터\s*아키텍처|"
+    r"데이터\s*거버넌스|데이터\s*엔지니어(?:링)?"
+)
+
+
+def _quote_supports_root_relation_extra_job(code: str, quote: str) -> bool:
+    """Strict predicates for DATA/DEV root JOB relation lifts."""
+    text = (quote or "").strip()
+    if not text:
+        return False
+    if code == "JOB-DATA-DBA":
+        # Oracle/SQL/DB usage alone is insufficient.
+        return bool(_DBA_TOKEN_RE.search(text) or _DBA_KO_ROLE_RE.search(text))
+    if code == "JOB-DATA-DA":
+        if _DA_KO_ROLE_RE.search(text):
+            return True
+        # DA token needs data-duty context (blocks DATA/DAY substring and bare DA).
+        return bool(_DA_TOKEN_RE.search(text) and _DA_DUTY_CONTEXT_RE.search(text))
+    if code == "JOB-DEV-GEN":
+        # Project participation / bare "개발" is insufficient.
+        return bool(_DEV_GEN_ROLE_RE.search(text))
+    return False
+
+
+def _quote_supports_root_relation_extra_exp(code: str, quote: str) -> bool:
+    """Strict predicates for DATA root EXP relation lifts."""
+    text = (quote or "").strip()
+    if not text:
+        return False
+    if code == "EXP-DATA-DB-TUNING":
+        # General 성능개선 without DB/SQL tuning words is insufficient.
+        return bool(_DB_TUNING_RE.search(text))
+    if code == "EXP-DATA":
+        # Bare 데이터/DB/Oracle/SQL alone is insufficient.
+        return bool(_EXP_DATA_PHRASE_RE.search(text))
+    return False
+
+
+def _root_job_relation_supplement_eligible(code: str) -> bool:
+    if code in _CORE_JOB_ROOT_FORBIDDEN_CODES:
+        return False
+    return (
+        code in _CORE_JOB_EVIDENCE_REQUIRED_CODES
+        or code in _ROOT_RELATION_EXTRA_JOB_CODES
+    )
+
+
+def _root_exp_relation_supplement_eligible(code: str) -> bool:
+    return (
+        code in _PROJECT_EXP_SEMANTIC_PATTERNS
+        or code in _EXP_SEMANTIC_PATTERNS
+        or code in _ROOT_RELATION_EXTRA_EXP_CODES
+    )
+
+
 def _quote_supports_root_exp_from_project(code: str, quote: str) -> bool | None:
     """EXP support for project-relation lifts. None = no rule for this code.
 
@@ -1631,6 +1725,8 @@ def _quote_supports_root_exp_from_project(code: str, quote: str) -> bool | None:
         return _quote_supports_semantic_project_exp(code, quote)
     if code in _EXP_SEMANTIC_PATTERNS:
         return _quote_supports_semantic_exp(code, quote)
+    if code in _ROOT_RELATION_EXTRA_EXP_CODES:
+        return _quote_supports_root_relation_extra_exp(code, quote)
     return None
 
 
@@ -1638,12 +1734,14 @@ def _quote_supports_root_job_from_project(code: str, quote: str) -> bool | None:
     """Root-applicable JOB support for project-relation lifts. None = no rule."""
     if code in _CORE_JOB_ROOT_FORBIDDEN_CODES:
         return None
-    if code not in _CORE_JOB_EVIDENCE_REQUIRED_CODES:
-        return None
-    # Prefer project-enhanced OPS-SYS rules (SEC title phrase handling).
-    return _quote_supports_semantic_project_job(
-        code, quote, enhanced_project_relation_semantics=True
-    )
+    if code in _CORE_JOB_EVIDENCE_REQUIRED_CODES:
+        # Prefer project-enhanced OPS-SYS rules (SEC title phrase handling).
+        return _quote_supports_semantic_project_job(
+            code, quote, enhanced_project_relation_semantics=True
+        )
+    if code in _ROOT_RELATION_EXTRA_JOB_CODES:
+        return _quote_supports_root_relation_extra_job(code, quote)
+    return None
 
 
 def _relation_ref_attributable_to_project(
@@ -1825,9 +1923,7 @@ def supplement_root_job_exp_evidence_from_project_relations(
         if not code or _refs_nonempty(job.source_refs):
             new_jobs.append(job)
             continue
-        if code in _CORE_JOB_ROOT_FORBIDDEN_CODES or (
-            code not in _CORE_JOB_EVIDENCE_REQUIRED_CODES
-        ):
+        if not _root_job_relation_supplement_eligible(code):
             report["unresolved_jobs"].append(code)
             new_jobs.append(job)
             continue
@@ -1863,10 +1959,7 @@ def supplement_root_job_exp_evidence_from_project_relations(
         if not code or _refs_nonempty(exp.source_refs):
             new_expertise.append(exp)
             continue
-        if (
-            code not in _EXP_SEMANTIC_PATTERNS
-            and code not in _PROJECT_EXP_SEMANTIC_PATTERNS
-        ):
+        if not _root_exp_relation_supplement_eligible(code):
             report["unresolved_expertise"].append(code)
             new_expertise.append(exp)
             continue
