@@ -11,8 +11,10 @@ import {
 /** Same separator backend uses when joining incompatible employment ends. */
 export const EMPLOYMENT_END_CONFLICT_SEP = ' / '
 
+/** Matches backend ``confirm_dates._DATE_RE`` after `.`/`/` → `-` normalization. */
 const DATE_RE =
-  /^(?<y>\d{4})(?:[./-](?<m>\d{1,2})(?:[./-](?<d>\d{1,2}))?)?$/
+  /^(?<y>\d{4})(?:-(?<m>\d{1,2})(?:-(?<d>\d{1,2}))?)?$/
+/** Matches backend ``confirm_dates._KOREAN_DATE_RE`` (internal spaces allowed). */
 const KOREAN_DATE_RE =
   /^(?<y>\d{4})\s*년(?:\s*(?<m>\d{1,2})\s*월(?:\s*(?<d>\d{1,2})\s*일)?)?\s*\.?$/
 
@@ -33,33 +35,45 @@ function daysInMonth(year: number, month: number): number {
   return new Date(year, month, 0).getDate()
 }
 
-/** Parse YYYY / YYYY.MM / YYYY.MM.DD (and -, /, Korean) like Confirm. */
+/**
+ * Parse YYYY / YYYY-MM / YYYY-MM-DD like Confirm ``parse_partial_date``.
+ * Does not strip internal spaces on dotted/ISO forms (backend rejects those).
+ * Korean ``2014년 8월`` keeps internal spaces via the Korean regex.
+ */
 export function parseEmploymentPartialDate(
   value: unknown,
 ): ParsedPartialDate | null {
   if (value == null) return null
-  const text = String(value).trim()
+  let text = String(value).trim()
   if (!text) return null
+  if (text.includes('T')) {
+    text = text.split('T', 1)[0] ?? text
+  }
 
   const korean = KOREAN_DATE_RE.exec(text)
-  const match = korean ?? DATE_RE.exec(text.replace(/\s+/g, ''))
+  let match = korean
+  if (!match) {
+    // Same as backend: replace separators, keep internal spaces (so they fail).
+    const normalized = text.replaceAll('/', '-').replaceAll('.', '-').replace(/-+$/, '')
+    match = DATE_RE.exec(normalized)
+  }
   if (!match?.groups) {
-    throw new Error(`invalid date: ${text}`)
+    throw new Error(`invalid date: ${String(value)}`)
   }
   const year = Number(match.groups.y)
   if (year < 1900 || year > 2100) {
-    throw new Error(`invalid year: ${text}`)
+    throw new Error(`invalid year: ${String(value)}`)
   }
   const month = match.groups.m ? Number(match.groups.m) : null
   const day = match.groups.d ? Number(match.groups.d) : null
   if (month != null && (month < 1 || month > 12)) {
-    throw new Error(`invalid month: ${text}`)
+    throw new Error(`invalid month: ${String(value)}`)
   }
   if (day != null) {
-    if (month == null) throw new Error(`invalid date: ${text}`)
+    if (month == null) throw new Error(`invalid date: ${String(value)}`)
     const last = daysInMonth(year, month)
     if (day < 1 || day > last) {
-      throw new Error(`invalid day: ${text}`)
+      throw new Error(`invalid day: ${String(value)}`)
     }
   }
   return { year, month, day }
@@ -98,16 +112,16 @@ export function containsEmploymentEndConflictSep(value: unknown): boolean {
 /**
  * Split a known conflict end_date into discrete date candidates.
  * Returns null when the pattern is unexpected → caller should JSON-fallback.
+ * Empty segments (e.g. ``"A /  / B"``) are abnormal — do not drop them.
  */
 export function extractEmploymentEndDateConflictCandidates(
   endDate: unknown,
 ): string[] | null {
   if (typeof endDate !== 'string') return null
   if (!endDate.includes(EMPLOYMENT_END_CONFLICT_SEP)) return null
-  const parts = endDate
-    .split(EMPLOYMENT_END_CONFLICT_SEP)
-    .map((p) => p.trim())
-    .filter(Boolean)
+  const parts = endDate.split(EMPLOYMENT_END_CONFLICT_SEP).map((p) => p.trim())
+  // Empty candidate after split → unexpected pattern → JSON fallback.
+  if (parts.some((p) => !p)) return null
   if (parts.length < 2) return null
   for (const part of parts) {
     // Nested conflict or non-date tokens → do not invent a decomposition.
