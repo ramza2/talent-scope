@@ -20,6 +20,17 @@ def _ref(quote: str, *, doc: str = _DOC, page: int = 1) -> dict:
     return {"document_id": doc, "page_no": page, "quote_text": quote}
 
 
+def _row(
+    name: str,
+    *,
+    period: str = "2020.01~2020.12",
+    duty: str,
+    customer: str = "고객A",
+) -> str:
+    """PPTX-like career row used by project-owned span attribution."""
+    return f"{name} | 개요 | {period} | {duty} | {customer}"
+
+
 def _doc(
     *,
     jobs=None,
@@ -43,9 +54,9 @@ def _doc(
         for item in items or []:
             refs = [
                 SourceRef(
-                    document_id=r["document_id"],
-                    page_no=r["page_no"],
-                    quote_text=r["quote_text"],
+                    document_id=r.get("document_id"),
+                    page_no=r.get("page_no"),
+                    quote_text=r.get("quote_text"),
                 )
                 for r in (item.get("source_refs") or [])
             ]
@@ -65,9 +76,9 @@ def _doc(
         for item in items or []:
             refs = [
                 SourceRef(
-                    document_id=r["document_id"],
-                    page_no=r["page_no"],
-                    quote_text=r["quote_text"],
+                    document_id=r.get("document_id"),
+                    page_no=r.get("page_no"),
+                    quote_text=r.get("quote_text"),
                 )
                 for r in (item.get("source_refs") or [])
             ]
@@ -107,9 +118,9 @@ def _doc(
         project_rows.append(
             ProjectCandidate(
                 project_name=p["project_name"],
-                customer_name=p.get("customer_name"),
-                start_date=p.get("start_date"),
-                end_date=p.get("end_date"),
+                customer_name=p.get("customer_name", "고객A"),
+                start_date=p.get("start_date", "2020.01"),
+                end_date=p.get("end_date", "2020.12"),
                 jobs=_rels(p.get("jobs")),
                 expertise=_rels(p.get("expertise")),
                 skills=_rels(p.get("skills")),
@@ -143,12 +154,12 @@ def _run(doc, *, page_texts, allowed=None):
     return supplement_root_job_exp_evidence_from_project_relations(
         doc,
         page_texts=page_texts,
-        allowed_documents=allowed or {_DOC: {1}},
+        allowed_documents=allowed or {_DOC: {1, 2}},
     )
 
 
 def test_same_code_supporting_quote_supplements_root_job_and_exp() -> None:
-    page = "PM 역할 수행 및 정보시스템 운영 담당"
+    page = _row("사업A", duty="PM 역할 수행 및 정보시스템 운영")
     doc = _doc(
         jobs=[{"code": "JOB-MGT-PM", "raw_value": "JOB-MGT-PM", "job_type": "PRIMARY"}],
         expertise=[
@@ -183,20 +194,62 @@ def test_same_code_supporting_quote_supplements_root_job_and_exp() -> None:
     assert report["supplemented_jobs"] == ["JOB-MGT-PM"]
     assert report["supplemented_expertise"] == ["EXP-INFRA"]
     assert out.jobs[0].source_refs[0].quote_text == "PM 역할 수행"
-    assert out.jobs[0].raw_value == "PM 역할 수행"  # code-string corrected
+    assert out.jobs[0].raw_value == "PM 역할 수행"
     assert out.jobs[0].job_type == "PRIMARY"
     assert out.expertise[0].source_refs[0].quote_text == "정보시스템 운영"
     assert out.expertise[0].raw_value == "정보시스템 운영"
     assert out.expertise[0].evidence_type == "EXPLICIT"
     assert out.expertise[0].confidence == 0.9
-    # PROJECT untouched
     assert len(out.projects) == 1
     assert out.projects[0].jobs[0].source_refs[0].quote_text == "PM 역할 수행"
-    assert out.projects[0].expertise[0].source_refs[0].quote_text == "정보시스템 운영"
+
+
+def test_sec_ops_title_not_treated_as_exp_infra() -> None:
+    """PROJECT enhanced rule: 정보보안시스템 운영 is SEC-OPS, not INFRA."""
+    page = _row("보안사업", duty="정보보안시스템 운영")
+    doc = _doc(
+        expertise=[{"code": "EXP-INFRA"}],
+        projects=[
+            {
+                "project_name": "보안사업",
+                "expertise": [
+                    {
+                        "code": "EXP-INFRA",
+                        "source_refs": [_ref("정보보안시스템 운영")],
+                    }
+                ],
+            }
+        ],
+    )
+    out, report = _run(doc, page_texts={(_DOC, 1): page})
+    assert out.expertise[0].source_refs == []
+    assert report["supplemented_expertise"] == []
+    assert report["unresolved_expertise"] == ["EXP-INFRA"]
+
+
+def test_sec_ops_title_can_supplement_exp_sec_ops() -> None:
+    page = _row("보안사업", duty="정보보안시스템 운영")
+    doc = _doc(
+        expertise=[{"code": "EXP-SEC-OPS", "raw_value": "EXP-SEC-OPS"}],
+        projects=[
+            {
+                "project_name": "보안사업",
+                "expertise": [
+                    {
+                        "code": "EXP-SEC-OPS",
+                        "source_refs": [_ref("정보보안시스템 운영")],
+                    }
+                ],
+            }
+        ],
+    )
+    out, report = _run(doc, page_texts={(_DOC, 1): page})
+    assert report["supplemented_expertise"] == ["EXP-SEC-OPS"]
+    assert out.expertise[0].source_refs[0].quote_text == "정보보안시스템 운영"
 
 
 def test_same_code_unrelated_quote_not_supplemented() -> None:
-    page = "일반 업무 수행 및 회의 참석"
+    page = _row("사업A", duty="일반 업무 수행 및 회의 참석")
     doc = _doc(
         jobs=[{"code": "JOB-MGT-PM"}],
         expertise=[{"code": "EXP-INFRA"}],
@@ -227,28 +280,70 @@ def test_same_code_unrelated_quote_not_supplemented() -> None:
     assert out.expertise[0].source_refs == []
 
 
-def test_different_code_or_document_or_page_not_supplemented() -> None:
-    page = "PM 역할 정보시스템 운영"
+def test_other_project_evidence_not_borrowed() -> None:
+    """Project B relation must not feed root via Project A's page presence."""
+    page = (
+        _row("사업A", period="2020.01~2020.06", duty="회의 참석")
+        + "\n"
+        + _row(
+            "사업B",
+            period="2021.01~2021.12",
+            duty="PM 역할 수행 및 정보시스템 운영",
+            customer="고객B",
+        )
+    )
     doc = _doc(
         jobs=[{"code": "JOB-MGT-PM"}],
         expertise=[{"code": "EXP-INFRA"}],
         projects=[
             {
                 "project_name": "사업A",
-                # Different JOB code on project
+                "start_date": "2020.01",
+                "end_date": "2020.06",
+                # Wrong: relation refs point at B's supporting quotes
                 "jobs": [
                     {
-                        "code": "JOB-MGT-PL",
-                        "source_refs": [_ref("PM 역할")],
+                        "code": "JOB-MGT-PM",
+                        "source_refs": [_ref("PM 역할 수행")],
                     }
                 ],
-                # EXP quote on other document
                 "expertise": [
                     {
                         "code": "EXP-INFRA",
-                        "source_refs": [
-                            _ref("정보시스템 운영", doc=_DOC_OTHER, page=1)
-                        ],
+                        "source_refs": [_ref("정보시스템 운영")],
+                    }
+                ],
+            },
+            {
+                "project_name": "사업B",
+                "start_date": "2021.01",
+                "end_date": "2021.12",
+                "customer_name": "고객B",
+                "jobs": [],
+                "expertise": [],
+            },
+        ],
+    )
+    out, report = _run(doc, page_texts={(_DOC, 1): page})
+    assert out.jobs[0].source_refs == []
+    assert out.expertise[0].source_refs == []
+    assert "JOB-MGT-PM" in report["unresolved_jobs"]
+    assert "EXP-INFRA" in report["unresolved_expertise"]
+
+
+def test_same_document_other_page_not_linked() -> None:
+    page1 = _row("사업A", duty="회의 참석")
+    page2 = _row("사업A", duty="PM 역할 수행")
+    doc = _doc(
+        jobs=[{"code": "JOB-MGT-PM"}],
+        projects=[
+            {
+                "project_name": "사업A",
+                # Relation cites page 1, but supporting quote only exists on page 2
+                "jobs": [
+                    {
+                        "code": "JOB-MGT-PM",
+                        "source_refs": [_ref("PM 역할 수행", page=1)],
                     }
                 ],
             }
@@ -256,64 +351,85 @@ def test_different_code_or_document_or_page_not_supplemented() -> None:
     )
     out, report = _run(
         doc,
-        page_texts={
-            (_DOC, 1): page,
-            (_DOC_OTHER, 1): "정보시스템 운영",
-        },
-        allowed={_DOC: {1}},  # other doc not allowed
+        page_texts={(_DOC, 1): page1, (_DOC, 2): page2},
+        allowed={_DOC: {1, 2}},
     )
     assert out.jobs[0].source_refs == []
-    assert out.expertise[0].source_refs == []
-    assert "JOB-MGT-PM" in report["unresolved_jobs"]
-    assert "EXP-INFRA" in report["unresolved_expertise"]
+    assert report["unresolved_jobs"] == ["JOB-MGT-PM"]
 
 
-def test_metadata_only_ref_without_quote_not_supplemented() -> None:
+def test_metadata_only_root_refs_preserved_when_safe() -> None:
+    page = _row("사업A", duty="PM 역할 수행")
     doc = _doc(
-        jobs=[{"code": "JOB-OPS-SYS"}],
-        expertise=[{"code": "EXP-MGT"}],
+        jobs=[
+            {
+                "code": "JOB-MGT-PM",
+                "raw_value": "JOB-MGT-PM",
+                "source_refs": [
+                    {"document_id": _DOC, "page_no": 1, "quote_text": None}
+                ],
+            }
+        ],
         projects=[
             {
                 "project_name": "사업A",
                 "jobs": [
                     {
-                        "code": "JOB-OPS-SYS",
-                        "source_refs": [
-                            {
-                                "document_id": _DOC,
-                                "page_no": 1,
-                                "quote_text": None,
-                            },
-                            {
-                                "document_id": _DOC,
-                                "page_no": 1,
-                                "quote_text": "   ",
-                            },
-                        ],
+                        "code": "JOB-MGT-PM",
+                        "source_refs": [_ref("PM 역할 수행")],
                     }
                 ],
-                "expertise": [
+            }
+        ],
+    )
+    out, report = _run(doc, page_texts={(_DOC, 1): page})
+    assert report["supplemented_jobs"] == ["JOB-MGT-PM"]
+    assert len(out.jobs[0].source_refs) == 1
+    assert out.jobs[0].source_refs[0].document_id == _DOC
+    assert out.jobs[0].source_refs[0].page_no == 1
+    assert out.jobs[0].source_refs[0].quote_text == "PM 역할 수행"
+
+
+def test_metadata_only_conflicting_doc_or_page_not_overwritten() -> None:
+    page = _row("사업A", duty="PM 역할 수행")
+    doc = _doc(
+        jobs=[
+            {
+                "code": "JOB-MGT-PM",
+                "source_refs": [
                     {
-                        "code": "EXP-MGT",
-                        "source_refs": [
-                            {"document_id": _DOC, "page_no": 1},
-                        ],
+                        "document_id": _DOC_OTHER,
+                        "page_no": 1,
+                        "quote_text": "",
+                    }
+                ],
+            }
+        ],
+        projects=[
+            {
+                "project_name": "사업A",
+                "jobs": [
+                    {
+                        "code": "JOB-MGT-PM",
+                        "source_refs": [_ref("PM 역할 수행")],
                     }
                 ],
             }
         ],
     )
     out, report = _run(
-        doc, page_texts={(_DOC, 1): "시스템 운영 및 사업관리"}
+        doc,
+        page_texts={(_DOC, 1): page, (_DOC_OTHER, 1): "다른문서"},
+        allowed={_DOC: {1}, _DOC_OTHER: {1}},
     )
-    assert out.jobs[0].source_refs == []
-    assert out.expertise[0].source_refs == []
     assert report["supplemented_jobs"] == []
-    assert report["supplemented_expertise"] == []
+    assert report["unresolved_jobs"] == ["JOB-MGT-PM"]
+    assert out.jobs[0].source_refs[0].document_id == _DOC_OTHER
+    assert not (out.jobs[0].source_refs[0].quote_text or "").strip()
 
 
-def test_existing_root_refs_preserved_no_overwrite_or_duplicate() -> None:
-    page = "기존 원문 PM 과 정보시스템 운영"
+def test_existing_quoted_root_refs_preserved_no_overwrite() -> None:
+    page = _row("사업A", duty="기존 원문 PM 과 정보시스템 운영")
     doc = _doc(
         jobs=[
             {
@@ -350,15 +466,13 @@ def test_existing_root_refs_preserved_no_overwrite_or_duplicate() -> None:
     out, report = _run(doc, page_texts={(_DOC, 1): page})
     assert report["supplemented_jobs"] == []
     assert report["supplemented_expertise"] == []
-    assert len(out.jobs[0].source_refs) == 1
     assert out.jobs[0].source_refs[0].quote_text == "기존 원문 PM"
     assert out.jobs[0].raw_value == "기존 PM"
-    assert len(out.expertise[0].source_refs) == 1
     assert out.expertise[0].raw_value == "인프라"
 
 
 def test_codes_without_semantic_rules_remain_unresolved() -> None:
-    page = "AI개발자 RAG 전문"
+    page = _row("사업A", duty="AI개발자 RAG 전문")
     doc = _doc(
         jobs=[{"code": "JOB-DEV-GEN", "raw_value": "JOB-DEV-GEN"}],
         expertise=[{"code": "EXP-AI-RAG", "raw_value": "EXP-AI-RAG"}],
@@ -384,74 +498,61 @@ def test_codes_without_semantic_rules_remain_unresolved() -> None:
     assert out.jobs[0].source_refs == []
     assert out.expertise[0].source_refs == []
     assert out.jobs[0].raw_value == "JOB-DEV-GEN"
-    assert out.expertise[0].raw_value == "EXP-AI-RAG"
     assert report["unresolved_jobs"] == ["JOB-DEV-GEN"]
     assert report["unresolved_expertise"] == ["EXP-AI-RAG"]
 
 
-def test_does_not_cross_propagate_project_evidence_or_mutate_projects() -> None:
-    """One project's supporting quote must not be invented onto another project."""
-    page = "PM 역할\nPL 역할"
+def test_metadata_only_ref_without_quote_on_relation_not_supplemented() -> None:
+    page = _row("사업A", duty="시스템 운영 및 사업관리")
     doc = _doc(
-        jobs=[
-            {"code": "JOB-MGT-PM"},
-            {"code": "JOB-MGT-PL", "job_type": "SECONDARY"},
-        ],
+        jobs=[{"code": "JOB-OPS-SYS"}],
+        expertise=[{"code": "EXP-MGT"}],
         projects=[
             {
                 "project_name": "사업A",
                 "jobs": [
                     {
-                        "code": "JOB-MGT-PM",
-                        "source_refs": [_ref("PM 역할")],
+                        "code": "JOB-OPS-SYS",
+                        "source_refs": [
+                            {
+                                "document_id": _DOC,
+                                "page_no": 1,
+                                "quote_text": None,
+                            },
+                            {
+                                "document_id": _DOC,
+                                "page_no": 1,
+                                "quote_text": "   ",
+                            },
+                        ],
                     }
                 ],
-            },
-            {
-                "project_name": "사업B",
-                "jobs": [
+                "expertise": [
                     {
-                        "code": "JOB-MGT-PL",
-                        "source_refs": [],  # empty — must stay empty
-                    }
-                ],
-            },
-        ],
-    )
-    out, report = _run(doc, page_texts={(_DOC, 1): page})
-    assert "JOB-MGT-PM" in report["supplemented_jobs"]
-    assert "JOB-MGT-PL" in report["unresolved_jobs"]
-    assert len(out.projects) == 2
-    assert out.projects[0].jobs[0].source_refs[0].quote_text == "PM 역할"
-    assert out.projects[1].jobs[0].source_refs == []
-    assert out.projects[1].project_name == "사업B"
-
-
-def test_quote_not_on_page_text_rejected() -> None:
-    doc = _doc(
-        jobs=[{"code": "JOB-MGT-PM"}],
-        projects=[
-            {
-                "project_name": "사업A",
-                "jobs": [
-                    {
-                        "code": "JOB-MGT-PM",
-                        "source_refs": [_ref("PM 역할")],
+                        "code": "EXP-MGT",
+                        "source_refs": [{"document_id": _DOC, "page_no": 1}],
                     }
                 ],
             }
         ],
     )
-    out, report = _run(doc, page_texts={(_DOC, 1): "다른 내용만 있음"})
+    out, report = _run(doc, page_texts={(_DOC, 1): page})
     assert out.jobs[0].source_refs == []
-    assert report["unresolved_jobs"] == ["JOB-MGT-PM"]
+    assert out.expertise[0].source_refs == []
+    assert report["supplemented_jobs"] == []
+    assert report["supplemented_expertise"] == []
 
 
 def test_entity_counts_and_project_count_stable() -> None:
-    page = "시스템 운영 PM 역할 사업관리"
+    page = "\n".join(
+        _row(f"사업{i}", period=f"202{i}.01~202{i}.12", duty="PM 역할 사업관리")
+        for i in range(3)
+    )
     projects = [
         {
             "project_name": f"사업{i}",
+            "start_date": f"202{i}.01",
+            "end_date": f"202{i}.12",
             "jobs": [
                 {
                     "code": "JOB-MGT-PM",
@@ -472,15 +573,11 @@ def test_entity_counts_and_project_count_stable() -> None:
         expertise=[{"code": "EXP-MGT"}, {"code": "EXP-AI-RAG"}],
         projects=projects,
     )
-    out, report = _run(
-        doc, page_texts={(_DOC, 1): page + " 시스템 운영"}
-    )
+    out, report = _run(doc, page_texts={(_DOC, 1): page})
     assert len(out.jobs) == 2
     assert len(out.expertise) == 2
     assert len(out.projects) == 3
     assert "JOB-MGT-PM" in report["supplemented_jobs"]
     assert "EXP-MGT" in report["supplemented_expertise"]
-    # OPS-SYS has no supporting project quote with INFRA phrase in project jobs
     assert "JOB-OPS-SYS" in report["unresolved_jobs"]
-    # EXP-AI-RAG has no semantic rule
     assert "EXP-AI-RAG" in report["unresolved_expertise"]

@@ -79,6 +79,7 @@ jobs:
             tests/test_profile_extract_v23.py \
             tests/test_profile_extract_v22.py \
             tests/test_project_relation_supplement_v20.py \
+            tests/test_root_job_exp_project_relation_evidence.py \
             tests/test_analysis_token_budgeting.py \
             tests/test_openai_compat.py \
             tests/test_modelops_gateway_contract.py \

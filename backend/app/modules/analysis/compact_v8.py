@@ -1622,25 +1622,61 @@ def _source_ref_verified_on_allowed_page(
 
 
 def _quote_supports_root_exp_from_project(code: str, quote: str) -> bool | None:
-    """CORE/PROJECT EXP semantic support. None = no rule for this code."""
-    has_core = code in _EXP_SEMANTIC_PATTERNS
-    has_project = code in _PROJECT_EXP_SEMANTIC_PATTERNS
-    if not has_core and not has_project:
-        return None
-    if has_core and _quote_supports_semantic_exp(code, quote):
-        return True
-    if has_project and _quote_supports_semantic_project_exp(code, quote):
-        return True
-    return False
+    """EXP support for project-relation lifts. None = no rule for this code.
+
+    Prefers PROJECT enhanced semantics so weak CORE phrases cannot promote
+    SEC titles (e.g. ``정보보안시스템 운영``) into EXP-INFRA.
+    """
+    if code in _PROJECT_EXP_SEMANTIC_PATTERNS:
+        return _quote_supports_semantic_project_exp(code, quote)
+    if code in _EXP_SEMANTIC_PATTERNS:
+        return _quote_supports_semantic_exp(code, quote)
+    return None
 
 
 def _quote_supports_root_job_from_project(code: str, quote: str) -> bool | None:
-    """Root-applicable JOB semantic/literal support. None = no root rule."""
+    """Root-applicable JOB support for project-relation lifts. None = no rule."""
     if code in _CORE_JOB_ROOT_FORBIDDEN_CODES:
         return None
     if code not in _CORE_JOB_EVIDENCE_REQUIRED_CODES:
         return None
-    return _quote_supports_semantic_core_job(code, quote)
+    # Prefer project-enhanced OPS-SYS rules (SEC title phrase handling).
+    return _quote_supports_semantic_project_job(
+        code, quote, enhanced_project_relation_semantics=True
+    )
+
+
+def _relation_ref_attributable_to_project(
+    project: ProjectCandidate,
+    ref: SourceRef,
+    *,
+    page_texts: dict[tuple[str, int], str],
+    allowed_documents: dict[str, set[int]],
+    sibling_names: frozenset[str],
+) -> bool:
+    """True when quote is owned by this project on its cited page.
+
+    Allowed-page presence alone is insufficient — the quote must sit inside
+    the project's owned career-row span. Fail closed when ownership is unclear.
+    """
+    if not _source_ref_verified_on_allowed_page(
+        ref, page_texts=page_texts, allowed_documents=allowed_documents
+    ):
+        return False
+    doc_id = (ref.document_id or "").strip()
+    page_no = ref.page_no
+    quote = (ref.quote_text or "").strip()
+    if page_no is None or not quote:
+        return False
+    page_text = page_texts.get((doc_id, page_no)) or ""
+    if not page_text:
+        return False
+    owned = _project_owned_source_span(
+        project, page_text, sibling_names=sibling_names
+    )
+    if owned is None:
+        return False
+    return quote in owned
 
 
 def _iter_project_relation_refs_for_code(
@@ -1648,20 +1684,19 @@ def _iter_project_relation_refs_for_code(
     *,
     code: str,
     relation: str,
-) -> list[SourceRef]:
-    """Collect source_refs from project relations with the exact same code.
+) -> list[tuple[ProjectCandidate, SourceRef]]:
+    """Collect (project, ref) pairs for the exact same relation code.
 
-    Order is deterministic (project order, then relation order, then refs).
-    Does not cross-combine quotes from different projects into one ref.
+    Order is deterministic. Does not cross-combine quotes across projects.
     """
-    out: list[SourceRef] = []
+    out: list[tuple[ProjectCandidate, SourceRef]] = []
     for project in candidate.projects or []:
         rels = project.jobs if relation == "jobs" else project.expertise
         for rel in rels or []:
             if (rel.code or "").strip() != code:
                 continue
             for ref in rel.source_refs or []:
-                out.append(ref)
+                out.append((project, ref))
     return out
 
 
@@ -1674,12 +1709,17 @@ def _pick_supporting_project_relation_ref(
     allowed_documents: dict[str, set[int]],
     quote_supports,
 ) -> SourceRef | None:
-    """First single project-relation ref that verifies on page and supports code."""
-    for ref in _iter_project_relation_refs_for_code(
+    """First project-owned relation ref that supports the root code."""
+    siblings = _candidate_sibling_project_names(candidate)
+    for project, ref in _iter_project_relation_refs_for_code(
         candidate, code=code, relation=relation
     ):
-        if not _source_ref_verified_on_allowed_page(
-            ref, page_texts=page_texts, allowed_documents=allowed_documents
+        if not _relation_ref_attributable_to_project(
+            project,
+            ref,
+            page_texts=page_texts,
+            allowed_documents=allowed_documents,
+            sibling_names=siblings,
         ):
             continue
         supported = quote_supports(code, ref.quote_text or "")
@@ -1701,6 +1741,48 @@ def _raw_value_is_code_string(raw_value: str | None, code: str) -> bool:
     return raw == c or raw.upper() == c.upper()
 
 
+def _apply_root_ref_supplement(
+    existing: list[SourceRef] | None, match: SourceRef
+) -> list[SourceRef] | None:
+    """Attach a verified quote while preserving metadata-only root refs.
+
+    Returns None when existing grounded quotes exist or metadata doc/page
+    conflicts with ``match`` (never overwrite different provenance).
+    """
+    refs = list(existing or [])
+    if _refs_nonempty(refs):
+        return None
+    if not refs:
+        return [match]
+    match_doc = (match.document_id or "").strip()
+    match_page = match.page_no
+    filled = False
+    out: list[SourceRef] = []
+    for ref in refs:
+        doc = (ref.document_id or "").strip() or None
+        page = ref.page_no
+        if doc and match_doc and doc != match_doc:
+            return None
+        if page is not None and match_page is not None and page != match_page:
+            return None
+        if not filled and (doc is None or doc == match_doc) and (
+            page is None or page == match_page
+        ):
+            out.append(
+                SourceRef(
+                    document_id=doc or match_doc or None,
+                    page_no=page if page is not None else match_page,
+                    quote_text=match.quote_text,
+                )
+            )
+            filled = True
+        else:
+            out.append(ref)
+    if not filled:
+        return None
+    return out
+
+
 def supplement_root_job_exp_evidence_from_project_relations(
     candidate: ProfileCandidateDocument,
     *,
@@ -1710,14 +1792,14 @@ def supplement_root_job_exp_evidence_from_project_relations(
     """After staged merge: fill empty root JOB/EXP refs from same-code project rels.
 
     Conditions (all required):
-    - Root item lacks non-empty quote source_refs
+    - Root item lacks quote-bearing source_refs (metadata-only may be filled)
     - Exact same code on a project jobs/expertise relation
-    - Relation ref has quote_text present on an allowed document page
-    - Quote itself supports the JOB/EXP classification via existing semantic rules
-    - Codes without semantic rules are left unresolved (never guessed)
+    - Relation quote is attributable to that project on an allowed page
+    - Quote supports the JOB/EXP code via PROJECT-enhanced (preferred) rules
+    - Codes without semantic rules stay unresolved (never guessed)
 
-    Never overwrites existing root refs, never mutates projects, never combines
-    quotes across projects/documents into a synthetic ref.
+    Never mutates projects, never borrows other-project evidence, never
+    overwrites conflicting metadata doc/page on existing root refs.
     """
     report: dict[str, list[str]] = {
         "supplemented_jobs": [],
@@ -1743,7 +1825,6 @@ def supplement_root_job_exp_evidence_from_project_relations(
         if not code or _refs_nonempty(job.source_refs):
             new_jobs.append(job)
             continue
-        # Detect "no rule" without relying on quote content: forbidden / unknown.
         if code in _CORE_JOB_ROOT_FORBIDDEN_CODES or (
             code not in _CORE_JOB_EVIDENCE_REQUIRED_CODES
         ):
@@ -1762,7 +1843,12 @@ def supplement_root_job_exp_evidence_from_project_relations(
             report["unresolved_jobs"].append(code)
             new_jobs.append(job)
             continue
-        updates: dict[str, Any] = {"source_refs": [match]}
+        merged_refs = _apply_root_ref_supplement(job.source_refs, match)
+        if merged_refs is None:
+            report["unresolved_jobs"].append(code)
+            new_jobs.append(job)
+            continue
+        updates: dict[str, Any] = {"source_refs": merged_refs}
         if _raw_value_is_code_string(job.raw_value, code):
             quote = (match.quote_text or "").strip()
             if quote:
@@ -1796,7 +1882,12 @@ def supplement_root_job_exp_evidence_from_project_relations(
             report["unresolved_expertise"].append(code)
             new_expertise.append(exp)
             continue
-        updates = {"source_refs": [match]}
+        merged_refs = _apply_root_ref_supplement(exp.source_refs, match)
+        if merged_refs is None:
+            report["unresolved_expertise"].append(code)
+            new_expertise.append(exp)
+            continue
+        updates = {"source_refs": merged_refs}
         if _raw_value_is_code_string(exp.raw_value, code):
             quote = (match.quote_text or "").strip()
             if quote:
