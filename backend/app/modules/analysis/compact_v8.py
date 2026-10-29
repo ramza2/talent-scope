@@ -1633,24 +1633,31 @@ _DBA_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9])DBA(?![A-Za-z0-9])", re.IGNORECASE)
 _DBA_KO_ROLE_RE = re.compile(r"데이터베이스\s*관리자|(?<![A-Za-z0-9])DB\s*관리자")
 
 # Catalog: JOB-DATA-DA = DA / Data Architect (docs/04_code_taxonomy.md).
-# Analyst phrases (데이터 분석가) are NOT DA evidence.
+# Analyst phrases (데이터 분석가) are NOT DA evidence. Bare DA / PL alone
+# are insufficient; PL is JOB-MGT-PL and must never support DA.
 _DA_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9])DA(?![A-Za-z0-9])", re.IGNORECASE)
 _DA_ARCHITECT_ROLE_RE = re.compile(
     r"데이터\s*아키텍트|(?<![A-Za-z0-9])Data\s*Architect(?![A-Za-z0-9])|"
     r"데이터\s*아키텍처\s*(?:담당|설계|역할)",
     re.IGNORECASE,
 )
-# DA token may combine only with architecture / design / modeling duty context.
+# DA token may combine only with architecture / design / modeling / consulting
+# duty context (e.g. "DA 컨설팅"). Bare "컨설팅" without DA token fails.
 _DA_ARCH_DUTY_CONTEXT_RE = re.compile(
     r"데이터\s*모델(?:링)?|데이터\s*설계|데이터베이스\s*설계|"
-    r"DB\s*설계|DB\s*모델링|데이터\s*아키텍"
+    r"DB\s*설계|DB\s*모델링|데이터\s*아키텍|컨설팅"
 )
 
 # Catalog: JOB-DEV-GEN = 개발자 / Software Engineer / Programmer.
 # Specialist catalog titles (AI/BE/FE/…) must not lift GEN.
+# Bare 닷넷 / SM alone are insufficient; "닷넷 개발" requires stack+개발 duty.
 _DEV_GEN_ROLE_RE = re.compile(
     r"(?<![가-힣A-Za-z0-9])개발자(?![가-힣A-Za-z0-9])|"
     r"(?<![A-Za-z0-9])(?:Software\s+Engineer|Programmer|Developer)(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
+_DEV_GEN_DOTNET_DEV_RE = re.compile(
+    r"(?:닷넷|\.NET)\s*개발",
     re.IGNORECASE,
 )
 _DEV_SPECIALIST_BLOCK_RE = re.compile(
@@ -1666,6 +1673,7 @@ _DEV_SPECIALIST_BLOCK_RE = re.compile(
 )
 
 # Catalog: EXP-DATA-DB-TUNING / name "DB 튜닝". Explicit tuning + DB/SQL.
+# DBA role alone is NOT tuning evidence (stays unresolved).
 _DB_TUNING_RE = re.compile(
     r"(?:DB|데이터베이스|SQL|쿼리)\s*튜닝|"
     r"튜닝\s*(?:DB|데이터베이스)|"
@@ -1674,10 +1682,16 @@ _DB_TUNING_RE = re.compile(
 )
 
 # Catalog: EXP-DATA / name "Data/DB". Multi-token data/DB expertise phrases only.
+# Explicit modeler / ETL duty phrases allowed; bare DB / BI / DW rejected.
 _EXP_DATA_PHRASE_RE = re.compile(
     r"데이터\s*분석|데이터\s*모델링|데이터\s*모델\s*설계|"
     r"데이터베이스\s*설계|DB\s*설계|데이터\s*아키텍처|"
-    r"데이터\s*거버넌스|데이터\s*엔지니어(?:링)?"
+    r"데이터\s*거버넌스|데이터\s*엔지니어(?:링)?|"
+    r"(?:BI\s*/\s*DW\s+)?DB\s*모델러|"
+    r"(?:BI\s*/\s*DW\s+)?DB\s*ETL(?:er|러)?|"
+    r"데이터\s*모델러|"
+    r"(?:DB|데이터(?:베이스)?)\s*ETL(?:er|러)?",
+    re.IGNORECASE,
 )
 
 
@@ -1690,18 +1704,23 @@ def _quote_supports_root_relation_extra_job(code: str, quote: str) -> bool:
         # Oracle/SQL/DB usage alone is insufficient.
         return bool(_DBA_TOKEN_RE.search(text) or _DBA_KO_ROLE_RE.search(text))
     if code == "JOB-DATA-DA":
-        # Data Architect only — not data analyst / vague "DA 데이터 분석".
+        # Data Architect only — not data analyst / bare DA / PL alone.
+        # PL is JOB-MGT-PL; never treat as DA even when co-occurring without
+        # architect/DA+duty evidence.
         if _DA_ARCHITECT_ROLE_RE.search(text):
             return True
-        return bool(
-            _DA_TOKEN_RE.search(text) and _DA_ARCH_DUTY_CONTEXT_RE.search(text)
-        )
+        if not _DA_TOKEN_RE.search(text):
+            return False
+        return bool(_DA_ARCH_DUTY_CONTEXT_RE.search(text))
     if code == "JOB-DEV-GEN":
-        # Bare "개발" / project participation insufficient; specialist titles
-        # belong to JOB-AI-* / JOB-DEV-BE|FE|… and must not lift GEN.
+        # Bare "개발" / 닷넷 / SM / project participation insufficient;
+        # specialist titles belong to JOB-AI-* / JOB-DEV-BE|FE|… .
         if _DEV_SPECIALIST_BLOCK_RE.search(text):
             return False
-        return bool(_DEV_GEN_ROLE_RE.search(text))
+        if _DEV_GEN_ROLE_RE.search(text):
+            return True
+        # Stack-qualified development duty (e.g. "닷넷 개발"), not bare stack.
+        return bool(_DEV_GEN_DOTNET_DEV_RE.search(text))
     return False
 
 
@@ -1711,10 +1730,10 @@ def _quote_supports_root_relation_extra_exp(code: str, quote: str) -> bool:
     if not text:
         return False
     if code == "EXP-DATA-DB-TUNING":
-        # General 성능개선 without DB/SQL tuning words is insufficient.
+        # DBA / general 성능개선 without DB/SQL tuning words is insufficient.
         return bool(_DB_TUNING_RE.search(text))
     if code == "EXP-DATA":
-        # Bare 데이터/DB/Oracle/SQL alone is insufficient.
+        # Bare 데이터/DB/BI/DW/Oracle/SQL alone is insufficient.
         return bool(_EXP_DATA_PHRASE_RE.search(text))
     return False
 
@@ -3753,6 +3772,8 @@ def backfill_project_biz_evidence(
 
 _PM_PL_TO_OPS_REPAIR_CODES = frozenset({"JOB-MGT-PM", "JOB-MGT-PL"})
 # JOB codes checked by v20 PROJECT JOB semantic guard (PM/PL keep separate guard).
+# DATA/DEV extras (_ROOT_RELATION_EXTRA_JOB_CODES) share the same drop path so
+# mismatched quotes (DA←PL, DEV-GEN←닷넷/SM alone) cannot survive on projects.
 _JOB_SEMANTIC_GUARD_CODES = frozenset({"JOB-MGT", "JOB-OPS-SYS", "JOB-ARC-TA"})
 
 
@@ -3920,6 +3941,11 @@ def _project_job_has_semantic_guard_evidence(
 ) -> bool:
     """True when job is out of guard scope or has supporting semantic/literal quote."""
     code = (rel.code or "").strip()
+    if code in _ROOT_RELATION_EXTRA_JOB_CODES:
+        return any(
+            _quote_supports_root_relation_extra_job(code, ref.quote_text or "")
+            for ref in (rel.source_refs or [])
+        )
     if code not in _JOB_SEMANTIC_GUARD_CODES:
         return True
     return any(
@@ -3939,11 +3965,13 @@ def drop_project_jobs_without_semantic_evidence(
     *,
     enhanced_project_relation_semantics: bool = False,
 ) -> ProfileCandidateDocument:
-    """v20: drop PROJECT JOB-MGT/OPS-SYS/TA lacking semantic/literal quotes.
+    """Drop PROJECT JOB relations lacking supporting semantic/literal quotes.
 
     JOB-MGT needs literal 사업관리; JOB-OPS-SYS needs strong OPS phrases;
-    JOB-ARC-TA needs boundary-safe TA. JOB-MGT-PM/PL and other JOB codes are
-    left for their dedicated guards / unchanged. Root jobs stay.
+    JOB-ARC-TA needs boundary-safe TA. DATA/DEV extras (JOB-DATA-DA/DBA,
+    JOB-DEV-GEN) need their strict root-relation predicates so mismatched
+    quotes (e.g. DA←PL, DEV-GEN←닷넷/SM alone) are removed. JOB-MGT-PM/PL
+    keep their dedicated literal guard. Project rows and root jobs stay.
     """
     changed = False
     new_projects: list[ProjectCandidate] = []
@@ -4605,11 +4633,13 @@ def drop_project_expertise_without_semantic_evidence(
     *,
     enhanced_project_relation_semantics: bool = False,
 ) -> ProfileCandidateDocument:
-    """v20: drop PROJECT expertise whose quotes do not support known EXP codes.
+    """Drop PROJECT expertise whose quotes do not support known EXP codes.
 
-    Only ``project.expertise`` for PROJECT EXP-INFRA/MGT/SEC-OPS/SEC-BUILD.
-    Unknown EXP codes, root expertise, jobs/skills/domains, and the project
-    row stay. Any one supporting phrase quote keeps the relation.
+    Covers PROJECT EXP-INFRA/MGT/SEC-OPS/SEC-BUILD plus DATA extras
+    (EXP-DATA, EXP-DATA-DB-TUNING) so mismatched quotes (e.g. DB-tuning←DBA,
+    EXP-DATA←bare BI/DW) are removed. Unknown EXP codes, root expertise,
+    jobs/skills/domains, and the project row stay. Any one supporting phrase
+    quote keeps the relation.
     """
     known_exp = (
         _PROJECT_EXP_SEMANTIC_PATTERNS
@@ -4623,6 +4653,18 @@ def drop_project_expertise_without_semantic_evidence(
         dropped = False
         for rel in project.expertise:
             code = (rel.code or "").strip()
+            if code in _ROOT_RELATION_EXTRA_EXP_CODES:
+                supported = any(
+                    _quote_supports_root_relation_extra_exp(
+                        code, ref.quote_text or ""
+                    )
+                    for ref in (rel.source_refs or [])
+                )
+                if supported:
+                    kept_exp.append(rel)
+                else:
+                    dropped = True
+                continue
             if code not in known_exp:
                 kept_exp.append(rel)
                 continue
