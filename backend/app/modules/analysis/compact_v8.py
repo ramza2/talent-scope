@@ -2973,6 +2973,36 @@ def _line_has_year_month(line: str, year: int, month: int) -> bool:
     return False
 
 
+def _full_range_start_year_month(range_text: str) -> tuple[int, int] | None:
+    """Return the start YM of a full ``YYYY.MM~YYYY.MM`` range token.
+
+    Only the left side of ``~`` / ``～`` counts. End YM alone never matches a
+    candidate ``start_date``.
+    """
+    text = (range_text or "").strip()
+    if not text:
+        return None
+    match = _PROJECT_FULL_RANGE_RE.search(text)
+    if match is None:
+        return None
+    left = re.split(r"[~～]", match.group(0), maxsplit=1)[0]
+    dm = _LINE_DATE_YM_RE.search(left)
+    if dm is None:
+        return None
+    year = int(dm.group(1))
+    month = int(dm.group(2))
+    if month < 1 or month > 12:
+        return None
+    return year, month
+
+
+def _full_range_has_start_year_month(
+    range_text: str, year: int, month: int
+) -> bool:
+    """True when a full period range's start YM equals ``(year, month)``."""
+    return _full_range_start_year_month(range_text) == (year, month)
+
+
 def _quote_matches_project_start_month(
     project: ProjectCandidate, quote: str
 ) -> bool:
@@ -3107,12 +3137,13 @@ def _nameless_customer_period_unique(
     """True when customer+start-YM uniquely identifies one period block.
 
     Used only for nameless projects. Counts every full-range block on the page
-    whose start YM matches and whose post-period window contains ``customer``.
-    Sibling titles still cut each block end. Fail closed when not exactly one.
+    whose *range start* YM matches and whose post-period window contains
+    ``customer``. End YM alone never counts. Sibling titles still cut each
+    block end. Fail closed when not exactly one.
     """
     hits = 0
     for i, match in enumerate(ranges):
-        if not _line_has_year_month(match.group(0), year, month):
+        if not _full_range_has_start_year_month(match.group(0), year, month):
             continue
         block_end = ranges[i + 1].start() if i + 1 < len(ranges) else len(text)
         search_from = match.end()
@@ -3202,7 +3233,8 @@ def _project_owned_source_span(
         )
     owned: list[str] = []
     for i, match in enumerate(ranges):
-        if not _line_has_year_month(match.group(0), year, month):
+        # Match candidate.start_date to the range *start* YM only (not end).
+        if not _full_range_has_start_year_month(match.group(0), year, month):
             continue
         window_start = 0 if i == 0 else ranges[i - 1].end()
         block_end = len(text)
@@ -3261,7 +3293,9 @@ def _project_owned_source_span(
             continue
 
         span = text[block_start:block_end].strip()
-        if not span or not _line_has_year_month(span, year, month):
+        if not span or not _full_range_has_start_year_month(
+            match.group(0), year, month
+        ):
             continue
         # Nameless blocks already passed unique customer+start-YM; do not treat
         # them as employment-history rows solely for lacking a project title.

@@ -512,3 +512,109 @@ def test_db_tuning_still_rejects_dba_alone_on_multiline() -> None:
     assert report["supplemented_expertise"] == []
     assert report["unresolved_expertise"] == ["EXP-DATA-DB-TUNING"]
     assert out.expertise[0].source_refs == []
+
+
+def test_range_end_ym_alone_does_not_own_span() -> None:
+    """2020.01~2020.12 must not match candidate start=2020.12 (end-only)."""
+    page = _multiline_block(
+        period="2020.01~2020.12",
+        name="데이터사업",
+        customer="고객A",
+        duties=["DA 컨설팅"],
+        fillers=8,
+    )
+    doc = _doc(
+        jobs=[{"code": "JOB-DATA-DA"}],
+        projects=[
+            {
+                "project_name": "데이터사업",
+                "customer_name": "고객A",
+                "start_date": "2020.12",
+                "end_date": "2020.12",
+                "jobs": [
+                    {
+                        "code": "JOB-DATA-DA",
+                        "source_refs": [_ref("DA 컨설팅")],
+                    }
+                ],
+            }
+        ],
+    )
+    out, report = _run(doc, page_texts={(_DOC, 1): page})
+    assert report["supplemented_jobs"] == []
+    assert report["unresolved_jobs"] == ["JOB-DATA-DA"]
+    assert out.jobs[0].source_refs == []
+
+
+def test_range_start_ym_allows_ownership() -> None:
+    """Same 2020.01~2020.12 range allows candidate start=2020.01."""
+    page = _multiline_block(
+        period="2020.01~2020.12",
+        name="데이터사업",
+        customer="고객A",
+        duties=["DA 컨설팅"],
+        fillers=8,
+    )
+    doc = _doc(
+        jobs=[{"code": "JOB-DATA-DA"}],
+        projects=[
+            {
+                "project_name": "데이터사업",
+                "customer_name": "고객A",
+                "start_date": "2020.01",
+                "end_date": "2020.12",
+                "jobs": [
+                    {
+                        "code": "JOB-DATA-DA",
+                        "source_refs": [_ref("DA 컨설팅")],
+                    }
+                ],
+            }
+        ],
+    )
+    out, report = _run(doc, page_texts={(_DOC, 1): page})
+    assert report["supplemented_jobs"] == ["JOB-DATA-DA"]
+    assert out.jobs[0].source_refs[0].quote_text == "DA 컨설팅"
+
+
+def test_nameless_end_ym_collision_does_not_fake_uniqueness() -> None:
+    """End YM matching another range must not create false customer+start unique."""
+    # Only the first range ends at 2020.01; candidate start=2020.01 must not
+    # treat that end collision as a unique start-YM block for 고객X.
+    page = "\n".join(
+        [
+            _multiline_block(
+                period="2019.06~2020.01",
+                name=None,
+                customer="고객X",
+                duties=["DA 컨설팅"],
+            ),
+            _multiline_block(
+                period="2021.01~2021.12",
+                name=None,
+                customer="고객Y",
+                duties=["회의"],
+            ),
+        ]
+    )
+    doc = _doc(
+        jobs=[{"code": "JOB-DATA-DA"}],
+        projects=[
+            {
+                "project_name": None,
+                "customer_name": "고객X",
+                "start_date": "2020.01",
+                "end_date": "2020.12",
+                "jobs": [
+                    {
+                        "code": "JOB-DATA-DA",
+                        "source_refs": [_ref("DA 컨설팅")],
+                    }
+                ],
+            }
+        ],
+    )
+    out, report = _run(doc, page_texts={(_DOC, 1): page})
+    assert report["supplemented_jobs"] == []
+    assert report["unresolved_jobs"] == ["JOB-DATA-DA"]
+    assert out.jobs[0].source_refs == []
