@@ -1641,11 +1641,16 @@ _DA_ARCHITECT_ROLE_RE = re.compile(
     r"데이터\s*아키텍처\s*(?:담당|설계|역할)",
     re.IGNORECASE,
 )
-# DA token may combine only with architecture / design / modeling / consulting
-# duty context (e.g. "DA 컨설팅"). Bare "컨설팅" without DA token fails.
+# Contiguous DA+컨설팅 duty only — distant "DA … 컨설팅" must not match.
+_DA_CONSULTING_PHRASE_RE = re.compile(
+    r"(?<![A-Za-z0-9])DA\s*컨설팅",
+    re.IGNORECASE,
+)
+# DA token may combine only with architecture / design / modeling duty context.
+# Consulting is handled solely by ``_DA_CONSULTING_PHRASE_RE``.
 _DA_ARCH_DUTY_CONTEXT_RE = re.compile(
     r"데이터\s*모델(?:링)?|데이터\s*설계|데이터베이스\s*설계|"
-    r"DB\s*설계|DB\s*모델링|데이터\s*아키텍|컨설팅"
+    r"DB\s*설계|DB\s*모델링|데이터\s*아키텍"
 )
 
 # Catalog: JOB-DEV-GEN = 개발자 / Software Engineer / Programmer.
@@ -1706,8 +1711,10 @@ def _quote_supports_root_relation_extra_job(code: str, quote: str) -> bool:
     if code == "JOB-DATA-DA":
         # Data Architect only — not data analyst / bare DA / PL alone.
         # PL is JOB-MGT-PL; never treat as DA even when co-occurring without
-        # architect/DA+duty evidence.
+        # architect/DA+duty evidence. Consulting requires contiguous "DA 컨설팅".
         if _DA_ARCHITECT_ROLE_RE.search(text):
+            return True
+        if _DA_CONSULTING_PHRASE_RE.search(text):
             return True
         if not _DA_TOKEN_RE.search(text):
             return False
@@ -3937,13 +3944,37 @@ def repair_project_mgt_to_ops_sys(
 def _project_job_has_semantic_guard_evidence(
     rel: CodeRefCandidate,
     *,
+    project: ProjectCandidate | None = None,
+    page_texts: dict[tuple[str, int], str] | None = None,
+    allowed_documents: dict[str, set[int]] | None = None,
+    sibling_names: frozenset[str] | None = None,
     enhanced_project_relation_semantics: bool = False,
 ) -> bool:
-    """True when job is out of guard scope or has supporting semantic/literal quote."""
+    """True when job is out of guard scope or has supporting semantic/literal quote.
+
+    DATA/DEV extras additionally require the supporting quote to be attributable
+    to ``project`` via allowed-page + owned-span checks. Missing/ambiguous
+    ownership context fails closed for that relation only; other JOB codes are
+    unchanged (quote semantics only).
+    """
     code = (rel.code or "").strip()
     if code in _ROOT_RELATION_EXTRA_JOB_CODES:
+        if (
+            project is None
+            or not page_texts
+            or not allowed_documents
+        ):
+            return False
+        siblings = sibling_names or frozenset()
         return any(
             _quote_supports_root_relation_extra_job(code, ref.quote_text or "")
+            and _relation_ref_attributable_to_project(
+                project,
+                ref,
+                page_texts=page_texts,
+                allowed_documents=allowed_documents,
+                sibling_names=siblings,
+            )
             for ref in (rel.source_refs or [])
         )
     if code not in _JOB_SEMANTIC_GUARD_CODES:
@@ -3964,15 +3995,20 @@ def drop_project_jobs_without_semantic_evidence(
     candidate: ProfileCandidateDocument,
     *,
     enhanced_project_relation_semantics: bool = False,
+    page_texts: dict[tuple[str, int], str] | None = None,
+    allowed_documents: dict[str, set[int]] | None = None,
 ) -> ProfileCandidateDocument:
     """Drop PROJECT JOB relations lacking supporting semantic/literal quotes.
 
     JOB-MGT needs literal 사업관리; JOB-OPS-SYS needs strong OPS phrases;
     JOB-ARC-TA needs boundary-safe TA. DATA/DEV extras (JOB-DATA-DA/DBA,
-    JOB-DEV-GEN) need their strict root-relation predicates so mismatched
-    quotes (e.g. DA←PL, DEV-GEN←닷넷/SM alone) are removed. JOB-MGT-PM/PL
-    keep their dedicated literal guard. Project rows and root jobs stay.
+    JOB-DEV-GEN) need strict predicates plus project-owned attribution so
+    other-project quotes cannot remain. JOB-MGT-PM/PL keep their dedicated
+    literal guard. Project rows and root jobs stay.
     """
+    siblings = (
+        _candidate_sibling_project_names(candidate) if page_texts else None
+    )
     changed = False
     new_projects: list[ProjectCandidate] = []
     for project in candidate.projects:
@@ -3981,6 +4017,10 @@ def drop_project_jobs_without_semantic_evidence(
             for job in project.jobs
             if _project_job_has_semantic_guard_evidence(
                 job,
+                project=project,
+                page_texts=page_texts,
+                allowed_documents=allowed_documents,
+                sibling_names=siblings,
                 enhanced_project_relation_semantics=(
                     enhanced_project_relation_semantics
                 ),
@@ -4632,19 +4672,25 @@ def drop_project_expertise_without_semantic_evidence(
     candidate: ProfileCandidateDocument,
     *,
     enhanced_project_relation_semantics: bool = False,
+    page_texts: dict[tuple[str, int], str] | None = None,
+    allowed_documents: dict[str, set[int]] | None = None,
 ) -> ProfileCandidateDocument:
     """Drop PROJECT expertise whose quotes do not support known EXP codes.
 
     Covers PROJECT EXP-INFRA/MGT/SEC-OPS/SEC-BUILD plus DATA extras
-    (EXP-DATA, EXP-DATA-DB-TUNING) so mismatched quotes (e.g. DB-tuning←DBA,
-    EXP-DATA←bare BI/DW) are removed. Unknown EXP codes, root expertise,
-    jobs/skills/domains, and the project row stay. Any one supporting phrase
-    quote keeps the relation.
+    (EXP-DATA, EXP-DATA-DB-TUNING). DATA extras also require project-owned
+    attribution (allowed-page + owned-span); missing/ambiguous ownership fails
+    closed for that relation only. Other EXP codes keep quote-semantics-only
+    behavior. Unknown EXP codes, root expertise, jobs/skills/domains, and the
+    project row stay. Any one supporting phrase quote keeps the relation.
     """
     known_exp = (
         _PROJECT_EXP_SEMANTIC_PATTERNS
         if enhanced_project_relation_semantics
         else _EXP_SEMANTIC_PATTERNS
+    )
+    siblings = (
+        _candidate_sibling_project_names(candidate) if page_texts else None
     )
     changed = False
     new_projects: list[ProjectCandidate] = []
@@ -4654,9 +4700,19 @@ def drop_project_expertise_without_semantic_evidence(
         for rel in project.expertise:
             code = (rel.code or "").strip()
             if code in _ROOT_RELATION_EXTRA_EXP_CODES:
+                if not page_texts or not allowed_documents:
+                    dropped = True
+                    continue
                 supported = any(
                     _quote_supports_root_relation_extra_exp(
                         code, ref.quote_text or ""
+                    )
+                    and _relation_ref_attributable_to_project(
+                        project,
+                        ref,
+                        page_texts=page_texts,
+                        allowed_documents=allowed_documents,
+                        sibling_names=siblings or frozenset(),
                     )
                     for ref in (rel.source_refs or [])
                 )

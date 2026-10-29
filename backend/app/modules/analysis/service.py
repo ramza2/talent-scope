@@ -1970,6 +1970,8 @@ class AnalysisService:
                     enhanced_project_relation_semantics=(
                         enhanced_project_relation_semantics
                     ),
+                    page_texts=page_texts,
+                    allowed_documents=allowed_documents,
                 )
             # v20: known PROJECT EXP codes need quote phrases that actually
             # support the EXP (e.g. 업무분석 ≠ EXP-INFRA).
@@ -1979,6 +1981,8 @@ class AnalysisService:
                     enhanced_project_relation_semantics=(
                         enhanced_project_relation_semantics
                     ),
+                    page_texts=page_texts,
+                    allowed_documents=allowed_documents,
                 )
             # v20: JOB-MGT-PM/PL need literal PM/PL tokens in quote_text, not
             # merely any non-empty quote (e.g. "부장" / "사업관리" alone).

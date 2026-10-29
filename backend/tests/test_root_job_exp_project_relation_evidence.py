@@ -1021,23 +1021,31 @@ def test_dev_gen_rejects_specialist_catalog_titles() -> None:
 # --- DATA/DEV PROJECT relation consistency (PR #123) ---
 
 
-def _drop_data_dev_project_mismatches(doc):
+def _drop_data_dev_project_mismatches(doc, *, page_texts, allowed=None):
     from app.modules.analysis.compact_v8 import (
         drop_project_expertise_without_semantic_evidence,
         drop_project_jobs_without_semantic_evidence,
     )
 
+    allowed_documents = allowed or {_DOC: {1, 2}}
     out = drop_project_jobs_without_semantic_evidence(
-        doc, enhanced_project_relation_semantics=True
+        doc,
+        enhanced_project_relation_semantics=True,
+        page_texts=page_texts,
+        allowed_documents=allowed_documents,
     )
     return drop_project_expertise_without_semantic_evidence(
-        out, enhanced_project_relation_semantics=True
+        out,
+        enhanced_project_relation_semantics=True,
+        page_texts=page_texts,
+        allowed_documents=allowed_documents,
     )
 
 
 def test_project_da_pl_mismatch_dropped_project_row_kept() -> None:
     """DA←PL is cleared from project jobs; the project itself is not deleted."""
     page = _row("사업A", duty="PL 역할 및 DA 컨설팅")
+    page_texts = {(_DOC, 1): page}
     doc = _doc(
         jobs=[{"code": "JOB-DATA-DA"}],
         projects=[
@@ -1054,7 +1062,7 @@ def test_project_da_pl_mismatch_dropped_project_row_kept() -> None:
             }
         ],
     )
-    guarded = _drop_data_dev_project_mismatches(doc)
+    guarded = _drop_data_dev_project_mismatches(doc, page_texts=page_texts)
     assert len(guarded.projects) == 1
     codes = [j.code for j in guarded.projects[0].jobs]
     quotes = [
@@ -1065,7 +1073,7 @@ def test_project_da_pl_mismatch_dropped_project_row_kept() -> None:
     assert "DA 컨설팅" in quotes
     assert codes == ["JOB-DATA-DA"]
 
-    out, report = _run(guarded, page_texts={(_DOC, 1): page})
+    out, report = _run(guarded, page_texts=page_texts)
     assert report["supplemented_jobs"] == ["JOB-DATA-DA"]
     assert out.jobs[0].source_refs[0].quote_text == "DA 컨설팅"
 
@@ -1073,6 +1081,7 @@ def test_project_da_pl_mismatch_dropped_project_row_kept() -> None:
 def test_project_db_tuning_dba_mismatch_dropped() -> None:
     """DB 튜닝←DBA must not survive on project expertise or lift to root."""
     page = _row("사업A", duty="DBA 및 DB 운영")
+    page_texts = {(_DOC, 1): page}
     doc = _doc(
         expertise=[{"code": "EXP-DATA-DB-TUNING"}],
         projects=[
@@ -1088,11 +1097,11 @@ def test_project_db_tuning_dba_mismatch_dropped() -> None:
             }
         ],
     )
-    guarded = _drop_data_dev_project_mismatches(doc)
+    guarded = _drop_data_dev_project_mismatches(doc, page_texts=page_texts)
     assert len(guarded.projects) == 1
     assert guarded.projects[0].expertise == []
 
-    out, report = _run(doc, page_texts={(_DOC, 1): page})
+    out, report = _run(doc, page_texts=page_texts)
     assert report["supplemented_expertise"] == []
     assert report["unresolved_expertise"] == ["EXP-DATA-DB-TUNING"]
     assert out.expertise[0].source_refs == []
@@ -1106,6 +1115,7 @@ def test_ops_quotes_lone_tokens_rejected_for_da_and_dev_gen() -> None:
         "사업A",
         duty="DA / PL / 닷넷 / SM / 그룹웨어 닷넷 SM",
     )
+    page_texts = {(_DOC, 1): page}
     for quote in ("DA", "PL", "닷넷", "SM", "그룹웨어 닷넷 SM"):
         code = "JOB-DATA-DA" if quote in ("DA", "PL") else "JOB-DEV-GEN"
         doc = _doc(
@@ -1117,9 +1127,9 @@ def test_ops_quotes_lone_tokens_rejected_for_da_and_dev_gen() -> None:
                 }
             ],
         )
-        guarded = _drop_data_dev_project_mismatches(doc)
+        guarded = _drop_data_dev_project_mismatches(doc, page_texts=page_texts)
         assert guarded.projects[0].jobs == [], quote
-        out, report = _run(doc, page_texts={(_DOC, 1): page})
+        out, report = _run(doc, page_texts=page_texts)
         assert out.jobs[0].source_refs == [], quote
         assert report["unresolved_jobs"] == [code], quote
 
@@ -1127,6 +1137,7 @@ def test_ops_quotes_lone_tokens_rejected_for_da_and_dev_gen() -> None:
 def test_ops_quotes_da_consulting_and_dotnet_dev_allowed() -> None:
     """DA 컨설팅 / 닷넷 개발 lift when project-owned duty meaning matches."""
     page = _row("사업A", duty="DA 컨설팅 및 닷넷 개발")
+    page_texts = {(_DOC, 1): page}
     doc = _doc(
         jobs=[
             {"code": "JOB-DATA-DA", "raw_value": "JOB-DATA-DA"},
@@ -1148,15 +1159,71 @@ def test_ops_quotes_da_consulting_and_dotnet_dev_allowed() -> None:
             }
         ],
     )
-    guarded = _drop_data_dev_project_mismatches(doc)
+    guarded = _drop_data_dev_project_mismatches(doc, page_texts=page_texts)
     assert {j.code for j in guarded.projects[0].jobs} == {
         "JOB-DATA-DA",
         "JOB-DEV-GEN",
     }
-    out, report = _run(doc, page_texts={(_DOC, 1): page})
+    out, report = _run(doc, page_texts=page_texts)
     assert set(report["supplemented_jobs"]) == {"JOB-DATA-DA", "JOB-DEV-GEN"}
     assert out.jobs[0].source_refs[0].quote_text == "DA 컨설팅"
     assert out.jobs[1].source_refs[0].quote_text == "닷넷 개발"
+
+
+def test_da_consulting_requires_contiguous_phrase() -> None:
+    """Distant DA + unrelated 컨설팅 must not support JOB-DATA-DA."""
+    page = _row("사업A", duty="DA 역할 수행 및 IT 경영 컨설팅")
+    page_texts = {(_DOC, 1): page}
+    for quote in (
+        "DA 역할 수행 및 IT 경영 컨설팅",
+        "DA / 경영 컨설팅",
+        "DA 담당, 보안 컨설팅",
+    ):
+        # Ensure the false-positive quote is a page substring when used.
+        page_for_quote = _row("사업A", duty=quote)
+        docs_page = {(_DOC, 1): page_for_quote}
+        doc = _doc(
+            jobs=[{"code": "JOB-DATA-DA"}],
+            projects=[
+                {
+                    "project_name": "사업A",
+                    "jobs": [
+                        {
+                            "code": "JOB-DATA-DA",
+                            "source_refs": [_ref(quote)],
+                        }
+                    ],
+                }
+            ],
+        )
+        guarded = _drop_data_dev_project_mismatches(
+            doc, page_texts=docs_page
+        )
+        assert guarded.projects[0].jobs == [], quote
+        out, report = _run(doc, page_texts=docs_page)
+        assert out.jobs[0].source_refs == [], quote
+        assert report["unresolved_jobs"] == ["JOB-DATA-DA"], quote
+
+    # Contiguous phrase still allowed.
+    ok_page = {(_DOC, 1): _row("사업A", duty="DA 컨설팅")}
+    doc_ok = _doc(
+        jobs=[{"code": "JOB-DATA-DA"}],
+        projects=[
+            {
+                "project_name": "사업A",
+                "jobs": [
+                    {
+                        "code": "JOB-DATA-DA",
+                        "source_refs": [_ref("DA 컨설팅")],
+                    }
+                ],
+            }
+        ],
+    )
+    guarded_ok = _drop_data_dev_project_mismatches(doc_ok, page_texts=ok_page)
+    assert [j.code for j in guarded_ok.projects[0].jobs] == ["JOB-DATA-DA"]
+    out_ok, report_ok = _run(doc_ok, page_texts=ok_page)
+    assert report_ok["supplemented_jobs"] == ["JOB-DATA-DA"]
 
 
 def test_exp_data_modeler_etl_phrases_allowed_bare_tech_rejected() -> None:
@@ -1165,6 +1232,7 @@ def test_exp_data_modeler_etl_phrases_allowed_bare_tech_rejected() -> None:
         "데이터사업",
         duty="BI/DW DB 모델러, BI/DW DB ETLer, DB, BI/DW",
     )
+    page_texts = {(_DOC, 1): page}
     # Positive: modeler + ETLer
     for quote in ("BI/DW DB 모델러", "BI/DW DB ETLer"):
         doc = _doc(
@@ -1178,7 +1246,7 @@ def test_exp_data_modeler_etl_phrases_allowed_bare_tech_rejected() -> None:
                 }
             ],
         )
-        out, report = _run(doc, page_texts={(_DOC, 1): page})
+        out, report = _run(doc, page_texts=page_texts)
         assert report["supplemented_expertise"] == ["EXP-DATA"], quote
         assert out.expertise[0].source_refs[0].quote_text == quote
 
@@ -1195,9 +1263,11 @@ def test_exp_data_modeler_etl_phrases_allowed_bare_tech_rejected() -> None:
                 }
             ],
         )
-        guarded = _drop_data_dev_project_mismatches(doc)
+        guarded = _drop_data_dev_project_mismatches(
+            doc, page_texts=page_texts
+        )
         assert guarded.projects[0].expertise == [], quote
-        out, report = _run(doc, page_texts={(_DOC, 1): page})
+        out, report = _run(doc, page_texts=page_texts)
         assert report["unresolved_expertise"] == ["EXP-DATA"], quote
         assert out.expertise[0].source_refs == [], quote
 
@@ -1229,7 +1299,7 @@ def test_exp_data_full_page_text_ownership_unique_span() -> None:
 
 
 def test_ops_quote_confusion_across_projects_blocked() -> None:
-    """Quotes from another project must not lift or survive as this project's evidence."""
+    """Other-project quotes must not lift or survive PROJECT drop attribution."""
     page = (
         _row("사업A", period="2020.01~2020.06", duty="회의 참석")
         + "\n"
@@ -1240,6 +1310,7 @@ def test_ops_quote_confusion_across_projects_blocked() -> None:
             customer="고객B",
         )
     )
+    page_texts = {(_DOC, 1): page}
     doc = _doc(
         jobs=[{"code": "JOB-DATA-DA"}, {"code": "JOB-DEV-GEN"}],
         expertise=[{"code": "EXP-DATA"}],
@@ -1275,7 +1346,16 @@ def test_ops_quote_confusion_across_projects_blocked() -> None:
             },
         ],
     )
-    out, report = _run(doc, page_texts={(_DOC, 1): page})
+    guarded = _drop_data_dev_project_mismatches(doc, page_texts=page_texts)
+    assert len(guarded.projects) == 2
+    proj_a = next(p for p in guarded.projects if p.project_name == "사업A")
+    proj_b = next(p for p in guarded.projects if p.project_name == "사업B")
+    assert proj_a.jobs == []
+    assert proj_a.expertise == []
+    assert proj_b.jobs == []
+    assert proj_b.expertise == []
+
+    out, report = _run(doc, page_texts=page_texts)
     assert report["supplemented_jobs"] == []
     assert report["supplemented_expertise"] == []
     assert set(report["unresolved_jobs"]) == {"JOB-DATA-DA", "JOB-DEV-GEN"}
