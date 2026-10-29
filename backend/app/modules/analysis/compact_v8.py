@@ -2973,6 +2973,36 @@ def _line_has_year_month(line: str, year: int, month: int) -> bool:
     return False
 
 
+def _full_range_start_year_month(range_text: str) -> tuple[int, int] | None:
+    """Return the start YM of a full ``YYYY.MM~YYYY.MM`` range token.
+
+    Only the left side of ``~`` / ``～`` counts. End YM alone never matches a
+    candidate ``start_date``.
+    """
+    text = (range_text or "").strip()
+    if not text:
+        return None
+    match = _PROJECT_FULL_RANGE_RE.search(text)
+    if match is None:
+        return None
+    left = re.split(r"[~～]", match.group(0), maxsplit=1)[0]
+    dm = _LINE_DATE_YM_RE.search(left)
+    if dm is None:
+        return None
+    year = int(dm.group(1))
+    month = int(dm.group(2))
+    if month < 1 or month > 12:
+        return None
+    return year, month
+
+
+def _full_range_has_start_year_month(
+    range_text: str, year: int, month: int
+) -> bool:
+    """True when a full period range's start YM equals ``(year, month)``."""
+    return _full_range_start_year_month(range_text) == (year, month)
+
+
 def _quote_matches_project_start_month(
     project: ProjectCandidate, quote: str
 ) -> bool:
@@ -3082,6 +3112,61 @@ def _iter_exact_phrase_starts(text: str, phrase: str) -> list[int]:
         idx = found + 1
 
 
+def _customer_in_range_block(
+    text: str,
+    *,
+    customer: str,
+    range_start: int,
+    block_end: int,
+) -> bool:
+    """True when customer appears in ``[range_start, block_end)`` (ws-folded)."""
+    if block_end <= range_start:
+        return False
+    return _line_has_ws_folded_phrase(text[range_start:block_end], customer)
+
+
+def _nameless_customer_period_unique(
+    text: str,
+    ranges: list[re.Match[str]],
+    *,
+    customer: str,
+    year: int,
+    month: int,
+    siblings: set[str],
+) -> bool:
+    """True when customer+start-YM uniquely identifies one period block.
+
+    Used only for nameless projects. Counts every full-range block on the page
+    whose *range start* YM matches and whose post-period window contains
+    ``customer``. End YM alone never counts. Sibling titles still cut each
+    block end. Fail closed when not exactly one.
+    """
+    hits = 0
+    for i, match in enumerate(ranges):
+        if not _full_range_has_start_year_month(match.group(0), year, month):
+            continue
+        block_end = ranges[i + 1].start() if i + 1 < len(ranges) else len(text)
+        search_from = match.end()
+        earliest_sib: int | None = None
+        for sib in siblings:
+            for rel in _iter_exact_phrase_starts(text[search_from:block_end], sib):
+                abs_pos = search_from + rel
+                if earliest_sib is None or abs_pos < earliest_sib:
+                    earliest_sib = abs_pos
+        if earliest_sib is not None and earliest_sib < block_end:
+            block_end = earliest_sib
+        if _customer_in_range_block(
+            text,
+            customer=customer,
+            range_start=match.start(),
+            block_end=block_end,
+        ):
+            hits += 1
+            if hits > 1:
+                return False
+    return hits == 1
+
+
 def _project_owned_source_span(
     project: ProjectCandidate,
     line: str,
@@ -3094,7 +3179,13 @@ def _project_owned_source_span(
     ``프로젝트명 | 개요 | YYYY.MM~YYYY.MM | 담당업무 | 고객사``.
     Multi-project lines therefore keep the project name (before the period),
     the matched period, and following duties/customer until the next sibling
-    project name. Fail closed when ownership is not unique.
+    project name.
+
+    Multi-line DOCX/PDF tables may place name/customer/duty on separate lines
+    around the same period (name may appear after the period). Ownership still
+    requires a unique period block bounded by the previous/next full range and
+    sibling titles — never proximity-N matching. Nameless projects need a
+    unique customer+start-YM block. Fail closed when ownership is not unique.
     """
     start_ym = _project_start_year_month(project)
     if start_ym is None:
@@ -3130,58 +3221,88 @@ def _project_owned_source_span(
         for n in (sibling_names or frozenset())
         if n and n.strip() and n.strip() != (name or "")
     }
+    nameless_unique = False
+    if name is None and customer is not None:
+        nameless_unique = _nameless_customer_period_unique(
+            text,
+            ranges,
+            customer=customer,
+            year=year,
+            month=month,
+            siblings=siblings,
+        )
     owned: list[str] = []
     for i, match in enumerate(ranges):
-        if not _line_has_year_month(match.group(0), year, month):
+        # Match candidate.start_date to the range *start* YM only (not end).
+        if not _full_range_has_start_year_month(match.group(0), year, month):
             continue
         window_start = 0 if i == 0 else ranges[i - 1].end()
-        pre_range = text[window_start:match.start()]
-        name_matched = False
-        block_start = window_start
-        if name is not None:
-            name_starts = _iter_exact_phrase_starts(pre_range, name)
-            if not name_starts and _line_has_ws_folded_phrase(pre_range, name):
-                # ws-fold hit without exact index: keep window start.
-                name_matched = True
-                block_start = window_start
-            elif name_starts:
-                name_matched = True
-                # Rightmost name before this period (closest to the range).
-                block_start = window_start + name_starts[-1]
-        customer_matched = bool(
-            customer is not None
-            and _line_has_ws_folded_phrase(
-                text[match.start() : (ranges[i + 1].start() if i + 1 < len(ranges) else len(text))],
-                customer,
-            )
-        )
-        # Multi-range lines require the project name before the period so the
-        # next title cannot own this range by customer alone.
-        if len(ranges) > 1:
-            if not name_matched:
-                continue
-        elif not name_matched and not customer_matched:
-            continue
-
         block_end = len(text)
         if i + 1 < len(ranges):
             block_end = ranges[i + 1].start()
-        # Cut before the next sibling project title when it appears after this
-        # period (name | overview | period | duty | customer | NEXT_NAME ...).
+        # Cut before the next sibling project title after this period.
         search_from = match.end()
         earliest_sib: int | None = None
         for sib in siblings:
-            for rel in _iter_exact_phrase_starts(text[search_from:], sib):
+            for rel in _iter_exact_phrase_starts(text[search_from:block_end], sib):
                 abs_pos = search_from + rel
                 if earliest_sib is None or abs_pos < earliest_sib:
                     earliest_sib = abs_pos
         if earliest_sib is not None and earliest_sib < block_end:
             block_end = earliest_sib
 
-        span = text[block_start:block_end].strip()
-        if not span or not _line_has_year_month(span, year, month):
+        # Period block where name/customer/duty may sit on separate lines.
+        # Name may appear before or after the period within this block only.
+        block_slice = text[window_start:block_end]
+        name_matched = False
+        block_start = window_start
+        if name is not None:
+            name_starts = _iter_exact_phrase_starts(block_slice, name)
+            if not name_starts and _line_has_ws_folded_phrase(block_slice, name):
+                name_matched = True
+                block_start = window_start
+            elif name_starts:
+                name_matched = True
+                # Prefer rightmost name before the period; otherwise earliest
+                # name after the period still inside this unique block.
+                period_rel = match.start() - window_start
+                before = [s for s in name_starts if s < period_rel]
+                if before:
+                    block_start = window_start + before[-1]
+                else:
+                    block_start = window_start + name_starts[0]
+                    # Keep the matched period inside the owned span.
+                    if block_start > match.start():
+                        block_start = match.start()
+
+        customer_matched = bool(
+            customer is not None
+            and _customer_in_range_block(
+                text,
+                customer=customer,
+                range_start=match.start(),
+                block_end=block_end,
+            )
+        )
+        if name is not None:
+            if not name_matched:
+                continue
+        elif not nameless_unique or not customer_matched:
+            # Nameless: never claim a multi-project page by customer alone
+            # unless customer+start-YM uniquely selects one period block.
             continue
-        if _line_is_employment_history_row(span, name_matched=name_matched):
+
+        span = text[block_start:block_end].strip()
+        if not span or not _full_range_has_start_year_month(
+            match.group(0), year, month
+        ):
+            continue
+        # Nameless blocks already passed unique customer+start-YM; do not treat
+        # them as employment-history rows solely for lacking a project title.
+        identity_matched = name_matched or (
+            name is None and nameless_unique and customer_matched
+        )
+        if _line_is_employment_history_row(span, name_matched=identity_matched):
             continue
         owned.append(span)
     if len(owned) != 1:
@@ -3279,18 +3400,10 @@ def _find_unique_project_source_row(
 
     named_hits: list[tuple[str, int, str]] = []
     customer_hits: list[tuple[str, int, str]] = []
-    for doc_id, page_no, line in _iter_allowed_page_lines(
-        page_texts, allowed_documents
-    ):
-        if not _PROJECT_ROW_RANGE_MARK_RE.search(line):
-            continue
-        owned = _project_owned_source_span(
-            project, line, sibling_names=sibling_names
-        )
-        if owned is None:
-            continue
+
+    def _record_owned(doc_id: str, page_no: int, owned: str) -> None:
         if line_predicate is not None and not line_predicate(owned):
-            continue
+            return
         name_matched = bool(
             name is not None
             and (name in owned or _line_has_ws_folded_phrase(owned, name))
@@ -3303,6 +3416,36 @@ def _find_unique_project_source_row(
             named_hits.append(hit)
         elif customer_matched:
             customer_hits.append(hit)
+
+    # Whole-page first: DOCX/PDF tables split name/period/duty across lines.
+    for doc_id, page_no in sorted(page_texts.keys()):
+        if doc_id not in allowed_documents:
+            continue
+        pages = allowed_documents[doc_id]
+        if pages and page_no not in pages:
+            continue
+        page_text = (page_texts.get((doc_id, page_no)) or "").strip()
+        if not page_text or not _PROJECT_ROW_RANGE_MARK_RE.search(page_text):
+            continue
+        owned = _project_owned_source_span(
+            project, page_text, sibling_names=sibling_names
+        )
+        if owned is not None:
+            _record_owned(doc_id, page_no, owned)
+
+    # Also keep per-line PPTX row matching when page-level found nothing.
+    if not named_hits and not customer_hits:
+        for doc_id, page_no, line in _iter_allowed_page_lines(
+            page_texts, allowed_documents
+        ):
+            if not _PROJECT_ROW_RANGE_MARK_RE.search(line):
+                continue
+            owned = _project_owned_source_span(
+                project, line, sibling_names=sibling_names
+            )
+            if owned is None:
+                continue
+            _record_owned(doc_id, page_no, owned)
 
     def _unique(
         hits: list[tuple[str, int, str]],
