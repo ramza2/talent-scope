@@ -1172,8 +1172,6 @@ def test_ops_quotes_da_consulting_and_dotnet_dev_allowed() -> None:
 
 def test_da_consulting_requires_contiguous_phrase() -> None:
     """Distant DA + unrelated 컨설팅 must not support JOB-DATA-DA."""
-    page = _row("사업A", duty="DA 역할 수행 및 IT 경영 컨설팅")
-    page_texts = {(_DOC, 1): page}
     for quote in (
         "DA 역할 수행 및 IT 경영 컨설팅",
         "DA / 경영 컨설팅",
