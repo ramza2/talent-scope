@@ -230,3 +230,23 @@ class GuardRefreshPreviewResponse(BaseModel):
 
 class GuardRefreshApplyResponse(BaseModel):
     data: GuardRefreshResultData
+
+
+class RootEvidenceRecoverResultData(BaseModel):
+    analysis_id: UUID
+    status: AnalysisStatus
+    changed: bool
+    applied: bool = False
+    supplemented_jobs: list[str] = Field(default_factory=list)
+    supplemented_expertise: list[str] = Field(default_factory=list)
+    pending_diffs_updated: int = 0
+    project_dates_unchanged: bool = True
+    message: str | None = None
+
+
+class RootEvidenceRecoverPreviewResponse(BaseModel):
+    data: RootEvidenceRecoverResultData
+
+
+class RootEvidenceRecoverApplyResponse(BaseModel):
+    data: RootEvidenceRecoverResultData
