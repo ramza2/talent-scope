@@ -339,17 +339,27 @@ def _unique_owned_root_project_period(
             return None
 
         hits: set[tuple[str, str]] = set()
-        for matched in _PROJECT_FULL_RANGE_RE.finditer(page):
+        ranges = list(_PROJECT_FULL_RANGE_RE.finditer(page))
+        for index, matched in enumerate(ranges):
             parsed = parse_project_date_range_from_texts(
                 [matched.group(0)], project_name=name
             )
             if parsed is None:
                 continue
+            # Isolate this period block before testing ownership. Equal start
+            # months on separate projects must not invalidate each other.
+            block_start = ranges[index - 1].end() if index > 0 else 0
+            block_end = (
+                ranges[index + 1].start()
+                if index + 1 < len(ranges)
+                else len(page)
+            )
+            block = page[block_start:block_end]
             # Use the SOURCE start only to test existing ownership rules:
             # candidate.start_date may itself be the corrupted value.
             probe = project.model_copy(update={"start_date": parsed[0]})
             owned = _project_owned_source_span(
-                probe, page, sibling_names=siblings
+                probe, block, sibling_names=siblings
             )
             if owned is None or quote not in owned:
                 continue
