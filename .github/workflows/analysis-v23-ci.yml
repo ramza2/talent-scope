@@ -81,6 +81,8 @@ jobs:
             tests/test_project_relation_supplement_v20.py \
             tests/test_root_job_exp_project_relation_evidence.py \
             tests/test_multiline_project_owned_span.py \
+            tests/test_project_date_backfill_v20.py \
+            tests/test_project_date_reconciliation_v125.py \
             tests/test_analysis_token_budgeting.py \
             tests/test_openai_compat.py \
             tests/test_modelops_gateway_contract.py \
