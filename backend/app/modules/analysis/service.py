@@ -1855,7 +1855,11 @@ class AnalysisService:
                 )
             # v20: fill missing project s/e from unique root-quote date ranges.
             if prompt.backfill_project_dates_from_root_evidence:
-                doc = backfill_project_dates_from_root_evidence(doc)
+                doc = backfill_project_dates_from_root_evidence(
+                    doc,
+                    page_texts=page_texts,
+                    allowed_documents=allowed_documents,
+                )
             projects_with_quote = sum(
                 1
                 for project in doc.projects

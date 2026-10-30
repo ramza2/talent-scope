@@ -279,15 +279,118 @@ def parse_project_date_range_from_texts(
     return next(iter(parsed))
 
 
+def _unique_owned_root_project_period(
+    candidate: ProfileCandidateDocument,
+    project: ProjectCandidate,
+    *,
+    page_texts: dict[tuple[str, int], str],
+    allowed_documents: dict[str, set[int]] | None,
+) -> tuple[str, str] | None:
+    """Only an unambiguous, root-ref-owned name+customer+period may fix dates.
+
+    Enumerate periods on the *referenced* document/page; never use the nearest
+    preceding period, another project's relation ref, or an unreferenced page.
+    Existing PROJECT owned-span boundaries also guard multi-project pages.
+    """
+    name = (project.project_name or "").strip()
+    customer = (project.customer_name or "").strip()
+    refs = list(project.source_refs or [])
+    if not name or not customer or not refs:
+        return None
+
+    owned_pages: set[tuple[str, int]] = set()
+    for ref in refs:
+        doc_id = (ref.document_id or "").strip()
+        page_no = ref.page_no
+        if not doc_id or not isinstance(page_no, int):
+            return None
+        owned_pages.add((doc_id, page_no))
+
+    # Two candidate projects with the same identity on one referenced page
+    # cannot safely claim its period independently.
+    for other in candidate.projects:
+        if other is project:
+            continue
+        if (
+            _fold_ws_text(other.project_name or "") != _fold_ws_text(name)
+            or _fold_ws_text(other.customer_name or "") != _fold_ws_text(customer)
+        ):
+            continue
+        if any(
+            (ref.document_id, ref.page_no) in owned_pages
+            for ref in (other.source_refs or [])
+        ):
+            return None
+
+    siblings = _candidate_sibling_project_names(candidate)
+    periods: set[tuple[str, str]] = set()
+    for ref in refs:
+        doc_id = (ref.document_id or "").strip()
+        page_no = ref.page_no
+        quote = (ref.quote_text or "").strip()
+        if not quote or not isinstance(page_no, int):
+            return None
+        if allowed_documents is not None:
+            pages = allowed_documents.get(doc_id)
+            if pages is None or (pages and page_no not in pages):
+                return None
+        page = (page_texts.get((doc_id, page_no)) or "").strip()
+        if not page or quote not in page:
+            return None
+
+        hits: set[tuple[str, str]] = set()
+        ranges = list(_PROJECT_FULL_RANGE_RE.finditer(page))
+        for index, matched in enumerate(ranges):
+            parsed = parse_project_date_range_from_texts(
+                [matched.group(0)], project_name=name
+            )
+            if parsed is None:
+                continue
+            # Isolate this period block before testing ownership. Equal start
+            # months on separate projects must not invalidate each other.
+            block_start = ranges[index - 1].end() if index > 0 else 0
+            block_end = (
+                ranges[index + 1].start()
+                if index + 1 < len(ranges)
+                else len(page)
+            )
+            block = page[block_start:block_end]
+            # Use the SOURCE start only to test existing ownership rules:
+            # candidate.start_date may itself be the corrupted value.
+            probe = project.model_copy(update={"start_date": parsed[0]})
+            owned = _project_owned_source_span(
+                probe, block, sibling_names=siblings
+            )
+            if owned is None or quote not in owned:
+                continue
+            if (
+                not _line_has_ws_folded_phrase(owned, name)
+                or not _line_has_ws_folded_phrase(owned, customer)
+            ):
+                continue
+            if parse_project_date_range_from_texts(
+                [owned], project_name=name
+            ) != parsed:
+                continue
+            hits.add(parsed)
+        if len(hits) != 1:
+            return None
+        periods.update(hits)
+    return next(iter(periods)) if len(periods) == 1 else None
+
+
 def backfill_project_dates_from_root_evidence(
     candidate: ProfileCandidateDocument,
+    *,
+    page_texts: dict[tuple[str, int], str] | None = None,
+    allowed_documents: dict[str, set[int]] | None = None,
 ) -> ProfileCandidateDocument:
-    """v20: fill missing project start/end from unique root-quote date ranges.
+    """Fill missing dates and safely repair collapsed source-end/start dates.
 
-    Uses only project root ``source_refs[].quote_text``. Never reads relation
-    j/t/x refs or page text. Existing start/end values are never overwritten.
-    Recalculates ``duration_months`` via ``derive_duration_months`` when both
-    ends are present after fill.
+    Missing dates retain v20 root-quote behavior. Existing complete dates
+    change only when start=end equals one endpoint of a distinct source period
+    with unique project name, customer and root document/page ownership.
+    Unproven cases remain unchanged; relation evidence is never altered.
     """
     if not candidate.projects:
         return candidate
@@ -297,6 +400,34 @@ def backfill_project_dates_from_root_evidence(
         need_start = not (project.start_date or "").strip()
         need_end = not (project.end_date or "").strip()
         if not need_start and not need_end:
+            same_month = parse_year_month(project.start_date)
+            if (
+                page_texts
+                and same_month is not None
+                and same_month == parse_year_month(project.end_date)
+            ):
+                period = _unique_owned_root_project_period(
+                    candidate,
+                    project,
+                    page_texts=page_texts,
+                    allowed_documents=allowed_documents,
+                )
+                if period is not None and period[0] != period[1]:
+                    start_s, end_s = period
+                    updates: dict[str, Any] = {}
+                    if same_month == parse_year_month(end_s):
+                        updates["start_date"] = start_s
+                    elif same_month == parse_year_month(start_s):
+                        updates["end_date"] = end_s
+                    if updates:
+                        start = updates.get("start_date", project.start_date)
+                        end = updates.get("end_date", project.end_date)
+                        duration = derive_duration_months(start, end)
+                        if duration is not None:
+                            updates["duration_months"] = duration
+                        projects.append(project.model_copy(update=updates))
+                        changed_any = True
+                        continue
             projects.append(project)
             continue
         quotes = [
@@ -5520,12 +5651,17 @@ def _merge_project_relations_and_refs(
         for p in projects
         if isinstance(p.duration_months, int) and p.duration_months >= 0
     ]
+    derived_duration = derive_duration_months(start_date, end_date)
     return ProjectCandidate(
         project_name=project_name,
         customer_name=customer_name,
         start_date=start_date,
         end_date=end_date,
-        duration_months=max(durations) if durations else None,
+        duration_months=(
+            derived_duration
+            if derived_duration is not None
+            else (max(durations) if durations else None)
+        ),
         responsibilities=_pick_canonical_scalar(
             [p.responsibilities for p in projects]
         ),
