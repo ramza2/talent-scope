@@ -344,7 +344,7 @@ def test_preview_lists_targets_without_db_write(db_session) -> None:
     assert "EXP-DATA" in result.supplemented_expertise
     assert "JOB-DEV-GEN" not in result.supplemented_jobs
     assert "EXP-DATA-DB-TUNING" not in result.supplemented_expertise
-    assert result.pending_diffs_updated == 0
+    assert result.pending_diffs_updated == 2
     assert result.project_dates_unchanged is True
 
     db_session.expire_all()
@@ -385,8 +385,10 @@ def test_apply_recovers_refs_preserves_projects_and_modified(db_session) -> None
     jobs = run.candidate_json["jobs"]
     exps = run.candidate_json["expertise"]
     da = next(j for j in jobs if j["code"] == "JOB-DATA-DA")
+    assert da["raw_value"] == "JOB-DATA-DA"
     assert any((r.get("quote_text") or "").strip() == "DA 컨설팅" for r in da["source_refs"])
     exp = next(x for x in exps if x["code"] == "EXP-DATA")
+    assert exp["raw_value"] == "EXP-DATA"
     assert any(
         (r.get("quote_text") or "").strip() == "데이터 모델링"
         for r in exp["source_refs"]
@@ -420,6 +422,8 @@ def test_apply_recovers_refs_preserves_projects_and_modified(db_session) -> None
     assert pending_job is not None
     assert pending_job.review_status == "PENDING"
     assert pending_job.id == seeded["pending_job_id"]
+    assert pending_job.new_value["raw_value"] == "JOB-DATA-DA"
+    assert pending_job.new_value["code"] == "JOB-DATA-DA"
     assert any(
         (r.get("quote_text") or "") == "DA 컨설팅"
         for r in (pending_job.new_value or {}).get("source_refs") or []
@@ -483,3 +487,166 @@ def test_apply_rolls_back_on_failure(db_session, monkeypatch) -> None:
     assert modified is not None
     assert modified.review_status == "MODIFIED"
     assert modified.decided_value["project_name"] == "SKT 차세대 빌링(수정)"
+
+
+def test_raw_value_preserved_on_candidate_and_diff(db_session) -> None:
+    from app.db.models.analysis import AnalysisDiffItem, AnalysisRun
+    from app.modules.analysis.root_evidence_recover import apply_root_evidence_recover
+
+    admin = _create_admin(db_session)
+    seeded = _seed_reviewing_recover_case(db_session, admin.id)
+    apply_root_evidence_recover(db_session, seeded["run"].id, actor_user_id=admin.id)
+
+    db_session.expire_all()
+    run = db_session.get(AnalysisRun, seeded["run"].id)
+    assert run is not None
+    da = next(j for j in run.candidate_json["jobs"] if j["code"] == "JOB-DATA-DA")
+    assert da["raw_value"] == "JOB-DATA-DA"
+
+    pending_job = db_session.get(AnalysisDiffItem, seeded["pending_job_id"])
+    assert pending_job is not None
+    assert pending_job.new_value["raw_value"] == "JOB-DATA-DA"
+    assert pending_job.new_value["code"] == "JOB-DATA-DA"
+    assert pending_job.review_status == "PENDING"
+    assert pending_job.decided_value is None
+
+
+def test_duplicate_path_or_code_mismatch_fail_closed(db_session) -> None:
+    from app.core.exceptions import ValidationAppError
+    from app.db.models.analysis import AnalysisDiffItem
+    from app.modules.analysis.root_evidence_recover import (
+        preview_root_evidence_recover,
+    )
+
+    admin = _create_admin(db_session)
+    seeded = _seed_reviewing_recover_case(db_session, admin.id)
+    run_id = seeded["run"].id
+
+    # Duplicate candidate_path for JOB-DATA-DA.
+    db_session.add(
+        AnalysisDiffItem(
+            analysis_run_id=run_id,
+            entity_type="JOB",
+            candidate_path="jobs[0]",
+            change_type="NEW",
+            new_value={
+                "code": "JOB-DATA-DA",
+                "raw_value": "JOB-DATA-DA",
+                "job_type": "PRIMARY",
+                "source_refs": [],
+            },
+            review_status="PENDING",
+        )
+    )
+    db_session.commit()
+    with pytest.raises(ValidationAppError, match="중복"):
+        preview_root_evidence_recover(db_session, run_id)
+
+    # Reset duplicate, then code mismatch on path.
+    db_session.expire_all()
+    seeded2 = _seed_reviewing_recover_case(db_session, admin.id)
+    run2 = seeded2["run"]
+    pending = db_session.get(AnalysisDiffItem, seeded2["pending_job_id"])
+    assert pending is not None
+    pending.new_value = {
+        "code": "JOB-DEV-GEN",
+        "raw_value": "JOB-DEV-GEN",
+        "job_type": "PRIMARY",
+        "source_refs": [],
+    }
+    db_session.add(pending)
+    db_session.commit()
+    with pytest.raises(ValidationAppError, match="code가 후보와 불일치"):
+        preview_root_evidence_recover(db_session, run2.id)
+
+
+def test_reviewed_root_item_not_changed(db_session) -> None:
+    from app.db.models.analysis import AnalysisDiffItem, AnalysisRun
+    from app.modules.analysis.root_evidence_recover import apply_root_evidence_recover
+
+    admin = _create_admin(db_session)
+    seeded = _seed_reviewing_recover_case(db_session, admin.id)
+    pending_job = db_session.get(AnalysisDiffItem, seeded["pending_job_id"])
+    assert pending_job is not None
+    pending_job.review_status = "ACCEPTED"
+    pending_job.decided_value = {"code": "JOB-DATA-DA", "accepted": True}
+    db_session.add(pending_job)
+    db_session.commit()
+
+    result = apply_root_evidence_recover(
+        db_session, seeded["run"].id, actor_user_id=admin.id
+    )
+    # EXP-DATA still PENDING and recoverable; JOB-DATA-DA must stay untouched.
+    assert "JOB-DATA-DA" not in result.supplemented_jobs
+    assert "EXP-DATA" in result.supplemented_expertise
+
+    db_session.expire_all()
+    run = db_session.get(AnalysisRun, seeded["run"].id)
+    assert run is not None
+    da = next(j for j in run.candidate_json["jobs"] if j["code"] == "JOB-DATA-DA")
+    assert not any((r.get("quote_text") or "").strip() for r in (da.get("source_refs") or []))
+    accepted = db_session.get(AnalysisDiffItem, seeded["pending_job_id"])
+    assert accepted is not None
+    assert accepted.review_status == "ACCEPTED"
+    assert accepted.decided_value == {"code": "JOB-DATA-DA", "accepted": True}
+    assert accepted.new_value.get("source_refs") == []
+
+
+def test_preview_expected_pending_diff_count(db_session) -> None:
+    from app.modules.analysis.root_evidence_recover import (
+        apply_root_evidence_recover,
+        preview_root_evidence_recover,
+    )
+
+    admin = _create_admin(db_session)
+    seeded = _seed_reviewing_recover_case(db_session, admin.id)
+    preview = preview_root_evidence_recover(db_session, seeded["run"].id)
+    assert preview.applied is False
+    assert preview.pending_diffs_updated == 2
+    assert set(preview.supplemented_jobs) == {"JOB-DATA-DA"}
+    assert set(preview.supplemented_expertise) == {"EXP-DATA"}
+
+    applied = apply_root_evidence_recover(
+        db_session, seeded["run"].id, actor_user_id=admin.id
+    )
+    assert applied.pending_diffs_updated == preview.pending_diffs_updated
+
+
+def test_rollback_after_candidate_mutation(db_session, monkeypatch) -> None:
+    from app.db.models.analysis import AnalysisDiffItem, AnalysisRun
+    from app.modules.analysis import root_evidence_recover as mod
+    from app.modules.analysis.repository import AnalysisRepository
+
+    admin = _create_admin(db_session)
+    seeded = _seed_reviewing_recover_case(db_session, admin.id)
+    run_id = seeded["run"].id
+    before = dict(seeded["run"].candidate_json)
+    before_job_nv = dict(
+        db_session.get(AnalysisDiffItem, seeded["pending_job_id"]).new_value
+    )
+
+    original_add_audit = AnalysisRepository.add_audit
+
+    def _boom(self, *args, **kwargs):
+        # Candidate/Diff already mutated in-session; audit failure must roll back.
+        raise RuntimeError("audit failed after mutation")
+
+    monkeypatch.setattr(AnalysisRepository, "add_audit", _boom)
+    with pytest.raises(RuntimeError, match="audit failed after mutation"):
+        mod.apply_root_evidence_recover(
+            db_session, run_id, actor_user_id=admin.id
+        )
+
+    db_session.expire_all()
+    run = db_session.get(AnalysisRun, run_id)
+    assert run is not None
+    assert run.candidate_json == before
+    pending_job = db_session.get(AnalysisDiffItem, seeded["pending_job_id"])
+    assert pending_job is not None
+    assert pending_job.new_value == before_job_nv
+    assert pending_job.review_status == "PENDING"
+    modified = db_session.get(AnalysisDiffItem, seeded["modified_project_id"])
+    assert modified is not None
+    assert modified.decided_value["project_name"] == "SKT 차세대 빌링(수정)"
+    # silence unused
+    assert original_add_audit is not None
