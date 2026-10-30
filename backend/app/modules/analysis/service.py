@@ -120,6 +120,7 @@ from app.modules.analysis.schemas import (
     GuardRefreshResultData,
     PageMeta,
     PersonBrief,
+    RootEvidenceRecoverResultData,
 )
 from app.modules.analysis.source_builder import (
     AnalysisSourceBuilder,
@@ -3616,6 +3617,51 @@ class AnalysisService:
 
         return self._guard_refresh_result_data(
             apply_guard_refresh(
+                self.db, analysis_id, actor_user_id=actor_user_id
+            )
+        )
+
+    def _root_evidence_recover_result_data(
+        self, result: object
+    ) -> RootEvidenceRecoverResultData:
+        from app.modules.analysis.root_evidence_recover import (
+            RootEvidenceRecoverResult,
+        )
+
+        if not isinstance(result, RootEvidenceRecoverResult):
+            raise TypeError("expected RootEvidenceRecoverResult")
+        return RootEvidenceRecoverResultData(
+            analysis_id=result.analysis_id,
+            status=result.status,  # type: ignore[arg-type]
+            changed=result.changed,
+            applied=result.applied,
+            supplemented_jobs=list(result.supplemented_jobs),
+            supplemented_expertise=list(result.supplemented_expertise),
+            pending_diffs_updated=result.pending_diffs_updated,
+            project_dates_unchanged=result.project_dates_unchanged,
+            message=result.message,
+        )
+
+    def preview_root_evidence_recover(
+        self, analysis_id: UUID
+    ) -> RootEvidenceRecoverResultData:
+        from app.modules.analysis.root_evidence_recover import (
+            preview_root_evidence_recover,
+        )
+
+        return self._root_evidence_recover_result_data(
+            preview_root_evidence_recover(self.db, analysis_id)
+        )
+
+    def apply_root_evidence_recover(
+        self, analysis_id: UUID, *, actor_user_id: UUID
+    ) -> RootEvidenceRecoverResultData:
+        from app.modules.analysis.root_evidence_recover import (
+            apply_root_evidence_recover,
+        )
+
+        return self._root_evidence_recover_result_data(
+            apply_root_evidence_recover(
                 self.db, analysis_id, actor_user_id=actor_user_id
             )
         )

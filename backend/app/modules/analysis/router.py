@@ -24,6 +24,8 @@ from app.modules.analysis.schemas import (
     GuardRefreshApplyResponse,
     GuardRefreshPreviewResponse,
     RetryAnalysisResponse,
+    RootEvidenceRecoverApplyResponse,
+    RootEvidenceRecoverPreviewResponse,
 )
 from app.modules.analysis.service import AnalysisService
 from app.modules.auth.dependencies import (
@@ -161,6 +163,37 @@ def apply_guard_refresh(
 ) -> GuardRefreshApplyResponse:
     return GuardRefreshApplyResponse(
         data=service.apply_guard_refresh(
+            analysis_id, actor_user_id=ctx.user.id
+        )
+    )
+
+
+@router.get(
+    "/{analysis_id}/root-evidence-recover/preview",
+    response_model=RootEvidenceRecoverPreviewResponse,
+)
+def preview_root_evidence_recover(
+    analysis_id: UUID,
+    _admin: AuthenticatedContext = Depends(require_admin),
+    service: AnalysisService = Depends(get_analysis_service),
+) -> RootEvidenceRecoverPreviewResponse:
+    return RootEvidenceRecoverPreviewResponse(
+        data=service.preview_root_evidence_recover(analysis_id)
+    )
+
+
+@router.post(
+    "/{analysis_id}/root-evidence-recover/apply",
+    response_model=RootEvidenceRecoverApplyResponse,
+)
+def apply_root_evidence_recover(
+    analysis_id: UUID,
+    _admin: AuthenticatedContext = Depends(require_admin),
+    ctx: AuthenticatedContext = Depends(require_csrf),
+    service: AnalysisService = Depends(get_analysis_service),
+) -> RootEvidenceRecoverApplyResponse:
+    return RootEvidenceRecoverApplyResponse(
+        data=service.apply_root_evidence_recover(
             analysis_id, actor_user_id=ctx.user.id
         )
     )
