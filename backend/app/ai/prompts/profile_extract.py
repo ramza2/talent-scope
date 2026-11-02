@@ -30,10 +30,11 @@ from app.ai.prompts import (
     profile_extract_v21,
     profile_extract_v22,
     profile_extract_v23,
+    profile_extract_v24,
 )
 from app.ai.providers.errors import AIProviderError
 
-CURRENT_PROFILE_PROMPT_VERSION = "profile-extract-v23"
+CURRENT_PROFILE_PROMPT_VERSION = "profile-extract-v24"
 
 ExtractionMode = Literal["single", "staged"]
 
@@ -229,6 +230,7 @@ _REGISTRY: dict[str, ProfilePromptSpec] = {
     profile_extract_v21.PROMPT_VERSION: _spec_from_staged_module(profile_extract_v21),
     profile_extract_v22.PROMPT_VERSION: _spec_from_staged_module(profile_extract_v22),
     profile_extract_v23.PROMPT_VERSION: _spec_from_staged_module(profile_extract_v23),
+    profile_extract_v24.PROMPT_VERSION: _spec_from_staged_module(profile_extract_v24),
 }
 
 
