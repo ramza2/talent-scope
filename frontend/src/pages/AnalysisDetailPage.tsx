@@ -26,7 +26,7 @@ import {
   formatDiffValueSummary,
   formatValue,
 } from '@/api/diffValueDisplay'
-import { isUngroundedRootJobOrExpNew } from '@/api/diffEvidence'
+import { isUngroundedNewDiff } from '@/api/diffEvidence'
 import {
   EMPLOYMENT_END_DATE_CUSTOM_VALUE,
   buildEmploymentEndDateModifiedDecision,
@@ -698,10 +698,10 @@ export function AnalysisDetailPage() {
 
         const needsCodeMapping = diffRequiresCodeMapping(row)
         const needsEndDateConfirm = isEmploymentEndDateConflictReview(row)
-        const ungroundedRootJobExp = isUngroundedRootJobOrExpNew(row)
+        const ungroundedNew = isUngroundedNewDiff(row)
         return (
           <Space size="small" wrap>
-            {ungroundedRootJobExp ? (
+            {ungroundedNew ? (
               <Typography.Text type="danger">원문 근거 없음</Typography.Text>
             ) : null}
             {needsEndDateConfirm ? (
@@ -712,11 +712,11 @@ export function AnalysisDetailPage() {
                 size="small"
                 loading={decisionMutation.isPending}
                 onClick={() => {
-                  if (ungroundedRootJobExp) {
+                  if (ungroundedNew) {
                     Modal.confirm({
                       title: '원문 근거 없는 항목을 승인할까요?',
                       content:
-                        '이 JOB/EXP 신규 항목에는 원문 근거가 연결되어 있지 않습니다. 실수가 아닌지 확인한 뒤 승인하세요.',
+                        '이 신규 항목에는 원문 근거가 연결되어 있지 않습니다. 원본문서를 직접 확인한 뒤 승인하세요.',
                       okText: '승인',
                       cancelText: '취소',
                       onOk: () =>
@@ -957,12 +957,12 @@ export function AnalysisDetailPage() {
                     selectedKeys.includes(d.id),
                   )
                   const acceptTargets = selected.filter(
-                    (d) => !isUngroundedRootJobOrExpNew(d),
+                    (d) => !isUngroundedNewDiff(d),
                   )
                   const skipped = selected.length - acceptTargets.length
                   if (acceptTargets.length === 0) {
                     message.warning(
-                      '선택한 항목 중 일괄 승인 가능한 Diff가 없습니다. 원문 근거 없는 JOB/EXP는 단건으로 검토하세요.',
+                      '선택한 항목 중 일괄 승인 가능한 Diff가 없습니다. 원문 근거 없는 신규 항목은 단건으로 검토하세요.',
                     )
                     return
                   }
@@ -970,7 +970,7 @@ export function AnalysisDetailPage() {
                     title: `선택 ${acceptTargets.length}건을 승인할까요?`,
                     content:
                       skipped > 0
-                        ? `원문 근거 없는 루트 JOB/EXP ${skipped}건은 승인 대상에서 제외됩니다.`
+                        ? `원문 근거 없는 신규 항목 ${skipped}건은 승인 대상에서 제외됩니다.`
                         : '선택한 Diff를 ACCEPTED로 저장합니다.',
                     okText: '승인',
                     cancelText: '취소',
@@ -1006,7 +1006,7 @@ export function AnalysisDetailPage() {
                 선택 반려
               </Button>
               <Typography.Text type="secondary">
-                CONFLICT/REVIEW 및 원문 근거 없는 루트 JOB/EXP는 일괄 승인할 수
+                CONFLICT/REVIEW 및 원문 근거 없는 신규 항목은 일괄 승인할 수
                 없습니다.
               </Typography.Text>
             </Space>

@@ -899,8 +899,20 @@ def test_create_run_list_review_retry_confirm(
     conflict_or_new = next(
         d for d in diff_rows if d["change_type"] in {"CONFLICT", "NEW", "UPDATE"}
     )
-    # Accept a non-CONFLICT/REVIEW via bulk when possible; single review for CONFLICT.
-    if conflict_or_new["change_type"] == "CONFLICT":
+    # Ungrounded NEW and CONFLICT need individual decisions; other diffs allow bulk.
+    from app.modules.analysis.diff_evidence import diff_has_original_evidence
+
+    needs_individual = (
+        conflict_or_new["change_type"] == "CONFLICT"
+        or (
+            conflict_or_new["change_type"] == "NEW"
+            and not diff_has_original_evidence(
+                new_value=conflict_or_new.get("new_value"),
+                evidence=conflict_or_new.get("evidence"),
+            )
+        )
+    )
+    if needs_individual:
         patch = client.patch(
             f"/api/v1/analyses/{analysis_id}/diffs/{conflict_or_new['id']}",
             headers={"X-CSRF-Token": csrf},

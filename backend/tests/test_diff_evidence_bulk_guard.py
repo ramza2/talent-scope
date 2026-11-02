@@ -1,4 +1,4 @@
-"""Regression: ungrounded root JOB/EXP NEW cannot bulk ACCEPTED."""
+"""Regression: any ungrounded NEW Diff cannot bulk ACCEPTED."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from sqlalchemy import select
 from app.db.models.analysis import AnalysisDiffItem, AnalysisRun
 from app.modules.analysis.diff_evidence import (
     diff_has_original_evidence,
+    is_ungrounded_new_diff,
     is_root_job_or_exp_new,
     is_ungrounded_root_job_or_exp_new,
 )
@@ -92,6 +93,25 @@ def test_diff_evidence_helpers_unit() -> None:
         candidate_path="expertise[0]",
         new_value={"code": "EXP-RAG", "source_refs": []},
     )
+    assert is_ungrounded_new_diff(change_type="NEW", new_value=2007)
+    assert is_ungrounded_new_diff(
+        change_type="NEW",
+        new_value={"school_name": "OO대학교", "source_refs": []},
+    )
+    assert is_ungrounded_new_diff(
+        change_type="NEW",
+        new_value={"project_name": "사업A", "source_refs": []},
+    )
+    assert not is_ungrounded_new_diff(change_type="UPDATE", new_value=2007)
+    assert not is_ungrounded_new_diff(
+        change_type="NEW",
+        new_value={"source_refs": [{"quote_text": "근거"}]},
+    )
+    assert not is_ungrounded_new_diff(
+        change_type="NEW",
+        new_value="임의",
+        evidence=[{"id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}],
+    )
 
 
 def test_bulk_accepted_rejects_ungrounded_root_job_and_exp(
@@ -172,7 +192,50 @@ def test_bulk_accepted_rejects_ungrounded_root_job_and_exp(
         entity_type="PROJECT",
         candidate_path="projects[0]",
         change_type="NEW",
-        new_value={"project_name": "사업A", "source_refs": []},
+        new_value={
+            "project_name": "사업A",
+            "source_refs": [
+                {
+                    "document_id": str(document.id),
+                    "page_no": 1,
+                    "quote_text": "사업A",
+                }
+            ],
+        },
+        review_status="PENDING",
+    )
+    ungrounded_project = AnalysisDiffItem(
+        analysis_run_id=run.id,
+        entity_type="PROJECT",
+        candidate_path="projects[1]",
+        change_type="NEW",
+        new_value={"project_name": "사업B", "source_refs": []},
+        review_status="PENDING",
+    )
+    profile = AnalysisDiffItem(
+        analysis_run_id=run.id,
+        entity_type="PROFILE",
+        candidate_path="profile.birth_year",
+        field_name="birth_year",
+        change_type="NEW",
+        new_value=2007,
+        review_status="PENDING",
+    )
+    education = AnalysisDiffItem(
+        analysis_run_id=run.id,
+        entity_type="EDUCATION",
+        candidate_path="education[1]",
+        change_type="NEW",
+        new_value={"school_name": "OO대학교", "source_refs": []},
+        review_status="PENDING",
+    )
+    profile_update = AnalysisDiffItem(
+        analysis_run_id=run.id,
+        entity_type="PROFILE",
+        candidate_path="profile.department",
+        field_name="department",
+        change_type="UPDATE",
+        new_value="개발팀",
         review_status="PENDING",
     )
     modified = AnalysisDiffItem(
@@ -184,9 +247,20 @@ def test_bulk_accepted_rejects_ungrounded_root_job_and_exp(
         review_status="MODIFIED",
         decided_value={"company_name": "A", "end_date": "2014.09.30"},
     )
-    db_session.add_all([job, exp, grounded, project, modified])
+    rows = (
+        job,
+        exp,
+        grounded,
+        project,
+        ungrounded_project,
+        profile,
+        education,
+        profile_update,
+        modified,
+    )
+    db_session.add_all(rows)
     db_session.commit()
-    for row in (job, exp, grounded, project, modified):
+    for row in rows:
         db_session.refresh(row)
 
     bad_job = client.post(
@@ -205,20 +279,29 @@ def test_bulk_accepted_rejects_ungrounded_root_job_and_exp(
     assert bad_exp.status_code == 400, bad_exp.text
     assert "원문 근거" in bad_exp.text
 
+    for item in (profile, education, ungrounded_project):
+        rejected_bulk_accept = client.post(
+            f"/api/v1/analyses/{analysis_id}/diffs/bulk",
+            headers={"X-CSRF-Token": csrf},
+            json={"diff_ids": [str(item.id)], "review_status": "ACCEPTED"},
+        )
+        assert rejected_bulk_accept.status_code == 400, rejected_bulk_accept.text
+        assert "원문 근거" in rejected_bulk_accept.text
+
     mixed = client.post(
         f"/api/v1/analyses/{analysis_id}/diffs/bulk",
         headers={"X-CSRF-Token": csrf},
         json={
-            "diff_ids": [str(grounded.id), str(exp.id)],
+            "diff_ids": [str(grounded.id), str(profile.id)],
             "review_status": "ACCEPTED",
         },
     )
     assert mixed.status_code == 400, mixed.text
     assert "원문 근거" in mixed.text
     db_session.refresh(grounded)
-    db_session.refresh(exp)
+    db_session.refresh(profile)
     assert grounded.review_status == "PENDING"
-    assert exp.review_status == "PENDING"
+    assert profile.review_status == "PENDING"
 
     ok_grounded = client.post(
         f"/api/v1/analyses/{analysis_id}/diffs/bulk",
@@ -236,19 +319,31 @@ def test_bulk_accepted_rejects_ungrounded_root_job_and_exp(
     )
     assert ok_project.status_code == 200, ok_project.text
 
+    ok_update = client.post(
+        f"/api/v1/analyses/{analysis_id}/diffs/bulk",
+        headers={"X-CSRF-Token": csrf},
+        json={"diff_ids": [str(profile_update.id)], "review_status": "ACCEPTED"},
+    )
+    assert ok_update.status_code == 200, ok_update.text
+
     reject_ungrounded = client.post(
         f"/api/v1/analyses/{analysis_id}/diffs/bulk",
         headers={"X-CSRF-Token": csrf},
         json={
-            "diff_ids": [str(job.id), str(exp.id)],
+            "diff_ids": [
+                str(job.id),
+                str(exp.id),
+                str(profile.id),
+                str(education.id),
+                str(ungrounded_project.id),
+            ],
             "review_status": "REJECTED",
         },
     )
     assert reject_ungrounded.status_code == 200, reject_ungrounded.text
-    db_session.refresh(job)
-    db_session.refresh(exp)
-    assert job.review_status == "REJECTED"
-    assert exp.review_status == "REJECTED"
+    for row in (job, exp, profile, education, ungrounded_project):
+        db_session.refresh(row)
+        assert row.review_status == "REJECTED"
 
     db_session.refresh(modified)
     assert modified.review_status == "MODIFIED"
@@ -257,7 +352,7 @@ def test_bulk_accepted_rejects_ungrounded_root_job_and_exp(
         "end_date": "2014.09.30",
     }
 
-    # Single ACCEPTED for ungrounded JOB remains allowed (FE warns).
+    # Single ACCEPTED for ungrounded NEW remains allowed (FE warns).
     reset = client.patch(
         f"/api/v1/analyses/{analysis_id}/diffs/{job.id}",
         headers={"X-CSRF-Token": csrf},

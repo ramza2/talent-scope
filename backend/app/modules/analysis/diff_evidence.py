@@ -71,6 +71,19 @@ def diff_has_original_evidence(
     return False
 
 
+def is_ungrounded_new_diff(
+    *,
+    change_type: str | None,
+    new_value: Any = None,
+    evidence: list[Any] | None = None,
+) -> bool:
+    """Any NEW Diff without its own original evidence needs individual review."""
+    return (
+        (change_type or "").strip().upper() == "NEW"
+        and not diff_has_original_evidence(new_value=new_value, evidence=evidence)
+    )
+
+
 def is_root_job_or_exp_new(
     *,
     entity_type: str | None,
@@ -108,4 +121,8 @@ def is_ungrounded_root_job_or_exp_new(
         candidate_path=candidate_path,
     ):
         return False
-    return not diff_has_original_evidence(new_value=new_value, evidence=evidence)
+    return is_ungrounded_new_diff(
+        change_type=change_type,
+        new_value=new_value,
+        evidence=evidence,
+    )

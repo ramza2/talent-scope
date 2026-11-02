@@ -6,6 +6,7 @@ import {
   isNonEmptyEvidenceId,
   isNonEmptyQuoteText,
   isRootJobOrExpNew,
+  isUngroundedNewDiff,
   isUngroundedRootJobOrExpNew,
 } from '../src/api/diffEvidence'
 import type { DiffItem } from '../src/api/analyses'
@@ -83,12 +84,42 @@ const projectRoot = {
 
 assert(isRootJobOrExpNew(ungroundedExp), 'exp root new')
 assert(isUngroundedRootJobOrExpNew(ungroundedExp), 'exp ungrounded')
+assert(isUngroundedNewDiff(ungroundedExp), 'any new exp ungrounded')
 assert(isUngroundedRootJobOrExpNew(ungroundedJobMetaOnly), 'job meta-only ungrounded')
 assert(!isUngroundedRootJobOrExpNew(grounded), 'grounded job')
 assert(diffHasOriginalEvidence(grounded), 'grounded has evidence')
 assert(!isRootJobOrExpNew(projectRelation), 'project relation not root')
-assert(!isUngroundedRootJobOrExpNew(projectRelation), 'project relation not blocked')
-assert(!isUngroundedRootJobOrExpNew(projectRoot), 'project root not blocked')
+assert(!isUngroundedRootJobOrExpNew(projectRelation), 'project relation is not a root JOB/EXP')
+assert(!isUngroundedRootJobOrExpNew(projectRoot), 'project root not root job/exp')
+assert(isUngroundedNewDiff(projectRoot), 'project new without evidence blocked')
+assert(isUngroundedNewDiff(projectRelation), 'project relation NEW without evidence blocked')
+
+const profileScalar = {
+  id: '6',
+  entity_type: 'PROFILE',
+  candidate_path: 'profile.birth_year',
+  field_name: 'birth_year',
+  change_type: 'NEW',
+  review_status: 'PENDING',
+  new_value: 2007,
+  evidence: [],
+} as DiffItem
+const educationNoRefs = {
+  id: '7',
+  entity_type: 'EDUCATION',
+  candidate_path: 'education[1]',
+  change_type: 'NEW',
+  review_status: 'PENDING',
+  new_value: { school_name: 'OO대학교', source_refs: [] },
+  evidence: [],
+} as DiffItem
+assert(isUngroundedNewDiff(profileScalar), 'profile scalar NEW without evidence')
+assert(isUngroundedNewDiff(educationNoRefs), 'education NEW without evidence')
+assert(!isUngroundedNewDiff(grounded), 'grounded NEW can bulk accept')
+assert(
+  !isUngroundedNewDiff({ ...profileScalar, change_type: 'UPDATE' }),
+  'UPDATE without evidence unaffected',
+)
 
 const linkedEvidence = {
   ...ungroundedExp,
@@ -96,6 +127,7 @@ const linkedEvidence = {
 } as DiffItem
 assert(diffHasOriginalEvidence(linkedEvidence), 'linked evidence id counts')
 assert(!isUngroundedRootJobOrExpNew(linkedEvidence), 'linked evidence grounded')
+assert(!isUngroundedNewDiff(linkedEvidence), 'linked evidence can bulk accept')
 
 const badQuoteRefs = {
   ...ungroundedJobMetaOnly,
