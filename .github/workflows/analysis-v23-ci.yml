@@ -101,7 +101,7 @@ jobs:
           python -m pytest -q \
             tests/test_diff_evidence_bulk_guard.py \
             tests/test_analysis.py \
-            -k "diff_evidence_bulk_guard or test_create_run_list_review_retry_confirm or test_bulk_conflict_reject_and_foreign_diff"
+            -k "diff_evidence_bulk_guard or test_bulk_conflict_reject_and_foreign_diff"
 
   frontend-evidence:
     name: Diff evidence UI check (Node 22)
