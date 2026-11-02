@@ -3329,7 +3329,7 @@ class AnalysisService:
         # Validate all selected diffs first — no partial apply.
         # Pass 1: existence + PENDING (prefer 409 over ACCEPTED-rule 400).
         from app.modules.analysis.diff_evidence import (
-            is_ungrounded_root_job_or_exp_new,
+            is_ungrounded_new_diff,
         )
 
         locked: list[AnalysisDiffItem] = []
@@ -3355,18 +3355,14 @@ class AnalysisService:
                     raise ValidationAppError(
                         "CONFLICT/REVIEW Diff는 일괄 ACCEPTED할 수 없습니다."
                     )
-                if is_ungrounded_root_job_or_exp_new(
-                    entity_type=diff.entity_type,
+                if is_ungrounded_new_diff(
                     change_type=diff.change_type,
-                    field_name=diff.field_name,
-                    candidate_path=diff.candidate_path,
                     new_value=diff.new_value,
                     evidence=evidence_by_diff.get(diff.id, []),
                 ):
                     raise ValidationAppError(
-                        "원문 근거가 없는 루트 JOB/EXP 신규 항목이 포함되어 "
-                        "일괄 승인할 수 없습니다. 해당 항목을 제외하거나 "
-                        "단건으로 검토해 주세요."
+                        "원문 근거가 없는 신규 항목이 포함되어 일괄 승인할 수 "
+                        "없습니다. 해당 항목을 제외하거나 단건으로 검토해 주세요."
                     )
 
         results: list[DiffItemResponse] = []

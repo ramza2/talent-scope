@@ -60,6 +60,14 @@ export function diffHasOriginalEvidence(diff: {
   return false
 }
 
+/** Any NEW Diff lacking its own original evidence needs individual review. */
+export function isUngroundedNewDiff(diff: DiffItem): boolean {
+  return (
+    (diff.change_type || '').toUpperCase() === 'NEW' &&
+    !diffHasOriginalEvidence(diff)
+  )
+}
+
 /** Root JOB/EXP NEW only — never PROJECT relation rows. */
 export function isRootJobOrExpNew(diff: {
   entity_type?: string | null
@@ -78,6 +86,6 @@ export function isRootJobOrExpNew(diff: {
 
 export function isUngroundedRootJobOrExpNew(diff: DiffItem): boolean {
   return (
-    isRootJobOrExpNew(diff) && !diffHasOriginalEvidence(diff)
+    isRootJobOrExpNew(diff) && isUngroundedNewDiff(diff)
   )
 }
