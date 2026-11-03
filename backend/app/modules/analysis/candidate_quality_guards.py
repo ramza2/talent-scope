@@ -2025,12 +2025,205 @@ def _guard_certifications(
     return cleaned
 
 
+
+def _v25_explicit_section_name(
+    name: str,
+    *,
+    section: str,
+    page_texts: dict[tuple[str, int], str],
+    document_type_by_id: dict[str, str] | None,
+) -> bool:
+    """Look for literal names inside an actual education/certification region.
+
+    Evaluate pages separately so a certificate table on p1 cannot label a
+    headerless project row on p3 as a certificate. Later pages with their own
+    explicit section header are still eligible.
+    """
+    type_map = document_type_by_id or {}
+    section_header = (
+        _EDUCATION_SECTION_RE if section == "education" else _CERT_SECTION_RE
+    )
+    for (doc_id, page_no), text in page_texts.items():
+        raw = str(text or "")
+        prior = _default_page_section(type_map.get(str(doc_id)), int(page_no))
+        if prior == "project" and not section_header.search(raw):
+            continue
+        for kind, line in _iter_edu_cert_section_lines(
+            {(str(doc_id), int(page_no)): raw}
+        ):
+            if kind == section and _line_has_company(line, name):
+                return True
+    return False
+
+
+def _v25_prune_cross_section_rows(
+    candidate: ProfileCandidateDocument,
+    *,
+    page_texts: dict[tuple[str, int], str] | None,
+    document_type_by_id: dict[str, str] | None,
+) -> ProfileCandidateDocument:
+    """Conservative, opt-in source-section validation for v25 new runs.
+
+    Project customers are not employers; employer table rows are not
+    projects; project technology mentions are not certificates. If source
+    table authority is missing, retain candidates for human review.
+    """
+    if not page_texts:
+        return candidate
+    spans = list(_iter_context_spans(page_texts, document_type_by_id))
+    has_employer_table = any(
+        _EMPLOYMENT_SECTION_RE.search(str(page))
+        for page in page_texts.values()
+    )
+    has_education_table = any(
+        _EDUCATION_SECTION_RE.search(str(page))
+        for page in page_texts.values()
+    )
+    has_certification_table = any(
+        _CERT_SECTION_RE.search(str(page))
+        for page in page_texts.values()
+    )
+    project_spans = [
+        span for span in spans
+        if _classify_span(span.text, section=span.section) == "project"
+    ]
+    employer_spans = [
+        span for span in spans
+        if _classify_span(span.text, section=span.section) == "employment"
+    ]
+
+    employment: list[EmploymentCandidate] = []
+    for row in candidate.employment_history or []:
+        company = (row.company_name or "").strip()
+        # No start + only project-row mentions is the characteristic v24
+        # customer-as-employer leak. Real/ambiguous employer mentions win.
+        has_project = bool(company) and any(
+            _line_has_company(span.text, company) for span in project_spans
+        )
+        has_employer = bool(company) and any(
+            _line_has_company(span.text, company) for span in employer_spans
+        )
+        has_unknown = bool(company) and any(
+            _line_has_company(span.text, company)
+            for span in spans
+            if _classify_span(span.text, section=span.section) == "ambiguous"
+        )
+        if (
+            has_employer_table
+            and company
+            and not row.start_date
+            and has_project
+            and not has_employer
+            and not has_unknown
+        ):
+            continue
+        employment.append(row)
+
+    education: list[EducationCandidate] = []
+    for row in candidate.education or []:
+        school = (row.school_name or "").strip()
+        if not school or not has_education_table:
+            education.append(row)
+            continue
+        if _v25_explicit_section_name(
+            school,
+            section="education",
+            page_texts=page_texts,
+            document_type_by_id=document_type_by_id,
+        ):
+            education.append(row)
+            continue
+        # Not mentioned in the source, or mentioned only as a project/company
+        # with no education ref: clear fabricated school candidates.
+        literally_present = any(
+            _line_has_company(str(page), school)
+            for page in page_texts.values()
+        )
+        if not row.source_refs and (
+            not literally_present
+            or any(_line_has_company(span.text, school) for span in project_spans)
+        ):
+            continue
+        education.append(row)
+
+    certifications: list[CertificationCandidate] = []
+    for row in candidate.certifications or []:
+        name = (row.certification_name or "").strip()
+        if not name or not has_certification_table:
+            certifications.append(row)
+            continue
+        if _v25_explicit_section_name(
+            name,
+            section="certification",
+            page_texts=page_texts,
+            document_type_by_id=document_type_by_id,
+        ):
+            certifications.append(row)
+            continue
+        if any(_line_has_company(span.text, name) for span in project_spans):
+            continue
+        certifications.append(row)
+
+    projects: list[ProjectCandidate] = []
+    for project in candidate.projects or []:
+        name = (project.project_name or "").strip()
+        customer = (project.customer_name or "").strip()
+        # Strong evidence only: same entity+period as a REAL employer, project
+        # named exactly that employer, and ALL project quotes are employer-row
+        # phrases (e.g. "BI/DW PL 및 개발"), not independent project rows.
+        mirrors_employer = bool(name and project.start_date) and any(
+            _company_match_key(name) == _company_match_key(emp.company_name)
+            and emp.start_date
+            and dates_compatible(project.start_date, emp.start_date)
+            and (not project.end_date or not emp.end_date
+                 or dates_compatible(project.end_date, emp.end_date))
+            for emp in employment
+        )
+        refs = list(project.source_refs or [])
+        employer_quotes_only = bool(refs) and all(
+            bool((ref.quote_text or "").strip())
+            and any(
+                _fold(ref.quote_text).casefold()
+                in _fold(span.text).casefold()
+                for span in employer_spans
+            )
+            for ref in refs
+        )
+        if (
+            has_employer_table
+            and name
+            and _company_match_key(name)
+            and _company_match_key(name) == _company_match_key(customer)
+            and mirrors_employer
+            and employer_quotes_only
+        ):
+            continue
+        projects.append(project)
+
+    if (
+        employment == list(candidate.employment_history or [])
+        and education == list(candidate.education or [])
+        and certifications == list(candidate.certifications or [])
+        and projects == list(candidate.projects or [])
+    ):
+        return candidate
+    return candidate.model_copy(
+        update={
+            "employment_history": employment,
+            "education": education,
+            "certifications": certifications,
+            "projects": projects,
+        }
+    )
+
+
 def apply_candidate_quality_guards(
     candidate: ProfileCandidateDocument,
     *,
     confirmed_person_name: str | None = None,
     page_texts: dict[tuple[str, int], str] | None = None,
     document_type_by_id: dict[str, str] | None = None,
+    strict_section_authority: bool = False,
 ) -> ProfileCandidateDocument:
     """Drop unambiguous field leakage and header/customer-only pseudo-projects.
 
@@ -2104,6 +2297,22 @@ def apply_candidate_quality_guards(
     kept_certifications = _guard_certifications(
         cert_input, page_texts=page_texts
     )
+
+    if strict_section_authority:
+        guarded = _v25_prune_cross_section_rows(
+            candidate.model_copy(update={
+                "projects": kept_projects,
+                "employment_history": kept_employment,
+                "education": kept_education,
+                "certifications": kept_certifications,
+            }),
+            page_texts=page_texts,
+            document_type_by_id=document_type_by_id,
+        )
+        kept_projects = guarded.projects
+        kept_employment = guarded.employment_history
+        kept_education = guarded.education
+        kept_certifications = guarded.certifications
 
     if (
         profile is candidate.profile
