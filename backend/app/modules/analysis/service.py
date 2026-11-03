@@ -99,6 +99,7 @@ from app.modules.analysis.token_budget import (
     pack_phase_source_chunks,
     plan_phase_source_chunks,
     plan_project_source_chunks,
+    plan_project_recall_page_chunks,
     split_block_by_pages,
     split_document_blocks,
     split_page_block_text,
@@ -2733,6 +2734,7 @@ class AnalysisService:
             root_budget: PromptChatBudget,
             reason: str,
             force_structural_split: bool = False,
+            page_recall_chunks: list[str] | None = None,
         ) -> ProfileCandidateDocument:
             """Document/page(+bounded body) adaptive PROJECT path."""
             nonlocal used_project_adaptive_split
@@ -2747,16 +2749,19 @@ class AnalysisService:
                 root_budget.prompt_tokens,
                 force_structural_split,
             )
-            try:
-                planned = plan_project_source_chunks(
-                    aliased_blocks,
-                    budget_for_blocks=lambda blocks: _project_budget_for_blocks(
-                        blocks, recovery_retry=False, force_recount=True
-                    ),
-                )
-            except AIProviderError as exc:
-                # Token-count outage while planning — fail closed, no fan-out.
-                raise InsufficientCandidateError() from exc
+            if page_recall_chunks is not None:
+                planned = page_recall_chunks
+            else:
+                try:
+                    planned = plan_project_source_chunks(
+                        aliased_blocks,
+                        budget_for_blocks=lambda blocks: _project_budget_for_blocks(
+                            blocks, recovery_retry=False, force_recount=True
+                        ),
+                    )
+                except AIProviderError as exc:
+                    # Token-count outage while planning — fail closed, no fan-out.
+                    raise InsufficientCandidateError() from exc
             # length-driven escalate may still "fit" by token-count; force
             # document/page partition so we do not re-chat the same full source.
             if force_structural_split and len(planned) <= 1:
@@ -2812,6 +2817,34 @@ class AnalysisService:
                 )
             except AIProviderError as exc:
                 raise InsufficientCandidateError() from exc
+            # v25 only: on rich, bounded multi-page sources, extract per page
+            # even if the combined prompt fits. A single large JSON can be
+            # syntactically complete while silently omitting independent rows.
+            # The normal chunk extractor still checks per-page token budgets;
+            # over-cap sources retain the previous single/adaptive paths.
+            if (
+                prompt.project_page_recall_split
+                and root_budget.fits
+                and source_char_count >= _SPARSE_MIN_SOURCE_CHARS
+                and _documents_are_rich_profile_type(documents)
+            ):
+                page_chunks = plan_project_recall_page_chunks(
+                    aliased_blocks,
+                    max_chunks=int(self.settings.analysis_project_split_max_calls),
+                )
+                if page_chunks is not None:
+                    logger.info(
+                        "analysis v25 project page recall analysis_run_id=%s "
+                        "page_chunks=%s",
+                        base_log.get("analysis_run_id"),
+                        len(page_chunks),
+                    )
+                    return _run_projects_split_path(
+                        root_budget=root_budget,
+                        reason="v25_bounded_page_recall",
+                        page_recall_chunks=page_chunks,
+                    )
+
             # Budget-fit → try single PROJECT first pass. length / pre-chat
             # over-budget escalate to adaptive split (no full-source recovery).
             # Sparse/validation recovery semantics remain for non-length cases.
