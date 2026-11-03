@@ -44,6 +44,8 @@ SUPPLEMENT_SEMANTIC_PROJECT_RELATIONS_FROM_SOURCE = True
 SUPPLEMENT_LITERAL_PROJECT_TECH_FROM_SOURCE = True
 # v25: conservative, source-section-aware candidate filtering.
 GUARD_CORE_SECTION_AUTHORITY = True
+# v25: bounded per-page project extraction to reduce lost independent rows.
+PROJECT_PAGE_RECALL_SPLIT = True
 
 CORE_SCHEMA_GUIDE = """
 Compact CORE root (omit null/empty):
