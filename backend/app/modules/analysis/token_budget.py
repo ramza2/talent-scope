@@ -134,6 +134,54 @@ def split_block_by_pages(document_block: str) -> list[str]:
     return [f"{header}{page}" for page in pages]
 
 
+_DENSE_RECALL_DATE_RE = re.compile(
+    r"(?:19|20)\d{2}[./-](?:0?[1-9]|1[0-2])"
+)
+
+
+def _split_dense_project_recall_page(page_block: str) -> list[str]:
+    """Split only line-dense project pages into two overlapping windows.
+
+    Keep whole source lines, the original document header and page marker
+    in both windows. Overlap protects projects whose cells cross the midpoint.
+    Source facts are never inferred or reconstructed.
+    """
+    content_marker = "content:\n"
+    index = page_block.find(content_marker)
+    if index < 0:
+        return [page_block]
+    header = page_block[: index + len(content_marker)]
+    remainder = page_block[index + len(content_marker) :]
+    page_match = _LEADING_PAGE_MARKER_RE.match(remainder)
+    if page_match is None:
+        return [page_block]
+    page_marker = page_match.group(1)
+    body = remainder[page_match.end() :]
+    lines = body.splitlines(keepends=True)
+
+    # DOCX-style cell-per-line pages are vulnerable to row omissions; a few
+    # long KOSA lines cannot be split safely without field boundaries.
+    if (
+        len(body) < 900
+        or len(lines) < 60
+        or len(_DENSE_RECALL_DATE_RE.findall(body)) < 20
+    ):
+        return [page_block]
+
+    midpoint = len(lines) // 2
+    overlap_lines = max(10, min(24, len(lines) // 6))
+    left_end = midpoint + overlap_lines
+    right_start = midpoint - overlap_lines
+    if right_start <= 0 or left_end >= len(lines):
+        return [page_block]
+    first_body = "".join(lines[:left_end])
+    second_body = "".join(lines[right_start:])
+    if max(len(first_body), len(second_body)) * 100 >= len(body) * 85:
+        return [page_block]
+    prefix = header + page_marker
+    return [prefix + first_body, prefix + second_body]
+
+
 def plan_project_recall_page_chunks(
     document_blocks: str,
     *,
@@ -143,9 +191,9 @@ def plan_project_recall_page_chunks(
     """Opt-in bounded page-level PROJECT recall on rich multi-page sources.
 
     Never infer rows or drop source pages. Every chunk keeps its document
-    header/page marker, and an unsuitable or over-cap source falls back to
-    the existing budget-based planner. The caller still token-budgets and
-    validates every extraction via the normal project chunk path.
+    header/page marker. Only line-dense pages may gain one overlapping
+    window within the existing call cap; other pages stay intact.
+    The caller token-budgets and validates each project extraction.
     """
     if max_chunks < 3 or max_pages < 3:
         return None
@@ -158,7 +206,18 @@ def plan_project_recall_page_chunks(
         return None
     if not all(re.search(r"\[PAGE\s+\d+\]\n", page) for page in pages):
         return None
-    return pages
+
+    remaining_extra = max_chunks - len(pages)
+    planned: list[str] = []
+    for page in pages:
+        windows = (
+            _split_dense_project_recall_page(page)
+            if remaining_extra > 0
+            else [page]
+        )
+        planned.extend(windows)
+        remaining_extra -= len(windows) - 1
+    return planned
 
 
 def split_text_into_bounded_chunks(text: str, *, max_chars: int) -> list[str]:
