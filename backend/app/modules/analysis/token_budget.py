@@ -134,6 +134,33 @@ def split_block_by_pages(document_block: str) -> list[str]:
     return [f"{header}{page}" for page in pages]
 
 
+def plan_project_recall_page_chunks(
+    document_blocks: str,
+    *,
+    max_chunks: int,
+    max_pages: int = 12,
+) -> list[str] | None:
+    """Opt-in bounded page-level PROJECT recall on rich multi-page sources.
+
+    Never infer rows or drop source pages. Every chunk keeps its document
+    header/page marker, and an unsuitable or over-cap source falls back to
+    the existing budget-based planner. The caller still token-budgets and
+    validates every extraction via the normal project chunk path.
+    """
+    if max_chunks < 3 or max_pages < 3:
+        return None
+    pages = [
+        page
+        for document in split_document_blocks(document_blocks)
+        for page in split_block_by_pages(document)
+    ]
+    if not 3 <= len(pages) <= min(max_chunks, max_pages):
+        return None
+    if not all(re.search(r"\[PAGE\s+\d+\]\n", page) for page in pages):
+        return None
+    return pages
+
+
 def split_text_into_bounded_chunks(text: str, *, max_chars: int) -> list[str]:
     """Structural body split only — fitness must be rechecked via token-count."""
     raw = text or ""
