@@ -942,7 +942,8 @@ class AnalysisService:
             logger.info(
                 "analysis candidate field guards run_id=%s "
                 "email_cleared=%s employment_type_cleared=%s projects_dropped=%s "
-                "employment_dropped=%s employment_end_review=%s",
+                "employment_dropped=%s education_dropped=%s "
+                "certifications_dropped=%s employment_end_review=%s",
                 run_id,
                 original_candidate.profile.email is not None
                 and candidate.profile.email is None,
@@ -951,6 +952,8 @@ class AnalysisService:
                 len(original_candidate.projects) - len(candidate.projects),
                 len(original_candidate.employment_history)
                 - len(candidate.employment_history),
+                len(original_candidate.education) - len(candidate.education),
+                len(original_candidate.certifications) - len(candidate.certifications),
                 sum(
                     1
                     for row in candidate.employment_history
