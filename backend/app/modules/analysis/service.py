@@ -2818,13 +2818,13 @@ class AnalysisService:
             except AIProviderError as exc:
                 raise InsufficientCandidateError() from exc
             # v25 only: on rich, bounded multi-page sources, extract per page
-            # even if the combined prompt fits. A single large JSON can be
-            # syntactically complete while silently omitting independent rows.
-            # The normal chunk extractor still checks per-page token budgets;
-            # over-cap sources retain the previous single/adaptive paths.
+            # regardless of whole-source budget fit. Even a complete JSON can
+            # silently omit independent rows, and an over-budget whole source
+            # should still use the same bounded page recall. Each chunk is
+            # independently token-budgeted; over-cap sources retain the
+            # previous single/adaptive paths.
             if (
                 prompt.project_page_recall_split
-                and root_budget.fits
                 and source_char_count >= _SPARSE_MIN_SOURCE_CHARS
                 and _documents_are_rich_profile_type(documents)
             ):
