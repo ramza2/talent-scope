@@ -87,6 +87,7 @@ class ProfilePromptSpec:
     supplement_semantic_project_relations_from_source: bool = False
     supplement_literal_project_tech_from_source: bool = False
     guard_core_section_authority: bool = False
+    project_page_recall_split: bool = False
 
 
 def _spec_from_module(module) -> ProfilePromptSpec:
@@ -207,6 +208,9 @@ def _spec_from_staged_module(module) -> ProfilePromptSpec:
         ),
         guard_core_section_authority=bool(
             getattr(module, "GUARD_CORE_SECTION_AUTHORITY", False)
+        ),
+        project_page_recall_split=bool(
+            getattr(module, "PROJECT_PAGE_RECALL_SPLIT", False)
         ),
     )
 
