@@ -198,3 +198,63 @@ def test_v25_real_certificate_and_project_customer_stay_separate() -> None:
     assert guarded.employment_history == candidate.employment_history
     assert guarded.certifications == candidate.certifications
     assert guarded.projects == candidate.projects
+
+
+def test_v25_page_recall_is_opt_in_only() -> None:
+    from app.ai.prompts.profile_extract import resolve_profile_prompt
+
+    assert resolve_profile_prompt(
+        "profile-extract-v25"
+    ).project_page_recall_split is True
+    assert resolve_profile_prompt(
+        "profile-extract-v24"
+    ).project_page_recall_split is False
+    assert resolve_profile_prompt(
+        "profile-extract-v23"
+    ).project_page_recall_split is False
+
+
+def test_page_recall_keeps_independent_rows_and_document_aliases() -> None:
+    from app.modules.analysis.token_budget import (
+        plan_project_recall_page_chunks,
+    )
+
+    source = (
+        "[DOCUMENT D1]\\ndocument_id: D1\\ncontent:\\n"
+        "[PAGE 3]\\nBW / EIS-Mobile 프로젝트 2013.08~2014.01 한화\\n"
+        "[PAGE 4]\\nBW / OLAP 구축 프로젝트 2013.05~2013.07 S-OIL\\n"
+        "[PAGE 5]\\nEDW 프로젝트 2006.01~2006.12 대우인터네셔널\\n"
+        "[DOCUMENT D2]\\ndocument_id: D2\\ncontent:\\n"
+        "[PAGE 2]\\nEDW 프로젝트 2011.10~2011.12 한국전기안전공사\\n"
+    ).replace("\\n", "\n")
+
+    chunks = plan_project_recall_page_chunks(source, max_chunks=8)
+    assert chunks is not None
+    assert len(chunks) == 4
+    assert [c.count("[PAGE ") for c in chunks] == [1, 1, 1, 1]
+    assert sum("BW / EIS-Mobile" in c for c in chunks) == 1
+    assert sum("BW / OLAP" in c for c in chunks) == 1
+    assert sum("EDW 프로젝트" in c for c in chunks) == 2
+    assert chunks[0].startswith("[DOCUMENT D1]")
+    assert chunks[3].startswith("[DOCUMENT D2]")
+
+
+def test_page_recall_falls_back_when_over_cap_or_without_page_markers() -> None:
+    from app.modules.analysis.token_budget import (
+        plan_project_recall_page_chunks,
+    )
+
+    source = (
+        "[DOCUMENT D1]\\ncontent:\\n"
+        "[PAGE 1]\\nA 2006.01~2006.02\\n"
+        "[PAGE 2]\\nB 2007.01~2007.02\\n"
+        "[PAGE 3]\\nC 2008.01~2008.02\\n"
+    ).replace("\\n", "\n")
+
+    assert plan_project_recall_page_chunks(source, max_chunks=2) is None
+    assert plan_project_recall_page_chunks(
+        source, max_chunks=8, max_pages=2
+    ) is None
+    assert plan_project_recall_page_chunks(
+        "[DOCUMENT D1]\\ncontent:\\nno page labels", max_chunks=8
+    ) is None
