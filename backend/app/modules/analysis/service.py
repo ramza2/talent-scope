@@ -937,6 +937,7 @@ class AnalysisService:
                 confirmed_person_name=confirmed_name,
                 page_texts=prompt_source.page_texts,
                 document_type_by_id=document_type_by_id,
+                strict_section_authority=prompt.guard_core_section_authority,
             )
             logger.info(
                 "analysis candidate field guards run_id=%s "
