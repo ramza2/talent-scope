@@ -258,3 +258,81 @@ def test_page_recall_falls_back_when_over_cap_or_without_page_markers() -> None:
     assert plan_project_recall_page_chunks(
         "[DOCUMENT D1]\\ncontent:\\nno page labels", max_chunks=8
     ) is None
+
+
+def test_v25_dense_project_page_has_bounded_line_overlap() -> None:
+    from app.modules.analysis.token_budget import (
+        plan_project_recall_page_chunks,
+    )
+
+    # DOCX cell-per-line page: adjacent project labels, periods and customers
+    # must remain together in at least one window across the midpoint.
+    lines = [
+        (
+            f"업무 {i:03d} 2013.05~2013.07\n"
+            if i % 5 == 0 else f"업무 {i:03d}\n"
+        )
+        for i in range(120)
+    ]
+    lines[57:60] = [
+        "BW / OLAP 구축 프로젝트\n",
+        "기간 2013.05~2013.07\n",
+        "고객 S-OIL\n",
+    ]
+    lines[62:65] = [
+        "BW / EIS-Mobile 프로젝트\n",
+        "기간 2013.08~2014.01\n",
+        "고객 한화\n",
+    ]
+    body = "".join(lines)
+    source = (
+        "[DOCUMENT D1]\ndocument_id: D1\ncontent:\n"
+        "[PAGE 1]\n고용 정보\n"
+        "[PAGE 3]\n" + body + "[PAGE 4]\n자격증 정보\n"
+    )
+
+    chunks = plan_project_recall_page_chunks(source, max_chunks=5)
+    assert chunks is not None
+    assert len(chunks) == 4
+    dense_windows = chunks[1:3]
+    assert all(
+        chunk.startswith(
+            "[DOCUMENT D1]\ndocument_id: D1\ncontent:\n[PAGE 3]\n"
+        )
+        for chunk in dense_windows
+    )
+    assert all(chunk.count("[PAGE ") == 1 for chunk in chunks)
+    for line in lines:
+        assert any(line in chunk for chunk in dense_windows)
+    for project_lines in (lines[57:60], lines[62:65]):
+        assert any(
+            all(line in chunk for line in project_lines)
+            for chunk in dense_windows
+        )
+    assert chunks[0].endswith("[PAGE 1]\n고용 정보\n")
+    assert chunks[3].endswith("[PAGE 4]\n자격증 정보\n")
+
+    # No spare calls: retain the full original page, never omit or truncate.
+    limited = plan_project_recall_page_chunks(source, max_chunks=3)
+    assert limited is not None
+    assert len(limited) == 3
+    assert limited[1].endswith("[PAGE 3]\n" + body)
+
+
+def test_v25_dense_project_page_skips_nonstructural_source() -> None:
+    from app.modules.analysis.token_budget import (
+        plan_project_recall_page_chunks,
+    )
+
+    # KOSA collapsed rows are unsuitable for line-boundary subdivision.
+    dates = " ".join("2013.05~2013.07" for _ in range(40))
+    source = (
+        "[DOCUMENT D1]\ncontent:\n"
+        f"[PAGE 1]\n{dates}\n"
+        "[PAGE 2]\n한 줄 문서\n"
+        "[PAGE 3]\n한 줄 문서\n"
+    )
+    chunks = plan_project_recall_page_chunks(source, max_chunks=8)
+    assert chunks is not None
+    assert len(chunks) == 3
+    assert dates in chunks[0]
