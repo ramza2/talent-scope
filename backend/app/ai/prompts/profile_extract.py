@@ -31,10 +31,11 @@ from app.ai.prompts import (
     profile_extract_v22,
     profile_extract_v23,
     profile_extract_v24,
+    profile_extract_v25,
 )
 from app.ai.providers.errors import AIProviderError
 
-CURRENT_PROFILE_PROMPT_VERSION = "profile-extract-v24"
+CURRENT_PROFILE_PROMPT_VERSION = "profile-extract-v25"
 
 ExtractionMode = Literal["single", "staged"]
 
@@ -85,6 +86,7 @@ class ProfilePromptSpec:
     supplement_semantic_core_exp_from_source: bool = False
     supplement_semantic_project_relations_from_source: bool = False
     supplement_literal_project_tech_from_source: bool = False
+    guard_core_section_authority: bool = False
 
 
 def _spec_from_module(module) -> ProfilePromptSpec:
@@ -203,6 +205,9 @@ def _spec_from_staged_module(module) -> ProfilePromptSpec:
                 module, "SUPPLEMENT_LITERAL_PROJECT_TECH_FROM_SOURCE", False
             )
         ),
+        guard_core_section_authority=bool(
+            getattr(module, "GUARD_CORE_SECTION_AUTHORITY", False)
+        ),
     )
 
 
@@ -231,6 +236,7 @@ _REGISTRY: dict[str, ProfilePromptSpec] = {
     profile_extract_v22.PROMPT_VERSION: _spec_from_staged_module(profile_extract_v22),
     profile_extract_v23.PROMPT_VERSION: _spec_from_staged_module(profile_extract_v23),
     profile_extract_v24.PROMPT_VERSION: _spec_from_staged_module(profile_extract_v24),
+    profile_extract_v25.PROMPT_VERSION: _spec_from_staged_module(profile_extract_v25),
 }
 
 
