@@ -139,6 +139,60 @@ _DENSE_RECALL_DATE_RE = re.compile(
 )
 
 
+def _split_structured_kosa_project_table_page(
+    page_block: str, *, max_windows: int
+) -> list[str] | None:
+    """Bounded complete-row windows for validated 7-column KOSA tables.
+
+    Each row is self-contained (title, period, customer, company, role).
+    Never infer/rewrite cells or split inside one row; reject collapsed OCR.
+    """
+    if max_windows < 2:
+        return None
+    marker = "content:\n"
+    idx = page_block.find(marker)
+    if idx < 0:
+        return None
+    header = page_block[: idx + len(marker)]
+    if not re.search(r"(?m)^document_type:[ \t]*DOC-KOSA[ \t]*$", header):
+        return None
+    remainder = page_block[idx + len(marker) :]
+    page_match = _LEADING_PAGE_MARKER_RE.match(remainder)
+    if page_match is None:
+        return None
+    page_marker = page_match.group(1)
+    body = remainder[page_match.end() :]
+    lines = body.splitlines(keepends=True)
+    trailing = ""
+    while lines and not lines[-1].strip():
+        trailing = lines.pop() + trailing
+    if not 12 <= len(lines) <= 48:
+        return None
+
+    for line in lines:
+        if not line.strip() or "|" not in line:
+            return None
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if (
+            len(cells) != 7
+            or not cells[1]
+            or not cells[3]
+            or len(_DENSE_RECALL_DATE_RE.findall(cells[2])) != 2
+            or not any(sep in cells[2] for sep in ("~", "～"))
+        ):
+            return None
+
+    desired_windows = min(max_windows, math.ceil(len(lines) / 5))
+    rows_per_window = math.ceil(len(lines) / desired_windows)
+    prefix = header + page_marker
+    windows = [
+        prefix + "".join(lines[start : start + rows_per_window])
+        + (trailing if start + rows_per_window >= len(lines) else "")
+        for start in range(0, len(lines), rows_per_window)
+    ]
+    return windows if len(windows) >= 2 else None
+
+
 def _split_dense_project_recall_page(page_block: str) -> list[str]:
     """Split only line-dense project pages into two overlapping windows.
 
@@ -208,15 +262,32 @@ def plan_project_recall_page_chunks(
         return None
 
     remaining_extra = max_chunks - len(pages)
-    planned: list[str] = []
-    for page in pages:
-        windows = (
-            _split_dense_project_recall_page(page)
-            if remaining_extra > 0
-            else [page]
+
+    # Reserve extra calls for validated KOSA table rows before optional dense
+    # line overlap; a single 17-row page can silently lose earlier projects.
+    structured_windows: dict[int, list[str]] = {}
+    for index, page in enumerate(pages):
+        if remaining_extra <= 0:
+            break
+        windows = _split_structured_kosa_project_table_page(
+            page, max_windows=remaining_extra + 1
         )
+        if windows is not None:
+            structured_windows[index] = windows
+            remaining_extra -= len(windows) - 1
+
+    planned: list[str] = []
+    for index, page in enumerate(pages):
+        if index in structured_windows:
+            windows = structured_windows[index]
+        else:
+            windows = (
+                _split_dense_project_recall_page(page)
+                if remaining_extra > 0
+                else [page]
+            )
+            remaining_extra -= len(windows) - 1
         planned.extend(windows)
-        remaining_extra -= len(windows) - 1
     return planned
 
 
