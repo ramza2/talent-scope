@@ -89,6 +89,7 @@ from app.modules.analysis.compact_v8 import (
     supplement_root_job_exp_evidence_from_project_relations,
     supplement_semantic_project_relations_from_source,
 )
+from app.modules.analysis.kosa_project_recall import supplement_kosa_table_projects
 from app.modules.analysis.candidate_quality_guards import apply_candidate_quality_guards
 from app.modules.analysis.diff_engine import DiffSpec, build_diffs
 from app.modules.analysis.normalize import normalize_candidate
@@ -2921,6 +2922,20 @@ class AnalysisService:
             )
 
         projects_doc = _run_projects_adaptive()
+        if prompt.project_page_recall_split:
+            projects_doc, kosa_recall = supplement_kosa_table_projects(
+                projects_doc,
+                page_texts=page_texts,
+                document_type_by_id=document_type_by_id,
+            )
+            logger.info(
+                "analysis v25 kosa table project recall analysis_run_id=%s "
+                "table_rows=%s matched_rows=%s supplemented_rows=%s",
+                base_log.get("analysis_run_id"),
+                kosa_recall["table_rows"],
+                kosa_recall["matched_rows"],
+                kosa_recall["supplemented_rows"],
+            )
         logger.info(
             "analysis candidate quality run_id=%s phase=projects "
             "compact_protocol=%s document_count=%s vlm_pages=%s project_count=%s "

@@ -13,6 +13,7 @@ from app.ai.schemas.profile_candidate import (
 from app.modules.analysis.candidate_quality_guards import (
     apply_candidate_quality_guards,
 )
+from app.modules.analysis.kosa_project_recall import supplement_kosa_table_projects
 
 _DOC = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 _TYPES = {_DOC: "DOC-PROFILE"}
@@ -433,3 +434,90 @@ def test_v25_kosa_rows_take_split_budget_before_dense_profile_page() -> None:
     assert chunks is not None and len(chunks) == 6
     assert dense in chunks[0]
     assert sum("document_type: DOC-KOSA" in c for c in chunks) == 4
+
+# v25: structurally valid KOSA 7-column rows are retained even when LLM
+# under-recalls independent rows of the same scanned source page.
+
+_KOSA_RECALL_DOC = "00000000-0000-0000-0000-000000000001"
+_KOSA_RECALL_RESUME = "00000000-0000-0000-0000-000000000002"
+
+
+def _kosa_recall_table(count: int = 17) -> str:
+    return "\n".join(
+        f"확인 | 합성 프로젝트 {i:02d} | 2006.01.02 ~ 2006.12.22 | 고객사 {i:02d} | "
+        "소속회사 | 개발 | 업무"
+        for i in range(1, count + 1)
+    )
+
+
+def test_v25_kosa_structured_rows_survive_partial_llm_recall() -> None:
+    original = ProfileCandidateDocument(projects=[
+        ProjectCandidate(
+            project_name=f"합성 프로젝트 {i:02d}",
+            customer_name=f"고객사 {i:02d}",
+            start_date="2006.01", end_date="2006.12",
+            source_refs=[SourceRef(document_id=_KOSA_RECALL_RESUME,
+                                   page_no=1, quote_text="이력서")],
+        )
+        for i in range(11, 16)
+    ])
+    source = _kosa_recall_table()
+    result, counts = supplement_kosa_table_projects(
+        original,
+        page_texts={(_KOSA_RECALL_DOC, 3): source},
+        document_type_by_id={_KOSA_RECALL_DOC: "DOC-KOSA"},
+    )
+    assert counts == {"table_rows": 17, "matched_rows": 5, "supplemented_rows": 12}
+    assert len(result.projects) == 17
+    assert len(original.projects) == 5
+    for i in range(1, 18):
+        row = next(p for p in result.projects if p.project_name == f"합성 프로젝트 {i:02d}")
+        assert row.source_refs[-1].quote_text in source
+        assert row.source_refs[-1].document_id == _KOSA_RECALL_DOC
+        assert row.source_refs[-1].page_no == 3
+
+    repeated, metrics = supplement_kosa_table_projects(
+        result,
+        page_texts={(_KOSA_RECALL_DOC, 3): source},
+        document_type_by_id={_KOSA_RECALL_DOC: "DOC-KOSA"},
+    )
+    assert len(repeated.projects) == 17
+    assert metrics == {"table_rows": 17, "matched_rows": 17, "supplemented_rows": 0}
+
+
+def test_v25_kosa_conflicting_customer_is_reviewable_not_overwritten() -> None:
+    original = ProfileCandidateDocument(projects=[ProjectCandidate(
+        project_name="동일 사업", customer_name="다른 고객",
+        start_date="2006.01", end_date="2006.12",
+    )])
+    source = (
+        "확인 | 동일 사업 | 2006.01.02 ~ 2006.12.22 | 원본 고객 | 회사 | 개발 | 업무\n"
+        "확인 | 추가 사업 | 2006.01.02 ~ 2006.12.22 | 고객 | 회사 | 개발 | 업무"
+    )
+    result, counts = supplement_kosa_table_projects(
+        original,
+        page_texts={(_KOSA_RECALL_DOC, 3): source},
+        document_type_by_id={_KOSA_RECALL_DOC: "DOC-KOSA"},
+    )
+    assert counts["supplemented_rows"] == 2
+    assert original.projects[0].customer_name == "다른 고객"
+    assert result.projects[0].customer_name == "다른 고객"
+    assert result.projects[1].customer_name == "원본 고객"
+
+
+def test_v25_kosa_invalid_or_wrong_document_type_is_not_promoted() -> None:
+    original = ProfileCandidateDocument()
+    valid = _kosa_recall_table(2)
+    for text, doc_type in (
+        (valid, "DOC-RESUME"),
+        (valid + "\n소제목", "DOC-KOSA"),
+        (valid.replace("2006.12.22", "2006.13.22"), "DOC-KOSA"),
+        (valid[:60], "DOC-KOSA"),
+    ):
+        result, counts = supplement_kosa_table_projects(
+            original,
+            page_texts={(_KOSA_RECALL_DOC, 3): text},
+            document_type_by_id={_KOSA_RECALL_DOC: doc_type},
+        )
+        assert result is original
+        assert counts == {"table_rows": 0, "matched_rows": 0, "supplemented_rows": 0}
