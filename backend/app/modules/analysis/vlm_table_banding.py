@@ -48,7 +48,8 @@ def detect_table_row_bands(
     pixels = memoryview(pix.samples)
     x_start, x_end = width // 12, width - width // 12
     stride = 3
-    min_hits = int(((x_end - x_start) / stride) * 0.55)
+    # Scanned document rules can be narrower and lighter than vector rules.
+    min_hits = int(((x_end - x_start) / stride) * 0.42)
     candidates: list[tuple[int, int, int]] = []
     for y in range(height):
         row_start = y * pix.stride
@@ -80,7 +81,8 @@ def detect_table_row_bands(
         return []
 
     # Choose the longest table run, without crossing a large whitespace gap.
-    max_row_gap = int(dpi * 0.90)
+    # Also separates the table from wide footer verification/barcode blocks.
+    max_row_gap = int(dpi * 0.70)
     runs: list[list[tuple[int, int, int]]] = []
     run: list[tuple[int, int, int]] = []
     for rule in rules:
@@ -97,10 +99,10 @@ def detect_table_row_bands(
     # Reject scattered underlines that do not share the same table width.
     left = sorted(rule[1] for rule in rules)[len(rules) // 2]
     right = sorted(rule[2] for rule in rules)[len(rules) // 2]
-    if right - left < width * 0.5:
+    if right - left < width * 0.40:
         return []
     if any(
-        abs(rule[1] - left) > width * 0.10
+        abs(rule[1] - left) > width * 0.16
         or abs(rule[2] - right) > width * 0.10
         for rule in rules
     ):
