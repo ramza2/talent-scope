@@ -24,6 +24,7 @@ class VLMProvider(Protocol):
         image_bytes: bytes,
         mime_type: str = "image/png",
         log_context: dict | None = None,
+        user_prompt: str | None = None,
     ) -> str: ...
 
 
@@ -39,6 +40,7 @@ class OpenAICompatibleVLMProvider:
         image_bytes: bytes,
         mime_type: str = "image/png",
         log_context: dict | None = None,
+        user_prompt: str | None = None,
     ) -> str:
         if not image_bytes:
             raise AIProviderError("empty image for VLM")
@@ -53,7 +55,7 @@ class OpenAICompatibleVLMProvider:
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": VLM_TRANSCRIBE_USER},
+                        {"type": "text", "text": user_prompt or VLM_TRANSCRIBE_USER},
                         {"type": "image_url", "image_url": {"url": data_url}},
                     ],
                 },
@@ -88,9 +90,10 @@ class FakeVLMProvider:
         image_bytes: bytes,
         mime_type: str = "image/png",
         log_context: dict | None = None,
+        user_prompt: str | None = None,
     ) -> str:
         self.calls += 1
-        _ = (image_bytes, mime_type, log_context)
+        _ = (image_bytes, mime_type, log_context, user_prompt)
         if self.fail:
             raise AIProviderError("injected VLM failure")
         return self.text
