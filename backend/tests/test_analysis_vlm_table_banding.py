@@ -90,6 +90,39 @@ def test_ruled_table_uses_real_row_boundaries():
     ]
 
 
+def test_partial_width_grid_detected_without_fixed_crop_coordinates():
+    document = pymupdf.open()
+    try:
+        page = document.new_page(width=595, height=842)
+        for y in range(100, 701, 40):
+            page.draw_line((175, y), (450, y), color=(0.35, 0.35, 0.35), width=0.8)
+        for x in (175, 240, 310, 385, 450):
+            page.draw_line((x, 100), (x, 700), color=(0.3, 0.3, 0.3), width=0.8)
+        for y in range(110, 690, 40):
+            page.insert_text((244, y + 10), "ROW", fontsize=10)
+        bands = detect_table_row_bands(page, dpi=180)
+        assert [(band.first_row, band.last_row) for band in bands] == [
+            (1, 5), (6, 10), (11, 15)
+        ]
+    finally:
+        document.close()
+
+
+def test_footer_barcode_block_is_not_detected_as_table_rows():
+    document = pymupdf.open()
+    try:
+        page = document.new_page(width=595, height=842)
+        for x in (70, 225, 380):
+            page.draw_rect(
+                pymupdf.Rect(x, 625, x + 145, 715),
+                color=(0.1, 0.1, 0.1),
+                fill=(0.2, 0.2, 0.2),
+            )
+        assert detect_table_row_bands(page, dpi=180) == []
+    finally:
+        document.close()
+
+
 def test_unruled_page_rejected_and_strict_row_count():
     document = pymupdf.open(stream=_pdf_bytes(ruled=False), filetype="pdf")
     try:
