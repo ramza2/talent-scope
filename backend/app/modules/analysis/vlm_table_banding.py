@@ -131,10 +131,10 @@ def detect_table_row_bands(
 
 
 def normalize_table_band_transcription(text: str) -> str:
-    """Repair a repeated formatting split before a literal '>' inside the final cell.
+    """Repair two repeated, unambiguous KOSA-style cell-boundary errors.
 
-    Only repair when every nonempty row has the same trailing pseudo-column.
-    The characters are preserved; no missing values are inferred.
+    All source characters are preserved. Mixed or uncertain layouts are left
+    unchanged so that callers can reject them or use full-page fallback.
     """
     rows = [line.strip() for line in (text or "").splitlines() if line.strip()]
     cells_by_row = [
@@ -146,6 +146,16 @@ def normalize_table_band_transcription(text: str) -> str:
         for cells in cells_by_row:
             trailing = cells.pop()
             cells[-1] = f"{cells[-1]} {trailing}".strip()
+    # A narrow '확인' status cell can be joined to the project-name cell.
+    # Split only when *every* row shows the same six-cell pattern.
+    if cells_by_row and all(
+        len(cells) == 6
+        and cells[0].startswith("확인 ")
+        and cells[0][len("확인 "):].strip()
+        for cells in cells_by_row
+    ):
+        for cells in cells_by_row:
+            cells[0:1] = ["확인", cells[0][len("확인 "):].strip()]
     return "\n".join(" | ".join(cells) for cells in cells_by_row)
 
 
