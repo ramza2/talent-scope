@@ -138,7 +138,7 @@ def test_flag_false_on_v22_true_on_v23() -> None:
         resolve_profile_prompt,
     )
 
-    assert CURRENT_PROFILE_PROMPT_VERSION == "profile-extract-v24"
+    assert CURRENT_PROFILE_PROMPT_VERSION == "profile-extract-v25"
     assert v22.SUPPLEMENT_LITERAL_PROJECT_TECH_FROM_SOURCE is False
     assert resolve_profile_prompt(
         "profile-extract-v22"

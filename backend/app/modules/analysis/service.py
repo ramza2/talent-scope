@@ -89,6 +89,7 @@ from app.modules.analysis.compact_v8 import (
     supplement_root_job_exp_evidence_from_project_relations,
     supplement_semantic_project_relations_from_source,
 )
+from app.modules.analysis.kosa_project_recall import supplement_kosa_table_projects
 from app.modules.analysis.candidate_quality_guards import apply_candidate_quality_guards
 from app.modules.analysis.diff_engine import DiffSpec, build_diffs
 from app.modules.analysis.normalize import normalize_candidate
@@ -99,6 +100,7 @@ from app.modules.analysis.token_budget import (
     pack_phase_source_chunks,
     plan_phase_source_chunks,
     plan_project_source_chunks,
+    plan_project_recall_page_chunks,
     split_block_by_pages,
     split_document_blocks,
     split_page_block_text,
@@ -937,11 +939,13 @@ class AnalysisService:
                 confirmed_person_name=confirmed_name,
                 page_texts=prompt_source.page_texts,
                 document_type_by_id=document_type_by_id,
+                strict_section_authority=prompt.guard_core_section_authority,
             )
             logger.info(
                 "analysis candidate field guards run_id=%s "
                 "email_cleared=%s employment_type_cleared=%s projects_dropped=%s "
-                "employment_dropped=%s employment_end_review=%s",
+                "employment_dropped=%s education_dropped=%s "
+                "certifications_dropped=%s employment_end_review=%s",
                 run_id,
                 original_candidate.profile.email is not None
                 and candidate.profile.email is None,
@@ -950,6 +954,8 @@ class AnalysisService:
                 len(original_candidate.projects) - len(candidate.projects),
                 len(original_candidate.employment_history)
                 - len(candidate.employment_history),
+                len(original_candidate.education) - len(candidate.education),
+                len(original_candidate.certifications) - len(candidate.certifications),
                 sum(
                     1
                     for row in candidate.employment_history
@@ -2729,6 +2735,7 @@ class AnalysisService:
             root_budget: PromptChatBudget,
             reason: str,
             force_structural_split: bool = False,
+            page_recall_chunks: list[str] | None = None,
         ) -> ProfileCandidateDocument:
             """Document/page(+bounded body) adaptive PROJECT path."""
             nonlocal used_project_adaptive_split
@@ -2743,16 +2750,19 @@ class AnalysisService:
                 root_budget.prompt_tokens,
                 force_structural_split,
             )
-            try:
-                planned = plan_project_source_chunks(
-                    aliased_blocks,
-                    budget_for_blocks=lambda blocks: _project_budget_for_blocks(
-                        blocks, recovery_retry=False, force_recount=True
-                    ),
-                )
-            except AIProviderError as exc:
-                # Token-count outage while planning — fail closed, no fan-out.
-                raise InsufficientCandidateError() from exc
+            if page_recall_chunks is not None:
+                planned = page_recall_chunks
+            else:
+                try:
+                    planned = plan_project_source_chunks(
+                        aliased_blocks,
+                        budget_for_blocks=lambda blocks: _project_budget_for_blocks(
+                            blocks, recovery_retry=False, force_recount=True
+                        ),
+                    )
+                except AIProviderError as exc:
+                    # Token-count outage while planning — fail closed, no fan-out.
+                    raise InsufficientCandidateError() from exc
             # length-driven escalate may still "fit" by token-count; force
             # document/page partition so we do not re-chat the same full source.
             if force_structural_split and len(planned) <= 1:
@@ -2808,6 +2818,34 @@ class AnalysisService:
                 )
             except AIProviderError as exc:
                 raise InsufficientCandidateError() from exc
+            # v25 only: on rich, bounded multi-page sources, extract per page
+            # regardless of whole-source budget fit. Even a complete JSON can
+            # silently omit independent rows, and an over-budget whole source
+            # should still use the same bounded page recall. Each chunk is
+            # independently token-budgeted; over-cap sources retain the
+            # previous single/adaptive paths.
+            if (
+                prompt.project_page_recall_split
+                and source_char_count >= _SPARSE_MIN_SOURCE_CHARS
+                and _documents_are_rich_profile_type(documents)
+            ):
+                page_chunks = plan_project_recall_page_chunks(
+                    aliased_blocks,
+                    max_chunks=int(self.settings.analysis_project_split_max_calls),
+                )
+                if page_chunks is not None:
+                    logger.info(
+                        "analysis v25 project page recall analysis_run_id=%s "
+                        "page_chunks=%s",
+                        base_log.get("analysis_run_id"),
+                        len(page_chunks),
+                    )
+                    return _run_projects_split_path(
+                        root_budget=root_budget,
+                        reason="v25_bounded_page_recall",
+                        page_recall_chunks=page_chunks,
+                    )
+
             # Budget-fit → try single PROJECT first pass. length / pre-chat
             # over-budget escalate to adaptive split (no full-source recovery).
             # Sparse/validation recovery semantics remain for non-length cases.
@@ -2884,6 +2922,20 @@ class AnalysisService:
             )
 
         projects_doc = _run_projects_adaptive()
+        if prompt.project_page_recall_split:
+            projects_doc, kosa_recall = supplement_kosa_table_projects(
+                projects_doc,
+                page_texts=page_texts,
+                document_type_by_id=document_type_by_id,
+            )
+            logger.info(
+                "analysis v25 kosa table project recall analysis_run_id=%s "
+                "table_rows=%s matched_rows=%s supplemented_rows=%s",
+                base_log.get("analysis_run_id"),
+                kosa_recall["table_rows"],
+                kosa_recall["matched_rows"],
+                kosa_recall["supplemented_rows"],
+            )
         logger.info(
             "analysis candidate quality run_id=%s phase=projects "
             "compact_protocol=%s document_count=%s vlm_pages=%s project_count=%s "

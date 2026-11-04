@@ -58,6 +58,11 @@ class Settings(BaseSettings):
     analysis_max_vlm_pages: int = 5
     analysis_max_total_text_chars: int = 40000
     analysis_pdf_render_dpi: int = 120
+    # Experimental scanned-table row banding. OFF until live read-only validation.
+    analysis_vlm_table_banding_enabled: bool = False
+    analysis_vlm_table_banding_rows_per_band: int = 5
+    analysis_vlm_table_banding_max_calls_per_page: int = 6
+    analysis_vlm_table_banding_max_calls_total: int = 16
     analysis_code_context_max_chars: int = 12000
     analysis_max_quote_chars: int = 400
     analysis_max_source_refs: int = 5

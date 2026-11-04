@@ -12,7 +12,13 @@ import pymupdf
 
 from app.ai.providers.errors import AIProviderError
 from app.ai.providers.vlm import VLMProvider
+from app.ai.prompts.vlm_transcribe_table_v2 import VLM_TABLE_BAND_USER
 from app.core.config import Settings, get_settings
+from app.modules.analysis.vlm_table_banding import (
+    detect_table_row_bands,
+    is_valid_table_band_transcription,
+    normalize_table_band_transcription,
+)
 from app.modules.document_processing.types import (
     IMAGE_EXTENSIONS,
     MIN_TEXT_CHARS_FOR_READY_PAGE,
@@ -72,6 +78,7 @@ class DocumentSourceBlock:
     error: str | None = None
     vlm_pages_used: int = 0
     page_count: int = 0
+    vlm_table_band_calls_used: int = 0
 
 
 @dataclass
@@ -138,6 +145,7 @@ def _build_vlm_transcription(
     document_id: UUID,
     page: PageSnapshot,
     transcribed: str,
+    table_banded: bool = False,
 ) -> VLMPageTranscription | None:
     cleaned = (transcribed or "").strip()
     if not cleaned:
@@ -153,6 +161,8 @@ def _build_vlm_transcription(
     layout["needs_vlm"] = False
     layout["vlm_transcribed"] = True
     layout["vlm_text_chars"] = len(cleaned)
+    if table_banded:
+        layout["vlm_table_banded"] = True
     layout["final_text_chars"] = len(persisted)
     expected_layout = (
         copy.deepcopy(page.layout_json) if isinstance(page.layout_json, dict) else None
@@ -291,16 +301,19 @@ class AnalysisSourceBuilder:
     ) -> AnalysisSourceBundle:
         bundle = AnalysisSourceBundle()
         vlm_budget = int(self.settings.analysis_max_vlm_pages)
+        table_budget = max(0, int(self.settings.analysis_vlm_table_banding_max_calls_total))
         for doc in documents:
             block, transcriptions = self._build_one(
                 doc,
                 vlm_budget=vlm_budget,
+                table_budget=table_budget,
                 log_context=log_context,
             )
             bundle.blocks.append(block)
             bundle.vlm_transcriptions.extend(transcriptions)
             bundle.total_vlm_pages += block.vlm_pages_used
             vlm_budget = max(0, vlm_budget - block.vlm_pages_used)
+            table_budget = max(0, table_budget - block.vlm_table_band_calls_used)
         return bundle
 
     def _build_one(
@@ -308,6 +321,7 @@ class AnalysisSourceBuilder:
         doc: DocumentSnapshot,
         *,
         vlm_budget: int,
+        table_budget: int,
         log_context: dict | None,
     ) -> tuple[DocumentSourceBlock, list[VLMPageTranscription]]:
         doc_id = str(doc.id)
@@ -317,6 +331,7 @@ class AnalysisSourceBuilder:
         try:
             parts: list[str] = []
             vlm_used = 0
+            table_calls_used = 0
             pdf_doc: pymupdf.Document | None = None
             try:
                 for page in pages:
@@ -331,23 +346,39 @@ class AnalysisSourceBuilder:
                         if pdf_doc is None:
                             pdf_doc = self._open_render_source(doc)
                         if pdf_doc is not None:
-                            image_bytes = self._render_page_png(
-                                pdf_doc, page.page_no - 1
-                            )
-                            transcribed = self.vlm.transcribe_image(
-                                image_bytes=image_bytes,
-                                mime_type="image/png",
-                                log_context={
-                                    **(log_context or {}),
-                                    "document_id": doc_id,
-                                    "page_no": page.page_no,
-                                },
-                            )
+                            page_context = {
+                                **(log_context or {}),
+                                "document_id": doc_id,
+                                "page_no": page.page_no,
+                            }
+                            banded_text = None
+                            if (
+                                self.settings.analysis_vlm_table_banding_enabled
+                                and table_budget > table_calls_used
+                            ):
+                                banded_text, calls = self._try_transcribe_table_bands(
+                                    pdf_doc.load_page(page.page_no - 1),
+                                    log_context=page_context,
+                                    remaining_calls=table_budget - table_calls_used,
+                                )
+                                table_calls_used += calls
+                            if banded_text is None:
+                                image_bytes = self._render_page_png(
+                                    pdf_doc, page.page_no - 1
+                                )
+                                transcribed = self.vlm.transcribe_image(
+                                    image_bytes=image_bytes,
+                                    mime_type="image/png",
+                                    log_context=page_context,
+                                )
+                            else:
+                                transcribed = banded_text
                             vlm_used += 1
                             item = _build_vlm_transcription(
                                 document_id=doc.id,
                                 page=page,
                                 transcribed=transcribed,
+                                table_banded=banded_text is not None,
                             )
                             if item is not None:
                                 transcriptions.append(item)
@@ -392,6 +423,7 @@ class AnalysisSourceBuilder:
                     text="\n\n".join(parts),
                     page_count=len(pages),
                     vlm_pages_used=vlm_used,
+                    vlm_table_band_calls_used=table_calls_used,
                 ),
                 transcriptions,
             )
@@ -411,6 +443,76 @@ class AnalysisSourceBuilder:
                 ),
                 [],
             )
+
+    def _try_transcribe_table_bands(
+        self,
+        page: pymupdf.Page,
+        *,
+        log_context: dict,
+        remaining_calls: int,
+    ) -> tuple[str | None, int]:
+        """Fail closed to the existing full-page VLM path on any uncertainty."""
+        if self.vlm is None:
+            return None, 0
+        per_page_cap = min(
+            remaining_calls,
+            max(0, int(self.settings.analysis_vlm_table_banding_max_calls_per_page)),
+        )
+        if per_page_cap < 2:
+            return None, 0
+        calls = 0
+        try:
+            dpi = max(220, int(self.settings.analysis_pdf_render_dpi))
+            bands = detect_table_row_bands(
+                page,
+                dpi=dpi,
+                rows_per_band=int(self.settings.analysis_vlm_table_banding_rows_per_band),
+                max_bands=per_page_cap,
+            )
+            if not bands:
+                return None, 0
+            outputs: list[str] = []
+            column_count: int | None = None
+            for band in bands:
+                zoom = min(max(dpi, 120), 240) / 72.0
+                pix = page.get_pixmap(
+                    matrix=pymupdf.Matrix(zoom, zoom),
+                    clip=band.clip,
+                    alpha=False,
+                )
+                calls += 1
+                result = self.vlm.transcribe_image(
+                    image_bytes=pix.tobytes("png"),
+                    mime_type="image/png",
+                    log_context={
+                        **log_context,
+                        "table_band": f"{band.first_row}-{band.last_row}",
+                    },
+                    user_prompt=VLM_TABLE_BAND_USER,
+                )
+                cleaned = normalize_table_band_transcription(result)
+                if not is_valid_table_band_transcription(
+                    cleaned, expected_rows=band.last_row - band.first_row + 1
+                ):
+                    return None, calls
+                rows = [line.strip().strip("|").strip() for line in cleaned.splitlines()]
+                counts = {len(row.split("|")) for row in rows}
+                if len(counts) != 1:
+                    return None, calls
+                current = counts.pop()
+                if column_count is not None and column_count != current:
+                    return None, calls
+                column_count = current
+                outputs.extend(rows)
+            return "\n".join(outputs), calls
+        except Exception as exc:
+            logger.info(
+                "analysis table-banding fallback document_id=%s page_no=%s err=%s",
+                log_context.get("document_id"),
+                log_context.get("page_no"),
+                type(exc).__name__,
+            )
+            return None, calls
 
     def _is_image(self, doc: DocumentSnapshot) -> bool:
         ext = (doc.extension or "").lower().strip()
