@@ -17,6 +17,7 @@ from app.core.config import Settings, get_settings
 from app.modules.analysis.vlm_table_banding import (
     detect_table_row_bands,
     is_valid_table_band_transcription,
+    normalize_table_band_transcription,
 )
 from app.modules.document_processing.types import (
     IMAGE_EXTENSIONS,
@@ -461,7 +462,7 @@ class AnalysisSourceBuilder:
             return None, 0
         calls = 0
         try:
-            dpi = max(180, int(self.settings.analysis_pdf_render_dpi))
+            dpi = max(220, int(self.settings.analysis_pdf_render_dpi))
             bands = detect_table_row_bands(
                 page,
                 dpi=dpi,
@@ -489,11 +490,12 @@ class AnalysisSourceBuilder:
                     },
                     user_prompt=VLM_TABLE_BAND_USER,
                 )
+                cleaned = normalize_table_band_transcription(result)
                 if not is_valid_table_band_transcription(
-                    result, expected_rows=band.last_row - band.first_row + 1
+                    cleaned, expected_rows=band.last_row - band.first_row + 1
                 ):
                     return None, calls
-                rows = [line.strip().strip("|").strip() for line in result.splitlines()]
+                rows = [line.strip().strip("|").strip() for line in cleaned.splitlines()]
                 counts = {len(row.split("|")) for row in rows}
                 if len(counts) != 1:
                     return None, calls
