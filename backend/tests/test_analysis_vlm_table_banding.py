@@ -47,7 +47,7 @@ def _build(pdf: bytes, vlm: FakeVLMProvider, *, flag: bool, **options):
         "analysis_vlm_table_banding_enabled": flag,
         "analysis_vlm_table_banding_rows_per_band": 5,
         "analysis_vlm_table_banding_max_calls_per_page": 6,
-        "analysis_vlm_table_banding_max_calls_total": 12,
+        "analysis_vlm_table_banding_max_calls_total": 16,
     }
     params.update(options)
     settings = Settings(_env_file=None, **params)
