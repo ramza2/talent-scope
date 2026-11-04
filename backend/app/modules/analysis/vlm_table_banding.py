@@ -130,14 +130,38 @@ def detect_table_row_bands(
     return bands
 
 
-def is_valid_table_band_transcription(text: str, *, expected_rows: int) -> bool:
+def normalize_table_band_transcription(text: str) -> str:
+    """Repair a repeated formatting split before a literal '>' inside the final cell.
+
+    Only repair when every nonempty row has the same trailing pseudo-column.
+    The characters are preserved; no missing values are inferred.
+    """
+    rows = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    cells_by_row = [
+        [cell.strip() for cell in line.strip("|").split("|")] for line in rows
+    ]
+    if cells_by_row and all(
+        len(cells) >= 4 and cells[-1].startswith(">") for cells in cells_by_row
+    ):
+        for cells in cells_by_row:
+            trailing = cells.pop()
+            cells[-1] = f"{cells[-1]} {trailing}".strip()
+    return "\n".join(" | ".join(cells) for cells in cells_by_row)
+
+
+def is_valid_table_band_transcription(
+    text: str, *, expected_rows: int, expected_columns: int | None = None
+) -> bool:
     """Require exactly one multi-column output line per detected table row."""
-    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    normalized = normalize_table_band_transcription(text)
+    lines = [line.strip() for line in normalized.splitlines() if line.strip()]
     if len(lines) != expected_rows or any("|" not in line for line in lines):
         return False
     rows = [line.strip("|").split("|") for line in lines]
     counts = [len(cells) for cells in rows]
     expected = max(set(counts), key=counts.count)
     if expected < 3 or expected > 12 or any(count != expected for count in counts):
+        return False
+    if expected_columns is not None and expected != expected_columns:
         return False
     return all(any(cell.strip() for cell in cells) for cells in rows)
