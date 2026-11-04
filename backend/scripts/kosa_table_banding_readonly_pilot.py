@@ -67,7 +67,7 @@ def main() -> None:
     try:
         assert len(pdf) >= PAGE
         pdf_page = pdf[PAGE - 1]
-        dpi = 180
+        dpi = 220
         bands = detect_table_row_bands(pdf_page, dpi=dpi, rows_per_band=5, max_bands=6)
         assert len(bands) == 4, f"EXPECTED_4_BANDS: {len(bands)}"
         print("BANDS:", [(b.first_row, b.last_row) for b in bands])
@@ -106,12 +106,18 @@ def main() -> None:
     finally:
         vlm_module.VLM_TRANSCRIBE_USER = original_prompt
 
-    lines = [line.strip() for line in result.splitlines() if line.strip()]
+    raw_lines = [line.strip() for line in result.splitlines() if line.strip()]
+    cleaned = normalize_table_band_transcription(result)
+    lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
     print("TRANSCRIPTION_LINES:", len(lines))
+    print("RAW_COLUMN_COUNTS:", [len(line.strip("|").split("|")) for line in raw_lines])
+    print("NORMALIZED_COLUMN_COUNTS:", [len(line.split("|")) for line in lines])
     print(
         "STRUCTURE_VALID:",
         is_valid_table_band_transcription(
-            result, expected_rows=band.last_row - band.first_row + 1
+            cleaned,
+            expected_rows=band.last_row - band.first_row + 1,
+            expected_columns=7,  # KOSA form header: seven visible columns
         ),
     )
     for idx, line in enumerate(lines, 1):
