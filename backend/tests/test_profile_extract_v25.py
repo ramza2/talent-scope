@@ -505,6 +505,53 @@ def test_v25_kosa_conflicting_customer_is_reviewable_not_overwritten() -> None:
     assert result.projects[1].customer_name == "원본 고객"
 
 
+def test_v25_kosa_title_suffix_alias_requires_exact_customer_and_months() -> None:
+    original = ProfileCandidateDocument(projects=[
+        ProjectCandidate(
+            project_name="CRMS-05 프로젝트", customer_name="SKT",
+            start_date="2004.04", end_date="2005.12",
+            source_refs=[SourceRef(document_id=_KOSA_RECALL_RESUME,
+                                   page_no=1, quote_text="이력서 프로젝트")],
+        ),
+        ProjectCandidate(
+            project_name="DW 리뉴얼 프로젝트", customer_name="다른 고객",
+            start_date="2004.04", end_date="2005.12",
+        ),
+        ProjectCandidate(
+            project_name="DW 최적화 프로젝트", customer_name="SKT",
+            start_date="2004.04", end_date="2006.12",
+        ),
+    ])
+    rows = (
+        "확인 | CRMS-05 | 2004.04.01 ~ 2005.12.30 | SKT | 업체 | 개발 | 업무\n"
+        "확인 | DW 리뉴얼 | 2004.04.01 ~ 2005.12.30 | SKT | 업체 | 개발 | 업무\n"
+        "확인 | DW 최적화 | 2004.04.01 ~ 2005.12.30 | SKT | 업체 | 개발 | 업무"
+    )
+    kwargs = {
+        "page_texts": {(_KOSA_RECALL_DOC, 3): rows},
+        "document_type_by_id": {_KOSA_RECALL_DOC: "DOC-KOSA"},
+    }
+    result, counts = supplement_kosa_table_projects(original, **kwargs)
+    assert counts == {"table_rows": 3, "matched_rows": 1, "supplemented_rows": 2}
+    assert len(result.projects) == 5
+    assert len(original.projects[0].source_refs) == 1
+    assert result.projects[0].project_name == "CRMS-05 프로젝트"
+    assert len(result.projects[0].source_refs) == 2
+    assert result.projects[0].source_refs[-1].quote_text == rows.splitlines()[0]
+    assert [p.project_name for p in result.projects[3:]] == [
+        "DW 리뉴얼", "DW 최적화",
+    ]
+    assert result.projects[1].customer_name == "다른 고객"
+    assert result.projects[2].end_date == "2006.12"
+
+    repeated, repeated_counts = supplement_kosa_table_projects(result, **kwargs)
+    assert len(repeated.projects) == 5
+    assert repeated_counts == {
+        "table_rows": 3, "matched_rows": 3, "supplemented_rows": 0,
+    }
+    assert len(repeated.projects[0].source_refs) == 2
+
+
 def test_v25_kosa_invalid_or_wrong_document_type_is_not_promoted() -> None:
     original = ProfileCandidateDocument()
     valid = _kosa_recall_table(2)

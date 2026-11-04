@@ -43,6 +43,15 @@ def _match_key(value: str | None) -> str:
     return _NON_WORD_RE.sub("", unicodedata.normalize("NFKC", value or "").lower())
 
 
+def _project_title_key(value: str | None) -> str:
+    """Treat only a nontrivial final '프로젝트' label as an optional alias."""
+    key = _match_key(value)
+    suffix = "프로젝트"
+    if key.endswith(suffix) and len(key) - len(suffix) >= 4:
+        return key[: -len(suffix)]
+    return key
+
+
 def _month(value: str | None) -> tuple[int, int] | None:
     parts = _date_parts(value or "")
     return parts[:2] if parts else None
@@ -80,8 +89,8 @@ def supplement_kosa_table_projects(
 ) -> tuple[ProfileCandidateDocument, dict[str, int]]:
     """Keep every validated KOSA row evidenced in the *reviewable* candidate.
 
-    Exact title/customer and period-month agreement only: ambiguous cross-source
-    matches stay separate for user review, and no existing scalar is overwritten.
+    Exact customer and period-month agreement is required; titles may only differ
+    by a final generic '프로젝트' suffix. Other ambiguities stay reviewable.
     """
     metrics = {"table_rows": 0, "matched_rows": 0, "supplemented_rows": 0}
     if not page_texts:
@@ -100,7 +109,7 @@ def supplement_kosa_table_projects(
                 (
                     project
                     for project in projects
-                    if _match_key(project.project_name) == _match_key(title)
+                    if _project_title_key(project.project_name) == _project_title_key(title)
                     and _match_key(project.customer_name) == _match_key(customer)
                     and _month(project.start_date) == _month(start)
                     and _month(project.end_date) == _month(end)
