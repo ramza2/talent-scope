@@ -10,6 +10,7 @@ The script contains no case-specific names, identifiers, or credentials.
 from __future__ import annotations
 
 import copy
+from difflib import SequenceMatcher
 import hashlib
 import json
 import os
@@ -183,8 +184,73 @@ class MeteredLLM(OpenAICompatibleLLMProvider):
         return super().count_prompt_tokens(**kwargs)
 
 
+def _project_review_record(project) -> dict:
+    """Minimal local-only review data; excludes profile/contact fields."""
+    return {
+        "project_name": project.project_name,
+        "customer_name": project.customer_name,
+        "start_date": project.start_date,
+        "end_date": project.end_date,
+        "source_refs": [
+            {
+                "document_id": ref.document_id,
+                "page_no": ref.page_no,
+                "quote_text": (ref.quote_text or "")[:200],
+            }
+            for ref in project.source_refs[:3]
+        ],
+    }
+
+
+def _suggest_similar_projects(
+    title: str,
+    start_date: str,
+    end_date: str,
+    customer: str,
+    projects: list,
+) -> list[dict]:
+    """Diagnostic suggestions only; never classify a fuzzy match as PASS."""
+    expected_start, expected_end = _month(start_date), _month(end_date)
+    expected_customer = _norm(customer)
+    ranked = []
+    for project in projects:
+        similarity = SequenceMatcher(
+            None, _norm(title), _norm(project.project_name)
+        ).ratio()
+        same_start = bool(expected_start) and _month(project.start_date) == expected_start
+        same_end = bool(expected_end) and _month(project.end_date) == expected_end
+        same_customer = bool(expected_customer) and _norm(project.customer_name) == expected_customer
+        # Matching only a period is not enough to assert that two projects are
+        # identical. Include weak suggestions exclusively for human review.
+        if similarity < 0.45 and not (same_start and same_end and same_customer):
+            continue
+        score = (
+            0.55 * similarity
+            + 0.15 * same_start
+            + 0.15 * same_end
+            + 0.15 * same_customer
+        )
+        ranked.append(
+            (
+                score,
+                {
+                    "project_name": project.project_name,
+                    "customer_name": project.customer_name,
+                    "start_date": project.start_date,
+                    "end_date": project.end_date,
+                    "title_similarity": round(similarity, 3),
+                    "start_month_match": same_start,
+                    "end_month_match": same_end,
+                    "customer_match": same_customer,
+                },
+            )
+        )
+    ranked.sort(key=lambda pair: pair[0], reverse=True)
+    return [item for _score, item in ranked[:3]]
+
+
 def _compare_kosa_rows(text_value: str, candidate, kosa_id: UUID) -> None:
-    project_rows = list(candidate.projects)
+    projects = list(candidate.projects)
     metrics = {"PASS": 0, "NEEDS_REVIEW": 0, "NOT_FOUND": 0}
     for index, line in enumerate(text_value.splitlines(), 1):
         cells = [cell.strip() for cell in line.split("|")]
@@ -193,15 +259,22 @@ def _compare_kosa_rows(text_value: str, candidate, kosa_id: UUID) -> None:
         period = cells[2].split("~")
         assert len(period) == 2, f"INVALID_KOSA_PERIOD_{index}"
         same_title = [
-            row for row in project_rows
+            row for row in projects
             if _norm(row.project_name) == _norm(title)
         ]
+        suggestions: list[dict] = []
         if not same_title:
             status = "NOT_FOUND"
-            problems = ["project"]
+            problems = ["no_exact_project_title"]
+            suggestions = _suggest_similar_projects(
+                title, period[0], period[1], cells[3], projects
+            )
         elif len(same_title) > 1:
             status = "NEEDS_REVIEW"
             problems = ["duplicate_title"]
+            suggestions = [
+                _project_review_record(project) for project in same_title[:3]
+            ]
         else:
             row = same_title[0]
             problems = []
@@ -217,13 +290,52 @@ def _compare_kosa_rows(text_value: str, candidate, kosa_id: UUID) -> None:
             ):
                 problems.append("kosa_source_ref")
             status = "NEEDS_REVIEW" if problems else "PASS"
+            if problems:
+                suggestions = [_project_review_record(row)]
         metrics[status] += 1
         print(
             f"KOSA_ROW_{index:02d}: {status}"
             f" title={title[:90]!r} reason={','.join(problems) or '-'}",
             flush=True,
         )
+        if suggestions:
+            print(
+                f"KOSA_ROW_{index:02d}_CANDIDATES:",
+                json.dumps(suggestions, ensure_ascii=False),
+                flush=True,
+            )
     print("KOSA_ROW_METRICS:", metrics, flush=True)
+
+
+def _emit_review_bundle(
+    *, run_id: UUID, kosa_text: str, raw_candidate, guarded_candidate
+) -> None:
+    """Emit an opt-in JSON bundle to stdout for secure caller-side capture."""
+    rows = [
+        [cell.strip() for cell in line.split("|")]
+        for line in kosa_text.splitlines()
+    ]
+    assert len(rows) == 17 and all(len(row) == 7 for row in rows)
+    bundle = {
+        "format": "v25-kosa-project-review-v1",
+        "run_id": str(run_id),
+        "prompt_version": PROMPT_VERSION,
+        "kosa_page": KOSA_PAGE,
+        "kosa_rows": rows,
+        "projects_raw": [
+            _project_review_record(row) for row in raw_candidate.projects
+        ],
+        "projects_guarded": [
+            _project_review_record(row) for row in guarded_candidate.projects
+        ],
+    }
+    serialized = json.dumps(bundle, ensure_ascii=False, sort_keys=True)
+    print("===== V25_PROJECT_REVIEW_JSON_BEGIN =====", flush=True)
+    print(serialized, flush=True)
+    print("===== V25_PROJECT_REVIEW_JSON_END =====", flush=True)
+    print("PROJECT_REVIEW_SHA256:", hashlib.sha256(
+        serialized.encode("utf-8")
+    ).hexdigest(), flush=True)
 
 
 def main() -> None:
@@ -366,6 +478,13 @@ def main() -> None:
             print("PREVIOUS_PILOT_REFERENCE:", int(reference), flush=True)
             print("PROJECT_COUNT_DELTA:", len(guarded.projects) - int(reference), flush=True)
         _compare_kosa_rows(page.extracted_text or "", guarded, kosa.id)
+        if os.environ.get("TALENTSCOPE_V25_EXPORT_PROJECT_REPORT", "0") == "1":
+            _emit_review_bundle(
+                run_id=run_id,
+                kosa_text=page.extracted_text or "",
+                raw_candidate=raw,
+                guarded_candidate=guarded,
+            )
         print("LLM_COMPLETE_JSON_CALLS:", llm.json_calls, flush=True)
         print("LLM_TOKEN_COUNT_CALLS:", llm.token_calls, flush=True)
         print("ELAPSED_SECONDS:", round(time.monotonic() - started, 1), flush=True)
