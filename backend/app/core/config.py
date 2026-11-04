@@ -62,7 +62,7 @@ class Settings(BaseSettings):
     analysis_vlm_table_banding_enabled: bool = False
     analysis_vlm_table_banding_rows_per_band: int = 5
     analysis_vlm_table_banding_max_calls_per_page: int = 6
-    analysis_vlm_table_banding_max_calls_total: int = 12
+    analysis_vlm_table_banding_max_calls_total: int = 16
     analysis_code_context_max_chars: int = 12000
     analysis_max_quote_chars: int = 400
     analysis_max_source_refs: int = 5
