@@ -336,3 +336,100 @@ def test_v25_dense_project_page_skips_nonstructural_source() -> None:
     assert chunks is not None
     assert len(chunks) == 3
     assert dates in chunks[0]
+
+
+
+def test_v25_kosa_structured_seven_column_rows_split_without_loss() -> None:
+    from app.modules.analysis.token_budget import plan_project_recall_page_chunks
+
+    table_rows = [
+        (
+            f"확인 | KOSA 프로젝트 {idx:02d} | "
+            "2011.01.01 ~ 2011.02.28 | "
+            f"고객사 {idx:02d} | 수행사 | 개발자 | SW개발\n"
+        )
+        for idx in range(1, 18)
+    ]
+    kosa_header = (
+        "[DOCUMENT D2]\ndocument_id: D2\nfilename: KOSA.pdf\n"
+        "document_type: DOC-KOSA\ncontent:\n[PAGE 3]\n"
+    )
+    resume = (
+        "[DOCUMENT D1]\ndocument_id: D1\n"
+        "document_type: DOC-RESUME\ncontent:\n"
+        "[PAGE 1]\n프로필\n[PAGE 2]\n기술\n"
+    )
+    source = resume + kosa_header + "".join(table_rows)
+
+    chunks = plan_project_recall_page_chunks(source, max_chunks=8)
+    assert chunks is not None
+    assert len(chunks) == 6  # 2 résumé pages + 4 KOSA row windows
+    kosa_windows = chunks[2:]
+    assert all(chunk.startswith(kosa_header) for chunk in kosa_windows)
+    assert all(chunk.count("[PAGE ") == 1 for chunk in chunks)
+    assert [
+        len(chunk.splitlines()) - len(kosa_header.splitlines())
+        for chunk in kosa_windows
+    ] == [5, 5, 5, 2]
+    assert "".join(chunk[len(kosa_header):] for chunk in kosa_windows) == "".join(
+        table_rows
+    )
+    for row in table_rows:
+        assert sum(row in chunk for chunk in kosa_windows) == 1
+
+    # One extra call available: no row or source-page loss.
+    limited = plan_project_recall_page_chunks(source, max_chunks=4)
+    assert limited is not None
+    assert len(limited) == 4
+    assert "".join(chunk[len(kosa_header):] for chunk in limited[2:]) == "".join(
+        table_rows
+    )
+
+
+def test_v25_kosa_row_split_requires_valid_structure_and_doc_type() -> None:
+    from app.modules.analysis.token_budget import plan_project_recall_page_chunks
+
+    rows = "".join(
+        f"확인 | 프로젝트 {idx} | 2011.01 ~ 2011.02 | 고객 | 수행사 | 개발 | SW개발\n"
+        for idx in range(17)
+    )
+    base = (
+        "[DOCUMENT D1]\ndocument_type: DOC-KOSA\ncontent:\n"
+        "[PAGE 1]\n" + rows
+        + "[PAGE 2]\n기타\n"
+        + "[PAGE 3]\n기타\n"
+    )
+
+    malformed = base.replace("2011.01 ~ 2011.02", "날짜불명", 1)
+    chunks = plan_project_recall_page_chunks(malformed, max_chunks=12)
+    assert chunks is not None and len(chunks) == 3
+    assert "날짜불명" in chunks[0]
+
+    wrong_type = base.replace("DOC-KOSA", "DOC-RESUME")
+    chunks = plan_project_recall_page_chunks(wrong_type, max_chunks=12)
+    assert chunks is not None and len(chunks) == 3
+    assert rows in chunks[0]
+
+
+
+def test_v25_kosa_rows_take_split_budget_before_dense_profile_page() -> None:
+    from app.modules.analysis.token_budget import plan_project_recall_page_chunks
+
+    dense = "".join(
+        f"이력 {idx:03d} 2010.01~2010.02\n" for idx in range(120)
+    )
+    kosa_rows = "".join(
+        f"확인 | 프로젝트 {idx} | 2011.01 ~ 2011.02 | 고객 | 수행사 | 개발 | SW개발\n"
+        for idx in range(17)
+    )
+    source = (
+        "[DOCUMENT D1]\ndocument_type: DOC-RESUME\ncontent:\n"
+        "[PAGE 1]\n" + dense
+        + "[PAGE 2]\n기술\n"
+        + "[DOCUMENT D2]\ndocument_type: DOC-KOSA\ncontent:\n"
+        + "[PAGE 3]\n" + kosa_rows
+    )
+    chunks = plan_project_recall_page_chunks(source, max_chunks=6)
+    assert chunks is not None and len(chunks) == 6
+    assert dense in chunks[0]
+    assert sum("document_type: DOC-KOSA" in c for c in chunks) == 4
