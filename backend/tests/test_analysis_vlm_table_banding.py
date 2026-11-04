@@ -17,6 +17,7 @@ from app.modules.analysis.source_builder import (
 from app.modules.analysis.vlm_table_banding import (
     detect_table_row_bands,
     is_valid_table_band_transcription,
+    normalize_table_band_transcription,
 )
 
 
@@ -132,6 +133,36 @@ def test_unruled_page_rejected_and_strict_row_count():
     assert is_valid_table_band_transcription("A|B|C\nD|E|F", expected_rows=2)
     assert not is_valid_table_band_transcription("A|B|C", expected_rows=2)
     assert not is_valid_table_band_transcription("A|B\nC|D|E", expected_rows=2)
+
+
+def test_repeated_trailing_gt_is_one_cell_not_a_column():
+    raw = (
+        "확인 | 사업A | 2025 | 발주처 | 소속사 | 차장 | SW개발 | > 응용SW개발\n"
+        "확인 | 사업B | 2024 | 발주처 | 소속사 | 과장 | IT컨설팅 | > 정보기술컨설팅"
+    )
+    normalized = normalize_table_band_transcription(raw)
+    assert all(len(row.split("|")) == 7 for row in normalized.splitlines())
+    assert "SW개발 > 응용SW개발" in normalized
+    assert "IT컨설팅 > 정보기술컨설팅" in normalized
+    assert is_valid_table_band_transcription(
+        raw, expected_rows=2, expected_columns=7
+    )
+    assert not is_valid_table_band_transcription(
+        raw, expected_rows=2, expected_columns=8
+    )
+
+
+def test_enabled_pipeline_persists_normalized_seven_column_rows():
+    raw_rows = "\n".join(
+        f"확인 | 사업{i} | 2025 | 발주처 | 소속사 | 차장 | SW개발 | > 응용SW개발"
+        for i in range(5)
+    )
+    result = _build(_pdf_bytes(), FakeVLMProvider(raw_rows), flag=True)
+    assert result.total_vlm_pages == 1
+    assert len(result.vlm_transcriptions) == 1
+    cleaned_rows = result.vlm_transcriptions[0].persisted_text.splitlines()
+    assert len(cleaned_rows) == 15
+    assert all(len(row.split("|")) == 7 for row in cleaned_rows)
 
 
 @pytest.mark.parametrize("flag,expected_calls", [(False, 1), (True, 3)])
