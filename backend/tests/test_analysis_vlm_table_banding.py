@@ -152,6 +152,51 @@ def test_repeated_trailing_gt_is_one_cell_not_a_column():
     )
 
 
+
+def test_repeated_merged_confirmation_cell_restores_seven_columns():
+    raw = (
+        "확인 외국인 EIS 추가개발 프로젝트 | 2012.12.03 ~ 2012.12.31"
+        " | 한국고용 정보원 | 소속사 | 수석 | SW개발 > 응용SW개발\n"
+        "확인 아리따움 POS 재구축 프로젝트 OLAP개발 | 2011.02.01 ~ 2011.06.30"
+        " | 아모레퍼 시픽 | 소속사 | 과장 | SW개발 > 응용SW개발"
+    )
+    cleaned = normalize_table_band_transcription(raw)
+    rows = [[cell.strip() for cell in line.split("|")] for line in cleaned.splitlines()]
+    assert len(rows) == 2
+    assert all(len(cells) == 7 and cells[0] == "확인" for cells in rows)
+    assert rows[0][1] == "외국인 EIS 추가개발 프로젝트"
+    assert rows[1][1] == "아리따움 POS 재구축 프로젝트 OLAP개발"
+    assert rows[1][3] == "아모레퍼 시픽"
+    assert is_valid_table_band_transcription(
+        raw, expected_rows=2, expected_columns=7
+    )
+    assert not is_valid_table_band_transcription(
+        raw, expected_rows=2, expected_columns=6
+    )
+    mixed = raw.splitlines()[0] + "\n" + raw.splitlines()[1].replace(
+        "확인 아리따움", "미확인 아리따움"
+    )
+    assert not is_valid_table_band_transcription(
+        mixed, expected_rows=2, expected_columns=7
+    )
+
+
+def test_enabled_pipeline_restores_repeated_merged_confirmation_cells():
+    rows = "\n".join(
+        f"확인 프로젝트{i} | 2025.01 | 발주처 | 소속사 | 차장 | SW개발 > 응용SW개발"
+        for i in range(5)
+    )
+    result = _build(_pdf_bytes(), FakeVLMProvider(rows), flag=True)
+    assert len(result.vlm_transcriptions) == 1
+    transcription = result.vlm_transcriptions[0]
+    assert transcription.layout_json.get("vlm_table_banded") is True
+    cleaned = transcription.persisted_text.splitlines()
+    assert len(cleaned) == 15
+    assert all(
+        len(line.split("|")) == 7 and line.startswith("확인 | 프로젝트")
+        for line in cleaned
+    )
+
 def test_enabled_pipeline_persists_normalized_seven_column_rows():
     raw_rows = "\n".join(
         f"확인 | 사업{i} | 2025 | 발주처 | 소속사 | 차장 | SW개발 | > 응용SW개발"
