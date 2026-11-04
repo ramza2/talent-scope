@@ -91,6 +91,7 @@ jobs:
             tests/test_education_cert_quality_guards.py \
             tests/test_employment_ongoing_date_confirm.py \
             tests/test_analysis_guard_refresh.py
+            tests/test_analysis_vlm_table_banding.py
 
       - name: Run NEW Diff evidence review regression
         env:
