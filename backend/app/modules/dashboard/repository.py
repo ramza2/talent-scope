@@ -9,7 +9,8 @@ from sqlalchemy.orm import Session
 
 from app.db.models.analysis import AnalysisDiffItem, AnalysisRun
 from app.db.models.document import Document, DocumentGroup
-from app.db.models.person import Person, PersonProfile
+from app.db.models.code import CodeMaster
+from app.db.models.person import Person, PersonProfile, PersonSkill
 
 _VISIBLE_STATUSES = ("ACTIVE", "INACTIVE", "ARCHIVED")
 _OPS_ANALYSIS_STATUSES = (
@@ -50,6 +51,41 @@ class DashboardRepository:
             "inactive": int(row.inactive or 0),
             "archived": int(row.archived or 0),
         }
+
+    def grade_distribution(self) -> list[dict[str, Any]]:
+        """Count active people once per confirmed technical grade, including missing grades."""
+        rows = self.db.execute(
+            select(PersonProfile.technical_grade, func.count(Person.id))
+            .select_from(Person)
+            .outerjoin(PersonProfile, PersonProfile.person_id == Person.id)
+            .where(Person.deleted_at.is_(None), Person.status == "ACTIVE")
+            .group_by(PersonProfile.technical_grade)
+        ).all()
+        return [
+            {"grade": grade, "count": int(count)}
+            for grade, count in rows
+        ]
+
+    def skill_distribution(self, *, limit: int = 10) -> list[dict[str, Any]]:
+        """Top confirmed technologies by distinct active-person count."""
+        count_people = func.count(func.distinct(PersonSkill.person_id))
+        rows = self.db.execute(
+            select(PersonSkill.tech_code, CodeMaster.name, count_people.label("people_count"))
+            .join(Person, Person.id == PersonSkill.person_id)
+            .join(CodeMaster, CodeMaster.code == PersonSkill.tech_code)
+            .where(
+                Person.deleted_at.is_(None),
+                Person.status == "ACTIVE",
+                CodeMaster.code_type == "TECH",
+            )
+            .group_by(PersonSkill.tech_code, CodeMaster.name)
+            .order_by(count_people.desc(), PersonSkill.tech_code.asc())
+            .limit(limit)
+        ).all()
+        return [
+            {"code": code, "name": name, "count": int(count)}
+            for code, name, count in rows
+        ]
 
     def recent_people(self, *, limit: int = 5) -> list[dict[str, Any]]:
         rows = self.db.execute(

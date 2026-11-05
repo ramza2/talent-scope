@@ -640,3 +640,73 @@ def test_admin_dashboard_excludes_deleted_person_analyses(client: TestClient, db
         if csrf:
             client.post("/api/v1/auth/logout", headers={"X-CSRF-Token": csrf})
         _cleanup_user(db_session, admin.id)
+
+
+def test_dashboard_distributions_include_active_confirmed_people_only(
+    client: TestClient, db_session
+):
+    from app.db.models.code import CodeMaster
+    from app.db.models.person import PersonSkill
+    from app.modules.dashboard.repository import DashboardRepository
+
+    suffix = uuid.uuid4().hex
+    user = _create_user(db_session, login_id=f"ddist_{suffix[:8]}", role="USER")
+    tech_code = f"TECH-DASH-{suffix}"
+    people = []
+    try:
+        _login(client, user.login_id)
+        baseline = client.get("/api/v1/dashboard").json()["data"]
+        baseline_grades = {
+            item["grade"]: item["count"] for item in baseline["grade_distribution"]
+        }
+
+        db_session.add(
+            CodeMaster(code=tech_code, code_type="TECH", name="대시보드 시험기술")
+        )
+        active = _add_person(db_session, status="ACTIVE", grade="EXPERT")
+        inactive = _add_person(db_session, status="INACTIVE", grade="ADVANCED")
+        soft_deleted = _add_person(
+            db_session, status="ACTIVE", grade="BEGINNER", deleted_at=datetime.now(UTC)
+        )
+        people.extend([active, inactive, soft_deleted])
+        db_session.add_all(
+            [
+                PersonSkill(person_id=person.id, tech_code=tech_code)
+                for person in people
+            ]
+        )
+        db_session.commit()
+
+        response = client.get("/api/v1/dashboard")
+        assert response.status_code == 200, response.text
+        data = response.json()["data"]
+        assert data["people"]["active"] == baseline["people"]["active"] + 1
+        grades = {item["grade"]: item["count"] for item in data["grade_distribution"]}
+        assert grades["EXPERT"] == baseline_grades.get("EXPERT", 0) + 1
+        assert grades.get("ADVANCED", 0) == baseline_grades.get("ADVANCED", 0)
+        assert grades.get("BEGINNER", 0) == baseline_grades.get("BEGINNER", 0)
+
+        skills = DashboardRepository(db_session).skill_distribution(limit=10000)
+        assert next(item for item in skills if item["code"] == tech_code) == {
+            "code": tech_code,
+            "name": "대시보드 시험기술",
+            "count": 1,
+        }
+        assert len(data["skill_distribution"]) <= 10
+        assert all(item["count"] >= 1 for item in data["skill_distribution"])
+    finally:
+        if people:
+            db_session.execute(
+                delete(PersonSkill).where(
+                    PersonSkill.person_id.in_([person.id for person in people])
+                )
+            )
+            db_session.commit()
+        for person in people:
+            _cleanup_person(db_session, person.id)
+        db_session.execute(delete(CodeMaster).where(CodeMaster.code == tech_code))
+        db_session.commit()
+        csrf = client.cookies.get("ts_csrf")
+        if csrf:
+            client.post("/api/v1/auth/logout", headers={"X-CSRF-Token": csrf})
+        _cleanup_user(db_session, user.id)
