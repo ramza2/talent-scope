@@ -75,4 +75,4 @@ def test_v25_kosa_pilot_never_promotes_fuzzy_title_or_wrong_period() -> None:
     wrong_period = _project("맞는 제목", "고객사", "2006.04", "2007.12")
     output = _compare(_row("맞는 제목", "고객사"), [wrong_period])
     assert "KOSA_ROW_01: NEEDS_REVIEW" in output
-    assert "no_matching_period" in output
+    assert "start_date,end_date" in output
