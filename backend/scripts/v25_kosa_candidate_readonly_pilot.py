@@ -289,7 +289,15 @@ def _compare_kosa_rows(text_value: str, candidate, kosa_id: UUID) -> None:
             ]
         elif not same_period:
             status = "NEEDS_REVIEW"
-            problems = ["no_matching_period"]
+            if len(same_title) == 1:
+                only = same_title[0]
+                problems = []
+                if _month(only.start_date) != start_month:
+                    problems.append("start_date")
+                if _month(only.end_date) != end_month:
+                    problems.append("end_date")
+            else:
+                problems = ["no_matching_period"]
             suggestions = [
                 _project_review_record(project) for project in same_title[:3]
             ]
