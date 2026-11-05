@@ -30,6 +30,7 @@ from app.core.config import get_settings
 from app.db.session import SessionLocal
 from app.modules.analysis.repository import AnalysisRepository
 from app.modules.analysis.service import AnalysisService, apply_candidate_quality_guards
+from app.modules.analysis.kosa_project_recall import _project_title_key
 from app.modules.analysis.source_builder import (
     AnalysisSourceBuilder,
     DocumentSnapshot,
@@ -258,30 +259,43 @@ def _compare_kosa_rows(text_value: str, candidate, kosa_id: UUID) -> None:
         title = cells[1]
         period = cells[2].split("~")
         assert len(period) == 2, f"INVALID_KOSA_PERIOD_{index}"
+        start_month, end_month = _month(period[0]), _month(period[1])
+        assert start_month and end_month, f"INVALID_KOSA_MONTH_{index}"
         same_title = [
             row for row in projects
-            if _norm(row.project_name) == _norm(title)
+            if _project_title_key(row.project_name) == _project_title_key(title)
+        ]
+        # Repeated project names may describe different engagements. Only rows
+        # with the same period can be ambiguous for this specific KOSA record.
+        same_period = [
+            row for row in same_title
+            if _month(row.start_date) == start_month
+            and _month(row.end_date) == end_month
         ]
         suggestions: list[dict] = []
         if not same_title:
             status = "NOT_FOUND"
-            problems = ["no_exact_project_title"]
+            problems = ["no_matching_project_title"]
             suggestions = _suggest_similar_projects(
                 title, period[0], period[1], cells[3], projects
             )
-        elif len(same_title) > 1:
+        elif len(same_period) > 1:
             status = "NEEDS_REVIEW"
-            problems = ["duplicate_title"]
+            # Customer differences (e.g. end client vs. contractor) are not
+            # grounds for silently merging distinct Candidate records.
+            problems = ["ambiguous_same_title_period"]
+            suggestions = [
+                _project_review_record(project) for project in same_period[:3]
+            ]
+        elif not same_period:
+            status = "NEEDS_REVIEW"
+            problems = ["no_matching_period"]
             suggestions = [
                 _project_review_record(project) for project in same_title[:3]
             ]
         else:
-            row = same_title[0]
+            row = same_period[0]
             problems = []
-            if _month(row.start_date) != _month(period[0]):
-                problems.append("start_date")
-            if _month(row.end_date) != _month(period[1]):
-                problems.append("end_date")
             if _norm(row.customer_name) != _norm(cells[3]):
                 problems.append("customer")
             if not any(
