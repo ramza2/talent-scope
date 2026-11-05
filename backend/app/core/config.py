@@ -60,6 +60,9 @@ class Settings(BaseSettings):
     analysis_pdf_render_dpi: int = 120
     # Experimental scanned-table row banding. OFF until live read-only validation.
     analysis_vlm_table_banding_enabled: bool = False
+    # POC opt-in: re-read already VLM-transcribed PDF tables for a new analysis
+    # without replacing their stored DocumentPage text.
+    analysis_vlm_table_banding_reprocess_done: bool = False
     analysis_vlm_table_banding_rows_per_band: int = 5
     analysis_vlm_table_banding_max_calls_per_page: int = 6
     analysis_vlm_table_banding_max_calls_total: int = 16
