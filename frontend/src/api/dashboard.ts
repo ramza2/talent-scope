@@ -7,6 +7,17 @@ export type DashboardPeopleSummary = {
   archived: number
 }
 
+export type DashboardGradeDistribution = {
+  grade: string | null
+  count: number
+}
+
+export type DashboardSkillDistribution = {
+  code: string
+  name: string
+  count: number
+}
+
 export type DashboardRecentPerson = {
   person_id: string
   name?: string | null
@@ -52,6 +63,8 @@ export type DashboardDocumentFailure = {
 
 export type DashboardData = {
   people: DashboardPeopleSummary
+  grade_distribution: DashboardGradeDistribution[]
+  skill_distribution: DashboardSkillDistribution[]
   recent_people: DashboardRecentPerson[]
   permissions: DashboardPermissions
   analysis: DashboardAnalysisSummary | null

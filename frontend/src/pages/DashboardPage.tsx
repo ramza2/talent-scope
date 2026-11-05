@@ -4,6 +4,7 @@ import {
   Card,
   Col,
   Empty,
+  Progress,
   Row,
   Space,
   Spin,
@@ -50,6 +51,18 @@ const ANALYSIS_STATUS_LABELS: Record<string, { label: string; color: string }> =
   FAILED: { label: '실패', color: 'error' },
   CONFIRMED: { label: '확정', color: 'success' },
   CANCELLED: { label: '취소', color: 'default' },
+}
+
+const GRADE_ORDER: Record<string, number> = {
+  EXPERT: 0,
+  ADVANCED: 1,
+  INTERMEDIATE: 2,
+  BEGINNER: 3,
+  UNKNOWN: 4,
+}
+
+function activeShare(count: number, active: number): number {
+  return active > 0 ? Math.round((count / active) * 100) : 0
 }
 
 function formatDateTime(value?: string | null): string {
@@ -125,6 +138,10 @@ export function DashboardPage() {
   const canManageAnalyses = data.permissions.can_manage_analyses
   const analysis = data.analysis
   const inFlight = analysis ? analysis.queued + analysis.processing : 0
+  const gradeDistribution = [...(data.grade_distribution ?? [])].sort(
+    (a, b) => (GRADE_ORDER[a.grade ?? ''] ?? 5) - (GRADE_ORDER[b.grade ?? ''] ?? 5),
+  )
+  const skillDistribution = data.skill_distribution ?? []
 
   const recentPeopleColumns: ColumnsType<DashboardRecentPerson> = [
     {
@@ -301,6 +318,58 @@ export function DashboardPage() {
           ) : null}
         </Space>
       </Card>
+
+      <Row gutter={[16, 16]}>
+        <Col xs={24} lg={12}>
+          <Card size="small" title="기술등급별 인원">
+            {gradeDistribution.length === 0 ? (
+              <Empty description="활성 인력이 없습니다." image={Empty.PRESENTED_IMAGE_SIMPLE} />
+            ) : (
+              <Space direction="vertical" style={{ width: '100%' }} size="small">
+                {gradeDistribution.map((item) => (
+                  <div key={item.grade ?? 'UNSET'}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                      <Text>{item.grade ? gradeLabel(item.grade) : '등급 미등록'}</Text>
+                      <Text strong>{item.count}명</Text>
+                    </div>
+                    <Progress
+                      percent={activeShare(item.count, data.people.active)}
+                      showInfo={false}
+                      size="small"
+                    />
+                  </div>
+                ))}
+              </Space>
+            )}
+          </Card>
+        </Col>
+        <Col xs={24} lg={12}>
+          <Card size="small" title="기술별 인원 (상위 10개)">
+            {skillDistribution.length === 0 ? (
+              <Empty description="등록된 기술이 없습니다." image={Empty.PRESENTED_IMAGE_SIMPLE} />
+            ) : (
+              <Space direction="vertical" style={{ width: '100%' }} size="small">
+                {skillDistribution.map((item) => (
+                  <div key={item.code}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                      <Text>{item.name}</Text>
+                      <Text strong>{item.count}명</Text>
+                    </div>
+                    <Progress
+                      percent={activeShare(item.count, data.people.active)}
+                      showInfo={false}
+                      size="small"
+                    />
+                  </div>
+                ))}
+              </Space>
+            )}
+          </Card>
+        </Col>
+      </Row>
+      <Text type="secondary">
+        활성 인력 기준 · 기술별 인원은 한 사람이 여러 기술에 포함될 수 있습니다.
+      </Text>
 
       <Card
         size="small"

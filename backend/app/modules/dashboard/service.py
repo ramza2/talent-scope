@@ -10,9 +10,11 @@ from app.modules.dashboard.schemas import (
     DashboardData,
     DashboardPermissions,
     DocumentFailureItem,
+    GradeDistributionItem,
     PeopleSummary,
     RecentAnalysisItem,
     RecentPersonItem,
+    SkillDistributionItem,
 )
 
 PROCESSING_ERROR_MAX_CHARS = 500
@@ -26,6 +28,12 @@ class DashboardService:
 
     def get_dashboard(self, *, is_admin: bool) -> DashboardData:
         people = PeopleSummary(**self.repo.people_summary())
+        grade_distribution = [
+            GradeDistributionItem(**row) for row in self.repo.grade_distribution()
+        ]
+        skill_distribution = [
+            SkillDistributionItem(**row) for row in self.repo.skill_distribution()
+        ]
         recent_people = [
             RecentPersonItem(**row) for row in self.repo.recent_people(limit=RECENT_LIMIT)
         ]
@@ -37,6 +45,8 @@ class DashboardService:
         if not is_admin:
             return DashboardData(
                 people=people,
+                grade_distribution=grade_distribution,
+                skill_distribution=skill_distribution,
                 recent_people=recent_people,
                 permissions=permissions,
                 analysis=None,
@@ -71,6 +81,8 @@ class DashboardService:
         ]
         return DashboardData(
             people=people,
+            grade_distribution=grade_distribution,
+            skill_distribution=skill_distribution,
             recent_people=recent_people,
             permissions=permissions,
             analysis=analysis,

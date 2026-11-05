@@ -15,6 +15,17 @@ class PeopleSummary(BaseModel):
     archived: int
 
 
+class GradeDistributionItem(BaseModel):
+    grade: str | None = None
+    count: int
+
+
+class SkillDistributionItem(BaseModel):
+    code: str
+    name: str
+    count: int
+
+
 class RecentPersonItem(BaseModel):
     person_id: UUID
     name: str | None = None
@@ -60,6 +71,8 @@ class DocumentFailureItem(BaseModel):
 
 class DashboardData(BaseModel):
     people: PeopleSummary
+    grade_distribution: list[GradeDistributionItem] = Field(default_factory=list)
+    skill_distribution: list[SkillDistributionItem] = Field(default_factory=list)
     recent_people: list[RecentPersonItem] = Field(default_factory=list)
     permissions: DashboardPermissions
     analysis: AnalysisSummary | None = None
