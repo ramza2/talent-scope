@@ -275,3 +275,56 @@ def test_already_transcribed_page_not_overwritten_when_flag_on():
     assert vlm.calls == 0
     assert result.blocks[0].text == "[PAGE 1]\nexisting confirmed transcription"
     assert result.vlm_transcriptions == []
+
+
+@pytest.mark.parametrize("valid", [True, False])
+def test_opt_in_reprocesses_existing_vlm_table_in_memory_only(valid):
+    prior = "stored VLM transcription must stay unchanged"
+    rows = "\n".join(
+        f"확인 | 프로젝트{i} | 2025.01 | 발주처 | 소속사 | 개발 | SW개발"
+        for i in range(5)
+    )
+    vlm = FakeVLMProvider(rows if valid else "not a table row")
+    settings = Settings(
+        _env_file=None,
+        analysis_vlm_table_banding_enabled=True,
+        analysis_vlm_table_banding_reprocess_done=True,
+    )
+    source = AnalysisSourceBuilder(object(), settings=settings, vlm=vlm)
+    source._open_render_source = (  # type: ignore[method-assign]
+        lambda _snapshot: pymupdf.open(stream=_pdf_bytes(), filetype="pdf")
+    )
+    page = PageSnapshot(
+        page_no=1,
+        extracted_text=prior,
+        layout_json={"needs_vlm": False, "vlm_transcribed": True},
+        extraction_method="VLM",
+    )
+    document = DocumentSnapshot(
+        id=uuid4(),
+        original_filename="existing-kosa.pdf",
+        extension="pdf",
+        mime_type="application/pdf",
+        storage_key="unused",
+        preview_storage_key=None,
+        document_type_code=None,
+        document_type_name=None,
+        version_no=1,
+        person_id=uuid4(),
+        pages=[page],
+    )
+
+    result = source.build([document])
+
+    assert result.vlm_transcriptions == []
+    assert page.extracted_text == prior
+    assert page.layout_json == {"needs_vlm": False, "vlm_transcribed": True}
+    if valid:
+        assert vlm.calls == 3
+        assert result.blocks[0].text.startswith("[PAGE 1]\n확인 | 프로젝트0")
+        assert result.blocks[0].vlm_pages_used == 1
+        assert result.blocks[0].vlm_table_band_calls_used == 3
+    else:
+        assert vlm.calls == 1
+        assert result.blocks[0].text == f"[PAGE 1]\n{prior}"
+        assert result.blocks[0].vlm_pages_used == 0

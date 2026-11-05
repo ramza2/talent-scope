@@ -342,6 +342,41 @@ class AnalysisSourceBuilder:
                         layout_json=page.layout_json,
                     )
 
+                    # A completed VLM page normally stays untouched. For an
+                    # explicitly opted-in analysis, try better table banding
+                    # in memory only; retain the stored text on any fallback.
+                    if (
+                        self.settings.analysis_vlm_table_banding_enabled
+                        and self.settings.analysis_vlm_table_banding_reprocess_done
+                        and not needs_vlm
+                        and _already_vlm_transcribed(
+                            extraction_method=page.extraction_method,
+                            layout_json=page.layout_json,
+                        )
+                        and not _layout_dict(page.layout_json).get("vlm_table_banded")
+                        and (doc.extension or "").lower() == "pdf"
+                        and self.vlm is not None
+                        and vlm_used < vlm_budget
+                        and table_budget > table_calls_used
+                    ):
+                        if pdf_doc is None:
+                            pdf_doc = self._open_render_source(doc)
+                        if pdf_doc is not None and 0 < page.page_no <= len(pdf_doc):
+                            banded_text, calls = self._try_transcribe_table_bands(
+                                pdf_doc.load_page(page.page_no - 1),
+                                log_context={
+                                    **(log_context or {}),
+                                    "document_id": doc_id,
+                                    "page_no": page.page_no,
+                                    "reprocess_done": True,
+                                },
+                                remaining_calls=table_budget - table_calls_used,
+                            )
+                            table_calls_used += calls
+                            if banded_text is not None:
+                                text = banded_text
+                                vlm_used += 1
+
                     if needs_vlm and self.vlm is not None and vlm_used < vlm_budget:
                         if pdf_doc is None:
                             pdf_doc = self._open_render_source(doc)
