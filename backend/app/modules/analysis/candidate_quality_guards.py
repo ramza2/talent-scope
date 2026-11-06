@@ -20,7 +20,10 @@ from app.ai.schemas.profile_candidate import (
     SourceRef,
 )
 from app.core.person_name import is_korean_person_name, person_name_match_key
-from app.modules.analysis.confirm_dates import is_ongoing_end_marker
+from app.modules.analysis.confirm_dates import (
+    is_ongoing_end_marker,
+    parse_partial_date,
+)
 from app.modules.analysis.diff_engine import dates_compatible, parse_date_parts
 
 
@@ -49,6 +52,17 @@ _PROJECT_SECTION_RE = re.compile(
 _PROJECT_ROW_RE = re.compile(
     r"발주처|발주기관|고객사|사업명|프로젝트\s*수행|수행내역|정보화|"
     r"시스템\s*구축|BIA|BCP|이전통합"
+)
+# Participation tables include 소속회사/직위 columns, but their rows are
+# projects, not employer-history dates. Require this explicit source heading
+# before dropping a malformed v25 employer candidate.
+_PROJECT_PARTICIPATION_TABLE_RE = re.compile(
+    r"프로젝트\s*수행\s*(?:경력|내역)|"
+    r"(?:참여기간|사업명|사\s*업\s*명).*?발주처",
+    re.DOTALL,
+)
+_PROJECT_ROLE_AS_END_RE = re.compile(
+    r"(?i)(?<![A-Za-z])(?:PM|PL)(?![A-Za-z])"
 )
 # Bare "프로젝트" alone is too weak for row classification — it often appears
 # as the start of a following section header on collapsed KOSA lines.
@@ -2092,8 +2106,56 @@ def _v25_prune_cross_section_rows(
         if _classify_span(span.text, section=span.section) == "employment"
     ]
 
+    def is_project_table_misread_as_employment(row: EmploymentCandidate) -> bool:
+        """Drop only a proven v25 project-row column shift, not bad date guesses.
+
+        In project participation tables, an LLM can map 사업명 → start_date
+        and 담당업무(PM/PL) → end_date while using 소속회사 as company_name.
+        Both date columns must be plainly non-dates and the source reference
+        must point to a page with the explicit project participation table.
+        """
+        start = (row.start_date or "").strip()
+        end = (row.end_date or "").strip()
+        if not start or not end or len(start) < 8:
+            return False
+        if not re.search(r"[가-힣A-Za-z]", start):
+            return False
+        if not _PROJECT_ROLE_AS_END_RE.search(end):
+            return False
+        try:
+            parse_partial_date(start)
+            return False
+        except ValueError:
+            pass
+        if is_ongoing_end_marker(end):
+            return False
+        try:
+            parse_partial_date(end)
+            return False
+        except ValueError:
+            pass
+        company = (row.company_name or "").strip()
+        if not company:
+            return False
+        for ref in row.source_refs or []:
+            if not ref.document_id or ref.page_no is None:
+                continue
+            page = (page_texts or {}).get((str(ref.document_id), ref.page_no))
+            table_header = (
+                _PROJECT_PARTICIPATION_TABLE_RE.search(page) if page else None
+            )
+            # The company must occur AFTER the project heading, not merely in
+            # an earlier legitimate employer table on the same source page.
+            if table_header and _line_has_company(
+                page[table_header.end():], company
+            ):
+                return True
+        return False
+
     employment: list[EmploymentCandidate] = []
     for row in candidate.employment_history or []:
+        if is_project_table_misread_as_employment(row):
+            continue
         company = (row.company_name or "").strip()
         # No start + only project-row mentions is the characteristic v24
         # customer-as-employer leak. Real/ambiguous employer mentions win.

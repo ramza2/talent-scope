@@ -201,6 +201,94 @@ def test_v25_real_certificate_and_project_customer_stay_separate() -> None:
     assert guarded.projects == candidate.projects
 
 
+def test_v25_drops_project_participation_rows_misread_as_employment_dates() -> None:
+    """Regression: real project participation data from the v25 failed run."""
+    source = (
+        "주요 근무경력 ㈜씨에이에스 상무\n"
+        "프로젝트 수행경력 연번 참여기간 유형 사 업 명 담당업무 "
+        "참여 당시 발주처 소속회사 직위\n"
+        "2023.7.3~현재 데이터 표준화 데이터 품질향상을 위한 용역 "
+        "PM ㈜씨에이에스 상무 한국환경공단\n"
+        "2023.4.1~6.30 국방시설통합정보체계 고도화 BPR 및 ISP 사업 "
+        "PL ㈜씨에이에스 상무 국방부\n"
+    )
+    candidate = ProfileCandidateDocument(
+        employment_history=[
+            EmploymentCandidate(
+                company_name="㈜씨에이에스", start_date="2017.04",
+                end_date="현재", title="상무",
+                source_refs=[SourceRef(document_id=_DOC, page_no=1,
+                                       quote_text="㈜씨에이에스")],
+            ),
+            EmploymentCandidate(
+                company_name="㈜씨에이에스",
+                start_date="데이터 표준화, 데이터 품질 향상",
+                end_date="PM", title="상무",
+                source_refs=[SourceRef(document_id=_DOC, page_no=1,
+                                       quote_text="㈜씨에이에스")],
+            ),
+            EmploymentCandidate(
+                company_name="㈜씨에이에스",
+                start_date="국방시설통합정보체계 고도화 BPR 및 ISP 사업",
+                end_date="PL", title="상무",
+                source_refs=[SourceRef(document_id=_DOC, page_no=1,
+                                       quote_text="㈜씨에이에스")],
+            ),
+            EmploymentCandidate(
+                company_name="㈜씨에이에스", start_date="날짜 미상",
+                end_date="현재", title="상무",
+                source_refs=[SourceRef(document_id=_DOC, page_no=1,
+                                       quote_text="㈜씨에이에스")],
+            ),
+        ],
+    )
+    pages = {(_DOC, 1): source}
+    guarded = apply_candidate_quality_guards(
+        candidate, page_texts=pages, document_type_by_id=_TYPES,
+        strict_section_authority=True,
+    )
+    assert [(row.start_date, row.end_date)
+            for row in guarded.employment_history] == [
+        ("2017.04", "현재"), ("날짜 미상", "현재")
+    ]
+    # Historical prompts and the in-memory raw candidate are unchanged.
+    old = apply_candidate_quality_guards(
+        candidate, page_texts=pages, document_type_by_id=_TYPES,
+        strict_section_authority=False,
+    )
+    assert len(old.employment_history) == 4
+    assert len(candidate.employment_history) == 4
+
+
+def test_v25_ambiguous_employer_without_project_source_stays_for_review() -> None:
+    row = EmploymentCandidate(
+        company_name="㈜씨에이에스", start_date="시작일 확인 필요",
+        end_date="PL", source_refs=[SourceRef(
+            document_id=_DOC, page_no=1, quote_text="㈜씨에이에스",
+        )],
+    )
+    pages = {(_DOC, 1): "재직기간 회사명 직위\n㈜씨에이에스 재직기간 불명 PL"}
+    candidate = ProfileCandidateDocument(employment_history=[row])
+    guarded = apply_candidate_quality_guards(
+        candidate, page_texts=pages, document_type_by_id=_TYPES,
+        strict_section_authority=True,
+    )
+    assert guarded.employment_history == [row]
+
+    # Same page, but the employer appears only BEFORE a project table whose
+    # participation rows belong to a different company.
+    pages = {(_DOC, 1): (
+        "근무경력 ㈜씨에이에스 임원\n"
+        "프로젝트 수행경력 참여기간 사업명 발주처 소속회사\n"
+        "2023.7 ~ 현재 프로젝트 전환 PM ㈜다른회사\n"
+    )}
+    guarded = apply_candidate_quality_guards(
+        candidate, page_texts=pages, document_type_by_id=_TYPES,
+        strict_section_authority=True,
+    )
+    assert guarded.employment_history == [row]
+
+
 def test_v25_page_recall_is_opt_in_only() -> None:
     from app.ai.prompts.profile_extract import resolve_profile_prompt
 
