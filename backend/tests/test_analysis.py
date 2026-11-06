@@ -2055,6 +2055,118 @@ def test_bulk_conflict_reject_and_foreign_diff(client: TestClient, db_session):
     db_session.commit()
 
 
+def test_bulk_explicit_review_date_guard_and_decision_reset(client: TestClient, db_session):
+    """Grounded REVIEW may be approved explicitly; bad dates fail atomically."""
+    from app.db.models.analysis import AnalysisDiffItem, AnalysisRun
+
+    admin = _create_user(
+        db_session, login_id=f"br_{uuid.uuid4().hex[:10]}", password="Passw0rd!"
+    )
+    csrf = _login(client, admin.login_id, "Passw0rd!")
+    person, document = _seed_person_with_ready_doc(db_session, admin.id)
+    analysis_id = client.post(
+        "/api/v1/analyses",
+        headers={"X-CSRF-Token": csrf},
+        json={
+            "person_id": str(person.id),
+            "document_ids": [str(document.id)],
+            "analysis_type": "PROFILE",
+        },
+    ).json()["data"]["analysis_id"]
+    run = db_session.get(AnalysisRun, uuid.UUID(analysis_id))
+    run.status = "REVIEWING"
+    evidence = [{
+        "document_id": str(document.id),
+        "page_no": 1,
+        "quote_text": "프로필 원문 확인",
+    }]
+    safe = AnalysisDiffItem(
+        analysis_run_id=run.id,
+        entity_type="PROFILE",
+        candidate_path="profile.phone",
+        field_name="phone",
+        change_type="CONFLICT",
+        old_value="010-1111-1111",
+        new_value={"value": "010-2222-2222", "source_refs": evidence},
+        review_status="PENDING",
+    )
+    invalid = AnalysisDiffItem(
+        analysis_run_id=run.id,
+        entity_type="EMPLOYMENT",
+        candidate_path="employment_history[30]",
+        change_type="REVIEW",
+        new_value={
+            "company_name": "고객사",
+            "start_date": "클라우드 전환 구축 사업",
+            "end_date": "PM",
+            "source_refs": evidence,
+        },
+        review_status="PENDING",
+    )
+    db_session.add_all([safe, invalid])
+    db_session.commit()
+
+    listed = client.get(f"/api/v1/analyses/{analysis_id}/diffs")
+    assert listed.status_code == 200
+    by_id = {row["id"]: row for row in listed.json()["data"]}
+    assert by_id[str(safe.id)]["date_issues"] == []
+    assert len(by_id[str(invalid.id)]["date_issues"]) == 2
+
+    request = f"/api/v1/analyses/{analysis_id}/diffs/bulk"
+    no_ack = client.post(
+        request,
+        headers={"X-CSRF-Token": csrf},
+        json={"diff_ids": [str(safe.id)], "review_status": "ACCEPTED"},
+    )
+    assert no_ack.status_code == 400
+
+    bad_batch = client.post(
+        request,
+        headers={"X-CSRF-Token": csrf},
+        json={
+            "diff_ids": [str(safe.id), str(invalid.id)],
+            "review_status": "ACCEPTED",
+            "allow_conflict_review": True,
+        },
+    )
+    assert bad_batch.status_code == 400
+    assert bad_batch.json()["code"] == "CONFIRM_VALIDATION_ERROR"
+    db_session.refresh(safe)
+    db_session.refresh(invalid)
+    assert safe.review_status == invalid.review_status == "PENDING"
+
+    accepted = client.post(
+        request,
+        headers={"X-CSRF-Token": csrf},
+        json={
+            "diff_ids": [str(safe.id)],
+            "review_status": "ACCEPTED",
+            "allow_conflict_review": True,
+        },
+    )
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["data"][0]["review_status"] == "ACCEPTED"
+
+    reset = client.post(
+        request,
+        headers={"X-CSRF-Token": csrf},
+        json={"diff_ids": [str(safe.id)], "review_status": "PENDING"},
+    )
+    assert reset.status_code == 200, reset.text
+    db_session.refresh(safe)
+    assert safe.review_status == "PENDING"
+
+    single_invalid = client.patch(
+        f"/api/v1/analyses/{analysis_id}/diffs/{invalid.id}",
+        headers={"X-CSRF-Token": csrf},
+        json={"review_status": "ACCEPTED"},
+    )
+    assert single_invalid.status_code == 400
+    assert single_invalid.json()["code"] == "CONFIRM_VALIDATION_ERROR"
+
+    _cleanup_person(db_session, person.id, admin.id)
+
+
 def test_retry_state_guards_and_broker_fail(
     client: TestClient, db_session, monkeypatch: pytest.MonkeyPatch
 ):

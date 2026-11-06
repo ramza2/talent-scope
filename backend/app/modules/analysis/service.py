@@ -8,6 +8,7 @@ import re
 from dataclasses import dataclass
 from decimal import Decimal
 from collections.abc import Sequence
+from types import SimpleNamespace
 from typing import Any
 from uuid import UUID
 
@@ -91,6 +92,10 @@ from app.modules.analysis.compact_v8 import (
 )
 from app.modules.analysis.kosa_project_recall import supplement_kosa_table_projects
 from app.modules.analysis.candidate_quality_guards import apply_candidate_quality_guards
+from app.modules.analysis.diff_evidence import (
+    diff_has_original_evidence,
+    is_ungrounded_new_diff,
+)
 from app.modules.analysis.diff_engine import DiffSpec, build_diffs
 from app.modules.analysis.normalize import normalize_candidate
 from app.modules.analysis.repository import AnalysisRepository
@@ -3373,23 +3378,24 @@ class AnalysisService:
                 f"상태가 {run.status}인 분석은 검토할 수 없습니다."
             )
 
-        if payload.review_status not in {"ACCEPTED", "REJECTED"}:
+        if payload.review_status not in {"ACCEPTED", "REJECTED", "PENDING"}:
             raise ValidationAppError(
-                "일괄 검토는 ACCEPTED 또는 REJECTED만 지원합니다."
+                "일괄 검토는 ACCEPTED, REJECTED 또는 PENDING만 지원합니다."
             )
 
         # Validate all selected diffs first — no partial apply.
-        # Pass 1: existence + PENDING (prefer 409 over ACCEPTED-rule 400).
-        from app.modules.analysis.diff_evidence import (
-            is_ungrounded_new_diff,
-        )
-
+        # Pass 1: existence + compatible current status, all-or-nothing.
         locked: list[AnalysisDiffItem] = []
         for diff_id in payload.diff_ids:
             diff = self.repo.get_diff(diff_id, for_update=True)
             if diff is None or diff.analysis_run_id != analysis_id:
                 raise NotFoundError(f"Diff를 찾을 수 없습니다: {diff_id}")
-            if diff.review_status != "PENDING":
+            if payload.review_status == "PENDING":
+                if diff.review_status in {"PENDING", "MERGED", "SAME"}:
+                    raise AnalysisStateConflictError(
+                        "일괄 결정 취소는 승인/수정/반려된 Diff만 지원합니다."
+                    )
+            elif diff.review_status != "PENDING":
                 raise AnalysisStateConflictError(
                     "이미 결정된 Diff가 포함되어 일괄 검토할 수 없습니다."
                 )
@@ -3403,9 +3409,31 @@ class AnalysisService:
                 [d.id for d in locked]
             )
             for diff in locked:
-                if diff.change_type in {"CONFLICT", "REVIEW"}:
+                if (
+                    diff.change_type in {"CONFLICT", "REVIEW"}
+                    and not payload.allow_conflict_review
+                ):
                     raise ValidationAppError(
-                        "CONFLICT/REVIEW Diff는 일괄 ACCEPTED할 수 없습니다."
+                        "CONFLICT/REVIEW 일괄 승인에는 별도 확인이 필요합니다."
+                    )
+                if (
+                    diff.entity_type == "PROJECT"
+                    and diff.change_type == "REVIEW"
+                    and diff.field_name is None
+                    and re.fullmatch(r"projects\[\d+\]", diff.candidate_path or "")
+                ):
+                    raise ValidationAppError(
+                        "프로젝트 병합 가능성이 있는 REVIEW는 단건으로 검토해 주세요."
+                    )
+                if (
+                    diff.change_type in {"CONFLICT", "REVIEW"}
+                    and not diff_has_original_evidence(
+                        new_value=diff.new_value,
+                        evidence=evidence_by_diff.get(diff.id, []),
+                    )
+                ):
+                    raise ValidationAppError(
+                        "원문 근거가 없는 CONFLICT/REVIEW는 단건으로 검토해 주세요."
                     )
                 if is_ungrounded_new_diff(
                     change_type=diff.change_type,
@@ -3415,6 +3443,13 @@ class AnalysisService:
                     raise ValidationAppError(
                         "원문 근거가 없는 신규 항목이 포함되어 일괄 승인할 수 "
                         "없습니다. 해당 항목을 제외하거나 단건으로 검토해 주세요."
+                    )
+                date_issues = _review_date_issues(diff, status="ACCEPTED")
+                if date_issues:
+                    from app.core.exceptions import ConfirmValidationError
+
+                    raise ConfirmValidationError(
+                        "승인할 수 없는 날짜가 있습니다:\n" + "\n".join(date_issues)
                     )
 
         results: list[DiffItemResponse] = []
@@ -3431,6 +3466,7 @@ class AnalysisService:
             after={
                 "review_status": payload.review_status,
                 "diff_ids": [str(i) for i in payload.diff_ids],
+                "allow_conflict_review": payload.allow_conflict_review,
             },
             metadata={
                 "analysis_run_id": str(analysis_id),
@@ -3489,6 +3525,20 @@ class AnalysisService:
         if status == "MODIFIED":
             if payload.decided_value is None:
                 raise ValidationAppError("MODIFIED에는 decided_value가 필요합니다.")
+        if status in {"ACCEPTED", "MODIFIED"}:
+            from app.core.exceptions import ConfirmValidationError
+
+            date_issues = _review_date_issues(
+                diff,
+                status=status,
+                decided_value=payload.decided_value,
+            )
+            if date_issues:
+                raise ConfirmValidationError(
+                    "승인할 수 없는 날짜가 있습니다:\n" + "\n".join(date_issues)
+                )
+
+        if status == "MODIFIED":
             diff.decided_value = payload.decided_value
         elif status == "MERGED":
             path = diff.candidate_path or ""
@@ -3896,7 +3946,35 @@ class AnalysisService:
             decided_by=row.decided_by,
             decided_at=row.decided_at,
             evidence=evidence,
+            date_issues=_review_date_issues(
+                row,
+                status="ACCEPTED" if row.review_status == "PENDING" else None,
+            ),
         )
+
+
+def _review_date_issues(
+    diff: AnalysisDiffItem,
+    *,
+    status: str | None = None,
+    decided_value: Any = None,
+) -> list[str]:
+    """Preview exactly the same date rules used at final Confirm, read-only."""
+    from app.modules.analysis.confirm import collect_confirm_date_issues
+
+    effective_status = status or diff.review_status
+    applied_decision = (
+        decided_value if status == "MODIFIED" else diff.decided_value
+    )
+    preview = SimpleNamespace(
+        entity_type=diff.entity_type,
+        candidate_path=diff.candidate_path,
+        field_name=diff.field_name,
+        review_status=effective_status,
+        new_value=diff.new_value,
+        decided_value=applied_decision,
+    )
+    return collect_confirm_date_issues([preview])
 
 
 def _unwrap_new_value(value: Any) -> Any:

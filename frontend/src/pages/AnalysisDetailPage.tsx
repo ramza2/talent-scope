@@ -26,7 +26,7 @@ import {
   formatDiffValueSummary,
   formatValue,
 } from '@/api/diffValueDisplay'
-import { isUngroundedNewDiff } from '@/api/diffEvidence'
+import { diffHasOriginalEvidence, isUngroundedNewDiff } from '@/api/diffEvidence'
 import {
   EMPLOYMENT_END_DATE_CUSTOM_VALUE,
   buildEmploymentEndDateModifiedDecision,
@@ -74,6 +74,7 @@ type DiffFilterTab =
   | 'REVIEW'
   | 'pending'
   | 'reviewed'
+  | 'dateIssues'
 
 /** Empty string = 전체 항목 (no entity_type query param). */
 type EntityFilter = '' | EntityType
@@ -260,6 +261,17 @@ export function AnalysisDetailPage() {
           ),
         }
       }
+      if (filterTab === 'dateIssues') {
+        const scoped = await listAnalysisDiffs(analysisId, entityFilters)
+        return {
+          data: scoped.data.filter(
+            (d) =>
+              d.review_status !== 'REJECTED' &&
+              d.change_type !== 'SAME' &&
+              (d.date_issues?.length ?? 0) > 0,
+          ),
+        }
+      }
       if (filterTab === 'all') {
         return listAnalysisDiffs(analysisId, entityFilters)
       }
@@ -280,7 +292,16 @@ export function AnalysisDetailPage() {
   // Confirm / global pending alert ignore entity filter (full analysis scope).
   const pendingActionable = countPendingActionableDiffs(allDiffs)
   const reviewedCount = countReviewedDiffs(allDiffs)
-  const canConfirm = canConfirmAnalysis({
+  const dateIssueDiffs = allDiffs.filter(
+    (d) =>
+      d.review_status !== 'REJECTED' &&
+      d.change_type !== 'SAME' &&
+      (d.date_issues?.length ?? 0) > 0,
+  )
+  const approvedDateIssueDiffs = dateIssueDiffs.filter(
+    (d) => d.review_status !== 'PENDING',
+  )
+  const canConfirm = approvedDateIssueDiffs.length === 0 && canConfirmAnalysis({
     status: analysis?.status,
     diffsQuerySuccess: allDiffsQuery.isSuccess,
     totalDiffs: allDiffs.length,
@@ -333,7 +354,11 @@ export function AnalysisDetailPage() {
   })
 
   const bulkMutation = useMutation({
-    mutationFn: (body: { diff_ids: string[]; review_status: ReviewStatus }) =>
+    mutationFn: (body: {
+      diff_ids: string[]
+      review_status: ReviewStatus
+      allow_conflict_review?: boolean
+    }) =>
       bulkReviewDiffs(analysisId, body),
     onSuccess: async () => {
       message.success('일괄 검토가 저장되었습니다.')
@@ -365,15 +390,28 @@ export function AnalysisDetailPage() {
       if (apiErrorCode(error) === 'CONFIRM_VALIDATION_ERROR') {
         Modal.error({
           title: '확정 전 검증 실패',
-          width: 560,
+          width: 660,
           content: (
-            <Typography.Paragraph style={{ whiteSpace: 'pre-wrap', marginBottom: 0 }}>
-              {apiErrorMessage(
-                error,
-                '날짜 등 검토 값에 오류가 있어 확정할 수 없습니다.',
-              )}
-            </Typography.Paragraph>
+            <div>
+              <Typography.Paragraph>
+                확인이 필요한 값이 있어 프로필에 반영하지 않았습니다. 해당 Diff를 수정하거나 반려한 뒤 다시 확정해 주세요.
+              </Typography.Paragraph>
+              <div style={{ maxHeight: '45vh', overflowY: 'auto' }}>
+                <Typography.Paragraph style={{ whiteSpace: 'pre-wrap', marginBottom: 0 }}>
+                  {apiErrorMessage(
+                    error,
+                    '날짜 등 검토 값에 오류가 있어 확정할 수 없습니다.',
+                  )}
+                </Typography.Paragraph>
+              </div>
+            </div>
           ),
+          okText: '오류 항목 보기',
+          onOk: () => {
+            setConfirmOpen(false)
+            setFilterTab('dateIssues')
+            setSelectedKeys([])
+          },
         })
         return
       }
@@ -667,6 +705,20 @@ export function AnalysisDetailPage() {
       render: (v: ReviewStatus) => reviewStatusTag(v),
     },
     {
+      title: '날짜 검증',
+      key: 'date_issues',
+      width: 190,
+      render: (_, row) => row.date_issues?.length ? (
+        <Typography.Paragraph
+          type="danger"
+          ellipsis={{ rows: 2, expandable: true, symbol: '전체 보기' }}
+          style={{ whiteSpace: 'pre-wrap', marginBottom: 0, fontSize: 12 }}
+        >
+          {row.date_issues.join('\n')}
+        </Typography.Paragraph>
+      ) : <Typography.Text type="secondary">—</Typography.Text>,
+    },
+    {
       title: '작업',
       key: 'actions',
       width: 220,
@@ -699,8 +751,12 @@ export function AnalysisDetailPage() {
         const needsCodeMapping = diffRequiresCodeMapping(row)
         const needsEndDateConfirm = isEmploymentEndDateConflictReview(row)
         const ungroundedNew = isUngroundedNewDiff(row)
+        const dateIssues = row.date_issues ?? []
         return (
           <Space size="small" wrap>
+            {dateIssues.length > 0 ? (
+              <Typography.Text type="danger">날짜 확인 필요 ({dateIssues.length})</Typography.Text>
+            ) : null}
             {ungroundedNew ? (
               <Typography.Text type="danger">원문 근거 없음</Typography.Text>
             ) : null}
@@ -712,6 +768,10 @@ export function AnalysisDetailPage() {
                 size="small"
                 loading={decisionMutation.isPending}
                 onClick={() => {
+                  if (dateIssues.length > 0) {
+                    message.warning('날짜 오류를 수정하거나 항목을 반려한 뒤 진행해 주세요.')
+                    return
+                  }
                   if (ungroundedNew) {
                     Modal.confirm({
                       title: '원문 근거 없는 항목을 승인할까요?',
@@ -897,6 +957,20 @@ export function AnalysisDetailPage() {
               message={`미검토 항목 ${pendingActionable}건 — 모두 결정한 뒤 최종 확정할 수 있습니다.`}
             />
           ) : null}
+          {analysis.status === 'REVIEWING' && dateIssueDiffs.length > 0 ? (
+            <Alert
+              type={approvedDateIssueDiffs.length > 0 ? 'error' : 'warning'}
+              showIcon
+              style={{ marginBottom: 16 }}
+              message={`날짜 확인 필요 ${dateIssueDiffs.length}건 (승인된 오류 ${approvedDateIssueDiffs.length}건)`}
+              description="날짜 항목에 이름·역할·프로젝트명 등이 들어간 경우 AI 분석 오류일 수 있습니다. 원문을 확인하고 수정하거나 반려하세요. 승인된 오류는 먼저 결정을 취소해야 합니다."
+              action={
+                <Button size="small" onClick={() => { setFilterTab('dateIssues'); setSelectedKeys([]) }}>
+                  오류 항목 보기
+                </Button>
+              }
+            />
+          ) : null}
           {analysis.status === 'CONFIRMED' ? (
             <Alert
               type="success"
@@ -943,6 +1017,7 @@ export function AnalysisDetailPage() {
               { key: 'REVIEW', label: `확인필요 (${counts.review})` },
               { key: 'pending', label: `미검토 (${tabPendingCount})` },
               { key: 'reviewed', label: `검토완료 (${tabReviewedCount})` },
+              { key: 'dateIssues', label: `날짜 확인 (${dateIssueDiffs.length})` },
             ]}
             style={{ marginBottom: 8 }}
           />
@@ -954,30 +1029,48 @@ export function AnalysisDetailPage() {
                 loading={bulkMutation.isPending}
                 onClick={() => {
                   const selected = (diffsQuery.data?.data ?? []).filter((d) =>
-                    selectedKeys.includes(d.id),
+                    selectedKeys.includes(d.id) && d.review_status === 'PENDING',
                   )
-                  const acceptTargets = selected.filter(
-                    (d) => !isUngroundedNewDiff(d),
-                  )
+                  const acceptTargets = selected.filter((d) => {
+                    if ((d.date_issues?.length ?? 0) > 0) return false
+                    if (isUngroundedNewDiff(d)) return false
+                    if (diffRequiresCodeMapping(d)) return false
+                    if (isProjectRootReview(d)) return false
+                    if (isEmploymentEndDateConflictReview(d)) return false
+                    if (
+                      ['CONFLICT', 'REVIEW'].includes(d.change_type) &&
+                      !diffHasOriginalEvidence(d)
+                    ) return false
+                    return true
+                  })
                   const skipped = selected.length - acceptTargets.length
                   if (acceptTargets.length === 0) {
                     message.warning(
-                      '선택한 항목 중 일괄 승인 가능한 Diff가 없습니다. 원문 근거 없는 신규 항목은 단건으로 검토하세요.',
+                      '선택한 항목 중 일괄 승인 가능한 Diff가 없습니다. 날짜 오류·원문 근거·병합·코드 매핑을 개별 확인하세요.',
                     )
                     return
                   }
+                  const riskyCount = acceptTargets.filter(
+                    (d) => d.change_type === 'CONFLICT' || d.change_type === 'REVIEW',
+                  ).length
                   Modal.confirm({
                     title: `선택 ${acceptTargets.length}건을 승인할까요?`,
-                    content:
-                      skipped > 0
-                        ? `원문 근거 없는 신규 항목 ${skipped}건은 승인 대상에서 제외됩니다.`
-                        : '선택한 Diff를 ACCEPTED로 저장합니다.',
+                    content: (
+                      <div>
+                        <Typography.Paragraph>
+                          선택한 Diff를 승인합니다. 충돌·확인필요 항목은 원문을 직접 확인한 경우에만 승인하세요.
+                        </Typography.Paragraph>
+                        {riskyCount > 0 ? <Typography.Text type="warning">충돌/확인필요 {riskyCount}건을 포함합니다. 잘못 승인하면 기존 데이터가 변경되거나 중복될 수 있습니다.</Typography.Text> : null}
+                        {skipped > 0 ? <Typography.Paragraph type="secondary">날짜 오류·원문 근거 없음·개별 병합/코드 선택 등 {skipped}건은 제외됩니다.</Typography.Paragraph> : null}
+                      </div>
+                    ),
                     okText: '승인',
                     cancelText: '취소',
                     onOk: () =>
                       bulkMutation.mutateAsync({
                         diff_ids: acceptTargets.map((d) => d.id),
                         review_status: 'ACCEPTED',
+                        allow_conflict_review: riskyCount > 0,
                       }),
                   })
                 }}
@@ -988,16 +1081,22 @@ export function AnalysisDetailPage() {
                 disabled={selectedKeys.length === 0}
                 loading={bulkMutation.isPending}
                 onClick={() => {
-                  const count = selectedKeys.length
+                  const targets = (diffsQuery.data?.data ?? []).filter(
+                    (d) => selectedKeys.includes(d.id) && d.review_status === 'PENDING',
+                  )
+                  if (!targets.length) {
+                    message.warning('반려할 미검토 Diff를 선택해 주세요.')
+                    return
+                  }
                   Modal.confirm({
-                    title: `선택 ${count}건을 반려할까요?`,
-                    content: '선택한 Diff를 REJECTED로 저장합니다.',
+                    title: `선택 ${targets.length}건을 반려할까요?`,
+                    content: '미검토 Diff만 REJECTED로 저장합니다. 이미 결정된 항목은 먼저 결정을 취소하세요.',
                     okText: '반려',
                     okButtonProps: { danger: true },
                     cancelText: '취소',
                     onOk: () =>
                       bulkMutation.mutateAsync({
-                        diff_ids: selectedKeys.map(String),
+                        diff_ids: targets.map((d) => d.id),
                         review_status: 'REJECTED',
                       }),
                   })
@@ -1005,9 +1104,36 @@ export function AnalysisDetailPage() {
               >
                 선택 반려
               </Button>
+              <Button
+                disabled={
+                  !selectedKeys.some((key) => {
+                    const diff = (diffsQuery.data?.data ?? []).find((d) => d.id === key)
+                    return diff && diff.change_type !== 'SAME' &&
+                      !['PENDING', 'MERGED'].includes(diff.review_status)
+                  })
+                }
+                loading={bulkMutation.isPending}
+                onClick={() => {
+                  const targets = (diffsQuery.data?.data ?? []).filter(
+                    (d) => selectedKeys.includes(d.id) &&
+                      d.change_type !== 'SAME' &&
+                      !['PENDING', 'MERGED'].includes(d.review_status),
+                  )
+                  Modal.confirm({
+                    title: `승인/수정/반려 결정 ${targets.length}건을 취소할까요?`,
+                    content: '검토 결정만 미검토 상태로 되돌립니다. AI후보와 원문 근거는 유지됩니다.',
+                    okText: '결정 취소',
+                    onOk: () => bulkMutation.mutateAsync({
+                      diff_ids: targets.map((d) => d.id),
+                      review_status: 'PENDING',
+                    }),
+                  })
+                }}
+              >
+                선택 결정 취소
+              </Button>
               <Typography.Text type="secondary">
-                CONFLICT/REVIEW 및 원문 근거 없는 신규 항목은 일괄 승인할 수
-                없습니다.
+                원문 근거가 있는 충돌/확인필요는 확인 후 일괄 승인 가능. 날짜 오류·프로젝트 병합은 개별 검토.
               </Typography.Text>
             </Space>
           ) : null}
@@ -1018,7 +1144,7 @@ export function AnalysisDetailPage() {
             columns={columns}
             dataSource={diffsQuery.data?.data ?? []}
             size="small"
-            scroll={{ x: 1180 }}
+            scroll={{ x: 1340 }}
             pagination={{ pageSize: 50, showSizeChanger: true }}
             rowSelection={
               canReview
@@ -1026,7 +1152,7 @@ export function AnalysisDetailPage() {
                     selectedRowKeys: selectedKeys,
                     onChange: setSelectedKeys,
                     getCheckboxProps: (row) => ({
-                      disabled: row.review_status !== 'PENDING',
+                      disabled: row.review_status === 'MERGED' || row.change_type === 'SAME',
                     }),
                   }
                 : undefined

@@ -40,7 +40,11 @@ from app.db.models.project import (
     ProjectSkill,
 )
 from app.db.models.revision import ProfileRevision
-from app.modules.analysis.confirm_dates import assert_date_order, normalize_confirmed_date
+from app.modules.analysis.confirm_dates import (
+    assert_date_order,
+    is_ongoing_project_end_marker,
+    normalize_confirmed_date,
+)
 from app.modules.analysis.repository import AnalysisRepository
 from app.modules.analysis.schemas import ConfirmAnalysisResponseData
 from app.modules.career.repository import CareerRepository
@@ -297,6 +301,20 @@ def _normalize_field_date(
     bound = _DATE_BOUNDS.get(field_name)
     if bound is None:
         return value
+    # An explicit blank in optional certificate dates is not a real period.
+    if (
+        entity_type == "CERTIFICATION"
+        and field_name in {"acquired_date", "expiry_date"}
+        and isinstance(value, str)
+        and value.strip() in {"-", "–", "—"}
+    ):
+        return None
+    if (
+        entity_type == "PROJECT"
+        and field_name == "end_date"
+        and is_ongoing_project_end_marker(value)
+    ):
+        return None
     treat_ongoing = (
         entity_type == "EMPLOYMENT"
         and field_name == "end_date"
@@ -326,8 +344,8 @@ def _date_fields_for_entity(entity_type: str) -> tuple[str, ...]:
     return ()
 
 
-def _prevalidate_confirm_dates(diffs: list[AnalysisDiffItem]) -> None:
-    """Fail closed on invalid applied dates before any Confirmed mutation."""
+def collect_confirm_date_issues(diffs: list[AnalysisDiffItem]) -> list[str]:
+    """Find applied-date issues without changing review or confirmed data."""
     errors: list[str] = []
     for diff in diffs:
         status = diff.review_status
@@ -400,6 +418,12 @@ def _prevalidate_confirm_dates(diffs: list[AnalysisDiffItem]) -> None:
         except ValueError as exc:
             errors.append(f"{entity} {path}: {exc}")
 
+    return errors
+
+
+def _prevalidate_confirm_dates(diffs: list[AnalysisDiffItem]) -> None:
+    """Fail closed on invalid applied dates before any Confirmed mutation."""
+    errors = collect_confirm_date_issues(diffs)
     if errors:
         raise ConfirmValidationError(
             "확정 전 날짜 검증에 실패했습니다:\n"
