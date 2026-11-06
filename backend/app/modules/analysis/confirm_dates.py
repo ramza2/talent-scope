@@ -35,6 +35,12 @@ _ONGOING_END_MARKERS = frozenset(
     }
 )
 
+# A project may still be active, but employment-specific words (재직 등)
+# must not be interpreted as a project period.
+_ONGOING_PROJECT_END_MARKERS = frozenset(
+    {"현재", "진행중", "진행 중", "present", "ongoing"}
+)
+
 
 def _norm_date_token(value: Any) -> str:
     text = unicodedata.normalize("NFKC", str(value or "")).strip()
@@ -47,6 +53,11 @@ def is_ongoing_end_marker(value: Any) -> bool:
     if not text:
         return False
     return text.casefold() in {m.casefold() for m in _ONGOING_END_MARKERS}
+
+
+def is_ongoing_project_end_marker(value: Any) -> bool:
+    text = _norm_date_token(value)
+    return bool(text) and text.casefold() in _ONGOING_PROJECT_END_MARKERS
 
 
 def parse_partial_date(value: Any) -> tuple[int, int | None, int | None] | None:

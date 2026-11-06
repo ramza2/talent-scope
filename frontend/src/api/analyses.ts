@@ -114,6 +114,7 @@ export type DiffItem = {
   decided_by?: string | null
   decided_at?: string | null
   evidence: EvidenceLite[]
+  date_issues?: string[]
 }
 
 export type AnalysisListFilters = {
@@ -139,6 +140,7 @@ export type DiffDecisionBody = {
 export type BulkDiffBody = {
   diff_ids: string[]
   review_status: ReviewStatus
+  allow_conflict_review?: boolean
 }
 
 /** Confidence display labels — UI only, never auto-approve. */

@@ -39,6 +39,63 @@ def test_ongoing_end_marker_normalize_and_detect():
         )
 
 
+def test_confirm_date_preview_optional_and_invalid_fields():
+    """Preview follows Confirm; only explicit optional markers become null."""
+    from types import SimpleNamespace
+
+    from app.modules.analysis.confirm import (
+        _normalize_field_date,
+        collect_confirm_date_issues,
+    )
+
+    assert _normalize_field_date(
+        "acquired_date", "-", entity_type="CERTIFICATION"
+    ) is None
+    assert _normalize_field_date(
+        "expiry_date", "—", entity_type="CERTIFICATION"
+    ) is None
+    assert _normalize_field_date(
+        "end_date", "현재", entity_type="PROJECT"
+    ) is None
+    assert _normalize_field_date(
+        "end_date", "진행 중", entity_type="PROJECT"
+    ) is None
+    with pytest.raises(Exception, match="invalid date"):
+        _normalize_field_date("start_date", "PM", entity_type="EMPLOYMENT")
+    with pytest.raises(Exception, match="invalid date"):
+        _normalize_field_date("end_date", "재직중", entity_type="PROJECT")
+
+    def diff(entity: str, path: str, value: dict):
+        return SimpleNamespace(
+            entity_type=entity,
+            candidate_path=path,
+            field_name=None,
+            review_status="ACCEPTED",
+            new_value=value,
+            decided_value=None,
+        )
+
+    valid = [
+        diff("CERTIFICATION", "certifications[0]", {
+            "acquired_date": "-", "expiry_date": "-",
+        }),
+        diff("PROJECT", "projects[0]", {
+            "start_date": "2022.01", "end_date": "현재",
+        }),
+    ]
+    assert collect_confirm_date_issues(valid) == []
+
+    malformed = diff("EMPLOYMENT", "employment_history[30]", {
+        "start_date": "공공 클라우드 전환 사업", "end_date": "PM",
+    })
+    errors = collect_confirm_date_issues([malformed])
+    assert len(errors) == 2
+    assert any("field=start_date" in issue for issue in errors)
+    assert any("field=end_date" in issue for issue in errors)
+    malformed.review_status = "REJECTED"
+    assert collect_confirm_date_issues([malformed]) == []
+
+
 def test_employment_ongoing_end_can_be_new_invalid_becomes_review():
     from app.ai.schemas.profile_candidate import (
         EmploymentCandidate,

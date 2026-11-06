@@ -153,6 +153,7 @@ class DiffItemResponse(BaseModel):
     decided_by: UUID | None = None
     decided_at: datetime | None = None
     evidence: list[EvidenceLite] = Field(default_factory=list)
+    date_issues: list[str] = Field(default_factory=list)
 
 
 class DiffListResponse(BaseModel):
@@ -172,6 +173,7 @@ class DiffDecisionResponse(BaseModel):
 class BulkDiffRequest(BaseModel):
     diff_ids: list[UUID] = Field(min_length=1)
     review_status: ReviewStatus
+    allow_conflict_review: bool = False
 
 
 class BulkDiffResponse(BaseModel):
