@@ -267,7 +267,7 @@ export function AnalysisDetailPage() {
           data: scoped.data.filter(
             (d) =>
               d.review_status !== 'REJECTED' &&
-              d.review_status !== 'SAME' &&
+              d.change_type !== 'SAME' &&
               (d.date_issues?.length ?? 0) > 0,
           ),
         }
@@ -295,7 +295,7 @@ export function AnalysisDetailPage() {
   const dateIssueDiffs = allDiffs.filter(
     (d) =>
       d.review_status !== 'REJECTED' &&
-      d.review_status !== 'SAME' &&
+      d.change_type !== 'SAME' &&
       (d.date_issues?.length ?? 0) > 0,
   )
   const approvedDateIssueDiffs = dateIssueDiffs.filter(
@@ -1108,14 +1108,16 @@ export function AnalysisDetailPage() {
                 disabled={
                   !selectedKeys.some((key) => {
                     const diff = (diffsQuery.data?.data ?? []).find((d) => d.id === key)
-                    return diff && !['PENDING', 'MERGED', 'SAME'].includes(diff.review_status)
+                    return diff && diff.change_type !== 'SAME' &&
+                      !['PENDING', 'MERGED'].includes(diff.review_status)
                   })
                 }
                 loading={bulkMutation.isPending}
                 onClick={() => {
                   const targets = (diffsQuery.data?.data ?? []).filter(
                     (d) => selectedKeys.includes(d.id) &&
-                      !['PENDING', 'MERGED', 'SAME'].includes(d.review_status),
+                      d.change_type !== 'SAME' &&
+                      !['PENDING', 'MERGED'].includes(d.review_status),
                   )
                   Modal.confirm({
                     title: `승인/수정/반려 결정 ${targets.length}건을 취소할까요?`,
@@ -1150,7 +1152,7 @@ export function AnalysisDetailPage() {
                     selectedRowKeys: selectedKeys,
                     onChange: setSelectedKeys,
                     getCheckboxProps: (row) => ({
-                      disabled: row.review_status === 'MERGED' || row.review_status === 'SAME',
+                      disabled: row.review_status === 'MERGED' || row.change_type === 'SAME',
                     }),
                   }
                 : undefined
