@@ -60,6 +60,9 @@ j[]:{v,c,t,f,r?}  t=PRIMARY|SECONDARY|EXPERIENCE  Put code in c.
 s[]:{v,c,y,m,rep,f,r?}  x[]:{v,c,e,f,r?}  e=EXPLICIT|INFERRED
   Put catalog code in c. r optional (server may backfill exact matches).
 w[]:{co,dp,ti,s,e,resp,f,r?}  EMPLOYER rows only; never project customer/dates.
+  dp=explicit department/organization name only; NEVER rank/title (상무/이사/부장),
+  PM/PL project role, or a date (2020.11). If no department, omit dp.
+  ti=explicit employment position only; PM/PL role in project rows is not ti.
   A customer listed under a project is NOT an employer even if the name exists.
   프로젝트 수행경력 표의 소속회사/직위는 참여 당시 정보일 뿐 별도 재직 행이 아니다.
   참여기간/사업명/담당업무/소속회사/직위/발주처 표 전체를 w[]로 옮기지 말 것.
@@ -156,6 +159,7 @@ _EMPLOYMENT_AUTHORITY = """Employment (w[]):
 - Prefer 경력사항/직장명/근무기간/최종직급/담당업무 tables.
 - Never convert rows headed 고객사/발주처/수행프로젝트 into w[].
 - co/s/e from employer row only — never 발주처/고객사/project dates.
+- dp is a department, NOT a job rank, PM/PL role, or date; omit if unknown.
 - Employer table wins over 경력기술서 project rows. Keep all real employers.
 - '프로젝트 수행경력' 표에 소속회사/직위가 있어도 재직 표가 아니다.
   사업명은 재직 시작일(s)이 아니며 PM/PL 담당업무는 재직 종료일(e)이 아니다.

@@ -21,6 +21,7 @@ from app.modules.analysis.confirm_dates import (
     normalize_confirmed_date,
     parse_partial_date,
 )
+from app.modules.analysis.employment_field_quality import employment_department_issue
 
 EMPLOYMENT_FIELDS: tuple[str, ...] = (
     "company_name",
@@ -175,7 +176,7 @@ def build_diffs(
             ),
             dump_row=_dump_model,
             similar_match=_employment_similar,
-            new_requires_review=employment_candidate_dates_need_review,
+            new_requires_review=employment_candidate_needs_review,
         )
     )
     specs.extend(
@@ -656,6 +657,14 @@ def employment_candidate_dates_need_review(cand: Any) -> bool:
         if _employment_start_after_end(start_text, end_text):
             return True
     return False
+
+
+def employment_candidate_needs_review(cand: Any) -> bool:
+    """Keep suspicious employer departments visible for explicit review."""
+    return (
+        employment_candidate_dates_need_review(cand)
+        or employment_department_issue(_field(cand, "department")) is not None
+    )
 
 
 def _optional_str_compatible(a: Any, b: Any) -> bool:

@@ -45,6 +45,7 @@ from app.modules.analysis.confirm_dates import (
     is_ongoing_project_end_marker,
     normalize_confirmed_date,
 )
+from app.modules.analysis.employment_field_quality import employment_department_issue
 from app.modules.analysis.repository import AnalysisRepository
 from app.modules.analysis.schemas import ConfirmAnalysisResponseData
 from app.modules.career.repository import CareerRepository
@@ -431,6 +432,52 @@ def _prevalidate_confirm_dates(diffs: list[AnalysisDiffItem]) -> None:
         )
 
 
+def collect_confirm_employment_department_issues(
+    diffs: list[AnalysisDiffItem],
+) -> list[str]:
+    """Reject clear date/position leakage without changing candidate or profile."""
+    errors: list[str] = []
+    descriptions = {"DATE": "날짜", "POSITION": "직급/직책"}
+    for diff in diffs:
+        if diff.entity_type != "EMPLOYMENT":
+            continue
+        if diff.review_status in {"REJECTED", "SAME", "PENDING"}:
+            continue
+        try:
+            applied = _applied_value(diff)
+        except ConfirmValidationError as exc:
+            errors.append(f"EMPLOYMENT {diff.candidate_path}: {exc}")
+            continue
+        if applied is None:
+            continue
+        if diff.field_name == "department":
+            department = applied
+        elif diff.field_name is None and isinstance(applied, dict):
+            department = applied.get("department")
+        else:
+            continue
+        issue = employment_department_issue(department)
+        if issue is not None:
+            errors.append(
+                f"EMPLOYMENT {diff.candidate_path} field=department: "
+                f"부서에 {descriptions[issue]} 값({department})이 입력되었습니다. "
+                "실제 부서명으로 수정하거나 비워 주세요."
+            )
+    return errors
+
+
+def _prevalidate_confirm_employment_departments(
+    diffs: list[AnalysisDiffItem],
+) -> None:
+    errors = collect_confirm_employment_department_issues(diffs)
+    if errors:
+        raise ConfirmValidationError(
+            "확정 전 근무경력 부서 검증에 실패했습니다:\n"
+            + "\n".join(f"- {item}" for item in errors)
+        )
+
+
+
 def _require_active_code(
     people_repo: PeopleRepository, code: str, expected_type: str
 ) -> None:
@@ -568,6 +615,7 @@ def confirm_analysis_run(
     _assert_project_parent_consistency(diffs)
     # B2. Date validity on applied values (ACCEPTED/MODIFIED) before mutations.
     _prevalidate_confirm_dates(diffs)
+    _prevalidate_confirm_employment_departments(diffs)
 
     # C. Pre-lock existing mutation targets BEFORE Person/Profile
     #    (matches manual Project/Career: Entity → Person/Profile).

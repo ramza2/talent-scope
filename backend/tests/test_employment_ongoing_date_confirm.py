@@ -271,3 +271,126 @@ def test_education_cert_date_similarity_unchanged_by_ongoing_split():
         and s.new_value.get("certification_name") == "정보처리기사"
         for s in cert
     )
+
+
+@pytest.mark.parametrize(
+    ("department", "reason"),
+    [
+        ("상무", "POSITION"),
+        ("이사", "POSITION"),
+        ("상무 이사", "POSITION"),
+        ("PM", "POSITION"),
+        ("2020.11", "DATE"),
+        ("2017.07", "DATE"),
+        ("2020-04-01", "DATE"),
+        ("2020년 4월", "DATE"),
+        ("2020.11 ~ 2021.04", "DATE"),
+        ("경영지원팀", None),
+        ("상무실", None),
+        ("PMO팀", None),
+        ("이사회", None),
+        ("R&D", None),
+        (None, None),
+    ],
+)
+def test_employment_department_issue_is_conservative(department, reason):
+    from app.modules.analysis.employment_field_quality import (
+        employment_department_issue,
+    )
+
+    assert employment_department_issue(department) == reason
+
+
+@pytest.mark.parametrize("department", ["상무", "이사", "2020.11", "2020.04"])
+def test_suspicious_employment_department_requires_review(department):
+    from app.ai.schemas.profile_candidate import (
+        EmploymentCandidate,
+        ProfileCandidateDocument,
+    )
+    from app.modules.analysis.diff_engine import build_diffs
+
+    candidate = ProfileCandidateDocument(
+        employment_history=[
+            EmploymentCandidate(
+                company_name="넥스인테크",
+                department=department,
+                title="PL",
+                start_date="2020.05",
+                end_date="2020.11",
+            )
+        ]
+    )
+    specs = build_diffs(candidate, {"employment_history": []})
+    employment = [s for s in specs if s.entity_type == "EMPLOYMENT"]
+    assert len(employment) == 1
+    assert employment[0].change_type == "REVIEW"
+    assert employment[0].new_value["department"] == department
+
+    # REVIEW must preserve the original candidate for source-based correction.
+    assert candidate.employment_history[0].department == department
+
+
+def test_real_employment_department_still_auto_new():
+    from app.ai.schemas.profile_candidate import (
+        EmploymentCandidate,
+        ProfileCandidateDocument,
+    )
+    from app.modules.analysis.diff_engine import build_diffs
+
+    candidate = ProfileCandidateDocument(
+        employment_history=[
+            EmploymentCandidate(
+                company_name="A사",
+                department="기술전략팀",
+                title="상무",
+                start_date="2020.05",
+                end_date="2020.11",
+            )
+        ]
+    )
+    employment = [
+        s for s in build_diffs(candidate, {"employment_history": []})
+        if s.entity_type == "EMPLOYMENT"
+    ]
+    assert len(employment) == 1
+    assert employment[0].change_type == "NEW"
+
+
+def test_confirm_department_checks_applied_values_only():
+    from types import SimpleNamespace
+
+    from app.modules.analysis.confirm import (
+        collect_confirm_employment_department_issues,
+    )
+
+    def diff(status, *, field=None, new=None, decided=None):
+        return SimpleNamespace(
+            entity_type="EMPLOYMENT",
+            candidate_path="employment_history[0]",
+            field_name=field,
+            review_status=status,
+            new_value=new,
+            decided_value=decided,
+        )
+
+    bad = diff("ACCEPTED", new={"company_name": "A사", "department": "상무"})
+    issues = collect_confirm_employment_department_issues([bad])
+    assert len(issues) == 1
+    assert "field=department" in issues[0]
+    assert "상무" in issues[0]
+
+    bad_field = diff("ACCEPTED", field="department", new="2020.11")
+    assert len(collect_confirm_employment_department_issues([bad_field])) == 1
+
+    assert collect_confirm_employment_department_issues(
+        [diff("REJECTED", new=bad.new_value)]
+    ) == []
+    assert collect_confirm_employment_department_issues(
+        [diff("PENDING", new=bad.new_value)]
+    ) == []
+    assert collect_confirm_employment_department_issues(
+        [diff("MODIFIED", new=bad.new_value, decided={"department": None})]
+    ) == []
+    assert collect_confirm_employment_department_issues(
+        [diff("MODIFIED", field="department", new="상무", decided="개발팀")]
+    ) == []
