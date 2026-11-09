@@ -247,6 +247,7 @@ def confirm_analysis(
         analysis_id,
         expected_profile_version=payload.expected_profile_version,
         actor_user_id=ctx.user.id,
+        skip_invalid_values=payload.skip_invalid_values,
     )
     return ConfirmAnalysisResponse(data=data)
 

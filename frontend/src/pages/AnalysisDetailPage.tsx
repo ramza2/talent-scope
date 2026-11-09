@@ -3,8 +3,6 @@ import {
   Alert,
   Button,
   Drawer,
-  Form,
-  Input,
   Modal,
   Select,
   Space,
@@ -26,23 +24,10 @@ import {
   formatDiffValueSummary,
   formatValue,
 } from '@/api/diffValueDisplay'
-import { diffHasOriginalEvidence, isUngroundedNewDiff } from '@/api/diffEvidence'
-import {
-  EMPLOYMENT_END_DATE_CUSTOM_VALUE,
-  buildEmploymentEndDateModifiedDecision,
-  employmentEndDateSelectionError,
-  extractEmploymentEndDateConflictCandidates,
-  isEmploymentEndDateConflictReview,
-  resolveEmploymentEndDateSelection,
-  validateChosenEmploymentEndDate,
-} from '@/api/employmentEndDateConflict'
 import { DiffEvidenceGroups } from '@/pages/analysisDiffEvidence'
-import { EmploymentEndDateConflictForm } from '@/pages/EmploymentEndDateConflictForm'
 import { readAnalysesReturnTo } from '@/pages/analysesListState'
 import {
   bulkReviewDiffs,
-  buildDefaultModifiedDecision,
-  buildMergeDecisionRequestBody,
   canConfirmAnalysis,
   cancelAnalysis,
   confidenceColor,
@@ -50,14 +35,9 @@ import {
   confirmAnalysis,
   countPendingActionableDiffs,
   countReviewedDiffs,
-  diffRequiresCodeMapping,
   getAnalysis,
-  initialMergeDecidedValueText,
   isActiveAnalysisStatus,
-  isProfileScalarDiff,
-  isProjectRootReview,
   listAnalysisDiffs,
-  reviewDiff,
   type AnalysisStatus,
   type ChangeType,
   type DiffItem,
@@ -71,10 +51,8 @@ type DiffFilterTab =
   | 'NEW'
   | 'UPDATE'
   | 'CONFLICT'
-  | 'REVIEW'
   | 'pending'
   | 'reviewed'
-  | 'dateIssues'
 
 /** Empty string = 전체 항목 (no entity_type query param). */
 type EntityFilter = '' | EntityType
@@ -201,20 +179,10 @@ export function AnalysisDetailPage() {
   const [filterTab, setFilterTab] = useState<DiffFilterTab>('all')
   const [entityFilter, setEntityFilter] = useState<EntityFilter>('')
   const [selectedKeys, setSelectedKeys] = useState<Key[]>([])
-  const [editOpen, setEditOpen] = useState(false)
-  const [mergeOpen, setMergeOpen] = useState(false)
   const [confirmOpen, setConfirmOpen] = useState(false)
-  const [editingDiff, setEditingDiff] = useState<DiffItem | null>(null)
-  const [endDateChoice, setEndDateChoice] = useState<string | null>(null)
-  const [endDateCustom, setEndDateCustom] = useState('')
   const [evidenceOpen, setEvidenceOpen] = useState(false)
   const [evidenceDetail, setEvidenceDetail] = useState<EvidenceDetail | null>(null)
   const [evidenceLoading, setEvidenceLoading] = useState(false)
-  const [editForm] = Form.useForm<{ decided_value: string }>()
-  const [mergeForm] = Form.useForm<{
-    existing_target_id: string
-    decided_value?: string
-  }>()
 
   const detailKey = ['analyses', analysisId] as const
   const diffsKey = [
@@ -261,17 +229,6 @@ export function AnalysisDetailPage() {
           ),
         }
       }
-      if (filterTab === 'dateIssues') {
-        const scoped = await listAnalysisDiffs(analysisId, entityFilters)
-        return {
-          data: scoped.data.filter(
-            (d) =>
-              d.review_status !== 'REJECTED' &&
-              d.change_type !== 'SAME' &&
-              (d.date_issues?.length ?? 0) > 0,
-          ),
-        }
-      }
       if (filterTab === 'all') {
         return listAnalysisDiffs(analysisId, entityFilters)
       }
@@ -292,16 +249,7 @@ export function AnalysisDetailPage() {
   // Confirm / global pending alert ignore entity filter (full analysis scope).
   const pendingActionable = countPendingActionableDiffs(allDiffs)
   const reviewedCount = countReviewedDiffs(allDiffs)
-  const dateIssueDiffs = allDiffs.filter(
-    (d) =>
-      d.review_status !== 'REJECTED' &&
-      d.change_type !== 'SAME' &&
-      (d.date_issues?.length ?? 0) > 0,
-  )
-  const approvedDateIssueDiffs = dateIssueDiffs.filter(
-    (d) => d.review_status !== 'PENDING',
-  )
-  const canConfirm = approvedDateIssueDiffs.length === 0 && canConfirmAnalysis({
+  const canConfirm = canConfirmAnalysis({
     status: analysis?.status,
     diffsQuerySuccess: allDiffsQuery.isSuccess,
     totalDiffs: allDiffs.length,
@@ -327,39 +275,14 @@ export function AnalysisDetailPage() {
     setSelectedKeys([])
   }
 
-  const decisionMutation = useMutation({
-    mutationFn: ({
-      diffId,
-      body,
-    }: {
-      diffId: string
-      body: {
-        review_status: ReviewStatus
-        decided_value?: unknown
-        existing_target_id?: string | null
-      }
-    }) => reviewDiff(analysisId, diffId, body),
-    onSuccess: async () => {
-      message.success('검토 결과가 저장되었습니다.')
-      setEditOpen(false)
-      setMergeOpen(false)
-      setEditingDiff(null)
-      setEndDateChoice(null)
-      setEndDateCustom('')
-      await invalidateDetail()
-    },
-    onError: (error) => {
-      message.error(apiErrorMessage(error, '검토 저장에 실패했습니다.'))
-    },
-  })
-
   const bulkMutation = useMutation({
     mutationFn: (body: {
       diff_ids: string[]
       review_status: ReviewStatus
       allow_conflict_review?: boolean
+      simple_review?: boolean
     }) =>
-      bulkReviewDiffs(analysisId, body),
+      bulkReviewDiffs(analysisId, { ...body, simple_review: true }),
     onSuccess: async () => {
       message.success('일괄 검토가 저장되었습니다.')
       await invalidateDetail()
@@ -373,12 +296,35 @@ export function AnalysisDetailPage() {
     mutationFn: () =>
       confirmAnalysis(analysisId, {
         expected_profile_version: analysis!.base_profile_version!,
+        skip_invalid_values: true,
       }),
     onSuccess: async (res) => {
-      message.success('AI 분석 결과가 프로필에 반영되었습니다.')
       setConfirmOpen(false)
       await invalidateDetail()
       await queryClient.invalidateQueries({ queryKey: ['people', res.data.person_id] })
+      if (res.data.skipped_diff_count) {
+        Modal.warning({
+          title: `확정 완료 · ${res.data.skipped_diff_count}건 반영 제외`,
+          width: 620,
+          content: (
+            <div>
+              <Typography.Paragraph>
+                저장할 수 없는 AI 후보는 운영 프로필에 반영하지 않았습니다.
+                분석 원본과 감사 이력은 남아 있습니다. 인력 상세화면에서 보완해 주세요.
+              </Typography.Paragraph>
+              <div style={{ maxHeight: 180, overflowY: 'auto' }}>
+                {(res.data.skipped_diff_paths ?? []).map((path, index) => (
+                  <div key={`${path}-${index}`}>{path}</div>
+                ))}
+              </div>
+            </div>
+          ),
+          okText: '인력 상세 보기',
+          onOk: () => navigate(`/people/${res.data.person_id}`),
+        })
+      } else {
+        message.success('AI 분석 결과가 프로필에 반영되었습니다. 상세화면에서 수정할 수 있습니다.')
+      }
     },
     onError: (error) => {
       if (apiErrorCode(error) === 'PROFILE_VERSION_CONFLICT') {
@@ -394,7 +340,7 @@ export function AnalysisDetailPage() {
           content: (
             <div>
               <Typography.Paragraph>
-                확인이 필요한 값이 있어 프로필에 반영하지 않았습니다. 해당 Diff를 수정하거나 반려한 뒤 다시 확정해 주세요.
+                확정할 수 없는 데이터 관계나 시스템 제약이 있습니다. 아래 내용을 확인해 주세요.
               </Typography.Paragraph>
               <div style={{ maxHeight: '45vh', overflowY: 'auto' }}>
                 <Typography.Paragraph style={{ whiteSpace: 'pre-wrap', marginBottom: 0 }}>
@@ -409,7 +355,7 @@ export function AnalysisDetailPage() {
           okText: '오류 항목 보기',
           onOk: () => {
             setConfirmOpen(false)
-            setFilterTab('dateIssues')
+            setFilterTab('all')
             setSelectedKeys([])
           },
         })
@@ -438,158 +384,6 @@ export function AnalysisDetailPage() {
       okButtonProps: { danger: true },
       cancelText: '취소',
       onOk: () => cancelMutation.mutateAsync(),
-    })
-  }
-
-  const closeModify = () => {
-    setEditOpen(false)
-    setEditingDiff(null)
-    setEndDateChoice(null)
-    setEndDateCustom('')
-  }
-
-  const openModify = (diff: DiffItem) => {
-    setEditingDiff(diff)
-    if (isEmploymentEndDateConflictReview(diff)) {
-      const candidates = extractEmploymentEndDateConflictCandidates(
-        (diff.new_value as Record<string, unknown>).end_date,
-      )
-      let initialChoice: string | null = null
-      let initialCustom = ''
-      if (
-        diff.review_status === 'MODIFIED' &&
-        diff.decided_value &&
-        typeof diff.decided_value === 'object' &&
-        !Array.isArray(diff.decided_value)
-      ) {
-        const decidedEnd = (diff.decided_value as Record<string, unknown>)
-          .end_date
-        if (typeof decidedEnd === 'string' && decidedEnd.trim()) {
-          const trimmed = decidedEnd.trim()
-          if (candidates?.includes(trimmed)) {
-            initialChoice = trimmed
-          } else {
-            initialChoice = EMPLOYMENT_END_DATE_CUSTOM_VALUE
-            initialCustom = trimmed
-          }
-        }
-      }
-      setEndDateChoice(initialChoice)
-      setEndDateCustom(initialCustom)
-      editForm.resetFields()
-      setEditOpen(true)
-      return
-    }
-    setEndDateChoice(null)
-    setEndDateCustom('')
-    const seed =
-      diff.review_status === 'MODIFIED' && diff.decided_value != null
-        ? isProfileScalarDiff(diff) &&
-          (typeof diff.decided_value === 'string' ||
-            typeof diff.decided_value === 'number')
-          ? String(diff.decided_value)
-          : JSON.stringify(diff.decided_value, null, 2)
-        : buildDefaultModifiedDecision(diff)
-    editForm.setFieldsValue({ decided_value: seed })
-    setEditOpen(true)
-  }
-
-  const openMerge = (diff: DiffItem) => {
-    setEditingDiff(diff)
-    mergeForm.setFieldsValue({
-      existing_target_id: diff.existing_target_id ?? '',
-      decided_value: initialMergeDecidedValueText(),
-    })
-    setMergeOpen(true)
-  }
-
-  const submitEmploymentEndDateConflict = async () => {
-    if (!editingDiff || !isEmploymentEndDateConflictReview(editingDiff)) return
-    const startDate =
-      editingDiff.new_value &&
-      typeof editingDiff.new_value === 'object' &&
-      !Array.isArray(editingDiff.new_value)
-        ? (editingDiff.new_value as Record<string, unknown>).start_date
-        : undefined
-    const err = employmentEndDateSelectionError({
-      selected: endDateChoice,
-      customDate: endDateCustom,
-      startDate,
-    })
-    if (err) {
-      message.error(err)
-      return
-    }
-    const chosen = resolveEmploymentEndDateSelection({
-      selected: endDateChoice,
-      customDate: endDateCustom,
-    })
-    const validated = validateChosenEmploymentEndDate({
-      endDate: chosen,
-      startDate,
-    })
-    if (!validated.ok) {
-      message.error(validated.message)
-      return
-    }
-    const decided = buildEmploymentEndDateModifiedDecision(
-      editingDiff,
-      validated.value,
-    )
-    await decisionMutation.mutateAsync({
-      diffId: editingDiff.id,
-      body: { review_status: 'MODIFIED', decided_value: decided },
-    })
-  }
-
-  const submitModify = async (values: { decided_value: string }) => {
-    if (!editingDiff) return
-    if (isEmploymentEndDateConflictReview(editingDiff)) {
-      await submitEmploymentEndDateConflict()
-      return
-    }
-    let decided: unknown = values.decided_value
-    if (!isProfileScalarDiff(editingDiff)) {
-      try {
-        decided = JSON.parse(values.decided_value)
-      } catch {
-        message.error('JSON 형식이 올바르지 않습니다.')
-        return
-      }
-    } else if (editingDiff.field_name === 'birth_year') {
-      const n = Number(values.decided_value)
-      decided = Number.isNaN(n) ? values.decided_value : n
-    } else {
-      decided = values.decided_value
-    }
-    await decisionMutation.mutateAsync({
-      diffId: editingDiff.id,
-      body: { review_status: 'MODIFIED', decided_value: decided },
-    })
-  }
-
-  const submitMerge = async (values: {
-    existing_target_id: string
-    decided_value?: string
-  }) => {
-    if (!editingDiff) return
-    let body: {
-      review_status: 'MERGED'
-      existing_target_id: string
-      decided_value?: unknown
-    }
-    try {
-      body = buildMergeDecisionRequestBody({
-        existing_target_id: values.existing_target_id,
-        decided_value_text: values.decided_value,
-      })
-    } catch {
-      message.error('decided_value JSON 형식이 올바르지 않습니다.')
-      return
-    }
-    await decisionMutation.mutateAsync({
-      diffId: editingDiff.id,
-      body,
     })
   }
 
@@ -705,125 +499,35 @@ export function AnalysisDetailPage() {
       render: (v: ReviewStatus) => reviewStatusTag(v),
     },
     {
-      title: '날짜 검증',
-      key: 'date_issues',
-      width: 190,
-      render: (_, row) => row.date_issues?.length ? (
-        <Typography.Paragraph
-          type="danger"
-          ellipsis={{ rows: 2, expandable: true, symbol: '전체 보기' }}
-          style={{ whiteSpace: 'pre-wrap', marginBottom: 0, fontSize: 12 }}
-        >
-          {row.date_issues.join('\n')}
-        </Typography.Paragraph>
-      ) : <Typography.Text type="secondary">—</Typography.Text>,
-    },
-    {
       title: '작업',
       key: 'actions',
       width: 220,
       fixed: 'right',
       render: (_, row) => {
-        if (!canReview) {
+        if (!canReview || row.change_type === 'SAME') {
           return <Typography.Text type="secondary">—</Typography.Text>
         }
-        if (row.review_status !== 'PENDING') {
-          if (row.review_status === 'MERGED') {
-            return <Typography.Text type="secondary">—</Typography.Text>
-          }
-          return (
+        return (
+          <Space size="small" wrap>
             <Button
               type="link"
               size="small"
-              loading={decisionMutation.isPending}
-              onClick={() =>
-                decisionMutation.mutate({
-                  diffId: row.id,
-                  body: { review_status: 'PENDING' },
-                })
-              }
+              disabled={row.review_status === 'ACCEPTED'}
+              loading={bulkMutation.isPending}
+              onClick={() => bulkMutation.mutate({ diff_ids: [row.id], review_status: 'ACCEPTED' })}
             >
-              결정 취소
+              승인
             </Button>
-          )
-        }
-
-        const needsCodeMapping = diffRequiresCodeMapping(row)
-        const needsEndDateConfirm = isEmploymentEndDateConflictReview(row)
-        const ungroundedNew = isUngroundedNewDiff(row)
-        const dateIssues = row.date_issues ?? []
-        return (
-          <Space size="small" wrap>
-            {dateIssues.length > 0 ? (
-              <Typography.Text type="danger">날짜 확인 필요 ({dateIssues.length})</Typography.Text>
-            ) : null}
-            {ungroundedNew ? (
-              <Typography.Text type="danger">원문 근거 없음</Typography.Text>
-            ) : null}
-            {needsEndDateConfirm ? (
-              <Typography.Text type="warning">날짜 확인 필요</Typography.Text>
-            ) : !needsCodeMapping ? (
-              <Button
-                type="link"
-                size="small"
-                loading={decisionMutation.isPending}
-                onClick={() => {
-                  if (dateIssues.length > 0) {
-                    message.warning('날짜 오류를 수정하거나 항목을 반려한 뒤 진행해 주세요.')
-                    return
-                  }
-                  if (ungroundedNew) {
-                    Modal.confirm({
-                      title: '원문 근거 없는 항목을 승인할까요?',
-                      content:
-                        '이 신규 항목에는 원문 근거가 연결되어 있지 않습니다. 원본문서를 직접 확인한 뒤 승인하세요.',
-                      okText: '승인',
-                      cancelText: '취소',
-                      onOk: () =>
-                        decisionMutation.mutateAsync({
-                          diffId: row.id,
-                          body: { review_status: 'ACCEPTED' },
-                        }),
-                    })
-                    return
-                  }
-                  decisionMutation.mutate({
-                    diffId: row.id,
-                    body: { review_status: 'ACCEPTED' },
-                  })
-                }}
-              >
-                승인
-              </Button>
-            ) : (
-              <Typography.Text type="warning">코드 지정 필요</Typography.Text>
-            )}
             <Button
               type="link"
               size="small"
               danger
-              loading={decisionMutation.isPending}
-              onClick={() =>
-                decisionMutation.mutate({
-                  diffId: row.id,
-                  body: { review_status: 'REJECTED' },
-                })
-              }
+              disabled={row.review_status === 'REJECTED'}
+              loading={bulkMutation.isPending}
+              onClick={() => bulkMutation.mutate({ diff_ids: [row.id], review_status: 'REJECTED' })}
             >
               반려
             </Button>
-            <Button type="link" size="small" onClick={() => openModify(row)}>
-              {needsEndDateConfirm
-                ? '날짜 확인/수정'
-                : needsCodeMapping
-                  ? '코드 지정/수정'
-                  : '수정'}
-            </Button>
-            {isProjectRootReview(row) ? (
-              <Button type="link" size="small" onClick={() => openMerge(row)}>
-                병합
-              </Button>
-            ) : null}
           </Space>
         )
       },
@@ -957,20 +661,6 @@ export function AnalysisDetailPage() {
               message={`미검토 항목 ${pendingActionable}건 — 모두 결정한 뒤 최종 확정할 수 있습니다.`}
             />
           ) : null}
-          {analysis.status === 'REVIEWING' && dateIssueDiffs.length > 0 ? (
-            <Alert
-              type={approvedDateIssueDiffs.length > 0 ? 'error' : 'warning'}
-              showIcon
-              style={{ marginBottom: 16 }}
-              message={`날짜 확인 필요 ${dateIssueDiffs.length}건 (승인된 오류 ${approvedDateIssueDiffs.length}건)`}
-              description="날짜 항목에 이름·역할·프로젝트명 등이 들어간 경우 AI 분석 오류일 수 있습니다. 원문을 확인하고 수정하거나 반려하세요. 승인된 오류는 먼저 결정을 취소해야 합니다."
-              action={
-                <Button size="small" onClick={() => { setFilterTab('dateIssues'); setSelectedKeys([]) }}>
-                  오류 항목 보기
-                </Button>
-              }
-            />
-          ) : null}
           {analysis.status === 'CONFIRMED' ? (
             <Alert
               type="success"
@@ -1014,10 +704,8 @@ export function AnalysisDetailPage() {
               { key: 'NEW', label: `신규 (${counts.new})` },
               { key: 'UPDATE', label: `변경 (${counts.update})` },
               { key: 'CONFLICT', label: `충돌 (${counts.conflict})` },
-              { key: 'REVIEW', label: `확인필요 (${counts.review})` },
               { key: 'pending', label: `미검토 (${tabPendingCount})` },
               { key: 'reviewed', label: `검토완료 (${tabReviewedCount})` },
-              { key: 'dateIssues', label: `날짜 확인 (${dateIssueDiffs.length})` },
             ]}
             style={{ marginBottom: 8 }}
           />
@@ -1028,49 +716,24 @@ export function AnalysisDetailPage() {
                 disabled={selectedKeys.length === 0}
                 loading={bulkMutation.isPending}
                 onClick={() => {
-                  const selected = (diffsQuery.data?.data ?? []).filter((d) =>
-                    selectedKeys.includes(d.id) && d.review_status === 'PENDING',
+                  const targets = (diffsQuery.data?.data ?? []).filter((d) =>
+                    selectedKeys.includes(d.id) && d.change_type !== 'SAME',
                   )
-                  const acceptTargets = selected.filter((d) => {
-                    if ((d.date_issues?.length ?? 0) > 0) return false
-                    if (isUngroundedNewDiff(d)) return false
-                    if (diffRequiresCodeMapping(d)) return false
-                    if (isProjectRootReview(d)) return false
-                    if (isEmploymentEndDateConflictReview(d)) return false
-                    if (
-                      ['CONFLICT', 'REVIEW'].includes(d.change_type) &&
-                      !diffHasOriginalEvidence(d)
-                    ) return false
-                    return true
-                  })
-                  const skipped = selected.length - acceptTargets.length
-                  if (acceptTargets.length === 0) {
-                    message.warning(
-                      '선택한 항목 중 일괄 승인 가능한 Diff가 없습니다. 날짜 오류·원문 근거·병합·코드 매핑을 개별 확인하세요.',
-                    )
-                    return
-                  }
-                  const riskyCount = acceptTargets.filter(
-                    (d) => d.change_type === 'CONFLICT' || d.change_type === 'REVIEW',
-                  ).length
+                  if (!targets.length) return
                   Modal.confirm({
-                    title: `선택 ${acceptTargets.length}건을 승인할까요?`,
+                    title: `선택 ${targets.length}건을 승인할까요?`,
                     content: (
-                      <div>
-                        <Typography.Paragraph>
-                          선택한 Diff를 승인합니다. 충돌·확인필요 항목은 원문을 직접 확인한 경우에만 승인하세요.
-                        </Typography.Paragraph>
-                        {riskyCount > 0 ? <Typography.Text type="warning">충돌/확인필요 {riskyCount}건을 포함합니다. 잘못 승인하면 기존 데이터가 변경되거나 중복될 수 있습니다.</Typography.Text> : null}
-                        {skipped > 0 ? <Typography.Paragraph type="secondary">날짜 오류·원문 근거 없음·개별 병합/코드 선택 등 {skipped}건은 제외됩니다.</Typography.Paragraph> : null}
-                      </div>
+                      <Typography.Paragraph>
+                        기존 결정이 있는 항목도 승인으로 변경합니다. 최종 확정 시 저장할 수 없는 값은
+                        반영에서 제외되며, 이후 인력 상세화면에서 수정할 수 있습니다.
+                      </Typography.Paragraph>
                     ),
                     okText: '승인',
                     cancelText: '취소',
                     onOk: () =>
                       bulkMutation.mutateAsync({
-                        diff_ids: acceptTargets.map((d) => d.id),
+                        diff_ids: targets.map((d) => d.id),
                         review_status: 'ACCEPTED',
-                        allow_conflict_review: riskyCount > 0,
                       }),
                   })
                 }}
@@ -1082,15 +745,15 @@ export function AnalysisDetailPage() {
                 loading={bulkMutation.isPending}
                 onClick={() => {
                   const targets = (diffsQuery.data?.data ?? []).filter(
-                    (d) => selectedKeys.includes(d.id) && d.review_status === 'PENDING',
+                    (d) => selectedKeys.includes(d.id) && d.change_type !== 'SAME',
                   )
                   if (!targets.length) {
-                    message.warning('반려할 미검토 Diff를 선택해 주세요.')
+                    message.warning('반려할 Diff를 선택해 주세요.')
                     return
                   }
                   Modal.confirm({
                     title: `선택 ${targets.length}건을 반려할까요?`,
-                    content: '미검토 Diff만 REJECTED로 저장합니다. 이미 결정된 항목은 먼저 결정을 취소하세요.',
+                    content: '기존 결정이 있는 항목도 반려로 변경하며, 해당 AI 후보는 확정 시 반영하지 않습니다.',
                     okText: '반려',
                     okButtonProps: { danger: true },
                     cancelText: '취소',
@@ -1133,7 +796,7 @@ export function AnalysisDetailPage() {
                 선택 결정 취소
               </Button>
               <Typography.Text type="secondary">
-                원문 근거가 있는 충돌/확인필요는 확인 후 일괄 승인 가능. 날짜 오류·프로젝트 병합은 개별 검토.
+                모든 변경 유형에서 다중 승인·반려 가능. 잘못된 값은 확정 후 인력 상세에서 보완하세요.
               </Typography.Text>
             </Space>
           ) : null}
@@ -1152,7 +815,7 @@ export function AnalysisDetailPage() {
                     selectedRowKeys: selectedKeys,
                     onChange: setSelectedKeys,
                     getCheckboxProps: (row) => ({
-                      disabled: row.review_status === 'MERGED' || row.change_type === 'SAME',
+                      disabled: row.change_type === 'SAME',
                     }),
                   }
                 : undefined
@@ -1161,148 +824,6 @@ export function AnalysisDetailPage() {
           />
         </>
       )}
-
-      <Modal
-        title={
-          editingDiff && isEmploymentEndDateConflictReview(editingDiff)
-            ? '종료일 확인/수정'
-            : 'Diff 수정'
-        }
-        open={editOpen}
-        onCancel={closeModify}
-        onOk={() => {
-          if (editingDiff && isEmploymentEndDateConflictReview(editingDiff)) {
-            void submitEmploymentEndDateConflict()
-            return
-          }
-          editForm.submit()
-        }}
-        confirmLoading={decisionMutation.isPending}
-        destroyOnHidden
-        okText="저장"
-        okButtonProps={{
-          disabled:
-            Boolean(editingDiff) &&
-            isEmploymentEndDateConflictReview(editingDiff!) &&
-            employmentEndDateSelectionError({
-              selected: endDateChoice,
-              customDate: endDateCustom,
-              startDate:
-                editingDiff?.new_value &&
-                typeof editingDiff.new_value === 'object' &&
-                !Array.isArray(editingDiff.new_value)
-                  ? (editingDiff.new_value as Record<string, unknown>).start_date
-                  : undefined,
-            }) != null,
-        }}
-      >
-        <Typography.Paragraph type="secondary">
-          {editingDiff
-            ? `${editingDiff.entity_type} · ${editingDiff.field_name || editingDiff.candidate_path || ''}`
-            : null}
-        </Typography.Paragraph>
-        {editingDiff && isEmploymentEndDateConflictReview(editingDiff) ? (
-          <EmploymentEndDateConflictForm
-            candidates={
-              extractEmploymentEndDateConflictCandidates(
-                (editingDiff.new_value as Record<string, unknown>).end_date,
-              ) ?? []
-            }
-            startDate={
-              typeof (editingDiff.new_value as Record<string, unknown>)
-                .start_date === 'string'
-                ? String(
-                    (editingDiff.new_value as Record<string, unknown>).start_date,
-                  )
-                : null
-            }
-            companyName={
-              typeof (editingDiff.new_value as Record<string, unknown>)
-                .company_name === 'string'
-                ? String(
-                    (editingDiff.new_value as Record<string, unknown>)
-                      .company_name,
-                  )
-                : null
-            }
-            selected={endDateChoice}
-            customDate={endDateCustom}
-            onSelect={setEndDateChoice}
-            onCustomDateChange={setEndDateCustom}
-          />
-        ) : (
-          <Form form={editForm} layout="vertical" onFinish={submitModify}>
-            <Form.Item
-              name="decided_value"
-              label="decided_value"
-              rules={[{ required: true, message: '값을 입력하세요.' }]}
-            >
-              {editingDiff && isProfileScalarDiff(editingDiff) ? (
-                <Input />
-              ) : (
-                <Input.TextArea rows={8} style={{ fontFamily: 'monospace' }} />
-              )}
-            </Form.Item>
-          </Form>
-        )}
-      </Modal>
-
-      <Modal
-        title="프로젝트 병합 (MERGED)"
-        open={mergeOpen}
-        onCancel={() => {
-          setMergeOpen(false)
-          setEditingDiff(null)
-        }}
-        onOk={() => mergeForm.submit()}
-        confirmLoading={decisionMutation.isPending}
-        destroyOnHidden
-        okText="병합"
-      >
-        {editingDiff?.new_value != null ? (
-          <Typography.Paragraph type="secondary" style={{ marginBottom: 8 }}>
-            Candidate (읽기 전용)
-          </Typography.Paragraph>
-        ) : null}
-        {editingDiff?.new_value != null ? (
-          <Typography.Paragraph>
-            <pre
-              style={{
-                margin: 0,
-                marginBottom: 16,
-                maxHeight: 180,
-                overflow: 'auto',
-                padding: 8,
-                background: 'rgba(0,0,0,0.04)',
-                fontFamily: 'monospace',
-                fontSize: 12,
-              }}
-            >
-              {formatValue(editingDiff.new_value)}
-            </pre>
-          </Typography.Paragraph>
-        ) : null}
-        <Form form={mergeForm} layout="vertical" onFinish={submitMerge}>
-          <Form.Item
-            name="existing_target_id"
-            label="existing_target_id"
-            rules={[{ required: true, message: '기존 프로젝트 ID를 입력하세요.' }]}
-          >
-            <Input placeholder="기존 Project UUID" />
-          </Form.Item>
-          <Form.Item
-            name="decided_value"
-            label="override JSON (선택 — 명시한 필드만 overwrite)"
-            extra="비우면 null-fill + additive만 적용됩니다. 값이 있을 때만 decided_value를 전송합니다."
-          >
-            <Input.TextArea
-              rows={6}
-              style={{ fontFamily: 'monospace' }}
-              placeholder="비워 두면 decided_value를 보내지 않습니다"
-            />
-          </Form.Item>
-        </Form>
-      </Modal>
 
       <Modal
         title="최종 확정"
@@ -1314,7 +835,11 @@ export function AnalysisDetailPage() {
         destroyOnHidden
       >
         <Typography.Paragraph>
-          검토 결과를 운영 프로필에 반영합니다.
+          승인된 AI 분석 결과 중 저장 가능한 항목을 운영 프로필에 반영합니다.
+        </Typography.Paragraph>
+        <Typography.Paragraph type="secondary">
+          날짜·코드 등 형식 오류가 있는 항목은 자동 제외하고 확정합니다.
+          제외된 항목은 확정 결과에 표시되며, 인력 상세화면에서 추가·수정할 수 있습니다.
         </Typography.Paragraph>
         <Typography.Paragraph>
           Base Profile Version:{' '}

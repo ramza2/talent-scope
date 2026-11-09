@@ -3384,14 +3384,18 @@ class AnalysisService:
                 "일괄 검토는 ACCEPTED, REJECTED 또는 PENDING만 지원합니다."
             )
 
-        # Validate all selected diffs first — no partial apply.
-        # Pass 1: existence + compatible current status, all-or-nothing.
+        # Validate all selected diffs first — no partial apply. In explicit
+        # simple-review mode, earlier decisions may be replaced and SAME is
+        # informational only. Legacy requests retain the stricter guards.
         locked: list[AnalysisDiffItem] = []
         for diff_id in payload.diff_ids:
             diff = self.repo.get_diff(diff_id, for_update=True)
             if diff is None or diff.analysis_run_id != analysis_id:
                 raise NotFoundError(f"Diff를 찾을 수 없습니다: {diff_id}")
-            if payload.review_status == "PENDING":
+            if payload.simple_review:
+                if diff.change_type == "SAME":
+                    raise ValidationAppError("SAME 항목은 검토 대상이 아닙니다.")
+            elif payload.review_status == "PENDING":
                 if diff.review_status in {"PENDING", "MERGED", "SAME"}:
                     raise AnalysisStateConflictError(
                         "일괄 결정 취소는 승인/수정/반려된 Diff만 지원합니다."
@@ -3402,8 +3406,7 @@ class AnalysisService:
                 )
             locked.append(diff)
 
-        # Pass 2: ACCEPTED-only guards (still atomic — nothing applied yet).
-        if payload.review_status == "ACCEPTED":
+        if payload.review_status == "ACCEPTED" and not payload.simple_review:
             from app.modules.evidence.repository import EvidenceRepository
 
             evidence_by_diff = EvidenceRepository(self.db).list_evidence_by_diff_ids(
@@ -3455,8 +3458,17 @@ class AnalysisService:
 
         results: list[DiffItemResponse] = []
         for diff in locked:
+            if payload.simple_review and diff.review_status != "PENDING":
+                # Clear old MODIFIED/MERGED values before replacing the choice.
+                diff.review_status = "PENDING"
+                diff.decided_value = None
+                diff.decided_by = None
+                diff.decided_at = None
             decision = DiffDecisionRequest(review_status=payload.review_status)
-            self._apply_decision(run, diff, decision, actor_user_id)
+            self._apply_decision(
+                run, diff, decision, actor_user_id,
+                allow_unverified_accept=payload.simple_review,
+            )
             results.append(self._to_diff_response(diff))
 
         self.repo.add_audit(
@@ -3468,6 +3480,7 @@ class AnalysisService:
                 "review_status": payload.review_status,
                 "diff_ids": [str(i) for i in payload.diff_ids],
                 "allow_conflict_review": payload.allow_conflict_review,
+                "simple_review": payload.simple_review,
             },
             metadata={
                 "analysis_run_id": str(analysis_id),
@@ -3483,6 +3496,8 @@ class AnalysisService:
         diff: AnalysisDiffItem,
         payload: DiffDecisionRequest,
         actor_user_id: UUID,
+        *,
+        allow_unverified_accept: bool = False,
     ) -> None:
         from datetime import UTC, datetime
 
@@ -3507,7 +3522,9 @@ class AnalysisService:
 
         expected_code_type = _code_mapping_expected_type(diff)
         decision_value = payload.decided_value if status == "MODIFIED" else diff.new_value
-        if status in {"ACCEPTED", "MODIFIED"} and expected_code_type is not None:
+        if status in {"ACCEPTED", "MODIFIED"} and expected_code_type is not None and not (
+            status == "ACCEPTED" and allow_unverified_accept
+        ):
             code = _extract_candidate_code(decision_value)
             if not code:
                 raise ValidationAppError(
@@ -3523,10 +3540,11 @@ class AnalysisService:
                     f"유효한 {expected_code_type} 코드를 지정해 주세요: {code}"
                 )
 
-        if status == "MODIFIED":
-            if payload.decided_value is None:
-                raise ValidationAppError("MODIFIED에는 decided_value가 필요합니다.")
-        if status in {"ACCEPTED", "MODIFIED"}:
+        if status == "MODIFIED" and payload.decided_value is None:
+            raise ValidationAppError("MODIFIED에는 decided_value가 필요합니다.")
+        if status in {"ACCEPTED", "MODIFIED"} and not (
+            status == "ACCEPTED" and allow_unverified_accept
+        ):
             from app.core.exceptions import ConfirmValidationError
 
             date_issues = _review_date_issues(
@@ -3813,6 +3831,7 @@ class AnalysisService:
         *,
         expected_profile_version: int,
         actor_user_id: UUID,
+        skip_invalid_values: bool = False,
     ) -> ConfirmAnalysisResponseData:
         from sqlalchemy.exc import IntegrityError
 
@@ -3825,6 +3844,7 @@ class AnalysisService:
                 analysis_id=analysis_id,
                 expected_profile_version=expected_profile_version,
                 actor_user_id=actor_user_id,
+                skip_invalid_values=skip_invalid_values,
             )
             self.db.commit()
         except IntegrityError as exc:

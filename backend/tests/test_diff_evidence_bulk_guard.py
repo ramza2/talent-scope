@@ -1,10 +1,9 @@
-"""Regression: any ungrounded NEW Diff cannot bulk ACCEPTED."""
+"""Regression: evidence helpers and strict legacy bulk review guards."""
 
 from __future__ import annotations
 
 import uuid
 
-import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 

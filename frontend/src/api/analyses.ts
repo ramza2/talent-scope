@@ -141,6 +141,7 @@ export type BulkDiffBody = {
   diff_ids: string[]
   review_status: ReviewStatus
   allow_conflict_review?: boolean
+  simple_review?: boolean
 }
 
 /** Confidence display labels — UI only, never auto-approve. */
@@ -255,11 +256,13 @@ export type ConfirmAnalysisResult = {
   profile_version: number
   status: AnalysisStatus
   search_index_status: string
+  skipped_diff_count?: number
+  skipped_diff_paths?: string[]
 }
 
 export function confirmAnalysis(
   analysisId: string,
-  body: { expected_profile_version: number },
+  body: { expected_profile_version: number; skip_invalid_values?: boolean },
 ) {
   return apiFetch<{ data: ConfirmAnalysisResult }>(`/analyses/${analysisId}/confirm`, {
     method: 'POST',

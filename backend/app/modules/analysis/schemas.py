@@ -174,6 +174,7 @@ class BulkDiffRequest(BaseModel):
     diff_ids: list[UUID] = Field(min_length=1)
     review_status: ReviewStatus
     allow_conflict_review: bool = False
+    simple_review: bool = False
 
 
 class BulkDiffResponse(BaseModel):
@@ -190,6 +191,7 @@ class CancelAnalysisResponse(BaseModel):
 
 class ConfirmAnalysisRequest(BaseModel):
     expected_profile_version: int = Field(ge=1)
+    skip_invalid_values: bool = False
 
 
 class ConfirmAnalysisResponseData(BaseModel):
@@ -198,6 +200,8 @@ class ConfirmAnalysisResponseData(BaseModel):
     profile_version: int
     status: AnalysisStatus
     search_index_status: str = "PENDING"
+    skipped_diff_count: int = 0
+    skipped_diff_paths: list[str] = Field(default_factory=list)
 
 
 class ConfirmAnalysisResponse(BaseModel):

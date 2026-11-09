@@ -11,6 +11,7 @@ from typing import Any
 from uuid import UUID
 
 from sqlalchemy import select
+from sqlalchemy.exc import DataError, IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import (
@@ -589,6 +590,7 @@ def confirm_analysis_run(
     analysis_id: UUID,
     expected_profile_version: int,
     actor_user_id: UUID,
+    skip_invalid_values: bool = False,
 ) -> ConfirmAnalysisResponseData:
     """Apply reviewed Analysis Diffs into Confirmed Profile. Does not commit."""
     analysis_repo = AnalysisRepository(db)
@@ -612,10 +614,12 @@ def confirm_analysis_run(
     # B. Validate review completeness while AnalysisRun is locked.
     diffs = analysis_repo.list_diffs(run.id)
     _assert_review_complete(diffs)
-    _assert_project_parent_consistency(diffs)
-    # B2. Date validity on applied values (ACCEPTED/MODIFIED) before mutations.
-    _prevalidate_confirm_dates(diffs)
-    _prevalidate_confirm_employment_departments(diffs)
+    if not skip_invalid_values:
+        _assert_project_parent_consistency(diffs)
+        _prevalidate_confirm_dates(diffs)
+        _prevalidate_confirm_employment_departments(diffs)
+    # Explicit simple-review mode skips invalid individual diffs in savepoints;
+    # the legacy API remains strict unless the caller opts into that mode.
 
     # C. Pre-lock existing mutation targets BEFORE Person/Profile
     #    (matches manual Project/Career: Entity → Person/Profile).
@@ -656,13 +660,13 @@ def confirm_analysis_run(
         locked_certifications=locked["CERTIFICATION"],
         locked_projects=locked["PROJECT"],
     )
-    ctx.apply_all(diffs)
+    ctx.apply_all(diffs, skip_invalid_values=skip_invalid_values)
 
     db.flush()
     evidence_stats = materialize_confirm_evidence(
         db,
         run=run,
-        diffs=diffs,
+        diffs=[d for d in diffs if d.id not in ctx.skipped_diff_ids],
         person_id=run.person_id,
         registry=ctx.applied,
     )
@@ -697,6 +701,8 @@ def confirm_analysis_run(
             "evidence_count": evidence_stats.evidence_count,
             "evidence_link_count": evidence_stats.evidence_link_count,
             "diff_evidence_count": evidence_stats.diff_evidence_count,
+            "skipped_diff_count": len(ctx.skipped_diff_ids),
+            "skipped_diff_paths": ctx.skipped_paths,
             **counts,
         },
     )
@@ -716,6 +722,8 @@ def confirm_analysis_run(
         profile_version=version,
         status="CONFIRMED",
         search_index_status="PENDING",
+        skipped_diff_count=len(ctx.skipped_diff_ids),
+        skipped_diff_paths=ctx.skipped_paths,
     )
 
 
@@ -899,6 +907,8 @@ class _ConfirmContext:
         self.now = now
         # projects[n] → Project.id after root create/merge
         self.project_ids_by_index: dict[int, UUID] = {}
+        self.skipped_diff_ids: set[UUID] = set()
+        self.skipped_paths: list[str] = []
         self.locked_employment = locked_employment or {}
         self.locked_education = locked_education or {}
         self.locked_certifications = locked_certifications or {}
@@ -914,7 +924,9 @@ class _ConfirmContext:
     ) -> None:
         self.applied.register(diff.id, target_type, target_id, field_name)
 
-    def apply_all(self, diffs: list[AnalysisDiffItem]) -> None:
+    def apply_all(
+        self, diffs: list[AnalysisDiffItem], *, skip_invalid_values: bool = False
+    ) -> None:
         project_roots: list[AnalysisDiffItem] = []
         project_children: list[AnalysisDiffItem] = []
         others: list[AnalysisDiffItem] = []
@@ -928,12 +940,59 @@ class _ConfirmContext:
             else:
                 others.append(diff)
 
+        if not skip_invalid_values:
+            for diff in others:
+                self._apply_one(diff)
+            for diff in project_roots:
+                self._apply_project_root(diff)
+            for diff in project_children:
+                self._apply_project_child(diff)
+            return
+
+        rejected_projects = {
+            parse_project_index(diff.candidate_path)
+            for diff in project_roots
+            if diff.review_status == "REJECTED"
+        }
         for diff in others:
-            self._apply_one(diff)
+            self._apply_with_skip(diff, self._apply_one)
         for diff in project_roots:
-            self._apply_project_root(diff)
+            self._apply_with_skip(diff, self._apply_project_root)
         for diff in project_children:
-            self._apply_project_child(diff)
+            parent_index = parse_project_index(diff.candidate_path)
+            if parent_index in rejected_projects or (
+                parent_index is not None
+                and parent_index not in self.project_ids_by_index
+                and diff.existing_target_id is None
+            ):
+                if diff.review_status not in {"REJECTED", "SAME", "PENDING"}:
+                    self._mark_skipped(diff)
+                continue
+            self._apply_with_skip(diff, self._apply_project_child)
+
+    def _mark_skipped(self, diff: AnalysisDiffItem) -> None:
+        self.skipped_diff_ids.add(diff.id)
+        self.skipped_paths.append(f"{diff.entity_type} {diff.candidate_path or diff.id}")
+
+    def _apply_with_skip(self, diff: AnalysisDiffItem, apply_fn) -> None:
+        if diff.review_status in {"REJECTED", "SAME", "PENDING"}:
+            return
+        project_ids_before = self.project_ids_by_index.copy()
+        try:
+            # Flush inside the savepoint so DB constraints fail on this one
+            # candidate, not after other valid candidates have been applied.
+            with self.db.begin_nested():
+                issues = collect_confirm_date_issues([diff])
+                issues.extend(collect_confirm_employment_department_issues([diff]))
+                if issues:
+                    raise ConfirmValidationError("; ".join(issues))
+                apply_fn(diff)
+                self.db.flush()
+        except (ConfirmValidationError, IntegrityError, DataError):
+            self.project_ids_by_index = project_ids_before
+            self.applied._items.pop(diff.id, None)
+            self.db.expire_all()
+            self._mark_skipped(diff)
 
     def _require_locked_employment(self, employment_id: UUID) -> EmploymentHistory:
         row = self.locked_employment.get(employment_id)
