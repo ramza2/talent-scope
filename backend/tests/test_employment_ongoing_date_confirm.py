@@ -394,3 +394,211 @@ def test_confirm_department_checks_applied_values_only():
     assert collect_confirm_employment_department_issues(
         [diff("MODIFIED", field="department", new="상무", decided="개발팀")]
     ) == []
+
+
+@pytest.mark.parametrize(
+    ("candidate_start", "candidate_end"),
+    [
+        ("2023.07", "현재"),
+        ("2023.07.03", "Present"),
+        ("2023/07/01", "현재"),
+    ],
+)
+def test_employment_existing_month_match_requires_review(candidate_start, candidate_end):
+    from app.ai.schemas.profile_candidate import EmploymentCandidate, ProfileCandidateDocument
+    from app.modules.analysis.diff_engine import build_diffs
+
+    confirmed_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    existing = {
+        "id": confirmed_id,
+        "company_name": "㈜씨에이에스",
+        "start_date": "2023-07-01",
+        "end_date": None,
+        "title": "PM",
+    }
+    candidate = ProfileCandidateDocument(
+        employment_history=[
+            EmploymentCandidate(
+                company_name="㈜씨에이에스",
+                start_date=candidate_start,
+                end_date=candidate_end,
+                title="PM",
+            )
+        ]
+    )
+
+    specs = [
+        s
+        for s in build_diffs(candidate, {"employment_history": [existing]})
+        if s.entity_type == "EMPLOYMENT"
+    ]
+    assert len(specs) == 1
+    assert specs[0].change_type == "REVIEW"
+    assert str(specs[0].existing_target_id) == confirmed_id
+    assert specs[0].new_value["start_date"] == candidate_start
+    assert specs[0].new_value["end_date"] == candidate_end
+    assert existing["start_date"] == "2023-07-01"  # no confirmed-data rewrite
+
+
+def test_employment_same_month_but_different_actual_days_not_auto_new():
+    from app.ai.schemas.profile_candidate import EmploymentCandidate, ProfileCandidateDocument
+    from app.modules.analysis.diff_engine import build_diffs
+
+    candidate = ProfileCandidateDocument(
+        employment_history=[
+            EmploymentCandidate(
+                company_name="㈜메타넷디지털",
+                start_date="2022.11.14",
+                end_date="2023.03.31",
+                title="전환2 팀장",
+            )
+        ]
+    )
+    specs = [
+        s
+        for s in build_diffs(
+            candidate,
+            {
+                "employment_history": [
+                    {
+                        "id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                        "company_name": "㈜메타넷디지털",
+                        "start_date": "2022-11-01",
+                        "end_date": "2023-03-31",
+                    }
+                ]
+            },
+        )
+        if s.entity_type == "EMPLOYMENT"
+    ]
+    assert len(specs) == 1
+    assert specs[0].change_type == "REVIEW"
+    assert specs[0].new_value["start_date"] == "2022.11.14"
+
+
+def test_employment_repeated_candidate_month_periods_all_require_review():
+    from app.ai.schemas.profile_candidate import EmploymentCandidate, ProfileCandidateDocument
+    from app.modules.analysis.diff_engine import build_diffs
+
+    candidate = ProfileCandidateDocument(
+        employment_history=[
+            EmploymentCandidate(
+                company_name="넥스인테크",
+                start_date="2021.06",
+                end_date="2021.09",
+                title="PL",
+            ),
+            EmploymentCandidate(
+                company_name="넥스인테크",
+                start_date="2021.06.03",
+                end_date="2021-09-30",
+                title="PM",
+            ),
+        ]
+    )
+    specs = [
+        s
+        for s in build_diffs(candidate, {"employment_history": []})
+        if s.entity_type == "EMPLOYMENT"
+    ]
+    assert len(specs) == 2
+    assert {s.candidate_path for s in specs} == {"employment_history[0]", "employment_history[1]"}
+    assert all(s.change_type == "REVIEW" for s in specs)
+    assert [s.new_value["title"] for s in specs] == ["PL", "PM"]
+
+
+def test_employment_repeated_candidate_matches_existing_only_for_review():
+    from app.ai.schemas.profile_candidate import EmploymentCandidate, ProfileCandidateDocument
+    from app.modules.analysis.diff_engine import build_diffs
+
+    confirmed_id = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+    existing = {
+        "id": confirmed_id,
+        "company_name": "㈜씨에이에스",
+        "start_date": "2023-07-01",
+        "end_date": None,
+        "title": "PM",
+    }
+    candidate = ProfileCandidateDocument(
+        employment_history=[
+            EmploymentCandidate(company_name="㈜씨에이에스", start_date="2023.07", end_date="현재"),
+            EmploymentCandidate(
+                company_name="㈜씨에이에스", start_date="2023.07.03", end_date="현재"
+            ),
+        ]
+    )
+    specs = [
+        s
+        for s in build_diffs(candidate, {"employment_history": [existing]})
+        if s.entity_type == "EMPLOYMENT"
+    ]
+    assert len(specs) == 2
+    assert all(s.change_type == "REVIEW" for s in specs)
+    assert all(str(s.existing_target_id) == confirmed_id for s in specs)
+
+
+def test_employment_multiple_confirmed_month_matches_never_auto_update():
+    from app.ai.schemas.profile_candidate import EmploymentCandidate, ProfileCandidateDocument
+    from app.modules.analysis.diff_engine import build_diffs
+
+    existing = [
+        {
+            "id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            "company_name": "넥스인테크",
+            "start_date": "2020-12-01",
+            "end_date": "2021-04-30",
+            "title": "PL",
+        },
+        {
+            "id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            "company_name": "넥스인테크",
+            "start_date": "2020-12-03",
+            "end_date": "2021-04-29",
+            "title": "PM",
+        },
+    ]
+    candidate = ProfileCandidateDocument(
+        employment_history=[
+            EmploymentCandidate(
+                company_name="넥스인테크",
+                start_date="2020-12-01",
+                end_date="2021-04-30",
+                title="PM",
+            )
+        ]
+    )
+    specs = [
+        s
+        for s in build_diffs(candidate, {"employment_history": existing})
+        if s.entity_type == "EMPLOYMENT"
+    ]
+    assert len(specs) == 1
+    assert specs[0].change_type == "REVIEW"
+    assert specs[0].existing_target_id is None  # ambiguous confirmed target
+    assert len(specs[0].old_value) == 2
+
+
+def test_employment_different_company_or_month_stays_new():
+    from app.ai.schemas.profile_candidate import EmploymentCandidate, ProfileCandidateDocument
+    from app.modules.analysis.diff_engine import build_diffs
+
+    existing = [
+        {
+            "company_name": "㈜씨에이에스",
+            "start_date": "2023-07-01",
+            "end_date": None,
+        }
+    ]
+    candidate = ProfileCandidateDocument(
+        employment_history=[
+            EmploymentCandidate(company_name="㈜씨에이에스", start_date="2022.07", end_date="현재"),
+            EmploymentCandidate(company_name="다른회사", start_date="2023.07", end_date="현재"),
+        ]
+    )
+    specs = [
+        s
+        for s in build_diffs(candidate, {"employment_history": existing})
+        if s.entity_type == "EMPLOYMENT"
+    ]
+    assert len(specs) == 2
+    assert all(s.change_type == "NEW" for s in specs)

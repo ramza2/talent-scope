@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
@@ -177,6 +178,7 @@ def build_diffs(
             dump_row=_dump_model,
             similar_match=_employment_similar,
             new_requires_review=employment_candidate_needs_review,
+            candidate_duplicate_key=_employment_month_period_key,
         )
     )
     specs.extend(
@@ -675,18 +677,53 @@ def _optional_str_compatible(a: Any, b: Any) -> bool:
     return na == nb
 
 
+def _employment_month_period_key(cand: Any) -> tuple | None:
+    """Company + start/end month for *review only*, never automatic merging.
+
+    Confirmed DATE columns contain normalized first/last days while candidate
+    documents may contain month-only dates or different explicit days. A month
+    match is an ambiguity signal, not proof that two employment rows are equal.
+    """
+    company = _norm_str(_field(cand, "company_name"))
+    if not company:
+        return None
+
+    try:
+        start_parts = parse_partial_date(_field(cand, "start_date"))
+    except ValueError:
+        return None
+    if not start_parts or start_parts[1] is None:
+        return None
+
+    end = _field(cand, "end_date")
+    if _norm_str(end) is None or is_ongoing_end_marker(end):
+        end_key = None
+    else:
+        try:
+            end_parts = parse_partial_date(end)
+        except ValueError:
+            return None
+        if not end_parts or end_parts[1] is None:
+            return None
+        end_key = end_parts[:2]
+
+    return (company, start_parts[:2], end_key)
+
+
 def _employment_similar(cand: Any, existing_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     company = _norm_str(_field(cand, "company_name"))
     if not company:
         return []
+    month_period = _employment_month_period_key(cand)
     out: list[dict[str, Any]] = []
     for row in existing_rows:
         if _norm_str(row.get("company_name")) != company:
             continue
-        if not dates_compatible(_field(cand, "start_date"), row.get("start_date")):
-            continue
-        if not _employment_end_dates_compatible(
-            _field(cand, "end_date"), row.get("end_date")
+        exact_or_partial = dates_compatible(
+            _field(cand, "start_date"), row.get("start_date")
+        ) and _employment_end_dates_compatible(_field(cand, "end_date"), row.get("end_date"))
+        if not exact_or_partial and (
+            month_period is None or month_period != _employment_month_period_key(row)
         ):
             continue
         out.append(row)
@@ -740,8 +777,15 @@ def _diff_keyed_records(
     dump_row,
     similar_match=None,
     new_requires_review=None,
+    candidate_duplicate_key=None,
 ) -> list[DiffSpec]:
     specs: list[DiffSpec] = []
+    duplicate_keys = (
+        [candidate_duplicate_key(cand) for cand in candidate_rows]
+        if candidate_duplicate_key
+        else []
+    )
+    duplicate_counts = Counter(key for key in duplicate_keys if key is not None)
     grouped: dict[tuple, list[dict[str, Any]]] = {}
     for row in existing_rows:
         key = natural_key(row)
@@ -754,6 +798,26 @@ def _diff_keyed_records(
         dump = dump_row(cand)
         refs = _refs_dump(getattr(cand, "source_refs", None) or dump.get("source_refs"))
         key = natural_key(cand)
+        related = (
+            similar_match(cand, existing_rows) if candidate_duplicate_key and similar_match else []
+        )
+        if duplicate_keys and (duplicate_counts[duplicate_keys[idx]] > 1 or len(related) > 1):
+            # Repeated AI rows or multiple plausible confirmed targets are
+            # ambiguous; never silently create or update an employment row.
+            old = related[0] if len(related) == 1 else related or None
+            specs.append(
+                DiffSpec(
+                    entity_type=entity_type,
+                    candidate_path=path,
+                    change_type="REVIEW",
+                    existing_target_id=_as_uuid(old.get("id")) if len(related) == 1 else None,
+                    old_value=old,
+                    new_value=dump,
+                    confidence=getattr(cand, "confidence", None),
+                    source_refs=refs,
+                )
+            )
+            continue
         if key[0] is None:
             specs.append(
                 DiffSpec(
