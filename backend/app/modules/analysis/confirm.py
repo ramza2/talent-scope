@@ -1630,7 +1630,7 @@ class _ConfirmContext:
 
     def _coerce_project_scalar(self, field: str, value: Any) -> Any:
         if field in {"start_date", "end_date"}:
-            return _normalize_field_date(field, value)
+            return _normalize_field_date(field, value, entity_type="PROJECT")
         if field == "duration_months":
             months = _as_optional_months(value, field="duration_months")
             return months
