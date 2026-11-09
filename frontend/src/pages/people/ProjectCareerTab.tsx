@@ -298,8 +298,14 @@ export function ProjectCareerTab({ personId, isAdmin, onChanged }: Props) {
     {
       title: '담당업무',
       dataIndex: 'responsibilities',
-      ellipsis: true,
-      render: (v) => v || '—',
+      render: (v: string | null) =>
+        v ? (
+          <span style={{ display: 'block', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>
+            {v}
+          </span>
+        ) : (
+          '—'
+        ),
     },
     {
       title: '근거',
