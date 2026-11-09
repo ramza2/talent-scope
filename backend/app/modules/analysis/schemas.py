@@ -234,6 +234,22 @@ class GuardRefreshApplyResponse(BaseModel):
     data: GuardRefreshResultData
 
 
+class EmploymentDiffRefreshResultData(BaseModel):
+    analysis_id: UUID
+    changed_paths: list[str] = Field(default_factory=list)
+    before_counts: dict[str, int] = Field(default_factory=dict)
+    after_counts: dict[str, int] = Field(default_factory=dict)
+    applied: bool = False
+
+
+class EmploymentDiffRefreshPreviewResponse(BaseModel):
+    data: EmploymentDiffRefreshResultData
+
+
+class EmploymentDiffRefreshApplyResponse(BaseModel):
+    data: EmploymentDiffRefreshResultData
+
+
 class RootEvidenceRecoverResultData(BaseModel):
     analysis_id: UUID
     status: AnalysisStatus

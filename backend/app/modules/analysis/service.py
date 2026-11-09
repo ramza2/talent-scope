@@ -122,6 +122,7 @@ from app.modules.analysis.schemas import (
     DiffDecisionRequest,
     DiffItemResponse,
     DocumentBrief,
+    EmploymentDiffRefreshResultData,
     EvidenceLite,
     GuardRefreshEntityCounts,
     GuardRefreshResultData,
@@ -3715,6 +3716,48 @@ class AnalysisService:
 
         return self._guard_refresh_result_data(
             apply_guard_refresh(
+                self.db, analysis_id, actor_user_id=actor_user_id
+            )
+        )
+
+    @staticmethod
+    def _employment_diff_refresh_result_data(
+        result: object,
+    ) -> EmploymentDiffRefreshResultData:
+        from app.modules.analysis.employment_diff_refresh import (
+            EmploymentDiffRefreshResult,
+        )
+
+        if not isinstance(result, EmploymentDiffRefreshResult):
+            raise TypeError("expected EmploymentDiffRefreshResult")
+        return EmploymentDiffRefreshResultData(
+            analysis_id=result.analysis_id,
+            changed_paths=list(result.changed_paths),
+            before_counts=result.before_counts,
+            after_counts=result.after_counts,
+            applied=result.applied,
+        )
+
+    def preview_employment_diff_refresh(
+        self, analysis_id: UUID
+    ) -> EmploymentDiffRefreshResultData:
+        from app.modules.analysis.employment_diff_refresh import (
+            preview_employment_diff_refresh,
+        )
+
+        return self._employment_diff_refresh_result_data(
+            preview_employment_diff_refresh(self.db, analysis_id)
+        )
+
+    def apply_employment_diff_refresh(
+        self, analysis_id: UUID, *, actor_user_id: UUID
+    ) -> EmploymentDiffRefreshResultData:
+        from app.modules.analysis.employment_diff_refresh import (
+            apply_employment_diff_refresh,
+        )
+
+        return self._employment_diff_refresh_result_data(
+            apply_employment_diff_refresh(
                 self.db, analysis_id, actor_user_id=actor_user_id
             )
         )

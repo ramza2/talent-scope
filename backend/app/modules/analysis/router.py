@@ -21,6 +21,8 @@ from app.modules.analysis.schemas import (
     DiffDecisionRequest,
     DiffDecisionResponse,
     DiffListResponse,
+    EmploymentDiffRefreshApplyResponse,
+    EmploymentDiffRefreshPreviewResponse,
     GuardRefreshApplyResponse,
     GuardRefreshPreviewResponse,
     RetryAnalysisResponse,
@@ -163,6 +165,37 @@ def apply_guard_refresh(
 ) -> GuardRefreshApplyResponse:
     return GuardRefreshApplyResponse(
         data=service.apply_guard_refresh(
+            analysis_id, actor_user_id=ctx.user.id
+        )
+    )
+
+
+@router.get(
+    "/{analysis_id}/employment-diff-refresh/preview",
+    response_model=EmploymentDiffRefreshPreviewResponse,
+)
+def preview_employment_diff_refresh(
+    analysis_id: UUID,
+    _admin: AuthenticatedContext = Depends(require_admin),
+    service: AnalysisService = Depends(get_analysis_service),
+) -> EmploymentDiffRefreshPreviewResponse:
+    return EmploymentDiffRefreshPreviewResponse(
+        data=service.preview_employment_diff_refresh(analysis_id)
+    )
+
+
+@router.post(
+    "/{analysis_id}/employment-diff-refresh/apply",
+    response_model=EmploymentDiffRefreshApplyResponse,
+)
+def apply_employment_diff_refresh(
+    analysis_id: UUID,
+    _admin: AuthenticatedContext = Depends(require_admin),
+    ctx: AuthenticatedContext = Depends(require_csrf),
+    service: AnalysisService = Depends(get_analysis_service),
+) -> EmploymentDiffRefreshApplyResponse:
+    return EmploymentDiffRefreshApplyResponse(
+        data=service.apply_employment_diff_refresh(
             analysis_id, actor_user_id=ctx.user.id
         )
     )
