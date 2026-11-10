@@ -33,6 +33,7 @@ from app.ai.prompts import (
     profile_extract_v24,
     profile_extract_v25,
     profile_extract_v26,
+    profile_extract_v27,
 )
 from app.ai.providers.errors import AIProviderError
 
@@ -249,6 +250,14 @@ _REGISTRY: dict[str, ProfilePromptSpec] = {
         prompt_version=profile_extract_v26.PROMPT_VERSION,
         projects_system_prompt=profile_extract_v26.PROJECTS_SYSTEM_PROMPT,
         build_projects_user_prompt=profile_extract_v26.build_projects_user_prompt,
+    ),
+    # Opt-in: same v25/v26 pipeline; PROJECTS prompt adds period-before-name
+    # same-row binding. Production default stays at v25.
+    profile_extract_v27.PROMPT_VERSION: replace(
+        _spec_from_staged_module(profile_extract_v25),
+        prompt_version=profile_extract_v27.PROMPT_VERSION,
+        projects_system_prompt=profile_extract_v27.PROJECTS_SYSTEM_PROMPT,
+        build_projects_user_prompt=profile_extract_v27.build_projects_user_prompt,
     ),
 }
 

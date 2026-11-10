@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import argparse
 import inspect
 import io
 import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 
 from app.modules.analysis.service import AnalysisService
+from scripts import profile_prompt_ab_readonly as ab
 from scripts.profile_prompt_ab_readonly import compare_projects, project_metrics
 from scripts.profile_project_reference import (
     REFERENCE_SCHEMA,
@@ -70,6 +73,32 @@ def test_project_only_extraction_is_opt_in() -> None:
     method = AnalysisService._extract_staged_compact_candidate
     option = inspect.signature(method).parameters["projects_only"]
     assert option.default is False
+
+
+def test_ab_script_keeps_v25_v26_compare_and_adds_v27_solo_option() -> None:
+    assert ab.COMPARE_VERSIONS == ("profile-extract-v25", "profile-extract-v26")
+    assert ab.VERSIONS == ab.COMPARE_VERSIONS
+    assert ab.SOLO_VERSIONS == ("profile-extract-v27",)
+
+    parser = argparse.ArgumentParser()
+    # Reuse the live CLI's solo flag contract without invoking LLM/DB.
+    source = inspect.getsource(ab.main)
+    assert "--solo-version" in source
+    assert "compare_v25_v26" in source
+    assert "solo_profile-extract-v27" in source or 'f"solo_{versions[0]}"' in source
+
+    # Argparse choices match the exported solo tuple.
+    action = argparse.ArgumentParser()
+    action.add_argument("--solo-version", choices=ab.SOLO_VERSIONS)
+    action.add_argument("--run-id", required=True)
+    parsed = action.parse_args(
+        ["--run-id", str(uuid4()), "--solo-version", "profile-extract-v27"]
+    )
+    assert parsed.solo_version == "profile-extract-v27"
+    with pytest.raises(SystemExit):
+        action.parse_args(
+            ["--run-id", str(uuid4()), "--solo-version", "profile-extract-v26"]
+        )
 
 
 def test_reference_accepts_aliases_with_equivalent_punctuation(tmp_path: Path) -> None:

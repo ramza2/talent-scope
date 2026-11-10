@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""Read-only v25/v26 A/B experiment using an existing AnalysisRun's pages.
+"""Read-only PROJECTS prompt evaluation using an existing AnalysisRun's pages.
 
 Default mode is preflight (no AI calls). --live runs PROJECTS-only extraction
-for both variants against identical stored text and code catalog in memory.
-CORE is unchanged between v25/v26 and is deliberately not re-analyzed.
-No AnalysisRun creation, candidate/diff persistence, VLM or profile mutation.
-Results are diagnostics, not an accuracy verdict without a reviewed ground truth.
+for profile-extract-v25 vs profile-extract-v26 against identical stored text
+and code catalog in memory. CORE is unchanged between those variants and is
+deliberately not re-analyzed.
+
+`--solo-version profile-extract-v27` evaluates that opt-in version alone
+(no v25/v26 comparison). No AnalysisRun creation, candidate/diff persistence,
+VLM or profile mutation. Results are diagnostics, not an accuracy verdict
+without a reviewed ground truth.
 """
 
 from __future__ import annotations
@@ -44,7 +48,9 @@ from app.modules.analysis.source_builder import (
 from app.storage.s3 import get_object_storage
 from scripts.profile_project_reference import evaluate_projects, load_reference
 
-VERSIONS = ("profile-extract-v25", "profile-extract-v26")
+COMPARE_VERSIONS = ("profile-extract-v25", "profile-extract-v26")
+SOLO_VERSIONS = ("profile-extract-v27",)
+VERSIONS = COMPARE_VERSIONS
 ROLE_ONLY = frozenset({"PM", "PL", "PMO", "TA", "SA", "AA", "개발", "운영", "사업관리"})
 
 
@@ -221,7 +227,7 @@ def _run_version(*, version, snapshot, prompt_source, settings, storage, run_id)
         source_char_count=len(blocks.strip()),
         base_log={
             "analysis_run_id": str(run_id),
-            "pilot": "v25_v26_ab_read_only",
+            "pilot": "profile_prompt_ab_read_only",
             "document_count": len(snapshot.documents),
             "vlm_pages": 0,
             "prompt_version": version,
@@ -251,8 +257,16 @@ def _run_version(*, version, snapshot, prompt_source, settings, storage, run_id)
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-id", required=True, type=UUID)
-    parser.add_argument("--live", action="store_true", help="Two LLM analyses; no DB writes")
+    parser.add_argument("--live", action="store_true", help="LLM analyses; no DB writes")
     parser.add_argument("--include-project-names", action="store_true")
+    parser.add_argument(
+        "--solo-version",
+        choices=SOLO_VERSIONS,
+        help=(
+            "Evaluate one opt-in version alone. "
+            "Default without this flag remains v25 vs v26 comparison."
+        ),
+    )
     parser.add_argument(
         "--ground-truth-file",
         type=Path,
@@ -260,6 +274,8 @@ def main() -> None:
     )
     args = parser.parse_args()
     reference = load_reference(args.ground_truth_file) if args.ground_truth_file else None
+    versions = (args.solo_version,) if args.solo_version else COMPARE_VERSIONS
+    compare_mode = args.solo_version is None
 
     settings = get_settings()
     snapshot = _read_snapshot(args.run_id)
@@ -270,7 +286,10 @@ def main() -> None:
     })
     storage = get_object_storage()
     builder = AnalysisSourceBuilder(storage, settings=no_vlm_settings, vlm=None)
-    bundle = builder.build(list(snapshot.documents), log_context={"pilot": "v25_v26_ab"})
+    bundle = builder.build(
+        list(snapshot.documents),
+        log_context={"pilot": "profile_prompt_ab"},
+    )
     assert not bundle.vlm_transcriptions and bundle.total_vlm_pages == 0
     source = bundle.build_prompt_source(int(settings.analysis_max_total_text_chars))
     assert source.text.strip(), "EMPTY_STORED_DOCUMENT_SOURCE"
@@ -280,7 +299,8 @@ def main() -> None:
         "mode": "live" if args.live else "preflight",
         "source_mode": "stored_document_pages_only_no_vlm",
         "evaluation_scope": "projects_only_shared_core_skipped",
-        "versions": list(VERSIONS),
+        "evaluation_mode": "compare_v25_v26" if compare_mode else f"solo_{versions[0]}",
+        "versions": list(versions),
         "run_status": snapshot.run_status,
         "document_count": len(snapshot.documents),
         "stored_pages": page_count,
@@ -298,7 +318,7 @@ def main() -> None:
         if args.live:
             results = {}
             candidates = {}
-            for version in VERSIONS:
+            for version in versions:
                 candidate, stats = _run_version(
                     version=version,
                     snapshot=snapshot,
@@ -310,17 +330,18 @@ def main() -> None:
                 candidates[version] = candidate
                 results[version] = stats
             report["results"] = results
-            report["comparison"] = compare_projects(
-                candidates[VERSIONS[0]], candidates[VERSIONS[1]],
-                include_names=args.include_project_names,
-            )
+            if compare_mode:
+                report["comparison"] = compare_projects(
+                    candidates[versions[0]], candidates[versions[1]],
+                    include_names=args.include_project_names,
+                )
             if reference is not None:
                 report["reference_evaluation"] = {
                     version: evaluate_projects(
                         candidates[version], reference,
                         include_names=args.include_project_names,
                     )
-                    for version in VERSIONS
+                    for version in versions
                 }
             report["interpretation"] = (
                 "Provisional reference: verify against original document layout"
