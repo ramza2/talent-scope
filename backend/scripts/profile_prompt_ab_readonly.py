@@ -42,6 +42,7 @@ from app.modules.analysis.source_builder import (
     PageSnapshot,
 )
 from app.storage.s3 import get_object_storage
+from scripts.profile_project_reference import evaluate_projects, load_reference
 
 VERSIONS = ("profile-extract-v25", "profile-extract-v26")
 ROLE_ONLY = frozenset({"PM", "PL", "PMO", "TA", "SA", "AA", "개발", "운영", "사업관리"})
@@ -252,7 +253,13 @@ def main() -> None:
     parser.add_argument("--run-id", required=True, type=UUID)
     parser.add_argument("--live", action="store_true", help="Two LLM analyses; no DB writes")
     parser.add_argument("--include-project-names", action="store_true")
+    parser.add_argument(
+        "--ground-truth-file",
+        type=Path,
+        help="Optional reviewed project reference JSON for per-version accuracy metrics",
+    )
     args = parser.parse_args()
+    reference = load_reference(args.ground_truth_file) if args.ground_truth_file else None
 
     settings = get_settings()
     snapshot = _read_snapshot(args.run_id)
@@ -281,6 +288,12 @@ def main() -> None:
         "prompt_source_chars": len(source.text),
         "existing_candidate_sha256": snapshot.candidate_sha,
     }
+    if reference is not None:
+        report["reference"] = {
+            "review_status": reference["review_status"],
+            "project_count": len(reference["projects"]),
+            "matching": "reviewed title aliases + customer + year/month dates",
+        }
     try:
         if args.live:
             results = {}
@@ -301,7 +314,19 @@ def main() -> None:
                 candidates[VERSIONS[0]], candidates[VERSIONS[1]],
                 include_names=args.include_project_names,
             )
-            report["interpretation"] = "Manual ground-truth review required"
+            if reference is not None:
+                report["reference_evaluation"] = {
+                    version: evaluate_projects(
+                        candidates[version], reference,
+                        include_names=args.include_project_names,
+                    )
+                    for version in VERSIONS
+                }
+            report["interpretation"] = (
+                "Provisional reference: verify against original document layout"
+                if reference is not None and reference["review_status"] == "provisional"
+                else "Manual ground-truth review required"
+            )
     finally:
         _verify_unchanged(args.run_id, snapshot)
 

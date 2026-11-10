@@ -3,10 +3,19 @@
 from __future__ import annotations
 
 import inspect
+import json
+from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from app.modules.analysis.service import AnalysisService
 from scripts.profile_prompt_ab_readonly import compare_projects, project_metrics
+from scripts.profile_project_reference import (
+    REFERENCE_SCHEMA,
+    evaluate_projects,
+    load_reference,
+)
 
 
 def _candidate(*rows):
@@ -59,3 +68,98 @@ def test_project_only_extraction_is_opt_in() -> None:
     method = AnalysisService._extract_staged_compact_candidate
     option = inspect.signature(method).parameters["projects_only"]
     assert option.default is False
+
+
+def test_reference_accepts_aliases_with_equivalent_punctuation(tmp_path: Path) -> None:
+    payload = {
+        "schema_version": REFERENCE_SCHEMA,
+        "review_status": "provisional",
+        "projects": [{
+            "id": 1, "project_name": "프로젝트 A (1단계)",
+            "aliases": ["프로젝트 A 1단계"],
+            "customer_name": "기관", "start_date": "2020.01", "end_date": "2020.02",
+        }],
+    }
+    path = tmp_path / "reference.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    assert load_reference(path)["projects"][0]["id"] == 1
+
+
+def test_reference_scorer_counts_duplicate_title_and_cross_row_date() -> None:
+    reference = {
+        "review_status": "provisional",
+        "projects": [
+            {
+                "project_name": "ECM 구축", "aliases": ["문서중앙화 시스템 ECM 구축"],
+                "customer_name": "SKT", "start_date": "2008.10", "end_date": "2010.12",
+            },
+            {
+                "project_name": "광주은행 마이데이터",
+                "customer_name": "광주은행", "start_date": "2021.06", "end_date": "2021.09",
+            },
+            {
+                "project_name": "KBIZ 공제", "customer_name": "중소기업중앙회",
+                "start_date": "2021.02", "end_date": "2021.10",
+            },
+        ],
+    }
+    candidate = _candidate(
+        ("문서중앙화 시스템(ECM) 구축", "SKT", "2008.10", "2010.1", []),
+        ("ECM 구축", "SKT", "2008.10", "2010.12", []),
+        ("광주은행 마이데이터", "중소기업중앙회", "2021.02.01", "2021.10.30", []),
+        ("없는 사업", "KT", "2020.01", "2020.02", []),
+    )
+    result = evaluate_projects(candidate, reference, include_names=True)
+    assert result["reference_count"] == 3
+    assert result["actual_count"] == 4
+    assert result["matched_title_count"] == 2
+    assert result["fully_correct_project_count"] == 1
+    assert result["matched_customer_count"] == 1
+    assert result["matched_start_month_count"] == 1
+    assert result["matched_end_month_count"] == 1
+    assert result["missing_title_count"] == 1
+    assert result["unexpected_title_count"] == 1
+    assert result["duplicate_title_count"] == 1
+    assert result["project_precision_pct"] == 25.0
+    assert result["project_recall_pct"] == 33.33
+    assert result["duplicate_titles"][0]["extracted_count"] == 2
+    assert result["field_issues"][0]["wrong_fields"] == [
+        "customer", "start_month", "end_month",
+    ]
+
+
+def test_reference_scorer_normalizes_date_precision_and_customer_alias() -> None:
+    reference = {
+        "review_status": "verified",
+        "projects": [{
+            "project_name": "프로젝트 A", "customer_name": "한국양성평등교육원",
+            "customer_aliases": ["한국양성평등교육진흥원"],
+            "start_date": "2020.11", "end_date": "2020.12",
+        }],
+    }
+    candidate = _candidate((
+        "프로젝트 A", "한국양성평등교육진흥원", "2020.11.01", "2020.12.28", [],
+    ))
+    result = evaluate_projects(candidate, reference)
+    assert result["fully_correct_project_count"] == 1
+    assert result["project_precision_pct"] == 100.0
+    assert result["project_recall_pct"] == 100.0
+    assert "field_issues" not in result
+
+
+def test_reference_rejects_cross_project_alias_collision(tmp_path: Path) -> None:
+    reference = {
+        "schema_version": REFERENCE_SCHEMA,
+        "review_status": "provisional",
+        "projects": [
+            {
+                "id": i, "project_name": name, "aliases": [alias],
+                "customer_name": "기관", "start_date": "2020.01", "end_date": "2020.02",
+            }
+            for i, name, alias in [(1, "사업 A", "공통명"), (2, "사업 B", "공통명")]
+        ],
+    }
+    path = tmp_path / "reference.json"
+    path.write_text(json.dumps(reference), encoding="utf-8")
+    with pytest.raises(ValueError, match="DUPLICATE_OR_EMPTY_TITLE_ALIAS"):
+        load_reference(path)
