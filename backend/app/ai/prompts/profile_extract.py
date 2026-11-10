@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 
 from app.ai.prompts import (
@@ -32,6 +32,7 @@ from app.ai.prompts import (
     profile_extract_v23,
     profile_extract_v24,
     profile_extract_v25,
+    profile_extract_v26,
 )
 from app.ai.providers.errors import AIProviderError
 
@@ -241,6 +242,14 @@ _REGISTRY: dict[str, ProfilePromptSpec] = {
     profile_extract_v23.PROMPT_VERSION: _spec_from_staged_module(profile_extract_v23),
     profile_extract_v24.PROMPT_VERSION: _spec_from_staged_module(profile_extract_v24),
     profile_extract_v25.PROMPT_VERSION: _spec_from_staged_module(profile_extract_v25),
+    # A/B experiment: inherit the entire v25 pipeline and CORE instructions.
+    # Only project-facing prompts vary; the production default stays at v25.
+    profile_extract_v26.PROMPT_VERSION: replace(
+        _spec_from_staged_module(profile_extract_v25),
+        prompt_version=profile_extract_v26.PROMPT_VERSION,
+        projects_system_prompt=profile_extract_v26.PROJECTS_SYSTEM_PROMPT,
+        build_projects_user_prompt=profile_extract_v26.build_projects_user_prompt,
+    ),
 }
 
 
