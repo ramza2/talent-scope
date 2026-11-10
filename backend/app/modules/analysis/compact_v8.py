@@ -195,6 +195,21 @@ _PROJECT_DATE_RANGE_RE = re.compile(
     r"(?P<sy>\d{2}|\d{4})[.\-](?P<sm>\d{2})\s*[~～]\s*"
     r"(?P<ey>\d{2}|\d{4})[.\-](?P<em>\d{2})"
 )
+# v29-only: day-precision + omitted end-year + newline-tolerant ranges.
+# Requires a 4-digit start year so ``07.01 ~ 2020.01`` inside
+# ``2019.07.01 ~ 2020.01.31`` cannot false-match as YY.MM.
+_PROJECT_FLEXIBLE_DATE_RANGE_RE = re.compile(
+    r"(?<!\d)(?P<sy>(?:19|20)\d{2})[./\-](?P<sm>\d{1,2})"
+    r"(?:[./\-](?P<sd>\d{1,2}))?"
+    r"\s*[~～]\s*"
+    r"(?:"
+    r"(?P<ey>(?:19|20)\d{2})[./\-](?P<em>\d{1,2})"
+    r"(?:[./\-](?P<ed>\d{1,2}))?"
+    r"|"
+    r"(?P<em2>\d{1,2})[./\-](?P<ed2>\d{1,2})"
+    r")"
+    r"(?!\d)"
+)
 _FOUR_DIGIT_YEAR_RE = re.compile(r"(?<!\d)((?:19|20)\d{2})(?!\d)")
 
 
@@ -233,16 +248,80 @@ def _format_year_month(year: int, month: int) -> str:
     return f"{year:04d}.{month:02d}"
 
 
+def _parse_flexible_project_date_range_match(
+    match: re.Match[str],
+) -> tuple[str, str] | None:
+    """Normalize one flexible day/omitted-year match to YYYY.MM~YYYY.MM."""
+    sm = int(match.group("sm"))
+    if sm < 1 or sm > 12:
+        return None
+    sd = match.group("sd")
+    if sd is not None:
+        day = int(sd)
+        if day < 1 or day > 31:
+            return None
+    start_year = int(match.group("sy"))
+    if match.group("ey") is not None:
+        em = int(match.group("em"))
+        if em < 1 or em > 12:
+            return None
+        ed = match.group("ed")
+        if ed is not None:
+            day = int(ed)
+            if day < 1 or day > 31:
+                return None
+        end_year = int(match.group("ey"))
+    else:
+        em = int(match.group("em2"))
+        if em < 1 or em > 12:
+            return None
+        ed2 = match.group("ed2")
+        if ed2 is not None:
+            day = int(ed2)
+            if day < 1 or day > 31:
+                return None
+        # Omitted end year inherits start year; do not invent year wrap.
+        end_year = start_year
+        if (end_year, em) < (start_year, sm):
+            return None
+    if (end_year, em) < (start_year, sm):
+        return None
+    return (
+        _format_year_month(start_year, sm),
+        _format_year_month(end_year, em),
+    )
+
+
 def parse_project_date_range_from_texts(
     texts: list[str],
     *,
     project_name: str | None = None,
+    flexible_period_parse: bool = False,
 ) -> tuple[str, str] | None:
-    """Parse a unique YYYY.MM~YYYY.MM range from texts; else None (fail-closed)."""
+    """Parse a unique YYYY.MM~YYYY.MM range from texts; else None (fail-closed).
+
+    When ``flexible_period_parse`` is True (v29), accept day-precision and
+    omitted-end-year forms (``YYYY.M.D~M.D``, ``YYYY.M.D~YYYY.M.D``, newlines)
+    and normalize to month precision. Ambiguous or conflicting ranges fail closed.
+    """
     if not texts:
         return None
+    if flexible_period_parse:
+        parsed: set[tuple[str, str]] = set()
+        for text in texts:
+            for match in _PROJECT_FLEXIBLE_DATE_RANGE_RE.finditer(text or ""):
+                item = _parse_flexible_project_date_range_match(match)
+                if item is None:
+                    return None
+                parsed.add(item)
+                if len(parsed) > 1:
+                    return None
+        if len(parsed) != 1:
+            return None
+        return next(iter(parsed))
+
     anchors = _collect_year_anchors(project_name, *texts)
-    parsed: set[tuple[str, str]] = set()
+    parsed = set()
     for text in texts:
         for match in _PROJECT_DATE_RANGE_RE.finditer(text):
             sm = int(match.group("sm"))
@@ -285,6 +364,7 @@ def _unique_owned_root_project_period(
     *,
     page_texts: dict[tuple[str, int], str],
     allowed_documents: dict[str, set[int]] | None,
+    flexible_period_parse: bool = False,
 ) -> tuple[str, str] | None:
     """Only an unambiguous, root-ref-owned name+customer+period may fix dates.
 
@@ -323,6 +403,9 @@ def _unique_owned_root_project_period(
             return None
 
     siblings = _candidate_sibling_project_names(candidate)
+    range_re = _project_full_range_re(
+        flexible_period_parse=flexible_period_parse
+    )
     periods: set[tuple[str, str]] = set()
     for ref in refs:
         doc_id = (ref.document_id or "").strip()
@@ -339,10 +422,12 @@ def _unique_owned_root_project_period(
             return None
 
         hits: set[tuple[str, str]] = set()
-        ranges = list(_PROJECT_FULL_RANGE_RE.finditer(page))
+        ranges = list(range_re.finditer(page))
         for index, matched in enumerate(ranges):
             parsed = parse_project_date_range_from_texts(
-                [matched.group(0)], project_name=name
+                [matched.group(0)],
+                project_name=name,
+                flexible_period_parse=flexible_period_parse,
             )
             if parsed is None:
                 continue
@@ -359,7 +444,10 @@ def _unique_owned_root_project_period(
             # candidate.start_date may itself be the corrupted value.
             probe = project.model_copy(update={"start_date": parsed[0]})
             owned = _project_owned_source_span(
-                probe, block, sibling_names=siblings
+                probe,
+                block,
+                sibling_names=siblings,
+                flexible_period_parse=flexible_period_parse,
             )
             if owned is None or quote not in owned:
                 continue
@@ -369,7 +457,9 @@ def _unique_owned_root_project_period(
             ):
                 continue
             if parse_project_date_range_from_texts(
-                [owned], project_name=name
+                [owned],
+                project_name=name,
+                flexible_period_parse=flexible_period_parse,
             ) != parsed:
                 continue
             # Period-before-name tables leave the previous row's trailing
@@ -490,6 +580,7 @@ def correct_project_dates_from_unique_owned_period(
     *,
     page_texts: dict[tuple[str, int], str] | None = None,
     allowed_documents: dict[str, set[int]] | None = None,
+    flexible_period_parse: bool = False,
 ) -> ProfileCandidateDocument:
     """Overwrite filled wrong dates when name+customer+period ownership is unique.
 
@@ -509,6 +600,7 @@ def correct_project_dates_from_unique_owned_period(
             project,
             page_texts=page_texts,
             allowed_documents=allowed_documents,
+            flexible_period_parse=flexible_period_parse,
         )
         if period is None:
             projects.append(project)
@@ -3111,6 +3203,23 @@ _PROJECT_FULL_RANGE_RE = re.compile(
     r"(?<!\d)(?:19|20)\d{2}[./\-]\d{1,2}(?:[./\-]\d{1,2})?\s*[~～]\s*"
     r"(?:(?:19|20)?\d{2}[./\-]\d{1,2}(?:[./\-]\d{1,2})?)"
 )
+# v29-only: also accept omitted end year ``YYYY.M.D ~ M.D`` (and newlines via \s).
+_PROJECT_FLEXIBLE_FULL_RANGE_RE = re.compile(
+    r"(?<!\d)(?:19|20)\d{2}[./\-]\d{1,2}(?:[./\-]\d{1,2})?"
+    r"\s*[~～]\s*"
+    r"(?:"
+    r"(?:19|20)\d{2}[./\-]\d{1,2}(?:[./\-]\d{1,2})?"
+    r"|"
+    r"\d{1,2}[./\-]\d{1,2}"
+    r")"
+    r"(?!\d)"
+)
+
+
+def _project_full_range_re(*, flexible_period_parse: bool = False) -> re.Pattern[str]:
+    if flexible_period_parse:
+        return _PROJECT_FLEXIBLE_FULL_RANGE_RE
+    return _PROJECT_FULL_RANGE_RE
 # Project-row shape markers (name/customer/period table rows). Absence plus
 # employment section/title cues means the line is not usable as project evidence.
 _PROJECT_ROW_STRUCTURE_RE = re.compile(
@@ -3168,7 +3277,11 @@ def _line_has_year_month(line: str, year: int, month: int) -> bool:
     return False
 
 
-def _full_range_start_year_month(range_text: str) -> tuple[int, int] | None:
+def _full_range_start_year_month(
+    range_text: str,
+    *,
+    flexible_period_parse: bool = False,
+) -> tuple[int, int] | None:
     """Return the start YM of a full ``YYYY.MM~YYYY.MM`` range token.
 
     Only the left side of ``~`` / ``～`` counts. End YM alone never matches a
@@ -3177,7 +3290,9 @@ def _full_range_start_year_month(range_text: str) -> tuple[int, int] | None:
     text = (range_text or "").strip()
     if not text:
         return None
-    match = _PROJECT_FULL_RANGE_RE.search(text)
+    match = _project_full_range_re(
+        flexible_period_parse=flexible_period_parse
+    ).search(text)
     if match is None:
         return None
     left = re.split(r"[~～]", match.group(0), maxsplit=1)[0]
@@ -3192,10 +3307,16 @@ def _full_range_start_year_month(range_text: str) -> tuple[int, int] | None:
 
 
 def _full_range_has_start_year_month(
-    range_text: str, year: int, month: int
+    range_text: str,
+    year: int,
+    month: int,
+    *,
+    flexible_period_parse: bool = False,
 ) -> bool:
     """True when a full period range's start YM equals ``(year, month)``."""
-    return _full_range_start_year_month(range_text) == (year, month)
+    return _full_range_start_year_month(
+        range_text, flexible_period_parse=flexible_period_parse
+    ) == (year, month)
 
 
 def _quote_matches_project_start_month(
@@ -3328,6 +3449,7 @@ def _nameless_customer_period_unique(
     year: int,
     month: int,
     siblings: set[str],
+    flexible_period_parse: bool = False,
 ) -> bool:
     """True when customer+start-YM uniquely identifies one period block.
 
@@ -3338,7 +3460,12 @@ def _nameless_customer_period_unique(
     """
     hits = 0
     for i, match in enumerate(ranges):
-        if not _full_range_has_start_year_month(match.group(0), year, month):
+        if not _full_range_has_start_year_month(
+            match.group(0),
+            year,
+            month,
+            flexible_period_parse=flexible_period_parse,
+        ):
             continue
         block_end = ranges[i + 1].start() if i + 1 < len(ranges) else len(text)
         search_from = match.end()
@@ -3367,6 +3494,7 @@ def _project_owned_source_span(
     line: str,
     *,
     sibling_names: frozenset[str] | None = None,
+    flexible_period_parse: bool = False,
 ) -> str | None:
     """Return the unique name+period+duty span owned by ``project``.
 
@@ -3394,7 +3522,11 @@ def _project_owned_source_span(
     text = (line or "").strip()
     if not text or not _PROJECT_ROW_RANGE_MARK_RE.search(text):
         return None
-    ranges = list(_PROJECT_FULL_RANGE_RE.finditer(text))
+    ranges = list(
+        _project_full_range_re(
+            flexible_period_parse=flexible_period_parse
+        ).finditer(text)
+    )
     if not ranges:
         if not _line_has_year_month(text, year, month):
             return None
@@ -3425,11 +3557,17 @@ def _project_owned_source_span(
             year=year,
             month=month,
             siblings=siblings,
+            flexible_period_parse=flexible_period_parse,
         )
     owned: list[str] = []
     for i, match in enumerate(ranges):
         # Match candidate.start_date to the range *start* YM only (not end).
-        if not _full_range_has_start_year_month(match.group(0), year, month):
+        if not _full_range_has_start_year_month(
+            match.group(0),
+            year,
+            month,
+            flexible_period_parse=flexible_period_parse,
+        ):
             continue
         window_start = 0 if i == 0 else ranges[i - 1].end()
         block_end = len(text)
@@ -3489,7 +3627,10 @@ def _project_owned_source_span(
 
         span = text[block_start:block_end].strip()
         if not span or not _full_range_has_start_year_month(
-            match.group(0), year, month
+            match.group(0),
+            year,
+            month,
+            flexible_period_parse=flexible_period_parse,
         ):
             continue
         # Nameless blocks already passed unique customer+start-YM; do not treat

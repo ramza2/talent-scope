@@ -1875,13 +1875,15 @@ class AnalysisService:
                     page_texts=page_texts,
                     allowed_documents=allowed_documents,
                 )
-            # v28: overwrite already-filled wrong dates when name+customer+period
-            # ownership is uniquely proven (before chunk merge). Fail-closed.
+            # v28/v29: overwrite already-filled wrong dates when name+customer+
+            # period ownership is uniquely proven (before chunk merge).
+            # v29 also enables flexible day/omitted-year/newline period parse.
             if prompt.correct_project_dates_from_unique_owned_period:
                 doc = correct_project_dates_from_unique_owned_period(
                     doc,
                     page_texts=page_texts,
                     allowed_documents=allowed_documents,
+                    flexible_period_parse=prompt.flexible_project_period_parse,
                 )
             projects_with_quote = sum(
                 1

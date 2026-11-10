@@ -6,10 +6,10 @@ for profile-extract-v25 vs profile-extract-v26 against identical stored text
 and code catalog in memory. CORE is unchanged between those variants and is
 deliberately not re-analyzed.
 
-`--solo-version profile-extract-v27|profile-extract-v28` evaluates that
-opt-in version alone (no v25/v26 comparison). No AnalysisRun creation,
-candidate/diff persistence, VLM or profile mutation. Results are diagnostics,
-not an accuracy verdict without a reviewed ground truth.
+`--solo-version profile-extract-v27|v28|v29` evaluates that opt-in version
+alone (no v25/v26 comparison). No AnalysisRun creation, candidate/diff
+persistence, VLM or profile mutation. Results are diagnostics, not an
+accuracy verdict without a reviewed ground truth.
 """
 
 from __future__ import annotations
@@ -49,7 +49,11 @@ from app.storage.s3 import get_object_storage
 from scripts.profile_project_reference import evaluate_projects, load_reference
 
 COMPARE_VERSIONS = ("profile-extract-v25", "profile-extract-v26")
-SOLO_VERSIONS = ("profile-extract-v27", "profile-extract-v28")
+SOLO_VERSIONS = (
+    "profile-extract-v27",
+    "profile-extract-v28",
+    "profile-extract-v29",
+)
 VERSIONS = COMPARE_VERSIONS
 ROLE_ONLY = frozenset({"PM", "PL", "PMO", "TA", "SA", "AA", "개발", "운영", "사업관리"})
 

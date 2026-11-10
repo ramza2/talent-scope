@@ -35,6 +35,7 @@ from app.ai.prompts import (
     profile_extract_v26,
     profile_extract_v27,
     profile_extract_v28,
+    profile_extract_v29,
 )
 from app.ai.providers.errors import AIProviderError
 
@@ -72,6 +73,7 @@ class ProfilePromptSpec:
     require_core_tech_quote_evidence: bool = False
     backfill_project_dates_from_root_evidence: bool = False
     correct_project_dates_from_unique_owned_period: bool = False
+    flexible_project_period_parse: bool = False
     require_literal_pm_pl_project_job_evidence: bool = False
     normalize_career_document_value: bool = False
     require_literal_education_status_evidence: bool = False
@@ -156,6 +158,9 @@ def _spec_from_staged_module(module) -> ProfilePromptSpec:
             getattr(
                 module, "CORRECT_PROJECT_DATES_FROM_UNIQUE_OWNED_PERIOD", False
             )
+        ),
+        flexible_project_period_parse=bool(
+            getattr(module, "FLEXIBLE_PROJECT_PERIOD_PARSE", False)
         ),
         require_literal_pm_pl_project_job_evidence=bool(
             getattr(module, "REQUIRE_LITERAL_PM_PL_PROJECT_JOB_EVIDENCE", False)
@@ -275,6 +280,20 @@ _REGISTRY: dict[str, ProfilePromptSpec] = {
         build_projects_user_prompt=profile_extract_v28.build_projects_user_prompt,
         correct_project_dates_from_unique_owned_period=(
             profile_extract_v28.CORRECT_PROJECT_DATES_FROM_UNIQUE_OWNED_PERIOD
+        ),
+    ),
+    # Opt-in: v28 correction + flexible day/omitted-year/newline period parse.
+    # Production default stays at v25.
+    profile_extract_v29.PROMPT_VERSION: replace(
+        _spec_from_staged_module(profile_extract_v25),
+        prompt_version=profile_extract_v29.PROMPT_VERSION,
+        projects_system_prompt=profile_extract_v29.PROJECTS_SYSTEM_PROMPT,
+        build_projects_user_prompt=profile_extract_v29.build_projects_user_prompt,
+        correct_project_dates_from_unique_owned_period=(
+            profile_extract_v29.CORRECT_PROJECT_DATES_FROM_UNIQUE_OWNED_PERIOD
+        ),
+        flexible_project_period_parse=(
+            profile_extract_v29.FLEXIBLE_PROJECT_PERIOD_PARSE
         ),
     ),
 }

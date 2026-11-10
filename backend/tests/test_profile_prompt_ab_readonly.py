@@ -78,7 +78,11 @@ def test_project_only_extraction_is_opt_in() -> None:
 def test_ab_script_keeps_v25_v26_compare_and_adds_v27_v28_solo_options() -> None:
     assert ab.COMPARE_VERSIONS == ("profile-extract-v25", "profile-extract-v26")
     assert ab.VERSIONS == ab.COMPARE_VERSIONS
-    assert ab.SOLO_VERSIONS == ("profile-extract-v27", "profile-extract-v28")
+    assert ab.SOLO_VERSIONS == (
+        "profile-extract-v27",
+        "profile-extract-v28",
+        "profile-extract-v29",
+    )
 
     # Reuse the live CLI's solo flag contract without invoking LLM/DB.
     source = inspect.getsource(ab.main)
