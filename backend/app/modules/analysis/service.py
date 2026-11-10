@@ -58,6 +58,7 @@ from app.modules.analysis.compact_v8 import (
     backfill_literal_core_tech_from_source,
     backfill_exact_project_evidence,
     backfill_project_dates_from_root_evidence,
+    correct_project_dates_from_unique_owned_period,
     build_document_alias_view,
     backfill_semantic_core_expertise_evidence,
     backfill_semantic_core_job_evidence,
@@ -1870,6 +1871,14 @@ class AnalysisService:
             # v20: fill missing project s/e from unique root-quote date ranges.
             if prompt.backfill_project_dates_from_root_evidence:
                 doc = backfill_project_dates_from_root_evidence(
+                    doc,
+                    page_texts=page_texts,
+                    allowed_documents=allowed_documents,
+                )
+            # v28: overwrite already-filled wrong dates when name+customer+period
+            # ownership is uniquely proven (before chunk merge). Fail-closed.
+            if prompt.correct_project_dates_from_unique_owned_period:
+                doc = correct_project_dates_from_unique_owned_period(
                     doc,
                     page_texts=page_texts,
                     allowed_documents=allowed_documents,

@@ -75,26 +75,26 @@ def test_project_only_extraction_is_opt_in() -> None:
     assert option.default is False
 
 
-def test_ab_script_keeps_v25_v26_compare_and_adds_v27_solo_option() -> None:
+def test_ab_script_keeps_v25_v26_compare_and_adds_v27_v28_solo_options() -> None:
     assert ab.COMPARE_VERSIONS == ("profile-extract-v25", "profile-extract-v26")
     assert ab.VERSIONS == ab.COMPARE_VERSIONS
-    assert ab.SOLO_VERSIONS == ("profile-extract-v27",)
+    assert ab.SOLO_VERSIONS == ("profile-extract-v27", "profile-extract-v28")
 
-    parser = argparse.ArgumentParser()
     # Reuse the live CLI's solo flag contract without invoking LLM/DB.
     source = inspect.getsource(ab.main)
     assert "--solo-version" in source
     assert "compare_v25_v26" in source
-    assert "solo_profile-extract-v27" in source or 'f"solo_{versions[0]}"' in source
+    assert 'f"solo_{versions[0]}"' in source
 
     # Argparse choices match the exported solo tuple.
     action = argparse.ArgumentParser()
     action.add_argument("--solo-version", choices=ab.SOLO_VERSIONS)
     action.add_argument("--run-id", required=True)
-    parsed = action.parse_args(
-        ["--run-id", str(uuid4()), "--solo-version", "profile-extract-v27"]
-    )
-    assert parsed.solo_version == "profile-extract-v27"
+    for version in ab.SOLO_VERSIONS:
+        parsed = action.parse_args(
+            ["--run-id", str(uuid4()), "--solo-version", version]
+        )
+        assert parsed.solo_version == version
     with pytest.raises(SystemExit):
         action.parse_args(
             ["--run-id", str(uuid4()), "--solo-version", "profile-extract-v26"]

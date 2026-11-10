@@ -372,6 +372,21 @@ def _unique_owned_root_project_period(
                 [owned], project_name=name
             ) != parsed:
                 continue
+            # Period-before-name tables leave the previous row's trailing
+            # name/customer in [prev.end, this.start). Reject that bleed:
+            # identity only before this period (none after) is not ownership.
+            period_in_block = matched.start() - block_start
+            period_end_in_block = matched.end() - block_start
+            if period_in_block < 0 or period_end_in_block > len(block):
+                continue
+            pre = block[:period_in_block]
+            post = block[period_end_in_block:]
+            name_pre = _line_has_ws_folded_phrase(pre, name)
+            name_post = _line_has_ws_folded_phrase(post, name)
+            cust_pre = _line_has_ws_folded_phrase(pre, customer)
+            cust_post = _line_has_ws_folded_phrase(post, customer)
+            if (name_pre and not name_post) and (cust_pre and not cust_post):
+                continue
             hits.add(parsed)
         if len(hits) != 1:
             return None
@@ -461,6 +476,55 @@ def backfill_project_dates_from_root_evidence(
         new_start = updates.get("start_date", project.start_date)
         new_end = updates.get("end_date", project.end_date)
         duration = derive_duration_months(new_start, new_end)
+        if duration is not None:
+            updates["duration_months"] = duration
+        projects.append(project.model_copy(update=updates))
+        changed_any = True
+    if not changed_any:
+        return candidate
+    return candidate.model_copy(update={"projects": projects})
+
+
+def correct_project_dates_from_unique_owned_period(
+    candidate: ProfileCandidateDocument,
+    *,
+    page_texts: dict[tuple[str, int], str] | None = None,
+    allowed_documents: dict[str, set[int]] | None = None,
+) -> ProfileCandidateDocument:
+    """Overwrite filled wrong dates when name+customer+period ownership is unique.
+
+    Reuses ``_unique_owned_root_project_period``. When that helper returns one
+    unambiguous source period and the candidate's start/end year-months differ,
+    both dates (and derived duration) are replaced. Missing evidence, duplicate
+    identity on the same page, or conflicting periods leave values unchanged
+    (fail-closed). Relation refs and merge identity grouping are not altered.
+    """
+    if not candidate.projects or not page_texts:
+        return candidate
+    projects: list[ProjectCandidate] = []
+    changed_any = False
+    for project in candidate.projects:
+        period = _unique_owned_root_project_period(
+            candidate,
+            project,
+            page_texts=page_texts,
+            allowed_documents=allowed_documents,
+        )
+        if period is None:
+            projects.append(project)
+            continue
+        start_s, end_s = period
+        if (
+            parse_year_month(project.start_date) == parse_year_month(start_s)
+            and parse_year_month(project.end_date) == parse_year_month(end_s)
+        ):
+            projects.append(project)
+            continue
+        updates: dict[str, Any] = {
+            "start_date": start_s,
+            "end_date": end_s,
+        }
+        duration = derive_duration_months(start_s, end_s)
         if duration is not None:
             updates["duration_months"] = duration
         projects.append(project.model_copy(update=updates))
