@@ -1341,8 +1341,9 @@ class AnalysisService:
         source_char_count: int,
         base_log: dict[str, Any],
         vlm_pages: int,
+        projects_only: bool = False,
     ) -> ProfileCandidateDocument:
-        """Compact staged extraction (v8+): aliases + short keys; max 1 recovery."""
+        """Compact staged extraction; projects_only isolates the PROJECTS pilot."""
         if (
             prompt.build_core_user_prompt is None
             or prompt.build_projects_user_prompt is None
@@ -2450,35 +2451,37 @@ class AnalysisService:
                 root_budget=root_budget, reason="root_over_budget"
             )
 
-        core = _run_core_adaptive()
-        if _core_needs_retry(core):
-            raise InsufficientCandidateError()
-        logger.info(
-            "analysis candidate quality run_id=%s phase=core compact_protocol=%s "
-            "document_count=%s vlm_pages=%s empty=%s sparse=%s quality_score=%s "
-            "skills=%s expertise=%s jobs=%s employment=%s education=%s "
-            "certifications=%s projects=%s core_split_calls=%s "
-            "used_adaptive_split=%s token_count_calls=%s",
-            base_log.get("analysis_run_id"),
-            compact_tag,
-            base_log.get("document_count"),
-            vlm_pages,
-            candidate_is_empty(core),
-            candidate_is_sparse(
-                core, documents=documents, source_char_count=source_char_count
-            ),
-            candidate_quality_score(core),
-            len(core.skills),
-            len(core.expertise),
-            len(core.jobs),
-            len(core.employment_history),
-            len(core.education),
-            len(core.certifications),
-            len(core.projects),
-            core_split_calls,
-            used_core_adaptive_split,
-            token_count_calls,
-        )
+        core: ProfileCandidateDocument | None = None
+        if not projects_only:
+            core = _run_core_adaptive()
+            if _core_needs_retry(core):
+                raise InsufficientCandidateError()
+            logger.info(
+                "analysis candidate quality run_id=%s phase=core compact_protocol=%s "
+                "document_count=%s vlm_pages=%s empty=%s sparse=%s quality_score=%s "
+                "skills=%s expertise=%s jobs=%s employment=%s education=%s "
+                "certifications=%s projects=%s core_split_calls=%s "
+                "used_adaptive_split=%s token_count_calls=%s",
+                base_log.get("analysis_run_id"),
+                compact_tag,
+                base_log.get("document_count"),
+                vlm_pages,
+                candidate_is_empty(core),
+                candidate_is_sparse(
+                    core, documents=documents, source_char_count=source_char_count
+                ),
+                candidate_quality_score(core),
+                len(core.skills),
+                len(core.expertise),
+                len(core.jobs),
+                len(core.employment_history),
+                len(core.education),
+                len(core.certifications),
+                len(core.projects),
+                core_split_calls,
+                used_core_adaptive_split,
+                token_count_calls,
+            )
 
         def _split_project_body_prefer_boundaries(
             blocks: str, *, max_body_chars: int
@@ -3012,6 +3015,12 @@ class AnalysisService:
             used_project_adaptive_split,
         )
 
+        if projects_only:
+            # Standalone A/B evaluation: CORE is identical in v25 and v26.
+            # All PROJECTS parsing, evidence, recall and splitting above remain intact.
+            return projects_doc
+
+        assert core is not None
         merged = core.model_copy(update={"projects": list(projects_doc.projects)})
         merged, root_rel_report = supplement_root_job_exp_evidence_from_project_relations(
             merged,

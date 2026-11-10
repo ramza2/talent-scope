@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Read-only v25/v26 A/B experiment using an existing AnalysisRun's pages.
 
-Default mode is preflight (no AI calls). --live explicitly runs both variants
-against the exact same stored document text and code catalog in memory.
+Default mode is preflight (no AI calls). --live runs PROJECTS-only extraction
+for both variants against identical stored text and code catalog in memory.
+CORE is unchanged between v25/v26 and is deliberately not re-analyzed.
 No AnalysisRun creation, candidate/diff persistence, VLM or profile mutation.
 Results are diagnostics, not an accuracy verdict without a reviewed ground truth.
 """
@@ -226,6 +227,7 @@ def _run_version(*, version, snapshot, prompt_source, settings, storage, run_id)
             "source_char_count": len(blocks.strip()),
         },
         vlm_pages=0,
+        projects_only=True,
     )
     types = {
         str(doc.id): str(doc.document_type_code)
@@ -270,6 +272,7 @@ def main() -> None:
         "run_id": str(args.run_id),
         "mode": "live" if args.live else "preflight",
         "source_mode": "stored_document_pages_only_no_vlm",
+        "evaluation_scope": "projects_only_shared_core_skipped",
         "versions": list(VERSIONS),
         "run_status": snapshot.run_status,
         "document_count": len(snapshot.documents),

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import inspect
 from types import SimpleNamespace
 
+from app.modules.analysis.service import AnalysisService
 from scripts.profile_prompt_ab_readonly import compare_projects, project_metrics
 
 
@@ -51,3 +53,9 @@ def test_ab_compare_uses_name_customer_and_period() -> None:
     detail = compare_projects(baseline, experiment, include_names=True)
     assert detail["v25_only_identities"][0][0] == "pm"
     assert detail["v26_only_identities"][0][0] == "실제프로젝트"
+
+
+def test_project_only_extraction_is_opt_in() -> None:
+    method = AnalysisService._extract_staged_compact_candidate
+    option = inspect.signature(method).parameters["projects_only"]
+    assert option.default is False
