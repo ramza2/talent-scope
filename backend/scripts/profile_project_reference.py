@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from pathlib import Path
 
 REFERENCE_SCHEMA = "talentscope-prompt-ab-project-reference-v1"
@@ -30,7 +31,9 @@ def _month(value: str | None) -> str:
 
 
 def load_reference(path: Path) -> dict:
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    # '-' streams a private reference without a Docker host-file bind mount.
+    raw = sys.stdin.read() if path == Path("-") else path.read_text(encoding="utf-8")
+    payload = json.loads(raw)
     if not isinstance(payload, dict) or payload.get("schema_version") != REFERENCE_SCHEMA:
         raise ValueError("INVALID_PROJECT_REFERENCE_SCHEMA")
     if payload.get("review_status") not in {"provisional", "verified"}:

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import inspect
+import io
 import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -83,6 +85,19 @@ def test_reference_accepts_aliases_with_equivalent_punctuation(tmp_path: Path) -
     path = tmp_path / "reference.json"
     path.write_text(json.dumps(payload), encoding="utf-8")
     assert load_reference(path)["projects"][0]["id"] == 1
+
+
+def test_reference_can_be_streamed_from_stdin(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = {
+        "schema_version": REFERENCE_SCHEMA,
+        "review_status": "provisional",
+        "projects": [{
+            "id": 1, "project_name": "프로젝트 A", "customer_name": "기관",
+            "start_date": "2020.01", "end_date": "2020.02",
+        }],
+    }
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+    assert load_reference(Path("-")) == payload
 
 
 def test_reference_scorer_counts_duplicate_title_and_cross_row_date() -> None:

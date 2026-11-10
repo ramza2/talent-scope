@@ -256,7 +256,7 @@ def main() -> None:
     parser.add_argument(
         "--ground-truth-file",
         type=Path,
-        help="Optional reviewed project reference JSON for per-version accuracy metrics",
+        help="Optional project reference JSON path or '-' for stdin",
     )
     args = parser.parse_args()
     reference = load_reference(args.ground_truth_file) if args.ground_truth_file else None
