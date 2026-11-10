@@ -2,6 +2,7 @@ import { useState } from 'react'
 import {
   Alert,
   Button,
+  ConfigProvider,
   Drawer,
   Modal,
   Select,
@@ -712,6 +713,9 @@ export function AnalysisDetailPage() {
 
           {canReview ? (
             <Space style={{ marginBottom: 12 }} wrap>
+              <Tag color={selectedKeys.length > 0 ? 'green' : undefined}>
+                선택 {selectedKeys.length}건
+              </Tag>
               <Button
                 disabled={selectedKeys.length === 0}
                 loading={bulkMutation.isPending}
@@ -801,27 +805,38 @@ export function AnalysisDetailPage() {
             </Space>
           ) : null}
 
-          <Table
-            rowKey="id"
-            loading={diffsQuery.isLoading}
-            columns={columns}
-            dataSource={diffsQuery.data?.data ?? []}
-            size="small"
-            scroll={{ x: 1340 }}
-            pagination={{ pageSize: 50, showSizeChanger: true }}
-            rowSelection={
-              canReview
-                ? {
-                    selectedRowKeys: selectedKeys,
-                    onChange: setSelectedKeys,
-                    getCheckboxProps: (row) => ({
-                      disabled: row.change_type === 'SAME',
-                    }),
-                  }
-                : undefined
-            }
-            locale={{ emptyText: '표시할 Diff가 없습니다.' }}
-          />
+          <ConfigProvider
+            theme={{
+              components: {
+                Table: {
+                  rowSelectedBg: '#f3faf7',
+                  rowSelectedHoverBg: '#e9f7ef',
+                },
+              },
+            }}
+          >
+            <Table
+              rowKey="id"
+              loading={diffsQuery.isLoading}
+              columns={columns}
+              dataSource={diffsQuery.data?.data ?? []}
+              size="small"
+              scroll={{ x: 1340 }}
+              pagination={{ pageSize: 50, showSizeChanger: true }}
+              rowSelection={
+                canReview
+                  ? {
+                      selectedRowKeys: selectedKeys,
+                      onChange: setSelectedKeys,
+                      getCheckboxProps: (row) => ({
+                        disabled: row.change_type === 'SAME',
+                      }),
+                    }
+                  : undefined
+              }
+              locale={{ emptyText: '표시할 Diff가 없습니다.' }}
+            />
+          </ConfigProvider>
         </>
       )}
 
