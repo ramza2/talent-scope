@@ -14,6 +14,11 @@ from uuid import uuid4
 import pytest
 
 from app.modules.analysis.service import AnalysisService
+from app.ai.schemas.profile_candidate import (
+    ProfileCandidateDocument,
+    ProjectCandidate,
+    SourceRef,
+)
 from scripts import profile_prompt_ab_readonly as ab
 from scripts.profile_prompt_ab_readonly import compare_projects, project_metrics
 from scripts.profile_project_reference import (
@@ -211,3 +216,85 @@ def test_reference_rejects_cross_project_alias_collision(tmp_path: Path) -> None
     path.write_text(json.dumps(reference), encoding="utf-8")
     with pytest.raises(ValueError, match="DUPLICATE_OR_EMPTY_TITLE_ALIAS"):
         load_reference(path)
+
+
+def test_v29_diagnostics_is_opt_in_and_rejects_incomplete_flags(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sys, "argv", [
+        "profile_prompt_ab_readonly.py",
+        "--run-id", str(uuid4()),
+        "--solo-version", "profile-extract-v29",
+        "--diagnose-projects",
+    ])
+    with pytest.raises(SystemExit) as raised:
+        ab.main()
+    assert raised.value.code == 2
+
+
+def test_v29_diagnostics_captures_duplicate_and_date_owner_evidence_without_quotes() -> None:
+    page = (
+        "2020.5.30~11.30\n"
+        "사업 A\n기관\n"
+        "2019.1.1~4.30\n"
+        "사업 B\n고객\n"
+    )
+    ref_a = SourceRef(document_id="doc1", page_no=1, quote_text="사업 A")
+    ref_b = SourceRef(document_id="doc1", page_no=1, quote_text="사업 B")
+    candidate = ProfileCandidateDocument(projects=[
+        ProjectCandidate(
+            project_name="사업 A", customer_name="기관",
+            start_date="2020.05", end_date="2020.11", source_refs=[ref_a],
+        ),
+        ProjectCandidate(
+            project_name="사업 A", customer_name="기관",
+            start_date="2019.01", end_date="2019.04", source_refs=[ref_a],
+        ),
+        ProjectCandidate(
+            project_name="사업 B", customer_name="고객",
+            start_date="2019.01", end_date="2019.04", source_refs=[ref_b],
+        ),
+        ProjectCandidate(
+            project_name="미확인", customer_name="고객",
+            start_date="2019.01", end_date="2019.04", source_refs=[],
+        ),
+    ])
+    reference = {"review_status": "provisional", "projects": [
+        {"id": 1, "project_name": "사업 A", "customer_name": "기관",
+         "start_date": "2020.05", "end_date": "2020.11"},
+        {"id": 2, "project_name": "사업 B", "customer_name": "고객",
+         "start_date": "2019.01", "end_date": "2019.05"},
+        {"id": 3, "project_name": "누락", "customer_name": "기관",
+         "start_date": "2018.01", "end_date": "2018.02"},
+    ]}
+    original = candidate.model_dump()
+    summary = ab.diagnose_projects(
+        candidate,
+        reference,
+        page_texts={("doc1", 1): page},
+        allowed_documents={"doc1": {1}},
+    )
+    scored = evaluate_projects(candidate, reference)
+
+    assert summary["duplicate_title_extra_count"] == scored["duplicate_title_count"] == 1
+    assert summary["field_issue_group_count"] == 1
+    assert summary["diagnostic_group_count"] == 2
+    assert summary["missing_reference_titles"] == [
+        {"reference_id": 3, "project_name": "누락"},
+    ]
+    assert len(summary["unexpected_candidates"]) == 1
+    a_group = summary["groups"][0]
+    assert a_group["best_candidate_index_for_scoring"] == 0
+    assert a_group["candidate_count"] == 2
+    assert a_group["candidates"][0]["field_matches"] == {
+        "customer": True, "start_month": True, "end_month": True,
+    }
+    assert a_group["candidates"][0]["shared_title_customer_ref_page_other_count"] == 1
+    evidence = a_group["candidates"][0]["source_refs"][0]
+    assert evidence["quote_exact_on_page"] is True
+    assert evidence["page_allowed"] is True
+    assert evidence["nearby_page_periods_unverified"][0]["start_date"] == "2020.05"
+    assert len(evidence["quote_sha256_16"]) == 16
+    assert "2020.5.30~11.30" not in json.dumps(summary, ensure_ascii=False)
+    assert '"quote_text"' not in json.dumps(summary, ensure_ascii=False)
+    assert candidate.model_dump() == original

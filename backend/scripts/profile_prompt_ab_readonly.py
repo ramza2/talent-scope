@@ -46,7 +46,7 @@ from app.modules.analysis.source_builder import (
     PageSnapshot,
 )
 from app.storage.s3 import get_object_storage
-from scripts.profile_project_reference import evaluate_projects, load_reference
+from scripts.profile_project_reference import _fold, _month, evaluate_projects, load_reference
 
 COMPARE_VERSIONS = ("profile-extract-v25", "profile-extract-v26")
 SOLO_VERSIONS = (
@@ -120,6 +120,186 @@ def compare_projects(baseline, experiment, *, include_names: bool = False) -> di
         summary["v25_only_identities"] = only_a
         summary["v26_only_identities"] = only_b
     return summary
+
+
+def diagnose_projects(candidate, reference: dict, *, page_texts, allowed_documents) -> dict:
+    """Explain reference mismatches/duplicate titles without persisting candidates.
+
+    This opt-in report contains title/customer/date values and source locations,
+    but never full page text, source quotes, or personal profile data. Nearby
+    periods are clues, not an ownership verdict or a suggested automatic fix.
+    """
+    from app.modules.analysis import compact_v8
+
+    projects = list(candidate.projects)
+    rows = reference["projects"]
+    title_to_index = {
+        _fold(title): i
+        for i, row in enumerate(rows)
+        for title in [row["project_name"], *row.get("aliases", [])]
+    }
+    groups: dict[int, list[tuple[int, object]]] = {i: [] for i in range(len(rows))}
+    unexpected: list[tuple[int, object]] = []
+    for i, project in enumerate(projects):
+        index = title_to_index.get(_fold(project.project_name))
+        if index is None:
+            unexpected.append((i, project))
+        else:
+            groups[index].append((i, project))
+
+    def matches(project, row) -> dict[str, bool]:
+        customers = [row["customer_name"], *row.get("customer_aliases", [])]
+        return {
+            "customer": _fold(project.customer_name) in {_fold(c) for c in customers},
+            "start_month": _month(project.start_date) == _month(row["start_date"]),
+            "end_month": _month(project.end_date) == _month(row["end_date"]),
+        }
+
+    def evidence(project) -> list[dict]:
+        refs = []
+        for ref in project.source_refs or []:
+            doc_id = (ref.document_id or "").strip()
+            page_no = ref.page_no
+            quote = (ref.quote_text or "").strip()
+            page = page_texts.get((doc_id, page_no), "")
+            pos = page.find(quote) if quote else -1
+            allowed = allowed_documents.get(doc_id)
+            period_clues = []
+            if pos >= 0:
+                ranges = compact_v8._project_full_range_re(
+                    flexible_period_parse=True
+                ).finditer(page)
+                for match in ranges:
+                    parsed = compact_v8.parse_project_date_range_from_texts(
+                        [match.group(0)],
+                        project_name=project.project_name,
+                        flexible_period_parse=True,
+                    )
+                    if parsed is None:
+                        continue
+                    distance = max(
+                        pos - match.end(),
+                        match.start() - (pos + len(quote)),
+                        0,
+                    )
+                    period_clues.append((distance, match.start(), parsed))
+                period_clues.sort(key=lambda item: (item[0], item[1]))
+            refs.append({
+                "document_id": doc_id,
+                "page_no": page_no,
+                "quote_sha256_16": hashlib.sha256(
+                    quote.encode("utf-8")
+                ).hexdigest()[:16] if quote else None,
+                "quote_exact_on_page": pos >= 0,
+                "page_allowed": allowed is not None and (
+                    not allowed or page_no in allowed
+                ),
+                "name_seen_on_page": compact_v8._line_has_ws_folded_phrase(
+                    page, project.project_name or ""
+                ) if project.project_name else False,
+                "customer_seen_on_page": compact_v8._line_has_ws_folded_phrase(
+                    page, project.customer_name or ""
+                ) if project.customer_name else False,
+                "nearby_page_periods_unverified": [
+                    {"start_date": p[0], "end_date": p[1], "distance_chars": distance}
+                    for distance, _, p in period_clues[:3]
+                ],
+            })
+        return refs
+
+    def describe(index: int, project, row: dict | None) -> dict:
+        matches_by_field = matches(project, row) if row is not None else None
+        source_pages = {
+            (ref.document_id, ref.page_no) for ref in project.source_refs or []
+        }
+        same_title_customer_page = sum(
+            compact_v8._fold_ws_text(other.project_name or "")
+            == compact_v8._fold_ws_text(project.project_name or "")
+            and compact_v8._fold_ws_text(other.customer_name or "")
+            == compact_v8._fold_ws_text(project.customer_name or "")
+            and any(
+                (ref.document_id, ref.page_no) in source_pages
+                for ref in other.source_refs or []
+            )
+            for other in projects if other is not project
+        )
+        owned = compact_v8._unique_owned_root_project_period(
+            candidate,
+            project,
+            page_texts=page_texts,
+            allowed_documents=allowed_documents,
+            flexible_period_parse=True,
+        )
+        source_evidence = evidence(project)
+        if owned is not None:
+            owner_status = "verified_unique_owned_period"
+        elif not (project.project_name and project.customer_name and project.source_refs):
+            owner_status = "missing_identity_or_root_refs"
+        elif same_title_customer_page:
+            owner_status = "shared_title_customer_reference_page"
+        elif any(not ref["quote_exact_on_page"] for ref in source_evidence):
+            owner_status = "root_quote_not_exact_on_page"
+        else:
+            owner_status = "unresolved_ownership_or_period_block"
+        return {
+            "candidate_index": index,
+            "project_name": project.project_name,
+            "customer_name": project.customer_name,
+            "start_date": project.start_date,
+            "end_date": project.end_date,
+            "field_matches": matches_by_field,
+            "shared_title_customer_ref_page_other_count": same_title_customer_page,
+            "owner_probe_status": owner_status,
+            "unique_owned_period": list(owned) if owned is not None else None,
+            "source_refs": source_evidence,
+        }
+
+    problematic: list[dict] = []
+    duplicate_extras = 0
+    field_issue_groups = 0
+    missing = []
+    for row_index, row in enumerate(rows):
+        found = groups[row_index]
+        if not found:
+            missing.append({
+                "reference_id": row.get("id", row_index + 1),
+                "project_name": row["project_name"],
+            })
+            continue
+        duplicate_extras += len(found) - 1
+        best_index, best = max(
+            found,
+            key=lambda item: sum(matches(item[1], row).values()),
+        )
+        best_ok = all(matches(best, row).values())
+        if not best_ok:
+            field_issue_groups += 1
+        if len(found) == 1 and best_ok:
+            continue
+        problematic.append({
+            "reference_id": row.get("id", row_index + 1),
+            "project_name": row["project_name"],
+            "expected": {
+                "customer_name": row["customer_name"],
+                "start_date": row["start_date"],
+                "end_date": row["end_date"],
+            },
+            "best_candidate_index_for_scoring": best_index,
+            "candidate_count": len(found),
+            "candidates": [describe(i, p, row) for i, p in found],
+        })
+
+    return {
+        "scope": "in_memory_reference_mismatches_and_duplicate_titles_only",
+        "privacy": "no_page_text_or_source_quotes_in_output",
+        "nearby_periods_policy": "unverified_proximity_clues_not_ownership_or_fixes",
+        "duplicate_title_extra_count": duplicate_extras,
+        "field_issue_group_count": field_issue_groups,
+        "diagnostic_group_count": len(problematic),
+        "missing_reference_titles": missing,
+        "unexpected_candidates": [describe(i, p, None) for i, p in unexpected],
+        "groups": problematic,
+    }
 
 
 @dataclass(frozen=True)
@@ -264,6 +444,15 @@ def main() -> None:
     parser.add_argument("--live", action="store_true", help="LLM analyses; no DB writes")
     parser.add_argument("--include-project-names", action="store_true")
     parser.add_argument(
+        "--diagnose-projects",
+        action="store_true",
+        help=(
+            "Opt-in v29 evidence diagnostics for reference mismatches and "
+            "duplicate titles. Requires --live, --solo-version v29, "
+            "--ground-truth-file and --include-project-names."
+        ),
+    )
+    parser.add_argument(
         "--solo-version",
         choices=SOLO_VERSIONS,
         help=(
@@ -277,6 +466,16 @@ def main() -> None:
         help="Optional project reference JSON path or '-' for stdin",
     )
     args = parser.parse_args()
+    if args.diagnose_projects and not (
+        args.live
+        and args.solo_version == "profile-extract-v29"
+        and args.ground_truth_file is not None
+        and args.include_project_names
+    ):
+        parser.error(
+            "--diagnose-projects requires --live --solo-version "
+            "profile-extract-v29 --ground-truth-file and --include-project-names"
+        )
     reference = load_reference(args.ground_truth_file) if args.ground_truth_file else None
     versions = (args.solo_version,) if args.solo_version else COMPARE_VERSIONS
     compare_mode = args.solo_version is None
@@ -347,6 +546,13 @@ def main() -> None:
                     )
                     for version in versions
                 }
+            if args.diagnose_projects:
+                report["project_diagnostics"] = diagnose_projects(
+                    candidates["profile-extract-v29"],
+                    reference,
+                    page_texts=source.page_texts,
+                    allowed_documents=source.allowed_documents,
+                )
             report["interpretation"] = (
                 "Provisional reference: verify against original document layout"
                 if reference is not None and reference["review_status"] == "provisional"
