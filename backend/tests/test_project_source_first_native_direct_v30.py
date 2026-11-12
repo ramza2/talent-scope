@@ -138,9 +138,73 @@ class NativeDirectTests(unittest.TestCase):
         }]})
         self.assertEqual(r.diagnostics["candidate_project_count"], 3)
         self.assertEqual(r.diagnostics["represented_project_candidates"], 3)
-        self.assertEqual(r.diagnostics["project_diff_type_counts"]["SAME"], 1)
+        # Exact existing identity gets a field-level UPDATE because v30
+        # adds the original role. The similar-but-different title must NOT
+        # update the same existing record: v30 forces a root REVIEW instead.
+        self.assertEqual(r.diagnostics["project_diff_type_counts"]["UPDATE"], 1)
         self.assertEqual(r.diagnostics["project_diff_type_counts"]["REVIEW"], 1)
         self.assertEqual(r.diagnostics["project_diff_type_counts"]["NEW"], 1)
+        self.assertEqual(r.diagnostics["title_variant_auto_links_blocked"], 1)
+        variant_idx = next(
+            i for i, p in enumerate(r.candidate.projects)
+            if p.project_name == "비공개플랫폼구축사업2차"
+        )
+        variant = [s for s in r.specs
+                   if s.candidate_path == f"projects[{variant_idx}]"]
+        self.assertEqual(len(variant), 1)
+        self.assertEqual(variant[0].change_type, "REVIEW")
+        self.assertIsNone(variant[0].existing_target_id)
+
+    def test_no_fuzzy_match_when_confirmed_project_already_has_role(self):
+        r = run_native(latest={"projects": [{
+            "id": "00000000-0000-0000-0000-000000000111",
+            "project_name": "비공개플랫폼구축사업",
+            "customer_name": "비공개고객기관",
+            "start_date": "2020.02", "end_date": "2020.04",
+            "responsibilities": "수행역할: PL",
+        }]})
+        self.assertEqual(r.diagnostics["project_diff_type_counts"],
+                         {"SAME": 1, "REVIEW": 1, "NEW": 1})
+        self.assertEqual(r.diagnostics["title_variant_auto_links_blocked"], 1)
+
+    def test_multiple_exact_native_rows_never_update_same_existing_target(self):
+        rows = synthetic_native_rows()
+        duplicate = copy.deepcopy(rows[0])
+        duplicate["row_index"] = 2
+        duplicate["row_id"] = "a-separate-native-row"
+        rows.append(duplicate)
+        result = run_native(rows=rows, latest={"projects": [{
+            "id": "00000000-0000-0000-0000-000000000111",
+            "project_name": "비공개플랫폼구축사업",
+            "customer_name": "비공개고객기관",
+            "start_date": "2020.02", "end_date": "2020.04",
+        }]})
+        self.assertEqual(result.diagnostics["candidate_project_count"], 4)
+        self.assertEqual(result.diagnostics["represented_project_candidates"], 4)
+        self.assertEqual(
+            result.diagnostics["duplicate_target_auto_links_blocked"], 2
+        )
+        self.assertEqual(result.diagnostics["title_variant_auto_links_blocked"], 1)
+        self.assertEqual(result.diagnostics["project_diff_type_counts"],
+                         {"REVIEW": 3, "NEW": 1})
+        self.assertTrue(all(
+            s.existing_target_id is None
+            for s in result.specs if s.entity_type == "PROJECT"
+        ))
+
+    def test_exact_match_stays_update_without_collision(self):
+        rows = synthetic_native_rows()
+        first_only = [rows[0], rows[2]]
+        r = run_native(rows=first_only, latest={"projects": [{
+            "id": "00000000-0000-0000-0000-000000000111",
+            "project_name": "비공개플랫폼구축사업",
+            "customer_name": "비공개고객기관",
+            "start_date": "2020.02", "end_date": "2020.04",
+        }]})
+        self.assertEqual(r.diagnostics["project_diff_type_counts"],
+                         {"UPDATE": 1, "NEW": 1})
+        self.assertEqual(r.diagnostics["title_variant_auto_links_blocked"], 0)
+        self.assertEqual(r.diagnostics["duplicate_target_auto_links_blocked"], 0)
 
     def test_invalid_geometry_fails_closed(self):
         rows = synthetic_native_rows()
