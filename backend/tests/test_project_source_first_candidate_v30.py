@@ -125,6 +125,27 @@ class SourceFirstCandidateTests(unittest.TestCase):
         for forbidden in ("비공개", "AI 제안 업무", "JOB-PL", "2020.02"):
             self.assertNotIn(forbidden, output)
 
+    def test_open_ended_source_end_current_preserved(self):
+        """Native grouping normalizes ongoing end dates to '현재'."""
+        source, ai = fixtures()
+        # The source is authoritative; a matching model suggestion stays a
+        # suggestion, and never overwrites the source end month.
+        source["source_groups"][0]["end_month_from_source"] = "현재"
+        ai["projects"][0]["end_date"] = "Present"
+        ai["projects"][1]["end_date"] = "현재"
+        public, private = build_source_first_candidates(source, ai)
+        g1 = next(p for p in private["projects"] if p["group_id"] == "g1")
+        self.assertEqual(g1["source_project"]["end_date"], "현재")
+        self.assertTrue(g1["enrichment_suggestions"][0]["candidate_period_matches_original_months"])
+        self.assertEqual(public["proposed_project_count"], 3)
+        self.assertEqual(public["unlinked_ai_candidate_count"], 1)
+
+    def test_open_ended_start_current_rejected(self):
+        source, ai = fixtures()
+        source["source_groups"][0]["start_month_from_source"] = "현재"
+        with self.assertRaisesRegex(ValueError, "SOURCE_ROW_SCHEMA_INVALID"):
+            build_source_first_candidates(source, ai)
+
     def test_fails_on_duplicate_candidate_index(self):
         source, ai = fixtures()
         source["source_groups"][1]["candidate_indices"] = [1]
