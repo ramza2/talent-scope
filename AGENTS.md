@@ -434,3 +434,5 @@ Agent 작업은 정확성을 해치지 않는 범위에서 Context와 실행 비
 - 별도 v30 검토 분석 생성기 `backend/scripts/profile_source_first_review_run_optin.py`는 **기본 dry-run**이다. `--execute-create-review-run`와 정확한 `--acknowledge-create-review-run CREATE_V30_REVIEWING_RUN` 및 목표 리비전/원본 프로젝트 건수를 지정해야만 신규 `REVIEWING` 분석을 1건 만들 수 있다. 운영 DB 생성 실행은 사용자 검증·명시적 승인 전 수행하지 않는다.
 - 새 분석은 기존 v25 CORE를 재활용하며 v30의 PDF 프로젝트 후보만 교체한다. 일반 v25 `create_analysis`·자동 worker·프롬프트 registry는 그대로 유지한다. 신규 v30은 재분석·LLM 호출을 하지 않으며 확정/일괄 승인도 자동 수행하지 않는다.
 - 새 분석 생성 시 lock 후 인력 상태, 진행 중인 다른 분석, 최신 확정 리비전 및 원본 candidate SHA, 같은 문서와 READY 상태, 중복 v30 검토 생성 여부를 재검증한다. 실패 시 트랜잭션 전체 롤백한다.
+
+- 검토 UI에서 `PROJECT` 필터는 원본 사업명·고객사·기간·수행역할을 별도 열에 보여주되, 공통 Diff 결정 및 승인/반려 API를 재사용한다. v30 전용 메시지는 `prompt_version=profile-source-first-v30-native-direct`에만 표시한다. 기존 6개 탭·선택 상태·일괄 승인 절차는 변경하지 않는다.
