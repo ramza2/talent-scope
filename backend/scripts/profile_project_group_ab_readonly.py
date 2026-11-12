@@ -46,7 +46,8 @@ def load_cluster_file(path: Path) -> dict:
 
 
 def _run_hint_arm(*, snapshot, prompt_source, settings, storage, run_id, groups,
-                  alias_to_id: dict[str, str]) -> tuple:
+                  alias_to_id: dict[str, str], hint_builder=add_group_hints,
+                  llm_factory=MeteredLLM) -> tuple:
     baseline = resolve_profile_prompt("profile-extract-v29")
     assert baseline.prompt_version == "profile-extract-v29"
 
@@ -61,14 +62,14 @@ def _run_hint_arm(*, snapshot, prompt_source, settings, storage, run_id, groups,
             document_blocks=document_blocks,
             recovery_retry=recovery_retry,
         )
-        return add_group_hints(
+        return hint_builder(
             base, document_blocks=document_blocks,
             groups=groups, alias_to_id=alias_to_id,
             audit=lambda selected, chars: hint_counts.append((selected, chars)),
         )
 
     spec = replace(baseline, build_projects_user_prompt=wrapped_user_prompt)
-    llm = MeteredLLM(settings)
+    llm = llm_factory(settings)
     service = AnalysisService(None, storage=storage, settings=settings, llm=llm)
     service.repo = SimpleNamespace(
         list_active_codes=lambda: snapshot.codes,
@@ -116,6 +117,7 @@ def _run_hint_arm(*, snapshot, prompt_source, settings, storage, run_id, groups,
         "llm_calls": llm.json_calls,
         "elapsed_seconds": round(time.monotonic() - started, 1),
         "hint_prompt_build_count": sum(chars > 0 for _, chars in hint_counts),
+        "llm_call_details": getattr(llm, "call_details", []),
         "max_groups_per_project_prompt": max((count for count, _ in hint_counts), default=0),
         "max_hint_chars_per_project_prompt": max((chars for _, chars in hint_counts), default=0),
     }
