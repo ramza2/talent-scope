@@ -85,10 +85,14 @@ def make_candidate_bridge(
             raise ValueError(f"BRIDGE_GROUP_CONTRACT_INVALID:{index}")
         seen_groups.add(gid)
         title, customer = source.get("project_name"), source.get("customer_name")
+        title_aliases = source.get("original_titles")
+        customer_aliases = source.get("original_customers")
         start, end = source.get("start_date"), source.get("end_date")
         if (
             not isinstance(title, str) or not title.strip()
             or not isinstance(customer, str) or not customer.strip()
+            or not isinstance(title_aliases, list) or title not in title_aliases
+            or not isinstance(customer_aliases, list) or customer not in customer_aliases
             or not isinstance(start, str) or _ym(start) != start
             or not isinstance(end, str) or
                 _ym(end, allow_ongoing=True) != end
@@ -119,8 +123,12 @@ def make_candidate_bridge(
             used_candidate_indices.add(ai_index)
             indices.append(ai_index)
             item = ai_rows[ai_index]
-            title_matches = _fold(item.get("project_name")) == _fold(title)
-            customer_matches = _fold(item.get("customer_name")) == _fold(customer)
+            title_matches = _fold(item.get("project_name")) in {
+                _fold(name) for name in title_aliases
+            }
+            customer_matches = _fold(item.get("customer_name")) in {
+                _fold(name) for name in customer_aliases
+            }
             time_matches = (
                 _ym(item.get("start_date")) == start
                 and _ym(item.get("end_date"), allow_ongoing=True) == end
