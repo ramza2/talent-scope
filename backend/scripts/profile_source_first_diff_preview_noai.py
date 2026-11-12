@@ -33,6 +33,7 @@ from app.modules.analysis.project_source_first_candidate_v30 import build_source
 
 PASS = "TALENTSCOPE_V30_SOURCE_FIRST_DIFF_PREVIEW_PASS"
 ROOT_PATH = re.compile(r"^projects\[(\d+)\]$")
+ANY_PROJECT_PATH = re.compile(r"^projects\[(\d+)\](?:\.|$)")
 
 
 def report_diff(candidate, base_snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -44,8 +45,20 @@ def report_diff(candidate, base_snapshot: dict[str, Any]) -> dict[str, Any]:
         and ROOT_PATH.fullmatch(spec.candidate_path or "")
     ]
     root_indices = [int(ROOT_PATH.fullmatch(spec.candidate_path).group(1)) for spec in roots]
-    if len(roots) != len(candidate.projects) or sorted(root_indices) != list(range(len(candidate.projects))):
-        raise ValueError("DIFF_DROPPED_OR_DUPLICATED_SOURCE_ROOT")
+    project_specs = [
+        spec for spec in specs
+        if spec.entity_type == "PROJECT"
+        and ANY_PROJECT_PATH.match(spec.candidate_path or "")
+    ]
+    represented = {
+        int(ANY_PROJECT_PATH.match(spec.candidate_path).group(1))
+        for spec in project_specs
+    }
+    expected = set(range(len(candidate.projects)))
+    # Existing confirmed projects sometimes produce ONLY a field-level Diff,
+    # not a PROJECT root. Count those as represented, never as dropped.
+    if represented != expected or len(root_indices) != len(set(root_indices)):
+        raise ValueError("DIFF_DROPPED_OR_DUPLICATED_SOURCE_PROJECT")
     detail = []
     for spec in roots:
         idx = int(ROOT_PATH.fullmatch(spec.candidate_path).group(1))
@@ -68,6 +81,9 @@ def report_diff(candidate, base_snapshot: dict[str, Any]) -> dict[str, Any]:
         "candidate_project_count": len(candidate.projects),
         "diff_total_count": len(specs),
         "project_root_diff_count": len(roots),
+        "represented_project_candidate_count": len(represented),
+        "project_candidate_indices_without_root_diff": sorted(expected - set(root_indices)),
+        "project_field_or_relation_diff_count": len(project_specs) - len(roots),
         "project_root_change_types": dict(Counter(s.change_type for s in roots)),
         "non_root_diff_count": len(specs) - len(roots),
         "project_root_with_literal_quote": sum(x["has_literal_root_quote"] for x in detail),
