@@ -135,20 +135,29 @@ def preview_candidate_row_dedupe(
     replacements: dict[int, ProjectCandidate] = {}
     merged_groups = 0
     for gid, indices in exact.items():
-        if len(indices) < 2:
-            continue
-        # All verified against one unique PDF group. Use existing proven
-        # relation/ref union, never discard supporting evidence.
-        merged = _merge_same_identity_projects([original[i] for i in indices])
-        replacements[indices[0]] = merged
-        removals.update(indices[1:])
-        merged_groups += 1
-        decisions.append({
-            "kind": "strict_same_group_evidence_merge",
-            "group_id": gid,
-            "candidate_indices": indices,
-            "removed_extra_candidates": len(indices) - 1,
-        })
+        # Same year-month does NOT imply identical day-level dates. Only
+        # candidates with exactly the same stated period may be merged.
+        by_literal_period: dict[tuple[str, str], list[int]] = defaultdict(list)
+        for i in indices:
+            p = original[i]
+            by_literal_period[
+                ((p.start_date or "").strip(), (p.end_date or "").strip())
+            ].append(i)
+        for identical in by_literal_period.values():
+            if len(identical) < 2:
+                continue
+            # All verified against one unique PDF group and identical dates.
+            # Use the existing relation/ref union, not lossy keep-first.
+            merged = _merge_same_identity_projects([original[i] for i in identical])
+            replacements[identical[0]] = merged
+            removals.update(identical[1:])
+            merged_groups += 1
+            decisions.append({
+                "kind": "strict_same_group_evidence_merge",
+                "group_id": gid,
+                "candidate_indices": identical,
+                "removed_extra_candidates": len(identical) - 1,
+            })
 
     quarantined: set[int] = set()
     for gid, indices in conflicts.items():
