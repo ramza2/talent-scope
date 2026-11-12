@@ -30,8 +30,20 @@ def _fold(value: object) -> str:
     return re.sub(r"[^0-9a-z가-힣]", "", text)
 
 
-def _ym(value: object) -> str | None:
-    match = re.fullmatch(r"((?:19|20)\d{2})[.\-/](0?[1-9]|1[0-2])(?:[.\-/]\d{1,2})?", str(value or "").strip())
+def _ym(value: object, *, allow_ongoing: bool = False) -> str | None:
+    """Normalize source months and open-ended *end* dates.
+
+    The native PDF row parser uses '현재' for open-ended projects. Keep that
+    established representation instead of rejecting otherwise valid rows.
+    Never permit '현재' as a project start date.
+    """
+    raw = str(value or "").strip()
+    if allow_ongoing and raw.casefold() in {"현재", "진행중", "재직중", "present"}:
+        return "현재"
+    match = re.fullmatch(
+        r"((?:19|20)\d{2})[.\-/](0?[1-9]|1[0-2])(?:[.\-/]\d{1,2})?",
+        raw,
+    )
     return f"{match[1]}.{int(match[2]):02d}" if match else None
 
 
@@ -104,7 +116,7 @@ def build_source_first_candidates(
             or not isinstance(title, str) or not title.strip()
             or not isinstance(customer, str) or not customer.strip()
             or not isinstance(start, str) or _ym(start) != start
-            or not isinstance(end, str) or _ym(end) != end
+            or not isinstance(end, str) or _ym(end, allow_ongoing=True) != end
             or not isinstance(titles, list) or title not in titles
             or not isinstance(customers, list) or customer not in customers
             or not isinstance(source_evidence, list) or not source_evidence
@@ -143,7 +155,7 @@ def build_source_first_candidates(
                 _fold(cand.get("project_name")) in {_fold(t) for t in titles}
                 and _fold(cand.get("customer_name")) in {_fold(c) for c in customers}
             )
-            month_ok = _ym(cand.get("start_date")) == start and _ym(cand.get("end_date")) == end
+            month_ok = _ym(cand.get("start_date")) == start and _ym(cand.get("end_date"), allow_ongoing=True) == end
             fully_verified = reason == REASON_VERIFIED and identity_ok and month_ok
             if fully_verified:
                 verified_matches += 1
