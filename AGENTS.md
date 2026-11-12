@@ -427,4 +427,5 @@ Agent 작업은 정확성을 해치지 않는 범위에서 Context와 실행 비
 - `source_project`의 사업명·고객사·기간이 우선이다. PDF 역할 셀은 확인된 값 그대로 `responsibilities` 텍스트에 보존할 수 있으나 직무 코드로 자동 추정하지 않는다.
 - LLM 원문 인용이나 기술·업무 코드의 근거를 만들어 내지 않는다. 근거가 부족한 AI 확장 정보는 별도 제안으로 보존한다.
 - v30 새 분석 실행 시점에는 최신 확정 프로필 리비전을 사용한다. 예전 분석 실행의 Candidate/기존 Diff를 덮어쓰거나 임의로 확정하지 않는다.
-- PoC 테스트: `backend/tests/test_project_source_first_review_payload_v30.py` 중심, 비공개 산출물은 서버 내 0600으로 유지한다.
+- PoC 테스트: `backend/tests/test_project_source_first_review_payload_v30.py`, `backend/tests/test_project_source_first_native_direct_v30.py` 중심. 비공개 산출물은 서버 내 0600으로 유지한다.
+- 실험용 직접 실행기 `backend/scripts/profile_source_first_native_direct_readonly.py`: 기존 CONFIRMED run의 원본 PDF를 읽기만 한다. AI 재호출·DB 갱신·S3 쓰기·Diff 승인·새 분석 실행 생성은 금지한다. 원본 테이블 매핑 실패 시 후보 손실 없이 중단하고 보고한다.
