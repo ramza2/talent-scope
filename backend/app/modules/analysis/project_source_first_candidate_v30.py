@@ -95,7 +95,7 @@ def build_source_first_candidates(
     verified_matches = 0
     suggestions_count = 0
     group_suggestion_counts = []
-    for row in groups:
+    for source_row_index, row in enumerate(groups):
         if not isinstance(row, dict):
             raise ValueError("INVALID_SOURCE_ROW")
         gid = row.get("group_id")
@@ -123,7 +123,39 @@ def build_source_first_candidates(
             or not isinstance(indices, list) or not isinstance(reasons, list)
             or len(indices) != len(reasons)
         ):
-            raise ValueError("SOURCE_ROW_SCHEMA_INVALID")
+            # Only field names and source-list position, never source
+            # names, customers, quotations or dates, in diagnostics.
+            failures = []
+            if not isinstance(gid, str) or not gid or gid in ids:
+                failures.append("group_identity")
+            if row.get("source_status") not in SOURCE_STATUS:
+                failures.append("source_status")
+            if row.get("source_of_truth") != "verified_pdf_native_table_row":
+                failures.append("source_provenance")
+            if row.get("safe_to_auto_confirm") is not False:
+                failures.append("confirmation_guard")
+            if not isinstance(title, str) or not title.strip():
+                failures.append("title")
+            if not isinstance(customer, str) or not customer.strip():
+                failures.append("customer")
+            if not isinstance(start, str) or _ym(start) != start:
+                failures.append("start_month")
+            if not isinstance(end, str) or _ym(end, allow_ongoing=True) != end:
+                failures.append("end_month")
+            if not isinstance(titles, list) or title not in titles:
+                failures.append("source_title_aliases")
+            if not isinstance(customers, list) or customer not in customers:
+                failures.append("source_customer_aliases")
+            if not isinstance(source_evidence, list) or not source_evidence:
+                failures.append("source_evidence")
+            if not isinstance(indices, list) or not isinstance(reasons, list):
+                failures.append("candidate_links_type")
+            elif len(indices) != len(reasons):
+                failures.append("candidate_links_length")
+            raise ValueError(
+                "SOURCE_ROW_SCHEMA_INVALID:"
+                + str(source_row_index) + ":" + ",".join(failures)
+            )
         ids.add(gid)
         for e in source_evidence:
             bbox = e.get("bbox") if isinstance(e, dict) else None
