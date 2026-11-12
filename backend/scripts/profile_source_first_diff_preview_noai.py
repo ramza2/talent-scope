@@ -29,6 +29,7 @@ from app.modules.analysis.candidate_quality_guards import apply_candidate_qualit
 from app.modules.analysis.diff_engine import build_diffs
 from app.modules.analysis.diff_evidence import is_ungrounded_new_diff
 from app.modules.analysis.project_source_first_bridge_v30 import make_candidate_bridge
+from app.modules.analysis.project_source_first_candidate_v30 import build_source_first_candidates
 
 PASS = "TALENTSCOPE_V30_SOURCE_FIRST_DIFF_PREVIEW_PASS"
 ROOT_PATH = re.compile(r"^projects\[(\d+)\]$")
@@ -85,6 +86,7 @@ def report_diff(candidate, base_snapshot: dict[str, Any]) -> dict[str, Any]:
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--private-preview", required=True, type=Path)
+    p.add_argument("--private-source-rows", required=True, type=Path)
     p.add_argument("--private-ai-candidates", required=True, type=Path)
     p.add_argument("--base-snapshot", type=Path)
     p.add_argument("--private-candidate-output", type=Path)
@@ -94,6 +96,10 @@ def main() -> None:
 
     preview = json.loads(args.private_preview.read_text(encoding="utf-8"))
     ai = json.loads(args.private_ai_candidates.read_text(encoding="utf-8"))
+    source_rows = json.loads(args.private_source_rows.read_text(encoding="utf-8"))
+    _public, independently_derived_preview = build_source_first_candidates(source_rows, ai)
+    if preview != independently_derived_preview:
+        raise ValueError("BRIDGE_PREVIEW_NOT_DERIVED_FROM_MATCHING_SOURCE_ROWS_AND_AI")
     bridge = make_candidate_bridge(preview, ai)
     baseline = (json.loads(args.base_snapshot.read_text(encoding="utf-8"))
                 if args.base_snapshot else {"projects": []})
