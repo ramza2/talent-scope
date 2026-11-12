@@ -10,7 +10,6 @@ import argparse
 import json
 import sys
 import time
-from collections import Counter
 from pathlib import Path
 from uuid import UUID
 
@@ -18,7 +17,6 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from app.ai.providers.errors import AIProviderError
 from app.core.config import get_settings
 from app.modules.analysis.compact_v8 import build_document_alias_view
 from app.modules.analysis.project_group_hints_compact_v30 import add_compact_group_hints
@@ -138,6 +136,10 @@ def main() -> None:
     )
     if "BEGIN UNTRUSTED ROW GROUP HINTS" not in prompt_preview:
         raise ValueError("NO_COMPACT_HINTS_IN_SOURCE")
+    previous_max_hint = previous["results"]["v29_plus_v30_page_scoped_groups"]["max_hint_chars_per_project_prompt"]
+    compact_full_hint_chars = len(prompt_preview) - len("ORIGINAL_SOURCE_UNCHANGED")
+    if compact_full_hint_chars >= previous_max_hint:
+        raise ValueError("COMPACT_HINT_NOT_SMALLER_THAN_PREVIOUS")
     page_previews = []
     for document in split_document_blocks(alias_source):
         for page in split_block_by_pages(document):
@@ -155,7 +157,7 @@ def main() -> None:
         "source_sha256_unchanged": snapshot.documents_sha,
         "candidate_sha256_before_and_after": snapshot.candidate_sha,
         "input_groups": len(groups),
-        "full_source_compact_hint_chars": len(prompt_preview) - len("ORIGINAL_SOURCE_UNCHANGED"),
+        "full_source_compact_hint_chars": compact_full_hint_chars,
         "page_hint_preview": [
             {"groups": count, "hint_payload_chars": chars}
             for count, chars in page_previews
