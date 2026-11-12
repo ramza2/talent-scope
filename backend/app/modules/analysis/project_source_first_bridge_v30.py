@@ -59,6 +59,7 @@ def make_candidate_bridge(
     ref_group_indices: list[int] = []
     no_ref_group_indices: list[int] = []
     source_only_group_indices: list[int] = []
+    groups_with_unmapped_source_roles: list[int] = []
     multiple_candidates_group_indices: list[int] = []
 
     for index, row in enumerate(rows):
@@ -183,6 +184,9 @@ def make_candidate_bridge(
         else:
             no_ref_group_indices.append(index)
 
+        if source.get("roles_from_pdf_row"):
+            groups_with_unmapped_source_roles.append(index)
+
         # All code/role suggestions are preserved in the separate private
         # preview; NEVER copy them into a live-like Pydantic candidate until
         # each relation's evidence is independently validated.
@@ -219,6 +223,7 @@ def make_candidate_bridge(
             "root_original_quote_ref_groups": len(ref_group_indices),
             "root_unquoted_groups": len(no_ref_group_indices),
             "source_only_groups": len(source_only_group_indices),
+            "source_role_groups_not_mapped_to_job_codes": len(groups_with_unmapped_source_roles),
             "multiple_ai_suggestions_groups": len(multiple_candidates_group_indices),
             "ai_suggestion_count": len(used_candidate_indices),
             "unlinked_ai_count": len(unlinked),
@@ -226,6 +231,7 @@ def make_candidate_bridge(
             "all_name_variant_pairs_preserved_separately": True,
             "root_ref_indices": ref_group_indices,
             "root_no_ref_indices": no_ref_group_indices,
+            "source_role_unmapped_indices": groups_with_unmapped_source_roles,
             "no_ai_enrichment_auto_promoted": True,
             "no_fabricated_source_quotes": True,
         },
