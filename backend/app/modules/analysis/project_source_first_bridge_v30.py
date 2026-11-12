@@ -31,6 +31,8 @@ class BridgeResult:
 def make_candidate_bridge(
     private_preview: dict[str, Any],
     private_ai_fixture: dict[str, Any],
+    *,
+    preserve_source_roles: bool = False,
 ) -> BridgeResult:
     if (
         private_preview.get("kind") != PREVIEW_KIND
@@ -60,6 +62,7 @@ def make_candidate_bridge(
     no_ref_group_indices: list[int] = []
     source_only_group_indices: list[int] = []
     groups_with_unmapped_source_roles: list[int] = []
+    groups_with_preserved_source_role_text: list[int] = []
     multiple_candidates_group_indices: list[int] = []
 
     for index, row in enumerate(rows):
@@ -184,15 +187,33 @@ def make_candidate_bridge(
         else:
             no_ref_group_indices.append(index)
 
-        if source.get("roles_from_pdf_row"):
+        raw_roles = source.get("roles_from_pdf_row") or []
+        if (
+            not isinstance(raw_roles, list)
+            or any(not isinstance(role, str) or not role.strip()
+                   or len(role) > 500 for role in raw_roles)
+        ):
+            raise ValueError(f"BRIDGE_SOURCE_ROLES_INVALID:{index}")
+        if raw_roles:
             groups_with_unmapped_source_roles.append(index)
+        # The only new v30 scalar is literally sourced from the verified PDF
+        # role cell. It is NOT a taxonomy code or AI generated responsibility.
+        # A separately opted-in adapter may carry it into ProjectCandidate's
+        # existing responsibilities field, which survives existing Confirm.
+        # Preserve the unmodified role strings (including multi-doc variants).
+        responsibilities = None
+        if preserve_source_roles and raw_roles:
+            responsibilities = "수행역할: " + " / ".join(raw_roles)
+            if len(responsibilities) > 2000:
+                raise ValueError(f"BRIDGE_SOURCE_ROLES_TOO_LONG:{index}")
+            groups_with_preserved_source_role_text.append(index)
 
-        # All code/role suggestions are preserved in the separate private
-        # preview; NEVER copy them into a live-like Pydantic candidate until
-        # each relation's evidence is independently validated.
+        # AI-suggested code relations and textual enrichment stay separately
+        # reviewable in the private preview. No automatic code mapping.
         projects.append(ProjectCandidate(
             project_name=title, customer_name=customer,
             start_date=start, end_date=end, source_refs=root_refs,
+            responsibilities=responsibilities,
         ))
 
     unlinked = private_preview.get("unlinked_ai_candidate_indices")
@@ -224,6 +245,8 @@ def make_candidate_bridge(
             "root_unquoted_groups": len(no_ref_group_indices),
             "source_only_groups": len(source_only_group_indices),
             "source_role_groups_not_mapped_to_job_codes": len(groups_with_unmapped_source_roles),
+            "source_role_text_preserved_groups": len(groups_with_preserved_source_role_text),
+            "source_role_text_preservation_enabled": preserve_source_roles,
             "multiple_ai_suggestions_groups": len(multiple_candidates_group_indices),
             "ai_suggestion_count": len(used_candidate_indices),
             "unlinked_ai_count": len(unlinked),
