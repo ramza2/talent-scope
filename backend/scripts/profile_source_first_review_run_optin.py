@@ -140,6 +140,13 @@ def assemble_preflight(
     return plan, diagnostics, revisions
 
 
+def verify_execute_gate(execute: bool, acknowledgement: str) -> None:
+    if execute != (acknowledgement == "CREATE_V30_REVIEWING_RUN"):
+        raise ValueError("V30_EXECUTION_FLAG_AND_ACKNOWLEDGEMENT_REQUIRED_TOGETHER")
+    if not execute and acknowledgement:
+        raise ValueError("V30_PREFLIGHT_UNEXPECTED_WRITE_ACKNOWLEDGEMENT")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--existing-confirmed-run-id", required=True)
@@ -159,11 +166,10 @@ def main() -> None:
         run_id = UUID(args.existing_confirmed_run_id)
     except ValueError:
         raise ValueError("V30_PREFLIGHT_RUN_ID_INVALID") from None
-    ack = args.acknowledge_create_review_run
-    if args.execute_create_review_run != (ack == "CREATE_V30_REVIEWING_RUN"):
-        raise ValueError("V30_EXECUTION_FLAG_AND_ACKNOWLEDGEMENT_REQUIRED_TOGETHER")
-    if not args.execute_create_review_run and ack:
-        raise ValueError("V30_PREFLIGHT_UNEXPECTED_WRITE_ACKNOWLEDGEMENT")
+    verify_execute_gate(
+        args.execute_create_review_run,
+        args.acknowledge_create_review_run,
+    )
 
     plan, diagnostics, meta = assemble_preflight(
         source_run_id=run_id,
