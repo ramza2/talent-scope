@@ -20,7 +20,10 @@ from pydantic import ValidationError
 
 from app.ai.schemas.profile_candidate import ProfileCandidateDocument
 from app.modules.analysis.candidate_quality_guards import apply_candidate_quality_guards
-from app.modules.analysis.diff_engine import DiffSpec, build_diffs
+from app.modules.analysis.diff_engine import DiffSpec
+from app.modules.analysis.project_source_first_diff_guard_v30 import (
+    build_source_first_review_safe_diffs,
+)
 from app.modules.analysis.project_source_first_bridge_v30 import make_candidate_bridge
 from app.modules.analysis.project_source_first_candidate_v30 import build_source_first_candidates
 
@@ -97,7 +100,10 @@ def assemble_review_payload(
     if guarded_keys != source_keys:
         raise ValueError("V30_REVIEW_SOURCE_PROJECTS_DROPPED_BY_QUALITY_GUARD")
 
-    specs = build_diffs(proposed, current_profile_snapshot)
+    protected = build_source_first_review_safe_diffs(
+        proposed, current_profile_snapshot
+    )
+    specs = protected.specs
     project_indices = [
         int(match.group(1))
         for spec in specs
@@ -140,6 +146,12 @@ def assemble_review_payload(
         "existing_quality_guard_keeps_all_project_identities": True,
         "all_projects_represented_by_existing_diff": True,
         "no_automatic_source_group_merge": True,
+        "v30_title_variant_auto_links_blocked": len(
+            protected.variant_review_indices
+        ),
+        "v30_duplicate_target_auto_links_blocked": len(
+            protected.collision_review_indices
+        ),
         "no_automatic_ai_relation_code_mapping": True,
         "no_db_writes_or_llm_calls": True,
     }
