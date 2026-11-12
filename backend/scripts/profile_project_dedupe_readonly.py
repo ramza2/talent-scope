@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Read-only v30 compact LLM + conservative PDF row deduplication pilot.
 
-One isolated compact-hints LLM replay in memory. It does NOT write candidate,
-diff, original pages, confirmed profile, or a new AnalysisRun. Reports:
+One isolated compact-hints LLM replay in memory. It NEVER writes candidate
+to DB, diff, original pages, confirmed profile, or a new AnalysisRun.
+An explicitly requested private local project-only fixture is optional. Reports:
 (1) raw candidate, (2) evidence-verified strict same-group union,
 (3) counterfactual quarantine review only. Original data is never modified.
 """
@@ -10,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from uuid import UUID
@@ -43,7 +45,15 @@ def main() -> None:
     parser.add_argument("--ground-truth-file", required=True, type=Path)
     parser.add_argument("--live", action="store_true",
                         help="Replay the compact arm once, in memory only")
+    parser.add_argument(
+        "--private-project-fixture", type=Path,
+        help="Opt-in write of project-only candidate JSON to a new local mode-0600 file; NEVER upload publicly",
+    )
     args = parser.parse_args()
+    if args.private_project_fixture and not args.live:
+        parser.error("--private-project-fixture requires --live")
+    if args.private_project_fixture and args.private_project_fixture.exists():
+        raise FileExistsError("PRIVATE_PROJECT_FIXTURE_ALREADY_EXISTS")
 
     snapshot = _read_snapshot(args.run_id)
     if snapshot.run_status != "CONFIRMED":
@@ -120,6 +130,7 @@ def main() -> None:
         },
         "no_write_no_auto_delete": True,
     }
+    private_fixture_data = None
     try:
         if args.live:
             candidate, stats = _run_hint_arm(
@@ -141,6 +152,14 @@ def main() -> None:
                     preview.quarantine_simulation, reference, include_names=False
                 ),
             }
+            if args.private_project_fixture:
+                private_fixture_data = {
+                    "kind": "talentscope_readonly_project_candidate_fixture",
+                    "run_id": str(args.run_id),
+                    "source_sha256": snapshot.documents_sha,
+                    "existing_candidate_sha256": snapshot.candidate_sha,
+                    "projects": [p.model_dump(mode="json") for p in candidate.projects],
+                }
             report["llm_replay_stats"] = stats
             report["dedupe_diagnostics"] = preview.diagnostics
             report["reference_evaluation"] = scored
@@ -164,6 +183,22 @@ def main() -> None:
             )
     finally:
         _verify_unchanged(args.run_id, snapshot)
+
+    # Only after DB source fingerprint verification. Exclusive creation avoids
+    # overwriting previous private diagnostics; 0600 disallows group access.
+    if private_fixture_data is not None:
+        fd = os.open(
+            args.private_project_fixture,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as file:
+            json.dump(private_fixture_data, file, ensure_ascii=False)
+            file.write("\n")
+        report["private_project_fixture_written"] = True
+        report["private_project_fixture_project_count"] = len(
+            private_fixture_data["projects"]
+        )
 
     print(json.dumps(report, ensure_ascii=False, indent=2))
     print(SUCCESS)
