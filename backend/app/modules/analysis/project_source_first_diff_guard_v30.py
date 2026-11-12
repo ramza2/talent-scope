@@ -99,7 +99,16 @@ def build_source_first_review_safe_diffs(
         non_root = any(s.field_name is not None or
                        (s.candidate_path or "") != f"projects[{index}]"
                        for s in specs)
-        if non_root and not targets:
+        # NEW root may legitimately emit child relation REVIEW items with
+        # no existing target. Only an UPDATE-like field without a target is
+        # invalid; it would be impossible to apply safely in Confirm.
+        new_root = any(
+            s.candidate_path == f"projects[{index}]"
+            and s.field_name is None
+            and s.change_type in {"NEW", "REVIEW"}
+            for s in specs
+        )
+        if non_root and not targets and not new_root:
             raise ValueError(f"V30_SAFE_DIFF_FIELD_WITHOUT_TARGET:{index}")
         if len(targets) > 1:
             variant.add(index)
