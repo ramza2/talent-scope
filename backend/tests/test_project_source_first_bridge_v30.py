@@ -87,6 +87,32 @@ class BridgeTests(unittest.TestCase):
             [0, 1, 2],
         )
 
+    def test_existing_project_field_only_diff_is_not_mistaken_for_missing(self):
+        preview, ai = input_pair()
+        bridge = make_candidate_bridge(preview, ai)
+        projects = list(bridge.candidate.projects)
+        index = next(i for i, p in enumerate(projects)
+                     if p.project_name == "비공개다른사업")
+        projects[index] = projects[index].model_copy(
+            update={"responsibilities": "테스트용 역할 설명"}
+        )
+        candidate = bridge.candidate.model_copy(update={"projects": projects})
+        base = {
+            "projects": [{
+                "id": "00000000-0000-0000-0000-000000000123",
+                "project_name": "비공개다른사업",
+                "customer_name": "비공개고객기관",
+                "start_date": "2020.02",
+                "end_date": "2020.04",
+                "responsibilities": None,
+            }]
+        }
+        result = report_diff(candidate, base)
+        self.assertEqual(result["represented_project_candidate_count"], 3)
+        self.assertIn(index, result["project_candidate_indices_without_root_diff"])
+        self.assertEqual(result["project_root_diff_count"], 2)
+        self.assertGreaterEqual(result["project_field_or_relation_diff_count"], 1)
+
     def test_existing_guard_preserves_projects_without_page_context(self):
         preview, ai = input_pair()
         result = make_candidate_bridge(preview, ai)
