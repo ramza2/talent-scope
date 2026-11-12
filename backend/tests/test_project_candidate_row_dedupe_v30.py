@@ -64,6 +64,14 @@ class DedupPreviewTests(unittest.TestCase):
         self.assertEqual(outcome.strict.projects[0].jobs[0].code, "JOB-MGT-PL")
         self.assertEqual(len(outcome.quarantine_simulation.projects), 1)
 
+    def test_same_month_but_different_days_do_not_merge(self):
+        a = candidate(start="2020.02.01", end="2020.04.10")
+        b = candidate(start="2020.02.15", end="2020.04.30")
+        outcome = self.preview([a, b])
+        self.assertEqual(len(outcome.strict.projects), 2)
+        self.assertEqual(outcome.diagnostics["strict_removed_extra_count"], 0)
+        self.assertEqual(outcome.diagnostics["date_conflict_review_count"], 0)
+
     def test_date_conflict_is_review_only_never_strict_delete(self):
         wrong = candidate(start="2019.09", end="2019.10")
         outcome = self.preview([self.good, wrong])
