@@ -23,8 +23,11 @@ from app.ai.schemas.profile_candidate import (
     ProfileCandidateDocument, ProjectCandidate, SourceRef,
 )
 from app.modules.analysis.candidate_quality_guards import apply_candidate_quality_guards
-from app.modules.analysis.diff_engine import DiffSpec, build_diffs
+from app.modules.analysis.diff_engine import DiffSpec
 from app.modules.analysis.project_row_match_v30 import build_clusters
+from app.modules.analysis.project_source_first_diff_guard_v30 import (
+    build_source_first_review_safe_diffs,
+)
 from app.modules.analysis.project_source_first_candidate_v30 import _fold, _ym
 from app.modules.analysis.project_source_first_review_payload_v30 import PROJECT_PATH
 
@@ -228,7 +231,10 @@ def assemble_native_direct(
     # Strict guard may reject rows. Report the count; do not mutate source
     # candidates nor silently hide project records.
 
-    specs = build_diffs(proposed, latest_confirmed_snapshot)
+    protected = build_source_first_review_safe_diffs(
+        proposed, latest_confirmed_snapshot
+    )
+    specs = protected.specs
     mapped_indices = {
         int(match.group(1))
         for spec in specs
@@ -262,6 +268,13 @@ def assemble_native_direct(
             "strict_guard_preserves_all_native_projects": identities == strict_ident,
             "strict_guard_project_count": len(guarded.projects),
             "project_diff_type_counts": dict(Counter(x.change_type for x in project_specs)),
+            "title_variant_auto_links_blocked": len(
+                protected.variant_review_indices
+            ),
+            "duplicate_target_auto_links_blocked": len(
+                protected.collision_review_indices
+            ),
+            "v30_source_first_safe_diff_enabled": True,
             "total_diff_count": len(specs),
             "nonproject_candidate_unchanged": True,
             "no_model_calls_or_operational_writes": True,
