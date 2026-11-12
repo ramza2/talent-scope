@@ -45,7 +45,16 @@ class RevisionComparisonTests(unittest.TestCase):
         )
         self.assertEqual(r["latest_diff"]["represented_source_candidates"], 3)
         self.assertEqual(r["latest_diff"]["root_change_types"].get("SAME"), 1)
-        self.assertEqual(r["latest_diff"]["root_change_types"].get("NEW"), 2)
+        # The existing Diff engine treats a different title with the same
+        # customer AND period as REVIEW, not NEW. REVIEW is informational:
+        # it does not silently link, merge, or drop those two source projects.
+        self.assertEqual(r["latest_diff"]["root_change_types"].get("REVIEW"), 2)
+        self.assertNotIn("NEW", r["latest_diff"]["root_change_types"])
+        self.assertEqual(
+            sorted(item["candidate_index"] for item
+                   in r["latest_diff"]["root_indices_only"]),
+            [0, 1, 2],
+        )
         self.assertEqual(r["latest_confirmed_project_count"], 1)
 
     def test_latest_field_only_diffs_keep_36_like_projects_represented(self):
