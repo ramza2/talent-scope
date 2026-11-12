@@ -419,3 +419,12 @@ Agent 작업은 정확성을 해치지 않는 범위에서 Context와 실행 비
 - 작업과 무관한 README/docs/TODO 정리는 하지 않는다.
 - blocker 없이 지정 범위를 넘어 탐색하지 않는다.
 - 완료 보고에는 전체 diff/로그를 붙이지 않고 Changed / Verified / Git / Notes만 작성한다.
+
+## 20. Source-First v30 Experiment (Opt-in Only)
+
+- 운영 기본 프롬프트는 \`profile-extract-v25\`; 명시적 승인 전 v30을 기본 분석/Worker/배포 경로에 연결하지 않는다.
+- 현재 v30은 private native PDF source-group 입력을 사용하는 **읽기 전용 리뷰 페이로드 PoC**다. \`PROJECT\` 원본 그룹은 모두 각각 후보로 남기며, 명칭이 다른 3쌍의 사전 병합·차단 UI를 만들지 않는다.
+- \`source_project\`의 사업명·고객사·기간이 우선이다. PDF 역할 셀은 확인된 값 그대로 \`responsibilities\` 텍스트에 보존할 수 있으나 직무 코드로 자동 추정하지 않는다.
+- LLM 원문 인용이나 기술·업무 코드의 근거를 만들어 내지 않는다. 근거가 부족한 AI 확장 정보는 별도 제안으로 보존한다.
+- v30 새 분석 실행 시점에는 최신 확정 프로필 리비전을 사용한다. 예전 분석 실행의 Candidate/기존 Diff를 덮어쓰거나 임의로 확정하지 않는다.
+- PoC 테스트: \`backend/tests/test_project_source_first_review_payload_v30.py\` 중심, 비공개 산출물은 서버 내 0600으로 유지한다.
