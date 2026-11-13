@@ -21,19 +21,20 @@ from app.modules.analysis.project_row_match_v30 import build_clusters
 from app.modules.analysis.source_first_v30_runtime import assemble_live_source_first
 
 
-def _table_xml(body, *, frame=True):
+def _table_xml(body, *, frame=True, row_heights=None):
     rows = [
         ["수행기간", "프로젝트명", "담당역할", "고객사"],
         *body,
     ]
     records = []
-    for fields in rows:
+    for i, fields in enumerate(rows):
         cells = "".join(
             f"<a:tc><a:txBody><a:p><a:r><a:t>{escape(str(value))}</a:t>"
             "</a:r></a:p></a:txBody></a:tc>"
             for value in fields
         )
-        records.append(f'<a:tr h="508000">{cells}</a:tr>')
+        height = 508000 if row_heights is None else row_heights[i]
+        records.append(f'<a:tr h="{height}">{cells}</a:tr>')
     xfrm = (
         '<p:xfrm><a:off x="127000" y="254000"/>'
         '<a:ext cx="9144000" cy="3048000"/></p:xfrm>'
@@ -48,7 +49,10 @@ def _table_xml(body, *, frame=True):
     )
 
 
-def _make_pptx(*, bad_period=False, frame=True, blank_row=False, extra_rows=None):
+def _make_pptx(
+    *, bad_period=False, frame=True, blank_row=False, extra_rows=None,
+    row_heights=None,
+):
     projects = [
         ["2020.02~2020.04", "비공개 플랫폼 구축사업", "PL", "비공개 고객기관"]
     ]
@@ -61,7 +65,9 @@ def _make_pptx(*, bad_period=False, frame=True, blank_row=False, extra_rows=None
     xml = (
         '<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" '
         'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
-        '<p:cSld><p:spTree>' + _table_xml(projects, frame=frame)
+        '<p:cSld><p:spTree>' + _table_xml(
+            projects, frame=frame, row_heights=row_heights,
+        )
         + '</p:spTree></p:cSld></p:sld>'
     )
     buf = io.BytesIO()
@@ -316,3 +322,28 @@ def test_full_width_project_like_text_never_skipped(text):
         [text] + [""] * 8, columns, merged,
         row_index=23, table_row_count=24,
     )
+
+
+def test_zero_height_structural_rows_are_not_fabricated_as_evidence():
+    # The first header and last blank row are zero-height OOXML placeholders.
+    builder, storage = _builder(_make_pptx(
+        blank_row=True, row_heights=[0, 508000, 0],
+    ))
+    rows = pptx_native_table_rows(source_builder=builder, document=_doc("doc1"))
+    assert len(rows) == 1
+    assert rows[0]["fields"]["project_name"] == "비공개 플랫폼 구축사업"
+    assert rows[0]["bbox"][3] > rows[0]["bbox"][1]
+    assert storage.closed == ["doc1"]
+
+
+def test_zero_height_project_row_forces_full_fallback():
+    builder, storage = _builder(_make_pptx(row_heights=[508000, 0]))
+    with pytest.raises(ValueError, match="V30_PPTX_PROJECT_ROW_NO_GEOMETRY"):
+        pptx_native_table_rows(source_builder=builder, document=_doc("doc1"))
+    assert storage.closed == ["doc1"]
+
+
+def test_negative_height_still_fails_geometry_validation():
+    builder, _ = _builder(_make_pptx(row_heights=[508000, -1]))
+    with pytest.raises(ValueError, match="V30_PPTX_TABLE_GEOMETRY_INVALID"):
+        pptx_native_table_rows(source_builder=builder, document=_doc("doc1"))

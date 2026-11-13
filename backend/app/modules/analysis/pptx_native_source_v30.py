@@ -49,7 +49,7 @@ def _read_bounded_original(builder: AnalysisSourceBuilder, key: str) -> bytes:
     return b"".join(chunks)
 
 
-def _frame_geometry(frame: ET.Element, rows: list[ET.Element]) -> list[list[float]]:
+def _frame_geometry(frame: ET.Element, rows: list[ET.Element]) -> list[list[float] | None]:
     xfrm = frame.find(f"{_P}xfrm")
     if xfrm is None:
         raise ValueError("V30_PPTX_TABLE_GEOMETRY_MISSING")
@@ -67,12 +67,18 @@ def _frame_geometry(frame: ET.Element, rows: list[ET.Element]) -> list[list[floa
 
     total = sum(row_heights)
     if (x < 0 or y < 0 or width <= 0 or height <= 0
-            or not row_heights or min(row_heights) <= 0 or total <= 0):
+            or not row_heights or min(row_heights) < 0 or total <= 0):
         raise ValueError("V30_PPTX_TABLE_GEOMETRY_INVALID")
 
-    boxes = []
+    boxes: list[list[float] | None] = []
     prior = 0
     for h in row_heights:
+        # Zero-height OOXML placeholders have no defensible source bbox.
+        # Later parsing may skip an independently verified structural row;
+        # a project row with no bbox must fail the entire v30 attempt.
+        if h == 0:
+            boxes.append(None)
+            continue
         y0 = y + height * prior / total
         y1 = y + height * (prior + h) / total
         bbox = [
@@ -297,9 +303,12 @@ def pptx_native_table_rows(
                             or len(title) < 4):
                         raise ValueError("V30_PPTX_UNVERIFIED_PROJECT_ROW")
 
+                    bbox = geometry[row_index]
+                    if bbox is None:
+                        raise ValueError("V30_PPTX_PROJECT_ROW_NO_GEOMETRY")
                     entry = _row(
                         str(document.id), page_no, "pptx-native-table",
-                        row_index, row, columns, geometry[row_index],
+                        row_index, row, columns, bbox,
                     )
                     entry["geometry_space"] = "pptx-slide-points"
                     out.append(entry)
