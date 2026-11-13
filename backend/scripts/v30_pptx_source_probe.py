@@ -283,6 +283,28 @@ def main():
         print("V30_REPRESENTED_PROJECTS:",
               checks["represented_project_candidates"])
         print("V30_PROJECT_DIFF_COUNTS:", checks["project_diff_type_counts"])
+        conflict_specs = [
+            spec for spec in project_specs if spec.change_type == "CONFLICT"
+        ]
+        print("V30_CONFLICT_FIELD_COUNTS:", dict(sorted(Counter(
+            spec.field_name or "ROOT" for spec in conflict_specs
+        ).items())))
+        print("V30_CONFLICT_DISTINCT_PROJECTS:", len({
+            int(match.group(1))
+            for spec in conflict_specs
+            if (match := PROJECT_PATH.match(spec.candidate_path or ""))
+        }))
+        formatting_only_conflicts = sum(
+            isinstance(spec.old_value, str)
+            and isinstance(spec.new_value, str)
+            and "".join(unicodedata.normalize(
+                "NFKC", spec.old_value
+            ).split()) == "".join(unicodedata.normalize(
+                "NFKC", spec.new_value
+            ).split())
+            for spec in conflict_specs
+        )
+        print("V30_CONFLICT_FORMATTING_ONLY:", formatting_only_conflicts)
         print("V30_UNMATCHED_HISTORICAL_AI:",
               checks["unmatched_original_ai_project_candidates"])
         print("V30_DIFF_UNKNOWN_TARGETS:", invalid_link_count)
