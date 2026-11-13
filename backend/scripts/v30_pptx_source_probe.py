@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from collections import Counter
 import re
+import unicodedata
 from types import SimpleNamespace
 from uuid import UUID
 
@@ -18,6 +19,8 @@ from app.db.models.project import Project
 from app.db.session import SessionLocal
 from app.modules.analysis.pptx_native_source_v30 import pptx_native_table_rows
 from app.modules.analysis.project_row_match_v30 import build_clusters, folded
+from app.modules.analysis.diff_engine import _project_date_precision_compatible
+from app.modules.analysis.project_source_first_diff_guard_v30 import _exact_identity
 from app.modules.analysis.project_source_first_native_direct_v30 import (
     PROJECT_PATH, assemble_native_direct,
 )
@@ -286,6 +289,76 @@ def main():
         print("V30_DIFF_DUPLICATE_LINK_TARGETS:", duplicate_link_targets)
         print("V30_TITLE_VARIANT_REVIEW_COUNT:",
               checks["title_variant_auto_links_blocked"])
+
+        # Classify why source keys agree while strict v30 link checks
+        # still request review. Only aggregate counts; no private values.
+        def ws_only(value):
+            return "".join(
+                unicodedata.normalize("NFKC", str(value or "")).split()
+            )
+
+        reasons = Counter()
+        for project in preview.candidate.projects:
+            key = _key(
+                project.project_name, project.customer_name,
+                project.start_date, project.end_date,
+            )
+            if key is None:
+                reasons["SOURCE_KEY_INVALID"] += 1
+                continue
+            matches = [
+                item for item in confirmed if _key(
+                    item.project_name, item.customer_name,
+                    item.start_date, item.end_date,
+                ) == key
+            ]
+            if not matches:
+                reasons["NO_FOLDED_CONFIRMED_MATCH"] += 1
+                continue
+            if len(matches) != 1:
+                reasons["MULTIPLE_FOLDED_CONFIRMED_MATCHES"] += 1
+                continue
+            item = matches[0]
+            reasons["UNIQUE_FOLDED_CONFIRMED_MATCHES"] += 1
+            original_name = str(item.project_name or "")
+            original_customer = str(item.customer_name or "")
+            src_name = project.project_name
+            src_customer = project.customer_name
+            raw_title_equal = src_name.strip() == original_name.strip()
+            raw_customer_equal = src_customer.strip() == original_customer.strip()
+            if not raw_title_equal:
+                reasons["TITLE_RAW_DIFFERENT"] += 1
+                if ws_only(src_name) == ws_only(original_name):
+                    reasons["TITLE_ONLY_WHITESPACE_OR_UNICODE"] += 1
+                else:
+                    reasons["TITLE_OTHER_DIFFERENCE"] += 1
+            if not raw_customer_equal:
+                reasons["CUSTOMER_RAW_DIFFERENT"] += 1
+                if ws_only(src_customer) == ws_only(original_customer):
+                    reasons["CUSTOMER_ONLY_WHITESPACE_OR_UNICODE"] += 1
+                else:
+                    reasons["CUSTOMER_OTHER_DIFFERENCE"] += 1
+            target = {
+                "project_name": item.project_name,
+                "customer_name": item.customer_name,
+                "start_date": item.start_date.isoformat()
+                    if item.start_date else None,
+                "end_date": item.end_date.isoformat()
+                    if item.end_date else None,
+            }
+            if not _project_date_precision_compatible(
+                candidate=project.start_date, existing=target["start_date"],
+            ):
+                reasons["START_DATE_PRECISION_MISMATCH"] += 1
+            if not _project_date_precision_compatible(
+                candidate=project.end_date, existing=target["end_date"],
+            ):
+                reasons["END_DATE_PRECISION_MISMATCH"] += 1
+            if _exact_identity(project, target):
+                reasons["STRICT_IDENTITY_PASS"] += 1
+            else:
+                reasons["STRICT_IDENTITY_FAIL"] += 1
+        print("V30_IDENTITY_REASON_COUNTS:", dict(sorted(reasons.items())))
         print("V30_DEFAULT_GUARD_KEPT_ALL:",
               checks["default_guard_preserves_all_native_projects"])
         print("V30_NONPROJECT_CANDIDATE_UNCHANGED:",
