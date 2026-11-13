@@ -42,7 +42,7 @@ def assemble_live_source_first(
         if not doc.pages or len(doc.pages) > _MAX_PAGES_PER_DOCUMENT:
             raise ValueError("V30_SOURCE_PAGE_COUNT_OUT_OF_SCOPE")
         document_rows: list[dict[str, Any]] = []
-        if (doc.extension or "").lower().strip() == "pptx":
+        if (getattr(doc, "extension", None) or "").lower().strip() == "pptx":
             # The original OOXML retains independent table-row cells that the
             # rendered preview PDF may lose or split across visual rows.
             document_rows = pptx_native_table_rows(
