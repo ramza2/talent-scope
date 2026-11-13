@@ -340,8 +340,8 @@ class AnalysisService:
 
     # ------------------------------------------------------------------ create
 
-    def _selected_profile_prompt(self) -> ProfilePromptSpec:
-        if self.settings.analysis_source_first_v30_enabled:
+    def _selected_profile_prompt(self, *, source_first_v30: bool = False) -> ProfilePromptSpec:
+        if source_first_v30 or self.settings.analysis_source_first_v30_enabled:
             return resolve_profile_prompt(SOURCE_FIRST_V30_PROMPT_VERSION)
         return current_profile_prompt()
 
@@ -382,7 +382,9 @@ class AnalysisService:
                     f"문서가 READY 상태가 아닙니다: {document.original_filename}"
                 )
 
-        prompt = self._selected_profile_prompt()
+        prompt = self._selected_profile_prompt(
+            source_first_v30=payload.source_first_v30
+        )
         run = self.repo.create_run(
             person_id=payload.person_id,
             base_profile_version=profile.profile_version,
@@ -401,6 +403,8 @@ class AnalysisService:
                 "person_id": str(payload.person_id),
                 "document_ids": [str(i) for i in payload.document_ids],
                 "base_profile_version": profile.profile_version,
+                "prompt_version": prompt.prompt_version,
+                "source_first_v30_opt_in": payload.source_first_v30,
             },
         )
         self.db.commit()
