@@ -30,7 +30,7 @@ from app.modules.analysis.project_source_first_diff_guard_v30 import (
 )
 import unicodedata
 
-PROJECT_PATH = re.compile(r"^projects\\[(\\d+)\\](?:\\.|$)")
+PROJECT_PATH = re.compile(r"^projects\[(\d+)\](?:\.|$)")
 
 
 def _fold(value: object) -> str:
@@ -43,7 +43,7 @@ def _ym(value: object, *, allow_ongoing: bool = False) -> str | None:
     if allow_ongoing and raw.casefold() in {"현재", "진행중", "재직중", "present"}:
         return "현재"
     match = re.fullmatch(
-        r"((?:19|20)\\d{2})[.\\-/](0?[1-9]|1[0-2])(?:[.\\-/]\\d{1,2})?",
+        r"((?:19|20)\d{2})[.\-/](0?[1-9]|1[0-2])(?:[.\-/]\d{1,2})?",
         raw,
     )
     return f"{match[1]}.{int(match[2]):02d}" if match else None
