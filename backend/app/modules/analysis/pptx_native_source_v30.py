@@ -10,6 +10,7 @@ No DB mutation, office conversion or model calls.
 """
 from __future__ import annotations
 
+import hashlib
 import io
 import re
 import zipfile
@@ -220,8 +221,9 @@ def pptx_native_table_rows(
 ) -> list[dict]:
     """Extract only verified PPTX table cells, mapped to document slide pages.
 
-    BBox coordinates are in PPTX *slide points*, not PDF page points;
-    source/geometry_space identify that distinction in provenance.
+    Positive-height rows have bbox in PPTX slide points, not PDF points.
+    Zero-height source rows have bbox=None and an exact OOXML
+    slide/table/row/cell locator; geometry is never fabricated.
     """
     if (document.extension or "").lower().strip() != "pptx":
         raise ValueError("V30_PPTX_EXTENSION_MISMATCH")
@@ -257,10 +259,12 @@ def pptx_native_table_rows(
             except (ET.ParseError, zipfile.BadZipFile, RuntimeError) as exc:
                 raise ValueError("V30_PPTX_INVALID_SLIDE_XML") from exc
 
+            table_index = 0
             for frame in root.findall(f".//{_P}graphicFrame"):
                 table = frame.find(f".//{_A}tbl")
                 if table is None:
                     continue
+                table_index += 1
 
                 row_elements, cells = _table_rows(table)
                 columns = {}
@@ -304,13 +308,30 @@ def pptx_native_table_rows(
                         raise ValueError("V30_PPTX_UNVERIFIED_PROJECT_ROW")
 
                     bbox = geometry[row_index]
-                    if bbox is None:
-                        raise ValueError("V30_PPTX_PROJECT_ROW_NO_GEOMETRY")
+                    row_height = int(row_elements[row_index].attrib["h"])
                     entry = _row(
                         str(document.id), page_no, "pptx-native-table",
                         row_index, row, columns, bbox,
                     )
-                    entry["geometry_space"] = "pptx-slide-points"
+                    # Table+row+original cell values form stable source
+                    # identity even if OOXML specifies zero rendered height.
+                    entry["row_id"] = hashlib.sha256(
+                        (f"{document.id}|{page_no}|{table_index}|{row_index}|"
+                         + "|".join(row)).encode("utf-8")
+                    ).hexdigest()[:16]
+                    entry["pptx_locator"] = {
+                        "slide_no": page_no,
+                        "table_index": table_index,
+                        "row_index": row_index,
+                        "period_column": columns["period"],
+                        "project_name_column": columns["project_name"],
+                        "customer_column": columns.get("customer"),
+                        "row_height_emu": row_height,
+                    }
+                    entry["geometry_space"] = (
+                        "pptx-ooxml-row" if bbox is None
+                        else "pptx-slide-points"
+                    )
                     out.append(entry)
                     if len(out) > _MAX_NATIVE_ROWS:
                         raise ValueError("V30_PPTX_ROW_LIMIT_EXCEEDED")

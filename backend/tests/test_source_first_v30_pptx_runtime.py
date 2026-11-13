@@ -336,10 +336,16 @@ def test_zero_height_structural_rows_are_not_fabricated_as_evidence():
     assert storage.closed == ["doc1"]
 
 
-def test_zero_height_project_row_forces_full_fallback():
+def test_zero_height_project_row_retains_exact_ooxml_locator():
     builder, storage = _builder(_make_pptx(row_heights=[508000, 0]))
-    with pytest.raises(ValueError, match="V30_PPTX_PROJECT_ROW_NO_GEOMETRY"):
-        pptx_native_table_rows(source_builder=builder, document=_doc("doc1"))
+    rows = pptx_native_table_rows(source_builder=builder, document=_doc("doc1"))
+    assert len(rows) == 1
+    assert rows[0]["bbox"] is None
+    assert rows[0]["geometry_space"] == "pptx-ooxml-row"
+    assert rows[0]["pptx_locator"]["row_height_emu"] == 0
+    assert rows[0]["pptx_locator"]["table_index"] == 1
+    assert rows[0]["pptx_locator"]["row_index"] == 1
+    assert build_clusters(rows)["status_counts"] == {"single_source_unmatched": 1}
     assert storage.closed == ["doc1"]
 
 
@@ -347,3 +353,42 @@ def test_negative_height_still_fails_geometry_validation():
     builder, _ = _builder(_make_pptx(row_heights=[508000, -1]))
     with pytest.raises(ValueError, match="V30_PPTX_TABLE_GEOMETRY_INVALID"):
         pptx_native_table_rows(source_builder=builder, document=_doc("doc1"))
+
+
+def test_zero_height_pptx_source_and_normal_height_source_merge_safely():
+    storage = FakeStorage({
+        "doc1": _make_pptx(row_heights=[508000, 0]),
+        "doc2": _make_pptx(),
+    })
+    builder = SimpleNamespace(storage=storage)
+    result = assemble_live_source_first(
+        source_builder=builder,
+        documents=[_doc("doc1"), _doc("doc2")],
+        original_candidate=ProfileCandidateDocument.model_validate(
+            {"profile": {"name": "시험사용자"}, "projects": []}
+        ),
+        confirmed_snapshot={"projects": []},
+        page_texts={},
+    )
+    assert result.diagnostics["native_pdf_input_rows"] == 2
+    assert result.diagnostics["candidate_project_count"] == 1
+    sources = result.private_source_provenance[0]["native_pdf_row_sources"]
+    assert any(source["bbox"] is None for source in sources)
+    assert any(source["bbox"] is not None for source in sources)
+    assert all(source["pptx_locator"]["table_index"] == 1 for source in sources)
+
+
+@pytest.mark.parametrize("alter", [
+    lambda r: r.pop("pptx_locator"),
+    lambda r: r["pptx_locator"].update({"row_index": 999}),
+    lambda r: r["pptx_locator"].update({"row_height_emu": 5}),
+    lambda r: r.update({"geometry_space": "pptx-slide-points"}),
+    lambda r: r["pptx_locator"].update({"customer_column": -1}),
+    lambda r: r["pptx_locator"].update({"table_index": 0}),
+])
+def test_zero_height_pptx_invalid_locator_fails_closed(alter):
+    builder, _ = _builder(_make_pptx(row_heights=[508000, 0]))
+    row = pptx_native_table_rows(source_builder=builder, document=_doc("doc1"))[0]
+    alter(row)
+    result = build_clusters([row])
+    assert result["status_counts"] == {"unverified_source_row": 1}

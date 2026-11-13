@@ -24,7 +24,9 @@ from app.ai.schemas.profile_candidate import (
 )
 from app.modules.analysis.candidate_quality_guards import apply_candidate_quality_guards
 from app.modules.analysis.diff_engine import DiffSpec
-from app.modules.analysis.project_row_match_v30 import build_clusters
+from app.modules.analysis.project_row_match_v30 import (
+    build_clusters, verified_native_source_location,
+)
 from app.modules.analysis.project_source_first_diff_guard_v30 import (
     build_source_first_review_safe_diffs,
 )
@@ -135,19 +137,8 @@ def assemble_native_direct(
             raise ValueError(f"NATIVE_V30_NO_NATIVE_PROVENANCE:{idx}")
         source_pages = set()
         for src in sources:
-            bbox = src.get("bbox") if isinstance(src, dict) else None
-            if (
-                not isinstance(src, dict)
-                or not isinstance(src.get("document_id"), str)
-                or not src["document_id"]
-                or type(src.get("page_no")) is not int
-                or src["page_no"] < 1
-                or not isinstance(src.get("row_id"), str) or not src["row_id"]
-                or not isinstance(bbox, list) or len(bbox) != 4
-                or not all(type(x) in (int, float) for x in bbox)
-                or bbox[2] <= bbox[0] or bbox[3] <= bbox[1]
-            ):
-                raise ValueError(f"NATIVE_V30_INVALID_ROW_GEOMETRY:{idx}")
+            if not verified_native_source_location(src):
+                raise ValueError(f"NATIVE_V30_INVALID_ROW_PROVENANCE:{idx}")
             source_pages.add((src["document_id"], src["page_no"]))
 
         titles = group["project_names"]

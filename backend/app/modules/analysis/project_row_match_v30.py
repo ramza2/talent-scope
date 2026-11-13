@@ -87,6 +87,65 @@ def month_range(value: object) -> tuple[str, str] | None:
     return f"{start[0]:04}.{start[1]:02}", f"{end[0]:04}.{end[1]:02}"
 
 
+def verified_native_source_location(row: dict) -> bool:
+    """Accept true PDF geometry or strict PPTX OOXML row provenance.
+
+    A PPTX row with zero source height has no geometry. It is accepted
+    only with a real slide/table/row/cell locator tied to the same row.
+    """
+    if (
+        not isinstance(row, dict)
+        or not isinstance(row.get("document_id"), str)
+        or not row["document_id"]
+        or type(row.get("page_no")) is not int or row["page_no"] < 1
+        or not isinstance(row.get("row_id"), str) or not row["row_id"]
+    ):
+        return False
+
+    bbox = row.get("bbox")
+    bbox_ok = (
+        isinstance(bbox, (list, tuple))
+        and len(bbox) == 4
+        and all(type(v) in (int, float) for v in bbox)
+        and bbox[2] > bbox[0] and bbox[3] > bbox[1]
+    )
+    if row.get("source") == "pdf-native-table":
+        return bbox_ok
+    if row.get("source") != "pptx-native-table":
+        return False
+
+    locator = row.get("pptx_locator")
+    if not isinstance(locator, dict):
+        return False
+    for field in ("slide_no", "table_index", "row_index",
+                  "period_column", "project_name_column", "customer_column",
+                  "row_height_emu"):
+        if type(locator.get(field)) is not int:
+            return False
+    if (
+        locator["slide_no"] != row["page_no"]
+        or locator["table_index"] < 1
+        or locator["row_index"] < 0
+        or locator["row_index"] != row.get("row_index")
+        or locator["period_column"] < 0
+        or locator["project_name_column"] < 0
+        or locator["customer_column"] < 0
+        or len({
+            locator["period_column"], locator["project_name_column"],
+            locator["customer_column"]
+        }) != 3
+    ):
+        return False
+
+    height = locator["row_height_emu"]
+    if height == 0:
+        return bbox is None and row.get("geometry_space") == "pptx-ooxml-row"
+    return (
+        height > 0 and bbox_ok
+        and row.get("geometry_space") == "pptx-slide-points"
+    )
+
+
 def _source(row: dict, period: tuple[str, str] | None) -> dict:
     fields = row.get("fields") or {}
     return {
@@ -96,6 +155,8 @@ def _source(row: dict, period: tuple[str, str] | None) -> dict:
         "bbox": row.get("bbox"),
         "source": row.get("source"),
         "geometry_space": row.get("geometry_space"),
+        "row_index": row.get("row_index"),
+        "pptx_locator": row.get("pptx_locator"),
         "period_raw": fields.get("period") or "",
         "period_months": list(period) if period else None,
         "project_name": fields.get("project_name") or "",
@@ -113,20 +174,10 @@ def build_clusters(rows: list[dict]) -> dict:
         period = month_range(fields.get("period"))
         title = folded(fields.get("project_name"))
         customer = folded(fields.get("customer"))
-        bbox = row.get("bbox")
-        geometry_ok = (
-            isinstance(bbox, (list, tuple))
-            and len(bbox) == 4
-            and all(isinstance(v, (int, float)) for v in bbox)
-            and bbox[2] > bbox[0] and bbox[3] > bbox[1]
-        )
         if not (
             row.get("column_mapping_verified") is True
-            and row.get("source") in {"pdf-native-table", "pptx-native-table"}
-            and (row.get("source") != "pptx-native-table"
-                 or row.get("geometry_space") == "pptx-slide-points")
-            and row.get("document_id") and row.get("row_id")
-            and period and title and customer and geometry_ok
+            and period and title and customer
+            and verified_native_source_location(row)
         ):
             rejected.append(_source(row, period))
             continue
