@@ -1,4 +1,4 @@
-"""Opt-in native-PDF Source-First adapter for a newly analyzed candidate.
+"""Opt-in native PDF/PPTX Source-First adapter for a newly analyzed candidate.
 
 No database writes or decisions. Missing/unverifiable rows raise ValueError;
 the caller retains the complete validated v25 Candidate and Diff.
@@ -10,6 +10,7 @@ from typing import Any
 
 from app.ai.schemas.profile_candidate import ProfileCandidateDocument
 from app.modules.analysis.project_row_grouping import native_table_groups
+from app.modules.analysis.pptx_native_source_v30 import pptx_native_table_rows
 from app.modules.analysis.project_source_first_native_direct_v30 import (
     NativeDirectPreview, assemble_native_direct,
 )
@@ -30,8 +31,8 @@ def assemble_live_source_first(
 ) -> NativeDirectPreview:
     """Source-First only when every submitted document has native table rows.
 
-    A mixed/non-PDF document batch must not silently replace v25 projects
-    with a subset from the supported native-PDF files.
+    An unsupported/mixed document batch must not silently replace v25 projects
+    with a subset from the supported supported native-table files.
     """
     if not documents or len(documents) > _MAX_DOCUMENTS:
         raise ValueError("V30_SOURCE_DOCUMENT_COUNT_OUT_OF_SCOPE")
@@ -40,22 +41,29 @@ def assemble_live_source_first(
     for doc in documents:
         if not doc.pages or len(doc.pages) > _MAX_PAGES_PER_DOCUMENT:
             raise ValueError("V30_SOURCE_PAGE_COUNT_OUT_OF_SCOPE")
-        pdf = source_builder._open_render_source(doc)
-        if pdf is None:
-            raise ValueError("V30_SOURCE_PDF_UNAVAILABLE")
         document_rows: list[dict[str, Any]] = []
-        try:
-            for page in doc.pages:
-                if page.page_no < 1 or page.page_no > len(pdf):
-                    raise ValueError("V30_SOURCE_PAGE_MISMATCH")
-                document_rows.extend(native_table_groups(
-                    pdf.load_page(page.page_no - 1), str(doc.id), page.page_no,
-                    strict_rows=True,
-                ))
-                if len(native_rows) + len(document_rows) > _MAX_NATIVE_ROWS:
-                    raise ValueError("V30_SOURCE_ROW_LIMIT_EXCEEDED")
-        finally:
-            pdf.close()
+        if (doc.extension or "").lower().strip() == "pptx":
+            # The original OOXML retains independent table-row cells that the
+            # rendered preview PDF may lose or split across visual rows.
+            document_rows = pptx_native_table_rows(
+                source_builder=source_builder, document=doc,
+            )
+        else:
+            pdf = source_builder._open_render_source(doc)
+            if pdf is None:
+                raise ValueError("V30_SOURCE_PDF_UNAVAILABLE")
+            try:
+                for page in doc.pages:
+                    if page.page_no < 1 or page.page_no > len(pdf):
+                        raise ValueError("V30_SOURCE_PAGE_MISMATCH")
+                    document_rows.extend(native_table_groups(
+                        pdf.load_page(page.page_no - 1), str(doc.id), page.page_no,
+                        strict_rows=True,
+                    ))
+            finally:
+                pdf.close()
+        if len(native_rows) + len(document_rows) > _MAX_NATIVE_ROWS:
+            raise ValueError("V30_SOURCE_ROW_LIMIT_EXCEEDED")
         if not document_rows:
             raise ValueError("V30_SOURCE_DOCUMENT_WITHOUT_NATIVE_ROWS")
         native_rows.extend(document_rows)

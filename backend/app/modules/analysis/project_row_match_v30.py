@@ -1,4 +1,4 @@
-"""Opt-in, read-only cross-document matching for native PDF table rows.
+"""Opt-in, read-only cross-document matching for native PDF/PPTX table rows.
 
 Only exact folded title + customer + calendar-valid month range may merge.
 Never infer row ownership from order, nearest dates, or fuzzy title similarity.
@@ -94,6 +94,8 @@ def _source(row: dict, period: tuple[str, str] | None) -> dict:
         "document_id": row.get("document_id"),
         "page_no": row.get("page_no"),
         "bbox": row.get("bbox"),
+        "source": row.get("source"),
+        "geometry_space": row.get("geometry_space"),
         "period_raw": fields.get("period") or "",
         "period_months": list(period) if period else None,
         "project_name": fields.get("project_name") or "",
@@ -120,7 +122,9 @@ def build_clusters(rows: list[dict]) -> dict:
         )
         if not (
             row.get("column_mapping_verified") is True
-            and row.get("source") == "pdf-native-table"
+            and row.get("source") in {"pdf-native-table", "pptx-native-table"}
+            and (row.get("source") != "pptx-native-table"
+                 or row.get("geometry_space") == "pptx-slide-points")
             and row.get("document_id") and row.get("row_id")
             and period and title and customer and geometry_ok
         ):
