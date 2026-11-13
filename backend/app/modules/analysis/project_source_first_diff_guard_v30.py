@@ -14,6 +14,7 @@ There are no writes or review decisions.
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any
@@ -33,18 +34,27 @@ class SourceFirstDiff:
     collision_review_indices: list[int]
 
 
+def _stable_identity_text(value: Any) -> str:
+    """NFKC + Unicode whitespace removal only; keep punctuation and case.
+
+    Never use the more permissive punctuation-stripping grouping fold for
+    linking to a confirmed record.
+    """
+    if not isinstance(value, str):
+        return ""
+    return "".join(unicodedata.normalize("NFKC", value).split())
+
+
 def _exact_identity(project: Any, target: dict[str, Any]) -> bool:
-    """Require exact native title/customer and compatible period to auto-link."""
+    """Require unique formatting-equivalent title/customer and dates."""
     if not isinstance(target, dict):
         return False
-    name = project.project_name
-    customer = project.customer_name
-    # Never allow generic/substring/Levenshtein name matching here.
-    if not isinstance(name, str) or not isinstance(customer, str):
-        return False
+    name = _stable_identity_text(project.project_name)
+    customer = _stable_identity_text(project.customer_name)
     if (
-        name.strip() != str(target.get("project_name") or "").strip()
-        or customer.strip() != str(target.get("customer_name") or "").strip()
+        not name or not customer
+        or name != _stable_identity_text(target.get("project_name"))
+        or customer != _stable_identity_text(target.get("customer_name"))
     ):
         return False
     return (
@@ -120,6 +130,13 @@ def build_source_first_review_safe_diffs(
         if old is None:
             raise ValueError(f"V30_SAFE_DIFF_TARGET_MISSING:{index}")
         if not _exact_identity(project, old):
+            variant.add(index)
+        elif sum(
+            _exact_identity(project, existing)
+            for existing in latest_snapshot["projects"]
+        ) != 1:
+            # Formatting-equivalent confirmed records are ambiguous even
+            # if the legacy diff happened to select just one of them.
             variant.add(index)
         elif non_root or any(s.change_type == "SAME" for s in specs):
             linked[index] = target_id
