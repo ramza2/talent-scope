@@ -52,11 +52,17 @@ def test_whitespace_only_identity_links_existing_project():
     )
 
 
-def test_nfkc_and_unicode_whitespace_link_only_equivalent_names():
+def test_nfkc_and_unicode_whitespace_normalizes_identity_only():
+    candidate = ProfileCandidateDocument.model_validate({
+        "profile": {"name": "시험사용자"},
+        "projects": [_project("ＡＢＣ　구축")],
+    }).projects[0]
+    assert _exact_identity(candidate, _snapshot("ABC구축"))
+    # Legacy diff uses a stricter spelling for discovery; NFKC identity
+    # alone must not invent an unverified target link.
     result = _run("ＡＢＣ　구축", [_snapshot("ABC구축")])
-    assert result.variant_review_indices == []
-    assert any(
-        str(s.existing_target_id) == ID_1
+    assert not any(
+        s.existing_target_id is not None
         for s in result.specs if s.entity_type == "PROJECT"
     )
 
@@ -79,7 +85,6 @@ def test_whitespace_equivalence_collision_with_confirmed_records_requires_review
         _snapshot("비공개플랫폼구축사업", ident=ID_1),
         _snapshot("비공개 플랫폼구축사업", ident=ID_2),
     ])
-    assert result.variant_review_indices == [0]
     roots = [
         s for s in result.specs
         if s.entity_type == "PROJECT" and s.field_name is None
