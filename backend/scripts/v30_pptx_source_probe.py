@@ -6,6 +6,7 @@ Runs in a temporary API container with backend code mounted read-only.
 from __future__ import annotations
 
 from collections import Counter
+import re
 from types import SimpleNamespace
 from uuid import UUID
 
@@ -28,9 +29,16 @@ def _month(value):
     if hasattr(value, "strftime"):
         return value.strftime("%Y.%m")
     value = str(value).strip()
-    if len(value) >= 7 and value[4] in (".", "-", "/"):
-        return value[:4] + "." + value[5:7]
-    return None
+    if value.casefold() in {"현재", "진행중", "재직중", "present"}:
+        return "현재"
+    match = re.fullmatch(
+        r"((?:19|20)\d{2})[.\-/](0?[1-9]|1[0-2])"
+        r"(?:[.\-/](?:0?[1-9]|[12]\d|3[01]))?",
+        value,
+    )
+    if match is None:
+        return None
+    return f"{match[1]}.{int(match[2]):02d}"
 
 
 def _key(name, customer, start, end):
@@ -87,11 +95,11 @@ def main():
 
         clusters = build_clusters(rows)
         counts = Counter(g["status"] for g in clusters["groups"])
-        source_keys = {
+        source_key_values = [
             _key(g["project_names"][0], g["customers"][0], *g["period_months"])
             for g in clusters["groups"]
-        }
-        source_keys.discard(None)
+        ]
+        source_keys = {key for key in source_key_values if key is not None}
 
         print("SOURCE_ROWS:", len(rows))
         print("UNIQUE_PROJECTS:", clusters["group_count"])
@@ -99,6 +107,11 @@ def main():
         print("SINGLE_SOURCE:", counts["single_source_unmatched"])
         print("UNVERIFIED:", counts["unverified_source_row"])
         print("SAME_DOC_AMBIGUOUS:", counts["ambiguous_same_document_key"])
+        print("SOURCE_VALID_UNIQUE_KEYS:", len(source_keys))
+        print("SOURCE_UNKEYED_GROUPS:", source_key_values.count(None))
+        print("SOURCE_ONGOING_END_GROUPS:", sum(
+            g["period_months"][1] == "현재" for g in clusters["groups"]
+        ))
 
         expected = (
             len(rows) == 66
@@ -119,33 +132,41 @@ def main():
                 Project.deleted_at.is_(None),
             )
         ).all()
-        confirmed_keys = {
-            k for item in confirmed
-            if (k := _key(
+        confirmed_key_values = [
+            _key(
                 item.project_name, item.customer_name,
                 item.start_date, item.end_date,
-            )) is not None
+            )
+            for item in confirmed
+        ]
+        confirmed_keys = {
+            key for key in confirmed_key_values if key is not None
         }
         candidate = run.candidate_json or {}
         historical_projects = (
             candidate.get("projects", []) if isinstance(candidate, dict) else []
         )
-        historical_keys = {
-            k for item in historical_projects
-            if isinstance(item, dict)
-            if (k := _key(
+        historical_key_values = [
+            _key(
                 item.get("project_name"), item.get("customer_name"),
                 item.get("start_date"), item.get("end_date"),
-            )) is not None
+            )
+            for item in historical_projects
+            if isinstance(item, dict)
+        ]
+        historical_keys = {
+            key for key in historical_key_values if key is not None
         }
 
         print("CONFIRMED_PROJECT_ROWS:", len(confirmed))
         print("CONFIRMED_VALID_UNIQUE_KEYS:", len(confirmed_keys))
+        print("CONFIRMED_UNKEYED_ROWS:", confirmed_key_values.count(None))
         print("SOURCE_MATCHED_CONFIRMED:", len(source_keys & confirmed_keys))
         print("SOURCE_ONLY:", len(source_keys - confirmed_keys))
         print("CONFIRMED_ONLY:", len(confirmed_keys - source_keys))
         print("HISTORICAL_CANDIDATE_ROWS:", len(historical_projects))
         print("HISTORICAL_CANDIDATE_VALID_KEYS:", len(historical_keys))
+        print("HISTORICAL_UNKEYED_ROWS:", historical_key_values.count(None))
         print("SOURCE_MATCHED_HISTORICAL:", len(source_keys & historical_keys))
         print("RESULT: EXPECTED_34_PASS")
         print("DB_READ_ONLY: on")
