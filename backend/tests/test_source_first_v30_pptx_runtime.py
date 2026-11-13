@@ -10,7 +10,10 @@ from xml.sax.saxutils import escape
 import pytest
 
 from app.ai.schemas.profile_candidate import ProfileCandidateDocument
-from app.modules.analysis.pptx_native_source_v30 import pptx_native_table_rows
+from app.modules.analysis.pptx_native_source_v30 import (
+    _is_verified_trailing_footer,
+    pptx_native_table_rows,
+)
 from app.modules.analysis.project_row_match_v30 import build_clusters
 from app.modules.analysis.source_first_v30_runtime import assemble_live_source_first
 
@@ -206,3 +209,33 @@ def test_incomplete_nonempty_rows_remain_fail_closed(cells):
     with pytest.raises(ValueError, match="V30_PPTX_UNVERIFIED_PROJECT_ROW"):
         pptx_native_table_rows(source_builder=builder, document=_doc("doc1"))
     assert storage.closed == ["doc1"]
+
+
+def test_explicit_trailing_summary_in_unmapped_first_cell():
+    cols = {"period": 1, "project_name": 3, "role": 4, "customer": 7}
+    row = ["합계: 33건", "", "", "", "", "", "", "", ""]
+    assert _is_verified_trailing_footer(
+        row, cols, row_index=23, table_row_count=24,
+    )
+    assert not _is_verified_trailing_footer(
+        row, cols, row_index=22, table_row_count=24,
+    )
+
+
+@pytest.mark.parametrize("label", [
+    "추가 프로젝트", "비공개인력명", "2024년 이력", "계속되는 내용", "현장 경험",
+])
+def test_ambiguous_trailing_text_in_unmapped_column_fails_closed(label):
+    cols = {"period": 1, "project_name": 3, "role": 4, "customer": 7}
+    cells = [label, "", "", "", "", "", "", "", ""]
+    assert not _is_verified_trailing_footer(
+        cells, cols, row_index=23, table_row_count=24,
+    )
+
+
+def test_footer_rejected_if_another_cell_has_content():
+    cols = {"period": 1, "project_name": 3, "role": 4, "customer": 7}
+    assert not _is_verified_trailing_footer(
+        ["합계: 33건", "", "", "비공개 프로젝트", "", "", "", "", ""],
+        cols, row_index=23, table_row_count=24,
+    )

@@ -115,6 +115,29 @@ def _is_structural_separator(cells: list[str], columns: dict[str, int]) -> bool:
     return not re.search(r"(?:19|20)\d{2}", cells[columns["period"]])
 
 
+def _is_verified_trailing_footer(
+    cells: list[str], columns: dict[str, int],
+    *, row_index: int, table_row_count: int,
+) -> bool:
+    """Skip a final summary/annotation label only when it cannot be a project.
+
+    The label must be the ONLY populated cell, in the unassigned leftmost
+    column of the FINAL table row, without a year, and have an explicit
+    Korean footer marker. Anything else remains ambiguous and fails closed.
+    """
+    if row_index != table_row_count - 1 or 0 in columns.values():
+        return False
+    if [i for i, value in enumerate(cells) if value] != [0]:
+        return False
+    label = cells[0]
+    if len(label) > 80 or re.search(r"(?:19|20)\\d{2}", label):
+        return False
+    return bool(re.match(
+        r"^(?:합계|총계|소계|총합|총\\s*(?:\\d|건수|프로젝트)|비고\\s*[:：]|참고\\s*[:：]|주석\\s*[:：])",
+        label,
+    ))
+
+
 def pptx_native_table_rows(
     *,
     source_builder: AnalysisSourceBuilder,
@@ -183,6 +206,11 @@ def pptx_native_table_rows(
                         continue  # Explicit repeated column header.
                     if _is_structural_separator(row, columns):
                         continue  # Blank row or period-column non-date label.
+                    if _is_verified_trailing_footer(
+                        row, columns, row_index=row_index,
+                        table_row_count=len(cells),
+                    ):
+                        continue  # Explicit last-row summary/annotation label.
 
                     if len(row) <= max(columns.values()):
                         raise ValueError("V30_PPTX_INCOMPLETE_TABLE_ROW")
