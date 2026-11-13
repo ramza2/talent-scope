@@ -89,6 +89,25 @@ def test_whitespace_equivalence_collision_with_confirmed_records_requires_review
     assert roots[0].existing_target_id is None
 
 
+def test_exact_raw_match_does_not_bypass_confirmed_normalization_collision():
+    result = _run(
+        "비공개플랫폼구축사업",
+        [
+            _snapshot("비공개플랫폼구축사업", ident=ID_1),
+            _snapshot("비공개 플랫폼구축사업", ident=ID_2),
+        ],
+        customer="비공개고객기관",
+    )
+    assert result.variant_review_indices == [0]
+    roots = [
+        spec for spec in result.specs
+        if spec.entity_type == "PROJECT" and spec.field_name is None
+    ]
+    assert len(roots) == 1
+    assert roots[0].change_type == "REVIEW"
+    assert roots[0].existing_target_id is None
+
+
 def test_different_date_remains_nonidentity():
     candidate = ProfileCandidateDocument.model_validate({
         "profile": {"name": "시험사용자"},
