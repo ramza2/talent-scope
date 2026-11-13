@@ -130,10 +130,10 @@ def _is_verified_trailing_footer(
     if [i for i, value in enumerate(cells) if value] != [0]:
         return False
     label = cells[0]
-    if len(label) > 80 or re.search(r"(?:19|20)\\d{2}", label):
+    if len(label) > 80 or re.search(r"(?:19|20)\d{2}", label):
         return False
     return bool(re.match(
-        r"^(?:합계|총계|소계|총합|총\\s*(?:\\d|건수|프로젝트)|비고\\s*[:：]|참고\\s*[:：]|주석\\s*[:：])",
+        r"^(?:합계|총계|소계|총합|총\s*(?:\d|건수|프로젝트)|비고\s*[:：]|참고\s*[:：]|주석\s*[:：])",
         label,
     ))
 
