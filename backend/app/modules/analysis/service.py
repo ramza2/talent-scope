@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 from app.ai.prompts.profile_extract import (
     ProfilePromptSpec,
     UnknownProfilePromptVersionError,
+    SOURCE_FIRST_V30_PROMPT_VERSION,
     current_profile_prompt,
     resolve_profile_prompt,
 )
@@ -339,6 +340,11 @@ class AnalysisService:
 
     # ------------------------------------------------------------------ create
 
+    def _selected_profile_prompt(self) -> ProfilePromptSpec:
+        if self.settings.analysis_source_first_v30_enabled:
+            return resolve_profile_prompt(SOURCE_FIRST_V30_PROMPT_VERSION)
+        return current_profile_prompt()
+
     def create_analysis(
         self, payload: CreateAnalysisRequest, actor_user_id: UUID | None
     ) -> CreateAnalysisResponseData:
@@ -376,7 +382,7 @@ class AnalysisService:
                     f"문서가 READY 상태가 아닙니다: {document.original_filename}"
                 )
 
-        prompt = current_profile_prompt()
+        prompt = self._selected_profile_prompt()
         run = self.repo.create_run(
             person_id=payload.person_id,
             base_profile_version=profile.profile_version,
@@ -518,7 +524,7 @@ class AnalysisService:
                 [str(i) for i in batch],
             )
             return None
-        prompt = current_profile_prompt()
+        prompt = self._selected_profile_prompt()
         run = self.repo.create_run(
             person_id=person_id,
             base_profile_version=profile.profile_version,
@@ -581,7 +587,7 @@ class AnalysisService:
         if profile is None:
             raise NotFoundError("인력 프로필을 찾을 수 없습니다.")
 
-        prompt = current_profile_prompt()
+        prompt = self._selected_profile_prompt()
         run = self.repo.create_run(
             person_id=person_id,
             base_profile_version=profile.profile_version,
@@ -969,11 +975,46 @@ class AnalysisService:
                 ),
             )
             specs = build_diffs(candidate, base_snap)
+            source_first_fallback: str | None = None
+            if claimed.prompt_version == SOURCE_FIRST_V30_PROMPT_VERSION:
+                # Reuse v25 candidate for PROFILE/EMPLOYMENT/etc. Native PDF
+                # replaces PROJECT only if all source checks pass.
+                try:
+                    from app.modules.analysis.source_first_v30_runtime import (
+                        assemble_live_source_first,
+                    )
+
+                    native = assemble_live_source_first(
+                        source_builder=self.source_builder,
+                        documents=claimed.documents,
+                        original_candidate=candidate,
+                        confirmed_snapshot=base_snap,
+                        page_texts=prompt_source.page_texts,
+                    )
+                    candidate, specs = native.candidate, native.specs
+                    logger.info(
+                        "analysis source-first v30 applied run_id=%s "
+                        "native_rows=%s source_projects=%s",
+                        run_id,
+                        native.diagnostics["native_pdf_input_rows"],
+                        native.diagnostics["candidate_project_count"],
+                    )
+                except Exception as exc:
+                    # Preserve the entire validated v25 candidate and Diff.
+                    # Do not log private source text or candidate field values.
+                    source_first_fallback = type(exc).__name__
+                    logger.warning(
+                        "analysis source-first v30 fallback to v25 "
+                        "run_id=%s failure_class=%s",
+                        run_id, source_first_fallback,
+                    )
+
             return self._persist_reviewing(
                 run_id,
                 candidate=candidate,
                 specs=specs,
                 actor_user_id=actor_user_id,
+                source_first_fallback=source_first_fallback,
             )
         except Exception as exc:
             logger.exception("analysis failed run_id=%s", run_id)
@@ -3182,6 +3223,7 @@ class AnalysisService:
         candidate: ProfileCandidateDocument,
         specs: list[DiffSpec],
         actor_user_id: UUID | None,
+        source_first_fallback: str | None = None,
     ) -> str:
         run = self.repo.get_run(run_id, for_update=True)
         if run is None:
@@ -3192,6 +3234,11 @@ class AnalysisService:
             self.db.rollback()
             return status
 
+        if source_first_fallback is not None:
+            if run.prompt_version != SOURCE_FIRST_V30_PROMPT_VERSION:
+                raise ValueError("V30_FALLBACK_PROMPT_VERSION_MISMATCH")
+            # Fallback rows use the normal v25 UI, not Source-First labels.
+            run.prompt_version = current_profile_prompt().prompt_version
         confidence = candidate.analysis.overall_confidence
         self.repo.replace_diffs(run_id, [s.to_persist_dict() for s in specs])
         self.repo.mark_reviewing(
@@ -3207,6 +3254,7 @@ class AnalysisService:
                 "status": "REVIEWING",
                 "diff_count": len(specs),
                 "overall_confidence": float(confidence) if confidence is not None else None,
+                "source_first_v30_fallback_class": source_first_fallback,
             },
         )
         self.db.commit()

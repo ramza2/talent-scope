@@ -1,4 +1,4 @@
-"""Direct native-PDF-row -> v30 Candidate/Diff (pure, opt-in preview).
+"""Direct native-PDF-row -> v30 Candidate/Diff (pure, opt-in runtime/preview).
 
 No DB/LLM/MinIO calls here. The calling *read-only* CLI supplies verified
 native rows, a historical v25 candidate and the latest confirmed snapshot.
@@ -28,8 +28,25 @@ from app.modules.analysis.project_row_match_v30 import build_clusters
 from app.modules.analysis.project_source_first_diff_guard_v30 import (
     build_source_first_review_safe_diffs,
 )
-from app.modules.analysis.project_source_first_candidate_v30 import _fold, _ym
-from app.modules.analysis.project_source_first_review_payload_v30 import PROJECT_PATH
+import unicodedata
+
+PROJECT_PATH = re.compile(r"^projects\\[(\\d+)\\](?:\\.|$)")
+
+
+def _fold(value: object) -> str:
+    text = unicodedata.normalize("NFKC", str(value or "")).lower()
+    return re.sub(r"[^0-9a-z가-힣]", "", text)
+
+
+def _ym(value: object, *, allow_ongoing: bool = False) -> str | None:
+    raw = str(value or "").strip()
+    if allow_ongoing and raw.casefold() in {"현재", "진행중", "재직중", "present"}:
+        return "현재"
+    match = re.fullmatch(
+        r"((?:19|20)\\d{2})[.\\-/](0?[1-9]|1[0-2])(?:[.\\-/]\\d{1,2})?",
+        raw,
+    )
+    return f"{match[1]}.{int(match[2]):02d}" if match else None
 
 GOOD_STATUS = {
     "verified_exact_multi_document",
