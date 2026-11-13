@@ -83,8 +83,14 @@ def _row(doc_id: str, page_no: int, source: str, index: int,
     }
 
 
-def native_table_groups(page: object, doc_id: str, page_no: int) -> list[dict[str, Any]]:
-    """Read only strong header-identified native tables; fail closed otherwise."""
+def native_table_groups(
+    page: object, doc_id: str, page_no: int, *, strict_rows: bool = False,
+) -> list[dict[str, Any]]:
+    """Read only strong header-identified native tables; fail closed otherwise.
+
+    strict_rows is reserved for v30 runtime: partially recognized native
+    project rows must trigger fallback instead of silently losing a project.
+    """
     try:
         finder = getattr(page, "find_tables", None)
         if not callable(finder):
@@ -121,6 +127,8 @@ def native_table_groups(page: object, doc_id: str, page_no: int) -> list[dict[st
             title = _flat(cells[columns["project_name"]])
             # A fully explicit row is mandatory; don't join split rows.
             if not re.search(r"(?:19|20)\d{2}", period) or len(title) < 4:
+                if strict_rows and (period or title):
+                    raise ValueError("V30_UNVERIFIED_NATIVE_TABLE_ROW")
                 continue
             bbox = None
             try:
