@@ -991,7 +991,6 @@ class AnalysisService:
                         confirmed_snapshot=base_snap,
                         page_texts=prompt_source.page_texts,
                     )
-                    candidate, specs = native.candidate, native.specs
                     logger.info(
                         "analysis source-first v30 applied run_id=%s "
                         "native_rows=%s source_projects=%s",
@@ -999,6 +998,9 @@ class AnalysisService:
                         native.diagnostics["native_pdf_input_rows"],
                         native.diagnostics["candidate_project_count"],
                     )
+                    # Swap only after every v30 step succeeded; fallback must
+                    # never persist a partial Source-First candidate.
+                    candidate, specs = native.candidate, native.specs
                 except Exception as exc:
                     # Preserve the entire validated v25 candidate and Diff.
                     # Do not log private source text or candidate field values.
