@@ -46,7 +46,14 @@ def document(pages=2):
 
 
 def test_v30_is_opt_in_and_reuses_v25_prompts():
-    assert Settings(_env_file=None).analysis_source_first_v30_enabled is False
+    assert Settings.model_fields["analysis_source_first_v30_enabled"].default is False
+    from app.modules.analysis.service import AnalysisService
+
+    service = AnalysisService.__new__(AnalysisService)
+    service.settings = SimpleNamespace(analysis_source_first_v30_enabled=True)
+    assert service._selected_profile_prompt().prompt_version == SOURCE_FIRST_V30_PROMPT_VERSION
+    service.settings = SimpleNamespace(analysis_source_first_v30_enabled=False)
+    assert service._selected_profile_prompt().prompt_version == "profile-extract-v25"
     v25 = current_profile_prompt()
     v30 = resolve_profile_prompt(SOURCE_FIRST_V30_PROMPT_VERSION)
     assert v25.prompt_version == "profile-extract-v25"
@@ -120,4 +127,25 @@ def test_page_mismatch_falls_back_and_closes_pdf():
             confirmed_snapshot={"projects": []},
             page_texts={},
         )
+    assert pdf.closed
+
+
+def test_runtime_requests_strict_rows_not_partial_source():
+    pdf = FakePDF(length=1)
+    original = SimpleNamespace(to_storage_dict=lambda: {})
+    with patch(
+        "app.modules.analysis.source_first_v30_runtime.native_table_groups",
+        return_value=[{"source": "pdf-native-table"}],
+    ) as scanner, patch(
+        "app.modules.analysis.source_first_v30_runtime.assemble_native_direct",
+        return_value=object(),
+    ):
+        assemble_live_source_first(
+            source_builder=FakeBuilder(pdf),
+            documents=[document(pages=1)],
+            original_candidate=original,
+            confirmed_snapshot={"projects": []},
+            page_texts={},
+        )
+    assert scanner.call_args.kwargs["strict_rows"] is True
     assert pdf.closed
