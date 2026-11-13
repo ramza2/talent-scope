@@ -962,7 +962,7 @@ export function AnalysisDetailPage() {
             날짜·코드 등 형식 오류가 있는 항목은 자동 제외하고 확정합니다.
             제외된 항목은 확정 결과에 표시되며, 인력 상세화면에서 추가·수정할 수 있습니다.
           </Typography.Paragraph>
-        )
+        )}
         <Typography.Paragraph>
           Base Profile Version:{' '}
           <strong>
