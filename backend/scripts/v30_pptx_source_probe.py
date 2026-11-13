@@ -18,6 +18,9 @@ from app.db.models.project import Project
 from app.db.session import SessionLocal
 from app.modules.analysis.pptx_native_source_v30 import pptx_native_table_rows
 from app.modules.analysis.project_row_match_v30 import build_clusters, folded
+from app.modules.analysis.project_source_first_native_direct_v30 import (
+    assemble_native_direct,
+)
 from app.storage.s3 import get_object_storage
 
 RUN = UUID("19fdf976-5764-4f1e-b5ca-85d5cdb7dd61")
@@ -211,7 +214,100 @@ def main():
             and key in confirmed_only
             for item in confirmed
         ))
-        print("RESULT: EXPECTED_34_PASS")
+
+        # Pure in-memory Candidate+Diff dry run against the confirmed 52.
+        # All private payloads remain in memory; only aggregate counts print.
+        confirmed_snapshot = {
+            "projects": [
+                {
+                    "id": str(item.id),
+                    "project_name": item.project_name,
+                    "customer_name": item.customer_name,
+                    "start_date": (
+                        item.start_date.isoformat() if item.start_date else None
+                    ),
+                    "end_date": item.end_date.isoformat() if item.end_date else None,
+                    "duration_months": item.duration_months,
+                    "responsibilities": item.responsibilities,
+                    "project_summary": item.project_summary,
+                    "jobs": [], "skills": [], "expertise": [],
+                    "business_domains": [], "customer_types": [],
+                }
+                for item in confirmed
+            ]
+        }
+        try:
+            preview = assemble_native_direct(
+                native_rows=rows,
+                original_candidate_json=candidate,
+                latest_confirmed_snapshot=confirmed_snapshot,
+                page_texts={},  # Never invent unverifiable quote references.
+            )
+        except Exception as exc:
+            reason = str(exc).split(":", 1)[0]
+            if not reason.startswith(("NATIVE_V30_", "V30_")):
+                reason = type(exc).__name__
+            print("V30_DIFF_PREVIEW: FALLBACK", reason)
+            print("RESULT: DIFF_REVIEW_REQUIRED")
+            return
+
+        checks = preview.diagnostics
+        project_specs = [
+            spec for spec in preview.specs if spec.entity_type == "PROJECT"
+        ]
+        by_candidate = {}
+        for spec in project_specs:
+            match = re.match(r"^projects\\[(\\d+)\\](?:\\.|$)",
+                             spec.candidate_path or "")
+            if match:
+                by_candidate.setdefault(int(match.group(1)), []).append(spec)
+        target_ids = {str(item.id) for item in confirmed}
+        invalid_link_count = sum(
+            spec.existing_target_id is not None
+            and str(spec.existing_target_id) not in target_ids
+            for spec in project_specs
+        )
+        linked_candidates = {}
+        for index, specs in by_candidate.items():
+            for spec in specs:
+                if spec.existing_target_id is not None:
+                    linked_candidates.setdefault(
+                        str(spec.existing_target_id), set()
+                    ).add(index)
+        duplicate_link_targets = sum(
+            len(indices) > 1 for indices in linked_candidates.values()
+        )
+        print("V30_CANDIDATE_PROJECTS:", len(preview.candidate.projects))
+        print("V30_REPRESENTED_PROJECTS:",
+              checks["represented_project_candidates"])
+        print("V30_PROJECT_DIFF_COUNTS:", checks["project_diff_type_counts"])
+        print("V30_UNMATCHED_HISTORICAL_AI:",
+              checks["unmatched_original_ai_project_candidates"])
+        print("V30_DIFF_UNKNOWN_TARGETS:", invalid_link_count)
+        print("V30_DIFF_DUPLICATE_LINK_TARGETS:", duplicate_link_targets)
+        print("V30_TITLE_VARIANT_REVIEW_COUNT:",
+              checks["title_variant_auto_links_blocked"])
+        print("V30_DEFAULT_GUARD_KEPT_ALL:",
+              checks["default_guard_preserves_all_native_projects"])
+        print("V30_NONPROJECT_CANDIDATE_UNCHANGED:",
+              checks["nonproject_candidate_unchanged"])
+        print("V30_AUTOMATIC_DELETIONS: 0")
+        ok_preview = (
+            len(preview.candidate.projects) == 34
+            and checks["represented_project_candidates"] == 34
+            and checks["unmatched_original_ai_project_candidates"] == 2
+            and checks["default_guard_preserves_all_native_projects"]
+            and checks["nonproject_candidate_unchanged"]
+            and len(by_candidate) == 34
+            and invalid_link_count == 0
+            and duplicate_link_targets == 0
+            and all(spec.change_type in {
+                "SAME", "NEW", "UPDATE", "CONFLICT", "REVIEW"
+            } for spec in project_specs)
+        )
+        print("V30_DIFF_PREVIEW:", "PASS" if ok_preview else "REVIEW_REQUIRED")
+        print("RESULT:",
+              "EXPECTED_34_PASS" if ok_preview else "DIFF_REVIEW_REQUIRED")
         print("DB_READ_ONLY: on")
         print("MODEL_CALLS: 0")
         print("===== TALENTSCOPE_V30_PPTX_SOURCE_COMPARE_COMPLETE =====")
