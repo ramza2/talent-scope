@@ -2,9 +2,9 @@
 
 Reads the original uploaded PPTX, not a lossy PDF preview. Extracts only
 header-identified project tables, preserving independent row and source geometry.
-Only wholly empty rows or a single non-date label in the period column
-are recognized as structural separators. Every other incomplete row fails
-the *whole* v30 candidate, preserving the original v25 candidate/diffs.
+Only empty rows, strictly verified header continuations, and explicitly
+merged whole-table trailing notes may be skipped. Ambiguous project rows
+fail the *whole* v30 candidate, preserving the v25 candidate/diffs.
 
 No DB mutation, office conversion or model calls.
 """
@@ -138,6 +138,75 @@ def _is_verified_trailing_footer(
     ))
 
 
+def _is_merged_secondary_header(
+    cells: list[str],
+    columns: dict[str, int],
+    row_element: ET.Element,
+    *,
+    row_index: int,
+    first_data: int,
+) -> bool:
+    """Recognize a row directly beneath its table header as header continuation.
+
+    The source layout must explicitly mark BOTH project title and customer
+    as vertically continued cells. This is not a general date/row skip.
+    """
+    if row_index != first_data or not any(cells):
+        return False
+    if any(re.search(r"(?:19|20)\d{2}", value) for value in cells):
+        return False
+    for field in ("project_name", "customer", "role"):
+        idx = columns.get(field)
+        if idx is not None and (idx >= len(cells) or cells[idx]):
+            return False
+
+    merged = {
+        i for i, tc in enumerate(row_element.findall(f"{_A}tc"))
+        if tc.get("vMerge") == "1"
+    }
+    return bool(
+        columns["project_name"] in merged
+        and columns.get("customer") in merged
+    )
+
+
+def _is_full_width_trailing_note(
+    cells: list[str],
+    columns: dict[str, int],
+    row_element: ET.Element,
+    *,
+    row_index: int,
+    table_row_count: int,
+) -> bool:
+    """Recognize only a last-row, whole-table merged note (not a project).
+
+    One occupied first cell spans all table columns and all other cells
+    are explicitly horizontal-merge continuations. No mapped identity or
+    date may be present. Ambiguous non-merged text still fails closed.
+    """
+    if row_index != table_row_count - 1 or 0 in columns.values():
+        return False
+    if [i for i, value in enumerate(cells) if value] != [0]:
+        return False
+    if not 1 <= len(cells[0]) <= 80:
+        return False
+    if re.search(r"(?:19|20)\d{2}", cells[0]):
+        return False
+    if re.search(r"프로젝트|사업명|발주처|고객사|수행기간", cells[0]):
+        return False
+
+    elements = row_element.findall(f"{_A}tc")
+    if len(elements) != len(cells) or len(elements) < 2:
+        return False
+    try:
+        span = int(elements[0].get("gridSpan", "1"))
+    except ValueError:
+        return False
+    return span == len(cells) and all(
+        element.get("hMerge") == "1" for element in elements[1:]
+    )
+
+
 def pptx_native_table_rows(
     *,
     source_builder: AnalysisSourceBuilder,
@@ -206,11 +275,19 @@ def pptx_native_table_rows(
                         continue  # Explicit repeated column header.
                     if _is_structural_separator(row, columns):
                         continue  # Blank row or period-column non-date label.
+                    if _is_merged_secondary_header(
+                        row, columns, row_elements[row_index],
+                        row_index=row_index, first_data=first_data,
+                    ):
+                        continue  # Layout-verified continuation of the table header.
                     if _is_verified_trailing_footer(
                         row, columns, row_index=row_index,
                         table_row_count=len(cells),
+                    ) or _is_full_width_trailing_note(
+                        row, columns, row_elements[row_index],
+                        row_index=row_index, table_row_count=len(cells),
                     ):
-                        continue  # Explicit last-row summary/annotation label.
+                        continue  # Explicit footer or whole-table merged note.
 
                     if len(row) <= max(columns.values()):
                         raise ValueError("V30_PPTX_INCOMPLETE_TABLE_ROW")

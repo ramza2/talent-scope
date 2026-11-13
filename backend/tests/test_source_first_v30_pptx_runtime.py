@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import zipfile
+from xml.etree import ElementTree as ET
 from types import SimpleNamespace
 from xml.sax.saxutils import escape
 
@@ -11,6 +12,8 @@ import pytest
 
 from app.ai.schemas.profile_candidate import ProfileCandidateDocument
 from app.modules.analysis.pptx_native_source_v30 import (
+    _is_full_width_trailing_note,
+    _is_merged_secondary_header,
     _is_verified_trailing_footer,
     pptx_native_table_rows,
 )
@@ -238,4 +241,78 @@ def test_footer_rejected_if_another_cell_has_content():
     assert not _is_verified_trailing_footer(
         ["합계: 33건", "", "", "비공개 프로젝트", "", "", "", "", ""],
         cols, row_index=23, table_row_count=24,
+    )
+
+
+def _row_with_merge_flags(*, vertically_merged=(), full_width=False, ncols=9):
+    a_ns = "http://schemas.openxmlformats.org/drawingml/2006/main"
+    tr = ET.Element(f"{{{a_ns}}}tr", {"h": "508000"})
+    for i in range(ncols):
+        attrs = {}
+        if full_width:
+            attrs = {"gridSpan": str(ncols)} if i == 0 else {"hMerge": "1"}
+        elif i in vertically_merged:
+            attrs = {"vMerge": "1"}
+        ET.SubElement(tr, f"{{{a_ns}}}tc", attrs)
+    return tr
+
+
+def test_merged_secondary_header_only_immediately_after_header():
+    columns = {"period": 1, "project_name": 3, "role": 4, "customer": 7}
+    values = ["", "실적 분류", "", "", "", "보조 제목", "보조 열", "", ""]
+    row = _row_with_merge_flags(vertically_merged=(0, 2, 3, 4, 7, 8))
+    assert _is_merged_secondary_header(
+        values, columns, row, row_index=2, first_data=2,
+    )
+    assert not _is_merged_secondary_header(
+        values, columns, row, row_index=3, first_data=2,
+    )
+    assert not _is_merged_secondary_header(
+        values[:3] + ["비공개 프로젝트"] + values[4:],
+        columns, row, row_index=2, first_data=2,
+    )
+
+
+def test_secondary_header_cannot_skip_date_or_without_merged_project_cells():
+    columns = {"period": 0, "project_name": 2, "role": 4, "customer": 7}
+    row = _row_with_merge_flags(vertically_merged=(1, 2, 3, 6, 7))
+    values = ["실적 구분", "", "", "", "", "보조", "", "", ""]
+    assert _is_merged_secondary_header(
+        values, columns, row, row_index=2, first_data=2,
+    )
+    assert not _is_merged_secondary_header(
+        ["2024년"] + values[1:], columns, row,
+        row_index=2, first_data=2,
+    )
+    assert not _is_merged_secondary_header(
+        values, columns, _row_with_merge_flags(vertically_merged=(1, 3, 6)),
+        row_index=2, first_data=2,
+    )
+
+
+def test_full_width_note_requires_complete_merge_and_final_position():
+    columns = {"period": 1, "project_name": 3, "role": 4, "customer": 7}
+    values = ["작성 기준 참고", "", "", "", "", "", "", "", ""]
+    merged = _row_with_merge_flags(full_width=True)
+    assert _is_full_width_trailing_note(
+        values, columns, merged, row_index=23, table_row_count=24,
+    )
+    assert not _is_full_width_trailing_note(
+        values, columns, merged, row_index=22, table_row_count=24,
+    )
+    assert not _is_full_width_trailing_note(
+        values, columns, _row_with_merge_flags(),
+        row_index=23, table_row_count=24,
+    )
+
+
+@pytest.mark.parametrize("text", [
+    "2024년 프로젝트", "비공개 프로젝트", "고객사 현황", "수행기간 2020",
+])
+def test_full_width_project_like_text_never_skipped(text):
+    columns = {"period": 1, "project_name": 3, "customer": 7}
+    merged = _row_with_merge_flags(full_width=True)
+    assert not _is_full_width_trailing_note(
+        [text] + [""] * 8, columns, merged,
+        row_index=23, table_row_count=24,
     )
