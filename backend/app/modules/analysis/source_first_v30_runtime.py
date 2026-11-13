@@ -50,6 +50,7 @@ def assemble_live_source_first(
                     raise ValueError("V30_SOURCE_PAGE_MISMATCH")
                 document_rows.extend(native_table_groups(
                     pdf.load_page(page.page_no - 1), str(doc.id), page.page_no,
+                    strict_rows=True,
                 ))
                 if len(native_rows) + len(document_rows) > _MAX_NATIVE_ROWS:
                     raise ValueError("V30_SOURCE_ROW_LIMIT_EXCEEDED")
