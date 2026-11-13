@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 
 from app.ai.prompts import (
@@ -36,6 +36,7 @@ from app.ai.prompts import (
 from app.ai.providers.errors import AIProviderError
 
 CURRENT_PROFILE_PROMPT_VERSION = "profile-extract-v25"
+SOURCE_FIRST_V30_PROMPT_VERSION = "profile-source-first-v30-native-direct"
 
 ExtractionMode = Literal["single", "staged"]
 
@@ -242,6 +243,13 @@ _REGISTRY: dict[str, ProfilePromptSpec] = {
     profile_extract_v24.PROMPT_VERSION: _spec_from_staged_module(profile_extract_v24),
     profile_extract_v25.PROMPT_VERSION: _spec_from_staged_module(profile_extract_v25),
 }
+
+# v30 uses the unchanged v25 AI extraction prompt for all nonproject fields.
+# Its distinctive prompt_version pins Source-First handling per new analysis run.
+_REGISTRY[SOURCE_FIRST_V30_PROMPT_VERSION] = replace(
+    _REGISTRY[CURRENT_PROFILE_PROMPT_VERSION],
+    prompt_version=SOURCE_FIRST_V30_PROMPT_VERSION,
+)
 
 
 def resolve_profile_prompt(prompt_version: str | None) -> ProfilePromptSpec:

@@ -298,7 +298,8 @@ export function AnalysisDetailPage() {
     mutationFn: () =>
       confirmAnalysis(analysisId, {
         expected_profile_version: analysis!.base_profile_version!,
-        skip_invalid_values: true,
+        // Native Source-First projects must not be partially skipped on Confirm.
+        skip_invalid_values: analysis!.prompt_version !== 'profile-source-first-v30-native-direct',
       }),
     onSuccess: async (res) => {
       setConfirmOpen(false)
@@ -949,12 +950,19 @@ export function AnalysisDetailPage() {
         destroyOnHidden
       >
         <Typography.Paragraph>
-          승인된 AI 분석 결과 중 저장 가능한 항목을 운영 프로필에 반영합니다.
+          승인된 AI 분석 결과를 운영 프로필에 반영합니다.
         </Typography.Paragraph>
-        <Typography.Paragraph type="secondary">
-          날짜·코드 등 형식 오류가 있는 항목은 자동 제외하고 확정합니다.
-          제외된 항목은 확정 결과에 표시되며, 인력 상세화면에서 추가·수정할 수 있습니다.
-        </Typography.Paragraph>
+        {analysis?.prompt_version === 'profile-source-first-v30-native-direct' ? (
+          <Typography.Paragraph type="secondary">
+            v30 원본 프로젝트는 모두 정상 등록돼야 합니다.
+            저장할 수 없는 항목이 있으면 일부만 반영하지 않고 확정 전체를 중단합니다.
+          </Typography.Paragraph>
+        ) : (
+          <Typography.Paragraph type="secondary">
+            날짜·코드 등 형식 오류가 있는 항목은 자동 제외하고 확정합니다.
+            제외된 항목은 확정 결과에 표시되며, 인력 상세화면에서 추가·수정할 수 있습니다.
+          </Typography.Paragraph>
+        )}
         <Typography.Paragraph>
           Base Profile Version:{' '}
           <strong>

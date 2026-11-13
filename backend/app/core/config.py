@@ -63,6 +63,8 @@ class Settings(BaseSettings):
     # POC opt-in: re-read already VLM-transcribed PDF tables for a new analysis
     # without replacing their stored DocumentPage text.
     analysis_vlm_table_banding_reprocess_done: bool = False
+    # Disabled by default. Only newly created runs pin the v30 opt-in version.
+    analysis_source_first_v30_enabled: bool = False
     analysis_vlm_table_banding_rows_per_band: int = 5
     analysis_vlm_table_banding_max_calls_per_page: int = 6
     analysis_vlm_table_banding_max_calls_total: int = 16
