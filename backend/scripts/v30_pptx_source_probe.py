@@ -19,7 +19,7 @@ from app.db.session import SessionLocal
 from app.modules.analysis.pptx_native_source_v30 import pptx_native_table_rows
 from app.modules.analysis.project_row_match_v30 import build_clusters, folded
 from app.modules.analysis.project_source_first_native_direct_v30 import (
-    assemble_native_direct,
+    PROJECT_PATH, assemble_native_direct,
 )
 from app.storage.s3 import get_object_storage
 
@@ -257,8 +257,7 @@ def main():
         ]
         by_candidate = {}
         for spec in project_specs:
-            match = re.match(r"^projects\\[(\\d+)\\](?:\\.|$)",
-                             spec.candidate_path or "")
+            match = PROJECT_PATH.match(spec.candidate_path or "")
             if match:
                 by_candidate.setdefault(int(match.group(1)), []).append(spec)
         target_ids = {str(item.id) for item in confirmed}
