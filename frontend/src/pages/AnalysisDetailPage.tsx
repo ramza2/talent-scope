@@ -25,6 +25,7 @@ import {
   formatDiffValueSummary,
   formatValue,
 } from '@/api/diffValueDisplay'
+import { projectReviewView } from '@/api/projectReviewDisplay'
 import { DiffEvidenceGroups } from '@/pages/analysisDiffEvidence'
 import { readAnalysesReturnTo } from '@/pages/analysesListState'
 import {
@@ -535,6 +536,90 @@ export function AnalysisDetailPage() {
     },
   ]
 
+  // Project-only view: keep the same Diff decisions and evidence actions,
+  // but present native project identity/period/role as readable columns.
+  // General v25 and non-project rows continue to use the existing table.
+  const projectColumns: ColumnsType<DiffItem> = [
+    {
+      title: '분류',
+      key: 'project_change_type',
+      width: 105,
+      render: (_, row) => changeTypeTag(row.change_type),
+    },
+    {
+      title: '프로젝트 / 고객사',
+      key: 'project_identity',
+      width: 290,
+      render: (_, row) => {
+        const value = projectReviewView(row, analysis?.candidate_json ?? {})
+        return (
+          <div>
+            <Typography.Paragraph
+              strong
+              ellipsis={{ rows: 2, expandable: true, symbol: '더보기' }}
+              style={{ marginBottom: 3, overflowWrap: 'anywhere' }}
+            >
+              {value.projectName}
+            </Typography.Paragraph>
+            <Typography.Text type="secondary" style={{ overflowWrap: 'anywhere' }}>
+              {value.customerName}
+            </Typography.Text>
+          </div>
+        )
+      },
+    },
+    {
+      title: '수행기간',
+      key: 'project_period',
+      width: 180,
+      render: (_, row) => (
+        <Typography.Text>
+          {projectReviewView(row, analysis?.candidate_json ?? {}).period}
+        </Typography.Text>
+      ),
+    },
+    {
+      title: '수행역할 / 변경내용',
+      key: 'project_role',
+      width: 270,
+      render: (_, row) => {
+        const value = projectReviewView(row, analysis?.candidate_json ?? {})
+        return (
+          <div style={{ overflowWrap: 'anywhere' }}>
+            <Typography.Paragraph
+              ellipsis={{ rows: 3, expandable: true, symbol: '더보기' }}
+              style={{ marginBottom: value.updateDescription ? 4 : 0 }}
+            >
+              {value.role}
+            </Typography.Paragraph>
+            {value.updateDescription ? (
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                {value.updateDescription}
+              </Typography.Text>
+            ) : null}
+          </div>
+        )
+      },
+    },
+    {
+      title: '기존 비교 대상',
+      key: 'project_existing',
+      width: 240,
+      render: (_, row) => (
+        <Typography.Paragraph
+          type="secondary"
+          ellipsis={{ rows: 3, expandable: true, symbol: '더보기' }}
+          style={{ marginBottom: 0, overflowWrap: 'anywhere' }}
+        >
+          {projectReviewView(row, analysis?.candidate_json ?? {}).existingSummary}
+        </Typography.Paragraph>
+      ),
+    },
+    // Retain existing document evidence, review status and per-row actions
+    // without changing the 6 tabs or approval/rejection behavior.
+    ...columns.filter((_, idx) => [5, 7, 8].includes(idx)),
+  ]
+
   if (detailQuery.isLoading || !analysis) {
     return <Typography.Text>불러오는 중…</Typography.Text>
   }
@@ -711,6 +796,14 @@ export function AnalysisDetailPage() {
             style={{ marginBottom: 8 }}
           />
 
+          {entityFilter === 'PROJECT' &&
+            analysis.prompt_version === 'profile-source-first-v30-native-direct' ? (
+            <Typography.Paragraph type="secondary" style={{ marginBottom: 10 }}>
+              PDF 원본 기준 프로젝트를 별도 항목으로 표시합니다.
+              REVIEW는 유사성 검토 대상이며 자동 병합되지 않습니다.
+            </Typography.Paragraph>
+          ) : null}
+
           {canReview ? (
             <Space style={{ marginBottom: 12 }} wrap>
               <Tag color={selectedKeys.length > 0 ? 'green' : undefined}>
@@ -818,7 +911,7 @@ export function AnalysisDetailPage() {
             <Table
               rowKey="id"
               loading={diffsQuery.isLoading}
-              columns={columns}
+              columns={entityFilter === 'PROJECT' ? projectColumns : columns}
               dataSource={diffsQuery.data?.data ?? []}
               size="small"
               scroll={{ x: 1340 }}
