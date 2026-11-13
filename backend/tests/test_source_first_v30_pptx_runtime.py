@@ -42,7 +42,7 @@ def _table_xml(body, *, frame=True):
     )
 
 
-def _make_pptx(*, bad_period=False, frame=True, blank_row=False):
+def _make_pptx(*, bad_period=False, frame=True, blank_row=False, extra_rows=None):
     projects = [
         ["2020.02~2020.04", "비공개 플랫폼 구축사업", "PL", "비공개 고객기관"]
     ]
@@ -50,6 +50,8 @@ def _make_pptx(*, bad_period=False, frame=True, blank_row=False):
         projects.append(["", "비공개 별도 사업", "PM", "비공개 고객기관"])
     if blank_row:
         projects.append(["", "", "", ""])
+    if extra_rows:
+        projects.extend(extra_rows)
     xml = (
         '<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" '
         'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
@@ -180,3 +182,27 @@ def test_pptx_row_requires_geometry_source_marker():
     row.pop("geometry_space")
     report = build_clusters([row])
     assert report["status_counts"] == {"unverified_source_row": 1}
+
+
+def test_non_date_period_only_section_label_is_skipped():
+    builder, _ = _builder(_make_pptx(extra_rows=[
+        ["프로젝트 수행 경력", "", "", ""],
+        ["", "", "", ""],
+    ]))
+    result = pptx_native_table_rows(source_builder=builder, document=_doc("doc1"))
+    assert len(result) == 1
+    assert result[0]["fields"]["project_name"] == "비공개 플랫폼 구축사업"
+
+
+@pytest.mark.parametrize("cells", [
+    ["2024", "", "", ""],                        # Orphan date: not a separator
+    ["", "비공개 추가 프로젝트", "", ""],         # Missing period, possible project
+    ["", "", "프로젝트 상세 업무", ""],           # Continuation cells
+    ["", "", "", "비공개 고객기관"],              # Customer-only row
+    ["", "", "", "", "다른 열의 보조 정보"],       # Unmapped column: ambiguous
+])
+def test_incomplete_nonempty_rows_remain_fail_closed(cells):
+    builder, storage = _builder(_make_pptx(extra_rows=[cells]))
+    with pytest.raises(ValueError, match="V30_PPTX_UNVERIFIED_PROJECT_ROW"):
+        pptx_native_table_rows(source_builder=builder, document=_doc("doc1"))
+    assert storage.closed == ["doc1"]

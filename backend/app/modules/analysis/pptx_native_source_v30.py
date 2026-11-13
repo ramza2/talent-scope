@@ -2,8 +2,9 @@
 
 Reads the original uploaded PPTX, not a lossy PDF preview. Extracts only
 header-identified project tables, preserving independent row and source geometry.
-Any nonempty, incomplete project-table row fails the *whole* v30 candidate;
-the calling service preserves its complete v25 candidate/diffs.
+Only wholly empty rows or a single non-date label in the period column
+are recognized as structural separators. Every other incomplete row fails
+the *whole* v30 candidate, preserving the original v25 candidate/diffs.
 
 No DB mutation, office conversion or model calls.
 """
@@ -99,6 +100,21 @@ def _table_rows(table: ET.Element) -> tuple[list[ET.Element], list[list[str]]]:
     return elements, cells
 
 
+def _is_structural_separator(cells: list[str], columns: dict[str, int]) -> bool:
+    """Recognize only structurally unambiguous non-project rows.
+
+    No project title, customer, role or unmapped-column content may be present.
+    A sole period-column label with no calendar year can be a section marker.
+    An orphan date is NOT a section marker and must fail closed.
+    """
+    occupied = [index for index, value in enumerate(cells) if value]
+    if not occupied:
+        return True
+    if occupied != [columns["period"]]:
+        return False
+    return not re.search(r"(?:19|20)\d{2}", cells[columns["period"]])
+
+
 def pptx_native_table_rows(
     *,
     source_builder: AnalysisSourceBuilder,
@@ -163,10 +179,10 @@ def pptx_native_table_rows(
                 geometry = _frame_geometry(frame, row_elements)
                 for row_index in range(first_data, len(cells)):
                     row = cells[row_index]
-                    if not any(row):
-                        continue  # Entirely blank separator is not a project.
                     if header_columns(row) == columns:
                         continue  # Explicit repeated column header.
+                    if _is_structural_separator(row, columns):
+                        continue  # Blank row or period-column non-date label.
 
                     if len(row) <= max(columns.values()):
                         raise ValueError("V30_PPTX_INCOMPLETE_TABLE_ROW")
