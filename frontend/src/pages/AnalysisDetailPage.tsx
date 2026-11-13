@@ -568,6 +568,13 @@ export function AnalysisDetailPage() {
         )
       },
     },
+    // Keep actions beside the project identity, not fixed to the right:
+    // Ant Design's sticky right cells can disappear for offscreen rows in
+    // long project lists/full-page captures. Every row must retain its
+    // existing simple-review approval/rejection actions.
+    ...columns
+      .filter((_, idx) => idx === 8)
+      .map((column) => ({ ...column, fixed: undefined, width: 160 })),
     {
       title: '수행기간',
       key: 'project_period',
@@ -615,9 +622,8 @@ export function AnalysisDetailPage() {
         </Typography.Paragraph>
       ),
     },
-    // Retain existing document evidence, review status and per-row actions
-    // without changing the 6 tabs or approval/rejection behavior.
-    ...columns.filter((_, idx) => [5, 7, 8].includes(idx)),
+    // Retain existing evidence and review status; actions moved beside name.
+    ...columns.filter((_, idx) => [5, 7].includes(idx)),
   ]
 
   if (detailQuery.isLoading || !analysis) {
