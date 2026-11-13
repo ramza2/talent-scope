@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from app.modules.analysis.project_row_grouping import native_table_groups
 
 
@@ -60,3 +62,16 @@ def test_row_ids_are_stable_for_identical_source():
     table = FakeTable([["참여기간", "사업명"], ["2020.2.1~4.30", "블록체인 연구"]])
     page = FakePage([table])
     assert native_table_groups(page, "d", 1) == native_table_groups(page, "d", 1)
+
+
+def test_v30_strict_rows_fall_back_on_split_or_incomplete_project():
+    table = FakeTable([
+        ["참여기간", "사업명", "발주처"],
+        ["2020.01~2020.05", "정상프로젝트 사업", "공공기관"],
+        ["2020.06~2020.09", "", "공공기관"],
+    ])
+    # v25 exploratory scans can omit the incomplete row, but v30 must
+    # never silently persist the valid subset as *all* source projects.
+    assert len(native_table_groups(FakePage([table]), "d", 1)) == 1
+    with pytest.raises(ValueError, match="V30_UNVERIFIED_NATIVE_TABLE_ROW"):
+        native_table_groups(FakePage([table]), "d", 1, strict_rows=True)
