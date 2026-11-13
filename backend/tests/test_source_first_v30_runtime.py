@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from uuid import uuid4
 from unittest.mock import patch
 
 import pytest
@@ -149,3 +150,52 @@ def test_runtime_requests_strict_rows_not_partial_source():
         )
     assert scanner.call_args.kwargs["strict_rows"] is True
     assert pdf.closed
+
+
+def test_v30_failure_persists_original_v25_candidate_and_diffs():
+    from app.modules.analysis.service import AnalysisService
+
+    original_data = {"projects": [{"project_name": "v25 fallback"}]}
+    events = []
+    run = SimpleNamespace(
+        status="PROCESSING",
+        prompt_version=SOURCE_FIRST_V30_PROMPT_VERSION,
+    )
+
+    class FakeRepo:
+        def get_run(self, run_id, *, for_update):
+            assert for_update
+            return run
+
+        def replace_diffs(self, run_id, rows):
+            events.append(("diffs", rows))
+
+        def mark_reviewing(self, row, *, candidate_json, overall_confidence):
+            events.append(("candidate", candidate_json))
+            row.status = "REVIEWING"
+
+        def add_audit(self, **kwargs):
+            events.append(("audit", kwargs["after"]))
+
+    service = AnalysisService.__new__(AnalysisService)
+    service.repo = FakeRepo()
+    service.db = SimpleNamespace(commit=lambda: events.append(("commit", None)))
+    candidate = SimpleNamespace(
+        analysis=SimpleNamespace(overall_confidence=None),
+        to_storage_dict=lambda: original_data,
+    )
+    diff = SimpleNamespace(to_persist_dict=lambda: {"change_type": "NEW"})
+
+    assert service._persist_reviewing(
+        uuid4(),
+        candidate=candidate,
+        specs=[diff],
+        actor_user_id=None,
+        source_first_fallback="ValueError",
+    ) == "REVIEWING"
+
+    assert run.prompt_version == "profile-extract-v25"
+    assert events[0] == ("diffs", [{"change_type": "NEW"}])
+    assert events[1] == ("candidate", original_data)
+    assert events[2][1]["source_first_v30_fallback_class"] == "ValueError"
+    assert events[-1] == ("commit", None)
