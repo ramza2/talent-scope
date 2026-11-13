@@ -168,6 +168,49 @@ def main():
         print("HISTORICAL_CANDIDATE_VALID_KEYS:", len(historical_keys))
         print("HISTORICAL_UNKEYED_ROWS:", historical_key_values.count(None))
         print("SOURCE_MATCHED_HISTORICAL:", len(source_keys & historical_keys))
+
+        # Diagnostics for the delta only. Never print names, dates or keys.
+        historical_only = historical_keys - source_keys
+        confirmed_only = confirmed_keys - source_keys
+        source_only = source_keys - confirmed_keys
+        print("HISTORICAL_ONLY:", len(historical_only))
+        print("HISTORICAL_ONLY_IN_CONFIRMED:", len(historical_only & confirmed_keys))
+        print("HISTORICAL_ONLY_NOT_CONFIRMED:",
+              len(historical_only - confirmed_keys))
+        print("SOURCE_ONLY_IN_HISTORICAL:",
+              len(source_only & historical_keys))
+        print("SOURCE_ONLY_SAME_NAME_CUSTOMER_CONFIRMED:", sum(
+            any(key[:2] == other[:2] for other in confirmed_keys)
+            for key in source_only
+        ))
+        print("SOURCE_ONLY_SAME_NAME_CONFIRMED:", sum(
+            any(key[0] == other[0] for other in confirmed_keys)
+            for key in source_only
+        ))
+        print("CONFIRMED_ONLY_IN_HISTORICAL:",
+              len(confirmed_only & historical_keys))
+        print("CONFIRMED_ONLY_NOT_HISTORICAL:",
+              len(confirmed_only - historical_keys))
+        print("CONFIRMED_FROM_SOURCE_RUN_ROWS:", sum(
+            item.source_analysis_run_id == RUN for item in confirmed
+        ))
+        print("CONFIRMED_OTHER_SOURCE_RUN_ROWS:", sum(
+            item.source_analysis_run_id != RUN for item in confirmed
+        ))
+        print("CONFIRMED_ONLY_SOURCE_RUN_ROWS:", sum(
+            item.source_analysis_run_id == RUN
+            and (key := _key(item.project_name, item.customer_name,
+                             item.start_date, item.end_date)) is not None
+            and key in confirmed_only
+            for item in confirmed
+        ))
+        print("CONFIRMED_ONLY_OTHER_RUN_ROWS:", sum(
+            item.source_analysis_run_id != RUN
+            and (key := _key(item.project_name, item.customer_name,
+                             item.start_date, item.end_date)) is not None
+            and key in confirmed_only
+            for item in confirmed
+        ))
         print("RESULT: EXPECTED_34_PASS")
         print("DB_READ_ONLY: on")
         print("MODEL_CALLS: 0")
