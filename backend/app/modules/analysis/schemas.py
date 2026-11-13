@@ -44,6 +44,8 @@ class CreateAnalysisRequest(BaseModel):
     person_id: UUID
     document_ids: list[UUID] = Field(min_length=1)
     analysis_type: AnalysisType = "PROFILE"
+    # Per-run administrator opt-in; absent/false keeps the configured default.
+    source_first_v30: bool = Field(default=False, strict=True)
 
     @field_validator("document_ids")
     @classmethod
