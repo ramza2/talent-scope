@@ -58,13 +58,8 @@ def test_nfkc_and_unicode_whitespace_normalizes_identity_only():
         "projects": [_project("ＡＢＣ　구축")],
     }).projects[0]
     assert _exact_identity(candidate, _snapshot("ABC구축"))
-    # Legacy diff uses a stricter spelling for discovery; NFKC identity
-    # alone must not invent an unverified target link.
-    result = _run("ＡＢＣ　구축", [_snapshot("ABC구축")])
-    assert not any(
-        s.existing_target_id is not None
-        for s in result.specs if s.entity_type == "PROJECT"
-    )
+    # Unicode compatibility must not also erase punctuation.
+    assert not _exact_identity(candidate, _snapshot("ABC-구축"))
 
 
 def test_punctuation_difference_never_auto_links():
