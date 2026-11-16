@@ -527,7 +527,10 @@ def test_v31_native_success_skips_project_llm_and_returns_native_specs():
         side_effect=lambda c, **kwargs: c,
     ):
         candidate, specs, fallback = service._run_source_first_v31_native_first(
-            prompt=SimpleNamespace(guard_core_section_authority=False),
+            prompt=SimpleNamespace(
+                guard_core_section_authority=False,
+                prompt_version=SOURCE_FIRST_V31_PROMPT_VERSION,
+            ),
             claimed=SimpleNamespace(documents=[object()]),
             blocks="blocks",
             catalog_map={},
@@ -587,7 +590,10 @@ def test_v31_probe_failure_runs_complete_v25_with_projects():
         return_value=[SimpleNamespace(entity_type="PROJECT")],
     ) as build:
         candidate, specs, fallback = service._run_source_first_v31_native_first(
-            prompt=SimpleNamespace(guard_core_section_authority=False),
+            prompt=SimpleNamespace(
+                guard_core_section_authority=False,
+                prompt_version=SOURCE_FIRST_V31_PROMPT_VERSION,
+            ),
             claimed=SimpleNamespace(documents=[object()]),
             blocks="blocks",
             catalog_map={},
@@ -653,7 +659,10 @@ def test_v31_assembly_failure_reuses_core_then_runs_project_llm():
         return_value=[SimpleNamespace(entity_type="PROJECT")],
     ):
         candidate, specs, fallback = service._run_source_first_v31_native_first(
-            prompt=SimpleNamespace(guard_core_section_authority=False),
+            prompt=SimpleNamespace(
+                guard_core_section_authority=False,
+                prompt_version=SOURCE_FIRST_V31_PROMPT_VERSION,
+            ),
             claimed=SimpleNamespace(documents=[object()]),
             blocks="blocks",
             catalog_map={},
@@ -692,7 +701,10 @@ def test_v31_fallback_rejects_empty_projects():
     ):
         with pytest.raises(InsufficientCandidateError):
             service._run_source_first_v31_native_first(
-                prompt=SimpleNamespace(guard_core_section_authority=False),
+                prompt=SimpleNamespace(
+                    guard_core_section_authority=False,
+                    prompt_version=SOURCE_FIRST_V31_PROMPT_VERSION,
+                ),
                 claimed=SimpleNamespace(documents=[object()]),
                 blocks="blocks",
                 catalog_map={},
