@@ -18,6 +18,7 @@ from app.ai.prompts.profile_extract import (
     ProfilePromptSpec,
     UnknownProfilePromptVersionError,
     SOURCE_FIRST_V30_PROMPT_VERSION,
+    SOURCE_FIRST_V31_PROMPT_VERSION,
     current_profile_prompt,
     resolve_profile_prompt,
 )
@@ -340,7 +341,18 @@ class AnalysisService:
 
     # ------------------------------------------------------------------ create
 
-    def _selected_profile_prompt(self, *, source_first_v30: bool = False) -> ProfilePromptSpec:
+    def _selected_profile_prompt(
+        self,
+        *,
+        source_first_v30: bool = False,
+        source_first_v31: bool = False,
+    ) -> ProfilePromptSpec:
+        if source_first_v30 and source_first_v31:
+            raise ValidationAppError(
+                "source_first_v30과 source_first_v31은 동시에 사용할 수 없습니다."
+            )
+        if source_first_v31:
+            return resolve_profile_prompt(SOURCE_FIRST_V31_PROMPT_VERSION)
         if source_first_v30 or self.settings.analysis_source_first_v30_enabled:
             return resolve_profile_prompt(SOURCE_FIRST_V30_PROMPT_VERSION)
         return current_profile_prompt()
@@ -383,7 +395,8 @@ class AnalysisService:
                 )
 
         prompt = self._selected_profile_prompt(
-            source_first_v30=payload.source_first_v30
+            source_first_v30=payload.source_first_v30,
+            source_first_v31=payload.source_first_v31,
         )
         run = self.repo.create_run(
             person_id=payload.person_id,
@@ -405,6 +418,7 @@ class AnalysisService:
                 "base_profile_version": profile.profile_version,
                 "prompt_version": prompt.prompt_version,
                 "source_first_v30_opt_in": payload.source_first_v30,
+                "source_first_v31_opt_in": payload.source_first_v31,
             },
         )
         self.db.commit()
@@ -874,22 +888,91 @@ class AnalysisService:
                 "prompt_version": prompt.prompt_version,
                 "source_char_count": source_char_count,
             }
+            source_first_fallback: str | None = None
 
-            if prompt.extraction_mode == "staged":
-                if prompt.compact_protocol:
-                    candidate = self._extract_staged_compact_candidate(
+            def _load_base_snapshot() -> dict[str, Any] | None:
+                if claimed.base_profile_version is None:
+                    raise AIProviderError("missing base_profile_version")
+                snap = self.repo.get_profile_revision_snapshot(
+                    claimed.person_id, claimed.base_profile_version
+                )
+                if snap is None:
+                    run = self.repo.get_run(run_id, for_update=True)
+                    if run is not None:
+                        self.repo.mark_failed(
+                            run,
+                            f"base profile revision {claimed.base_profile_version} not found",
+                        )
+                        self.repo.add_audit(
+                            action_type="ANALYSIS_FAILED",
+                            actor_user_id=actor_user_id,
+                            target_id=run_id,
+                            after={"status": "FAILED", "reason": "missing_revision"},
+                        )
+                        self.db.commit()
+                return snap
+
+            if claimed.prompt_version == SOURCE_FIRST_V31_PROMPT_VERSION:
+                # V31 needs the confirmed snapshot before native assembly / guards.
+                base_snap = _load_base_snapshot()
+                if base_snap is None:
+                    return "FAILED"
+                base_profile = (
+                    base_snap.get("profile") if isinstance(base_snap, dict) else None
+                )
+                confirmed_name = (
+                    base_profile.get("name") if isinstance(base_profile, dict) else None
+                )
+                document_type_by_id = {
+                    str(doc.id): str(doc.document_type_code).strip()
+                    for doc in claimed.documents
+                    if getattr(doc, "document_type_code", None)
+                }
+                candidate, specs, source_first_fallback = (
+                    self._run_source_first_v31_native_first(
                         prompt=prompt,
-                        document_blocks=blocks,
+                        claimed=claimed,
+                        blocks=blocks,
                         catalog_map=catalog_map,
-                        allowed_documents=prompt_source.allowed_documents,
-                        page_texts=prompt_source.page_texts,
-                        documents=claimed.documents,
+                        prompt_source=prompt_source,
                         source_char_count=source_char_count,
                         base_log=base_log,
                         vlm_pages=bundle.total_vlm_pages,
+                        base_snap=base_snap,
+                        confirmed_name=confirmed_name,
+                        document_type_by_id=document_type_by_id,
                     )
+                )
+            else:
+                # Keep the original v25/v30 order: extract first, then snapshot.
+                if prompt.extraction_mode == "staged":
+                    if prompt.compact_protocol:
+                        candidate = self._extract_staged_compact_candidate(
+                            prompt=prompt,
+                            document_blocks=blocks,
+                            catalog_map=catalog_map,
+                            allowed_documents=prompt_source.allowed_documents,
+                            page_texts=prompt_source.page_texts,
+                            documents=claimed.documents,
+                            source_char_count=source_char_count,
+                            base_log=base_log,
+                            vlm_pages=bundle.total_vlm_pages,
+                        )
+                    else:
+                        candidate = self._extract_staged_candidate(
+                            prompt=prompt,
+                            code_catalog_text=claimed.code_catalog_text,
+                            document_blocks=blocks,
+                            catalog_map=catalog_map,
+                            allowed_documents=prompt_source.allowed_documents,
+                            page_texts=prompt_source.page_texts,
+                            documents=claimed.documents,
+                            source_char_count=source_char_count,
+                            base_log=base_log,
+                            vlm_pages=bundle.total_vlm_pages,
+                        )
                 else:
-                    candidate = self._extract_staged_candidate(
+                    candidate = self._extract_single_candidate(
                         prompt=prompt,
                         code_catalog_text=claimed.code_catalog_text,
                         document_blocks=blocks,
@@ -901,119 +984,89 @@ class AnalysisService:
                         base_log=base_log,
                         vlm_pages=bundle.total_vlm_pages,
                     )
-            else:
-                candidate = self._extract_single_candidate(
-                    prompt=prompt,
-                    code_catalog_text=claimed.code_catalog_text,
-                    document_blocks=blocks,
-                    catalog_map=catalog_map,
-                    allowed_documents=prompt_source.allowed_documents,
-                    page_texts=prompt_source.page_texts,
-                    documents=claimed.documents,
-                    source_char_count=source_char_count,
-                    base_log=base_log,
-                    vlm_pages=bundle.total_vlm_pages,
+
+                base_snap = _load_base_snapshot()
+                if base_snap is None:
+                    return "FAILED"
+
+                # Post-merge quality guard for staged and single-pass extraction.
+                # Confirmed name is read-only and helps identify header-only projects
+                # even when CORE omitted the person's name.
+                base_profile = (
+                    base_snap.get("profile") if isinstance(base_snap, dict) else None
                 )
+                confirmed_name = (
+                    base_profile.get("name") if isinstance(base_profile, dict) else None
+                )
+                document_type_by_id = {
+                    str(doc.id): str(doc.document_type_code).strip()
+                    for doc in claimed.documents
+                    if getattr(doc, "document_type_code", None)
+                }
+                original_candidate = candidate
+                candidate = apply_candidate_quality_guards(
+                    candidate,
+                    confirmed_person_name=confirmed_name,
+                    page_texts=prompt_source.page_texts,
+                    document_type_by_id=document_type_by_id,
+                    strict_section_authority=prompt.guard_core_section_authority,
+                )
+                logger.info(
+                    "analysis candidate field guards run_id=%s "
+                    "email_cleared=%s employment_type_cleared=%s projects_dropped=%s "
+                    "employment_dropped=%s education_dropped=%s "
+                    "certifications_dropped=%s employment_end_review=%s",
+                    run_id,
+                    original_candidate.profile.email is not None
+                    and candidate.profile.email is None,
+                    original_candidate.profile.employment_type is not None
+                    and candidate.profile.employment_type is None,
+                    len(original_candidate.projects) - len(candidate.projects),
+                    len(original_candidate.employment_history)
+                    - len(candidate.employment_history),
+                    len(original_candidate.education) - len(candidate.education),
+                    len(original_candidate.certifications) - len(candidate.certifications),
+                    sum(
+                        1
+                        for row in candidate.employment_history
+                        if row.end_date and " / " in row.end_date
+                    ),
+                )
+                specs = build_diffs(candidate, base_snap)
+                if claimed.prompt_version == SOURCE_FIRST_V30_PROMPT_VERSION:
+                    # Reuse v25 candidate for PROFILE/EMPLOYMENT/etc. Native PDF
+                    # replaces PROJECT only if all source checks pass.
+                    try:
+                        from app.modules.analysis.source_first_v30_runtime import (
+                            assemble_live_source_first,
+                        )
 
-            if claimed.base_profile_version is None:
-                raise AIProviderError("missing base_profile_version")
-
-            base_snap = self.repo.get_profile_revision_snapshot(
-                claimed.person_id, claimed.base_profile_version
-            )
-            if base_snap is None:
-                run = self.repo.get_run(run_id, for_update=True)
-                if run is not None:
-                    self.repo.mark_failed(
-                        run,
-                        f"base profile revision {claimed.base_profile_version} not found",
-                    )
-                    self.repo.add_audit(
-                        action_type="ANALYSIS_FAILED",
-                        actor_user_id=actor_user_id,
-                        target_id=run_id,
-                        after={"status": "FAILED", "reason": "missing_revision"},
-                    )
-                    self.db.commit()
-                return "FAILED"
-
-            # Post-merge quality guard for staged and single-pass extraction.
-            # Confirmed name is read-only and helps identify header-only projects
-            # even when CORE omitted the person's name.
-            base_profile = base_snap.get("profile") if isinstance(base_snap, dict) else None
-            confirmed_name = (
-                base_profile.get("name") if isinstance(base_profile, dict) else None
-            )
-            original_candidate = candidate
-            document_type_by_id = {
-                str(doc.id): str(doc.document_type_code).strip()
-                for doc in claimed.documents
-                if getattr(doc, "document_type_code", None)
-            }
-            candidate = apply_candidate_quality_guards(
-                candidate,
-                confirmed_person_name=confirmed_name,
-                page_texts=prompt_source.page_texts,
-                document_type_by_id=document_type_by_id,
-                strict_section_authority=prompt.guard_core_section_authority,
-            )
-            logger.info(
-                "analysis candidate field guards run_id=%s "
-                "email_cleared=%s employment_type_cleared=%s projects_dropped=%s "
-                "employment_dropped=%s education_dropped=%s "
-                "certifications_dropped=%s employment_end_review=%s",
-                run_id,
-                original_candidate.profile.email is not None
-                and candidate.profile.email is None,
-                original_candidate.profile.employment_type is not None
-                and candidate.profile.employment_type is None,
-                len(original_candidate.projects) - len(candidate.projects),
-                len(original_candidate.employment_history)
-                - len(candidate.employment_history),
-                len(original_candidate.education) - len(candidate.education),
-                len(original_candidate.certifications) - len(candidate.certifications),
-                sum(
-                    1
-                    for row in candidate.employment_history
-                    if row.end_date and " / " in row.end_date
-                ),
-            )
-            specs = build_diffs(candidate, base_snap)
-            source_first_fallback: str | None = None
-            if claimed.prompt_version == SOURCE_FIRST_V30_PROMPT_VERSION:
-                # Reuse v25 candidate for PROFILE/EMPLOYMENT/etc. Native PDF
-                # replaces PROJECT only if all source checks pass.
-                try:
-                    from app.modules.analysis.source_first_v30_runtime import (
-                        assemble_live_source_first,
-                    )
-
-                    native = assemble_live_source_first(
-                        source_builder=self.source_builder,
-                        documents=claimed.documents,
-                        original_candidate=candidate,
-                        confirmed_snapshot=base_snap,
-                        page_texts=prompt_source.page_texts,
-                    )
-                    logger.info(
-                        "analysis source-first v30 applied run_id=%s "
-                        "native_rows=%s source_projects=%s",
-                        run_id,
-                        native.diagnostics["native_pdf_input_rows"],
-                        native.diagnostics["candidate_project_count"],
-                    )
-                    # Swap only after every v30 step succeeded; fallback must
-                    # never persist a partial Source-First candidate.
-                    candidate, specs = native.candidate, native.specs
-                except Exception as exc:
-                    # Preserve the entire validated v25 candidate and Diff.
-                    # Do not log private source text or candidate field values.
-                    source_first_fallback = type(exc).__name__
-                    logger.warning(
-                        "analysis source-first v30 fallback to v25 "
-                        "run_id=%s failure_class=%s",
-                        run_id, source_first_fallback,
-                    )
+                        native = assemble_live_source_first(
+                            source_builder=self.source_builder,
+                            documents=claimed.documents,
+                            original_candidate=candidate,
+                            confirmed_snapshot=base_snap,
+                            page_texts=prompt_source.page_texts,
+                        )
+                        logger.info(
+                            "analysis source-first v30 applied run_id=%s "
+                            "native_rows=%s source_projects=%s",
+                            run_id,
+                            native.diagnostics["native_pdf_input_rows"],
+                            native.diagnostics["candidate_project_count"],
+                        )
+                        # Swap only after every v30 step succeeded; fallback must
+                        # never persist a partial Source-First candidate.
+                        candidate, specs = native.candidate, native.specs
+                    except Exception as exc:
+                        # Preserve the entire validated v25 candidate and Diff.
+                        # Do not log private source text or candidate field values.
+                        source_first_fallback = type(exc).__name__
+                        logger.warning(
+                            "analysis source-first v30 fallback to v25 "
+                            "run_id=%s failure_class=%s",
+                            run_id, source_first_fallback,
+                        )
 
             return self._persist_reviewing(
                 run_id,
@@ -1376,6 +1429,257 @@ class AnalysisService:
             raise InsufficientCandidateError()
         return merged
 
+    @staticmethod
+    def _core_job_exp_metrics(candidate: ProfileCandidateDocument) -> dict[str, int]:
+        """Count-only CORE JOB/EXP evidence metrics (no taxonomy inference)."""
+        return {
+            "core_jobs": len(candidate.jobs),
+            "core_job_quote_refs": sum(
+                len(job.source_refs or []) for job in candidate.jobs
+            ),
+            "core_expertise": len(candidate.expertise),
+            "core_expertise_quote_refs": sum(
+                len(row.source_refs or []) for row in candidate.expertise
+            ),
+        }
+
+    def _run_source_first_v31_native_first(
+        self,
+        *,
+        prompt: ProfilePromptSpec,
+        claimed: Any,
+        blocks: str,
+        catalog_map: dict[str, tuple[str, bool]],
+        prompt_source: Any,
+        source_char_count: int,
+        base_log: dict[str, Any],
+        vlm_pages: int,
+        base_snap: dict[str, Any],
+        confirmed_name: str | None,
+        document_type_by_id: dict[str, str],
+    ) -> tuple[ProfileCandidateDocument, list[DiffSpec], str | None]:
+        """Native-first V31: probe → CORE-only on success; PROJECT LLM on fallback.
+
+        Probe failure: full v25 staged (CORE+PROJECT) candidate/diffs.
+        Final assembly failure after CORE: reuse CORE, run PROJECT LLM only.
+        Empty PROJECT results are never persisted on the fallback path.
+        """
+        from app.modules.analysis.source_first_v30_runtime import (
+            assemble_native_from_rows,
+            collect_native_source_rows,
+        )
+
+        native_rows: list[dict[str, Any]] | None = None
+        probe_failure: str | None = None
+        try:
+            native_rows = collect_native_source_rows(
+                source_builder=self.source_builder,
+                documents=claimed.documents,
+            )
+        except Exception as exc:
+            probe_failure = type(exc).__name__
+            logger.warning(
+                "analysis source-first v31 probe failed run_id=%s failure_class=%s",
+                base_log.get("analysis_run_id"),
+                probe_failure,
+            )
+
+        if native_rows is None:
+            # Probe failed before CORE: run the complete v25 staged path.
+            candidate = self._extract_staged_compact_candidate(
+                prompt=prompt,
+                document_blocks=blocks,
+                catalog_map=catalog_map,
+                allowed_documents=prompt_source.allowed_documents,
+                page_texts=prompt_source.page_texts,
+                documents=claimed.documents,
+                source_char_count=source_char_count,
+                base_log=base_log,
+                vlm_pages=vlm_pages,
+            )
+            original_candidate = candidate
+            candidate = apply_candidate_quality_guards(
+                candidate,
+                confirmed_person_name=confirmed_name,
+                page_texts=prompt_source.page_texts,
+                document_type_by_id=document_type_by_id,
+                strict_section_authority=prompt.guard_core_section_authority,
+            )
+            if not candidate.projects:
+                raise InsufficientCandidateError()
+            metrics = self._core_job_exp_metrics(candidate)
+            logger.info(
+                "analysis source-first v31 fallback complete_v25 "
+                "run_id=%s reason=probe_failed failure_class=%s "
+                "projects=%s core_jobs=%s core_job_quote_refs=%s "
+                "core_expertise=%s core_expertise_quote_refs=%s "
+                "project_llm_skipped=False",
+                base_log.get("analysis_run_id"),
+                probe_failure,
+                len(candidate.projects),
+                metrics["core_jobs"],
+                metrics["core_job_quote_refs"],
+                metrics["core_expertise"],
+                metrics["core_expertise_quote_refs"],
+            )
+            logger.info(
+                "analysis candidate field guards run_id=%s "
+                "email_cleared=%s employment_type_cleared=%s projects_dropped=%s "
+                "employment_dropped=%s education_dropped=%s "
+                "certifications_dropped=%s employment_end_review=%s",
+                base_log.get("analysis_run_id"),
+                original_candidate.profile.email is not None
+                and candidate.profile.email is None,
+                original_candidate.profile.employment_type is not None
+                and candidate.profile.employment_type is None,
+                len(original_candidate.projects) - len(candidate.projects),
+                len(original_candidate.employment_history)
+                - len(candidate.employment_history),
+                len(original_candidate.education) - len(candidate.education),
+                len(original_candidate.certifications) - len(candidate.certifications),
+                sum(
+                    1
+                    for row in candidate.employment_history
+                    if row.end_date and " / " in row.end_date
+                ),
+            )
+            specs = build_diffs(candidate, base_snap)
+            return candidate, specs, probe_failure or "V31_PROBE_FAILED"
+
+        # Probe succeeded: CORE only (PROJECT LLM / token-count skipped).
+        core_only = self._extract_staged_compact_candidate(
+            prompt=prompt,
+            document_blocks=blocks,
+            catalog_map=catalog_map,
+            allowed_documents=prompt_source.allowed_documents,
+            page_texts=prompt_source.page_texts,
+            documents=claimed.documents,
+            source_char_count=source_char_count,
+            base_log=base_log,
+            vlm_pages=vlm_pages,
+            skip_projects=True,
+        )
+        core_guarded = apply_candidate_quality_guards(
+            core_only,
+            confirmed_person_name=confirmed_name,
+            page_texts=prompt_source.page_texts,
+            document_type_by_id=document_type_by_id,
+            strict_section_authority=prompt.guard_core_section_authority,
+        )
+        # Guards must not invent projects while PROJECT LLM is skipped.
+        core_for_native = core_guarded.model_copy(update={"projects": []})
+        skip_metrics = self._core_job_exp_metrics(core_for_native)
+        logger.info(
+            "analysis source-first v31 core-only ready run_id=%s "
+            "native_rows=%s project_llm_skipped=True "
+            "core_jobs=%s core_job_quote_refs=%s "
+            "core_expertise=%s core_expertise_quote_refs=%s",
+            base_log.get("analysis_run_id"),
+            len(native_rows),
+            skip_metrics["core_jobs"],
+            skip_metrics["core_job_quote_refs"],
+            skip_metrics["core_expertise"],
+            skip_metrics["core_expertise_quote_refs"],
+        )
+
+        try:
+            native = assemble_native_from_rows(
+                native_rows=native_rows,
+                original_candidate=core_for_native,
+                confirmed_snapshot=base_snap,
+                page_texts=prompt_source.page_texts,
+            )
+        except Exception as exc:
+            assembly_failure = type(exc).__name__
+            logger.warning(
+                "analysis source-first v31 assembly failed run_id=%s "
+                "failure_class=%s; reusing CORE then PROJECT LLM",
+                base_log.get("analysis_run_id"),
+                assembly_failure,
+            )
+            candidate = self._extract_staged_compact_candidate(
+                prompt=prompt,
+                document_blocks=blocks,
+                catalog_map=catalog_map,
+                allowed_documents=prompt_source.allowed_documents,
+                page_texts=prompt_source.page_texts,
+                documents=claimed.documents,
+                source_char_count=source_char_count,
+                base_log=base_log,
+                vlm_pages=vlm_pages,
+                precomputed_core=core_for_native,
+            )
+            original_candidate = candidate
+            candidate = apply_candidate_quality_guards(
+                candidate,
+                confirmed_person_name=confirmed_name,
+                page_texts=prompt_source.page_texts,
+                document_type_by_id=document_type_by_id,
+                strict_section_authority=prompt.guard_core_section_authority,
+            )
+            if not candidate.projects:
+                raise InsufficientCandidateError() from exc
+            fallback_metrics = self._core_job_exp_metrics(candidate)
+            logger.info(
+                "analysis source-first v31 fallback complete_v25 "
+                "run_id=%s reason=assembly_failed failure_class=%s "
+                "projects=%s core_jobs=%s core_job_quote_refs=%s "
+                "core_expertise=%s core_expertise_quote_refs=%s "
+                "project_llm_skipped=False core_reused=True",
+                base_log.get("analysis_run_id"),
+                assembly_failure,
+                len(candidate.projects),
+                fallback_metrics["core_jobs"],
+                fallback_metrics["core_job_quote_refs"],
+                fallback_metrics["core_expertise"],
+                fallback_metrics["core_expertise_quote_refs"],
+            )
+            logger.info(
+                "analysis candidate field guards run_id=%s "
+                "email_cleared=%s employment_type_cleared=%s projects_dropped=%s "
+                "employment_dropped=%s education_dropped=%s "
+                "certifications_dropped=%s employment_end_review=%s",
+                base_log.get("analysis_run_id"),
+                original_candidate.profile.email is not None
+                and candidate.profile.email is None,
+                original_candidate.profile.employment_type is not None
+                and candidate.profile.employment_type is None,
+                len(original_candidate.projects) - len(candidate.projects),
+                len(original_candidate.employment_history)
+                - len(candidate.employment_history),
+                len(original_candidate.education) - len(candidate.education),
+                len(original_candidate.certifications) - len(candidate.certifications),
+                sum(
+                    1
+                    for row in candidate.employment_history
+                    if row.end_date and " / " in row.end_date
+                ),
+            )
+            specs = build_diffs(candidate, base_snap)
+            return candidate, specs, assembly_failure
+
+        diagnostics = native.diagnostics
+        success_metrics = self._core_job_exp_metrics(native.candidate)
+        logger.info(
+            "analysis source-first v31 applied run_id=%s "
+            "native_rows=%s source_projects=%s "
+            "project_llm_skipped=True "
+            "core_jobs=%s core_job_quote_refs=%s "
+            "core_expertise=%s core_expertise_quote_refs=%s "
+            "native_group_root_quotes_reverified_count=%s "
+            "literal_quote_ref_count=%s",
+            base_log.get("analysis_run_id"),
+            diagnostics.get("native_pdf_input_rows"),
+            diagnostics.get("candidate_project_count"),
+            success_metrics["core_jobs"],
+            success_metrics["core_job_quote_refs"],
+            success_metrics["core_expertise"],
+            success_metrics["core_expertise_quote_refs"],
+            diagnostics.get("native_group_root_quotes_reverified_count"),
+            diagnostics.get("literal_quote_ref_count"),
+        )
+        return native.candidate, native.specs, None
+
     def _extract_staged_compact_candidate(
         self,
         *,
@@ -1388,8 +1692,19 @@ class AnalysisService:
         source_char_count: int,
         base_log: dict[str, Any],
         vlm_pages: int,
+        skip_projects: bool = False,
+        precomputed_core: ProfileCandidateDocument | None = None,
     ) -> ProfileCandidateDocument:
-        """Compact staged extraction (v8+): aliases + short keys; max 1 recovery."""
+        """Compact staged extraction (v8+): aliases + short keys; max 1 recovery.
+
+        ``skip_projects=True`` runs CORE only (V31 native-first success path).
+        ``precomputed_core`` reuses a prior CORE and runs PROJECT only (V31
+        assembly-failure fallback). The two flags are mutually exclusive.
+        """
+        if skip_projects and precomputed_core is not None:
+            raise AIProviderError(
+                "skip_projects and precomputed_core cannot be combined"
+            )
         if (
             prompt.build_core_user_prompt is None
             or prompt.build_projects_user_prompt is None
@@ -2497,9 +2812,20 @@ class AnalysisService:
                 root_budget=root_budget, reason="root_over_budget"
             )
 
-        core = _run_core_adaptive()
-        if _core_needs_retry(core):
-            raise InsufficientCandidateError()
+        if precomputed_core is not None:
+            # V31 assembly-failure fallback: reuse the already-validated CORE and
+            # only spend the PROJECT LLM/token-count budget.
+            core = precomputed_core.model_copy(update={"projects": []})
+            used_core_adaptive_split = False
+            logger.info(
+                "analysis compact protocol analysis_run_id=%s "
+                "precomputed_core_reuse=True project_llm_skipped=False",
+                base_log.get("analysis_run_id"),
+            )
+        else:
+            core = _run_core_adaptive()
+            if _core_needs_retry(core):
+                raise InsufficientCandidateError()
         logger.info(
             "analysis candidate quality run_id=%s phase=core compact_protocol=%s "
             "document_count=%s vlm_pages=%s empty=%s sparse=%s quality_score=%s "
@@ -2526,6 +2852,50 @@ class AnalysisService:
             used_core_adaptive_split,
             token_count_calls,
         )
+
+        if skip_projects:
+            # V31 native-first success path: no PROJECT LLM / token-count.
+            # Empty projects make project-relation root JOB/EXP supplement a no-op;
+            # callers instrument the reduction numerically (no taxonomy inference).
+            merged = core.model_copy(update={"projects": []})
+            merged, root_rel_report = (
+                supplement_root_job_exp_evidence_from_project_relations(
+                    merged,
+                    page_texts=page_texts,
+                    allowed_documents=allowed_documents,
+                )
+            )
+            logger.info(
+                "analysis staged merge analysis_run_id=%s compact_protocol=%s "
+                "core_skills=%s core_expertise=%s projects=%s llm_calls=%s "
+                "doc_alias_count=%s project_llm_skipped=True "
+                "root_rel_supplemented_jobs=%s root_rel_supplemented_expertise=%s "
+                "root_rel_unresolved_jobs=%s root_rel_unresolved_expertise=%s "
+                "core_jobs=%s core_job_quote_refs=%s "
+                "core_expertise_count=%s core_expertise_quote_refs=%s",
+                base_log.get("analysis_run_id"),
+                compact_tag,
+                len(merged.skills),
+                len(merged.expertise),
+                len(merged.projects),
+                call_count,
+                len(alias_to_id),
+                root_rel_report.get("supplemented_jobs"),
+                root_rel_report.get("supplemented_expertise"),
+                root_rel_report.get("unresolved_jobs"),
+                root_rel_report.get("unresolved_expertise"),
+                len(merged.jobs),
+                sum(len(j.source_refs or []) for j in merged.jobs),
+                len(merged.expertise),
+                sum(len(x.source_refs or []) for x in merged.expertise),
+            )
+            if candidate_needs_llm_retry(
+                merged,
+                documents=documents,
+                source_char_count=source_char_count,
+            ):
+                raise InsufficientCandidateError()
+            return merged
 
         def _split_project_body_prefer_boundaries(
             blocks: str, *, max_body_chars: int
@@ -3240,9 +3610,13 @@ class AnalysisService:
             self.db.rollback()
             return status
 
+        prior_prompt_version = run.prompt_version
         if source_first_fallback is not None:
-            if run.prompt_version != SOURCE_FIRST_V30_PROMPT_VERSION:
-                raise ValueError("V30_FALLBACK_PROMPT_VERSION_MISMATCH")
+            if prior_prompt_version not in {
+                SOURCE_FIRST_V30_PROMPT_VERSION,
+                SOURCE_FIRST_V31_PROMPT_VERSION,
+            }:
+                raise ValueError("SOURCE_FIRST_FALLBACK_PROMPT_VERSION_MISMATCH")
             # Fallback rows use the normal v25 UI, not Source-First labels.
             run.prompt_version = current_profile_prompt().prompt_version
         confidence = candidate.analysis.overall_confidence
@@ -3260,7 +3634,16 @@ class AnalysisService:
                 "status": "REVIEWING",
                 "diff_count": len(specs),
                 "overall_confidence": float(confidence) if confidence is not None else None,
-                "source_first_v30_fallback_class": source_first_fallback,
+                "source_first_v30_fallback_class": (
+                    source_first_fallback
+                    if prior_prompt_version == SOURCE_FIRST_V30_PROMPT_VERSION
+                    else None
+                ),
+                "source_first_v31_fallback_class": (
+                    source_first_fallback
+                    if prior_prompt_version == SOURCE_FIRST_V31_PROMPT_VERSION
+                    else None
+                ),
             },
         )
         self.db.commit()
