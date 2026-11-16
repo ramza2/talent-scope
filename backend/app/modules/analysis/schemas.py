@@ -7,7 +7,7 @@ from decimal import Decimal
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 AnalysisStatus = Literal[
     "DEFERRED",
@@ -46,6 +46,8 @@ class CreateAnalysisRequest(BaseModel):
     analysis_type: AnalysisType = "PROFILE"
     # Per-run administrator opt-in; absent/false keeps the configured default.
     source_first_v30: bool = Field(default=False, strict=True)
+    # Independent native-first opt-in (PROJECT LLM skipped only on success).
+    source_first_v31: bool = Field(default=False, strict=True)
 
     @field_validator("document_ids")
     @classmethod
@@ -53,6 +55,14 @@ class CreateAnalysisRequest(BaseModel):
         if len(value) != len(set(value)):
             raise ValueError("document_ids에 중복이 있습니다.")
         return value
+
+    @model_validator(mode="after")
+    def exclusive_source_first_opt_ins(self) -> CreateAnalysisRequest:
+        if self.source_first_v30 and self.source_first_v31:
+            raise ValueError(
+                "source_first_v30과 source_first_v31은 동시에 사용할 수 없습니다."
+            )
+        return self
 
 
 class CreateAnalysisResponseData(BaseModel):

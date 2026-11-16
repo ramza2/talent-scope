@@ -2,6 +2,9 @@
 
 No database writes or decisions. Missing/unverifiable rows raise ValueError;
 the caller retains the complete validated v25 Candidate and Diff.
+
+``collect_native_source_rows`` is shared by V30 (post-LLM swap) and V31
+(native-first probe) so fail-closed document/row gates stay identical.
 """
 from __future__ import annotations
 
@@ -21,18 +24,15 @@ _MAX_PAGES_PER_DOCUMENT = 80
 _MAX_NATIVE_ROWS = 500
 
 
-def assemble_live_source_first(
+def collect_native_source_rows(
     *,
     source_builder: AnalysisSourceBuilder,
     documents: Sequence[DocumentSnapshot],
-    original_candidate: ProfileCandidateDocument,
-    confirmed_snapshot: dict[str, Any],
-    page_texts: dict[tuple[str, int], str],
-) -> NativeDirectPreview:
-    """Source-First only when every submitted document has native table rows.
+) -> list[dict[str, Any]]:
+    """Fail-closed native table-row collection for every submitted document.
 
-    An unsupported/mixed document batch must not silently replace v25 projects
-    with a subset from the supported supported native-table files.
+    An unsupported/mixed document batch must not silently yield a subset from
+    only the supported native-table files.
     """
     if not documents or len(documents) > _MAX_DOCUMENTS:
         raise ValueError("V30_SOURCE_DOCUMENT_COUNT_OUT_OF_SCOPE")
@@ -67,7 +67,38 @@ def assemble_live_source_first(
         if not document_rows:
             raise ValueError("V30_SOURCE_DOCUMENT_WITHOUT_NATIVE_ROWS")
         native_rows.extend(document_rows)
+    return native_rows
 
+
+def assemble_live_source_first(
+    *,
+    source_builder: AnalysisSourceBuilder,
+    documents: Sequence[DocumentSnapshot],
+    original_candidate: ProfileCandidateDocument,
+    confirmed_snapshot: dict[str, Any],
+    page_texts: dict[tuple[str, int], str],
+) -> NativeDirectPreview:
+    """Source-First only when every submitted document has native table rows."""
+    native_rows = collect_native_source_rows(
+        source_builder=source_builder,
+        documents=documents,
+    )
+    return assemble_native_direct(
+        native_rows=native_rows,
+        original_candidate_json=original_candidate.to_storage_dict(),
+        latest_confirmed_snapshot=confirmed_snapshot,
+        page_texts=page_texts,
+    )
+
+
+def assemble_native_from_rows(
+    *,
+    native_rows: list[dict[str, Any]],
+    original_candidate: ProfileCandidateDocument,
+    confirmed_snapshot: dict[str, Any],
+    page_texts: dict[tuple[str, int], str],
+) -> NativeDirectPreview:
+    """Assemble Source-First Candidate/Diff from already-probed native rows."""
     return assemble_native_direct(
         native_rows=native_rows,
         original_candidate_json=original_candidate.to_storage_dict(),
