@@ -143,70 +143,27 @@ def test_plan_core_length_risk_presplit_skips_when_leaf_does_not_fit():
     ) is None
 
 
-def test_v32_presplit_avoids_wasted_single_path_length_chat(monkeypatch):
-    """Multi-page fitting source must not Chat the combined root first."""
-    from app.ai.providers.errors import AIResponseTruncatedError
+def _caps_fixed():
     from app.ai.providers.model_capabilities import ModelCapabilities
-    from app.ai.providers.token_count import TokenCountResult
-    from app.core.config import Settings
-    import app.modules.analysis.service as svc_mod
-    from app.modules.analysis.source_builder import DocumentSnapshot, PageSnapshot
 
-    doc_a = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
-    doc_b = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
-    chat_prompts: list[str] = []
-
-    class FakeLLM:
-        def count_prompt_tokens(self, *, system_prompt, user_prompt, log_context=None):
-            both = doc_a[:8] in user_prompt and doc_b[:8] in user_prompt
-            # Aliased docs use D1/D2; detect combined vs leaf by page markers.
-            page_markers = user_prompt.count("[PAGE ")
-            doc_markers = user_prompt.count("[DOCUMENT")
-            combined = doc_markers > 1 or page_markers > 1
-            return TokenCountResult(
-                model="qwen3-14b",
-                prompt_tokens=1200 if combined else 500,
-                context_window=10_000,
-                status="VERIFIED",
-                deployment_id="dep-1",
-                route_id="route-1",
-                routing_version=1,
-            )
-
-        def complete_json(
-            self,
-            *,
-            system_prompt,
-            user_prompt,
-            log_context=None,
-            max_completion_tokens=None,
-        ):
-            phase = (log_context or {}).get("phase")
-            assert phase == "core"
-            chat_prompts.append(user_prompt)
-            # Combined root would truncate — V32 must never chat it first.
-            if user_prompt.count("[DOCUMENT") > 1 or user_prompt.count("[PAGE ") > 1:
-                raise AIResponseTruncatedError(
-                    meta={"finish_reason": "length", "prompt_tokens": 1200}
-                )
-            return _core_payload()
-
-    monkeypatch.setattr(
-        svc_mod,
-        "fetch_model_capabilities",
-        lambda settings: ModelCapabilities(
-            model_id="qwen3-14b",
-            context_window=10_000,
-            supports_thinking=True,
-            supports_tools=True,
-            deployment_id="dep-1",
-            route_id="route-1",
-            routing_version=1,
-            status="VERIFIED",
-        ),
+    return ModelCapabilities(
+        model_id="qwen3-14b",
+        context_window=10_000,
+        supports_thinking=True,
+        supports_tools=True,
+        deployment_id="dep-1",
+        route_id="route-1",
+        routing_version=1,
+        status="VERIFIED",
     )
 
-    settings = Settings(
+
+def _service_with_llm(monkeypatch, llm, *, settings_kwargs=None):
+    from app.core.config import Settings
+    import app.modules.analysis.service as svc_mod
+
+    monkeypatch.setattr(svc_mod, "fetch_model_capabilities", lambda settings: _caps_fixed())
+    args = dict(
         llm_base_url="https://gateway.example.test",
         llm_api_key="k",
         llm_model="qwen3-14b",
@@ -220,6 +177,8 @@ def test_v32_presplit_avoids_wasted_single_path_length_chat(monkeypatch):
         analysis_project_output_ratio=0.35,
         analysis_token_safety_ratio=0.05,
     )
+    if settings_kwargs:
+        args.update(settings_kwargs)
     repo = MagicMock()
     repo.list_active_codes.return_value = [
         SimpleNamespace(
@@ -236,53 +195,99 @@ def test_v32_presplit_avoids_wasted_single_path_length_chat(monkeypatch):
         ),
     ]
     repo.list_aliases_for_codes.return_value = []
-
     service = AnalysisService.__new__(AnalysisService)
     service.repo = repo
-    service.settings = settings
-    service.llm = FakeLLM()
+    service.settings = Settings(**args)
+    service.llm = llm
     service.db = MagicMock()
     service.storage = MagicMock()
+    return service
 
-    blocks = (
-        _doc_block(doc_a, pages="[PAGE 1]\n" + ("문서A 경력 본문 " * 30))
-        + _doc_block(doc_b, pages="[PAGE 1]\n" + ("문서B 경력 본문 " * 30))
+
+def _two_page_doc_snapshot(doc_id: str):
+    from app.modules.analysis.source_builder import DocumentSnapshot, PageSnapshot
+
+    return DocumentSnapshot(
+        id=__import__("uuid").UUID(doc_id),
+        original_filename="a.pdf",
+        extension="pdf",
+        mime_type="application/pdf",
+        storage_key="k1",
+        preview_storage_key=None,
+        document_type_code="DOC-PROFILE",
+        document_type_name="프로필",
+        version_no=1,
+        person_id=__import__("uuid").uuid4(),
+        pages=[
+            PageSnapshot(page_no=1, extracted_text="P1", layout_json=None),
+            PageSnapshot(page_no=2, extracted_text="P2", layout_json=None),
+        ],
     )
-    docs = (
-        DocumentSnapshot(
-            id=__import__("uuid").UUID(doc_a),
-            original_filename="a.pdf",
-            extension="pdf",
-            mime_type="application/pdf",
-            storage_key="k1",
-            preview_storage_key=None,
-            document_type_code="DOC-PROFILE",
-            document_type_name="프로필",
-            version_no=1,
-            person_id=__import__("uuid").uuid4(),
-            pages=[
-                PageSnapshot(
-                    page_no=1, extracted_text="문서A 경력 본문", layout_json=None
+
+
+def test_v32_root_over_budget_presplits_fitting_multipage_before_chat(monkeypatch):
+    """root_over_budget keeps fitting multi-page docs; V32 expands to pages first."""
+    from app.ai.providers.errors import AIResponseTruncatedError
+    from app.ai.providers.token_count import TokenCountResult
+
+    doc_a = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    doc_b = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    chat_prompts: list[str] = []
+    length_hits = {"n": 0}
+
+    class FakeLLM:
+        def count_prompt_tokens(self, *, system_prompt, user_prompt, log_context=None):
+            docs = user_prompt.count("[DOCUMENT")
+            pages = user_prompt.count("[PAGE ")
+            # Combined root over budget; each multi-page doc still fits.
+            if docs >= 2:
+                tokens = 9000
+            elif pages >= 2:
+                tokens = 7000
+            else:
+                tokens = 500
+            return TokenCountResult(
+                model="qwen3-14b",
+                prompt_tokens=tokens,
+                context_window=10_000,
+                status="VERIFIED",
+                deployment_id="dep-1",
+                route_id="route-1",
+                routing_version=1,
+            )
+
+        def complete_json(
+            self,
+            *,
+            system_prompt,
+            user_prompt,
+            log_context=None,
+            max_completion_tokens=None,
+        ):
+            chat_prompts.append(user_prompt)
+            if user_prompt.count("[PAGE ") >= 2:
+                length_hits["n"] += 1
+                raise AIResponseTruncatedError(
+                    meta={"finish_reason": "length", "prompt_tokens": 7000}
                 )
-            ],
-        ),
-        DocumentSnapshot(
-            id=__import__("uuid").UUID(doc_b),
-            original_filename="b.pdf",
-            extension="pdf",
-            mime_type="application/pdf",
-            storage_key="k2",
-            preview_storage_key=None,
-            document_type_code="DOC-PROFILE",
-            document_type_name="프로필",
-            version_no=1,
-            person_id=__import__("uuid").uuid4(),
-            pages=[
-                PageSnapshot(
-                    page_no=1, extracted_text="문서B 경력 본문", layout_json=None
-                )
-            ],
-        ),
+            return _core_payload()
+
+    service = _service_with_llm(monkeypatch, FakeLLM())
+    blocks = (
+        _doc_block(
+            doc_a,
+            pages=(
+                "[PAGE 1]\n" + ("A1 경력 본문 " * 30)
+                + "\n[PAGE 2]\n" + ("A2 경력 본문 " * 30)
+            ),
+        )
+        + _doc_block(
+            doc_b,
+            pages=(
+                "[PAGE 1]\n" + ("B1 경력 본문 " * 30)
+                + "\n[PAGE 2]\n" + ("B2 경력 본문 " * 30)
+            ),
+        )
     )
     result = service._extract_staged_compact_candidate(
         prompt=resolve_profile_prompt(SOURCE_FIRST_V32_PROMPT_VERSION),
@@ -292,35 +297,30 @@ def test_v32_presplit_avoids_wasted_single_path_length_chat(monkeypatch):
             "TECH-LANG-PYTHON": ("TECH", True),
             "EXP-MGT": ("EXP", True),
         },
-        allowed_documents={doc_a: {1}, doc_b: {1}},
+        allowed_documents={doc_a: {1, 2}, doc_b: {1, 2}},
         page_texts={
-            (doc_a, 1): "문서A 경력 본문 PL Python 사업관리",
-            (doc_b, 1): "문서B 경력 본문 PL Python 사업관리",
+            (doc_a, 1): "A1 경력 본문 PL Python 사업관리",
+            (doc_a, 2): "A2 경력 본문 PL Python 사업관리",
+            (doc_b, 1): "B1 경력 본문 PL Python 사업관리",
+            (doc_b, 2): "B2 경력 본문 PL Python 사업관리",
         },
-        documents=docs,
-        source_char_count=1200,
-        base_log={"analysis_run_id": "v32-presplit"},
+        documents=(_two_page_doc_snapshot(doc_a), _two_page_doc_snapshot(doc_b)),
+        source_char_count=4000,
+        base_log={"analysis_run_id": "v32-root-over"},
         vlm_pages=0,
         skip_projects=True,
         core_length_presplit=True,
     )
-
     assert isinstance(result, ProfileCandidateDocument)
-    assert result.projects == []
+    assert length_hits["n"] == 0
     assert chat_prompts
-    assert all(
-        p.count("[DOCUMENT") <= 1 and p.count("[PAGE ") <= 1 for p in chat_prompts
-    )
-    assert len(chat_prompts) >= 2
+    assert all(p.count("[PAGE ") == 1 for p in chat_prompts)
+    assert len(chat_prompts) >= 4
 
 
-def test_v31_without_presplit_flag_still_chats_combined_root(monkeypatch):
-    """V31 default path must keep single-path Chat when root fits."""
-    from app.ai.providers.model_capabilities import ModelCapabilities
+def test_v32_root_fit_keeps_single_chat(monkeypatch):
+    """V32 must not pre-split when the verified root budget already fits."""
     from app.ai.providers.token_count import TokenCountResult
-    from app.core.config import Settings
-    import app.modules.analysis.service as svc_mod
-    from app.modules.analysis.source_builder import DocumentSnapshot, PageSnapshot
 
     doc_a = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
     doc_b = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
@@ -349,61 +349,13 @@ def test_v31_without_presplit_flag_still_chats_combined_root(monkeypatch):
             chat_prompts.append(user_prompt)
             return _core_payload()
 
-    monkeypatch.setattr(
-        svc_mod,
-        "fetch_model_capabilities",
-        lambda settings: ModelCapabilities(
-            model_id="qwen3-14b",
-            context_window=10_000,
-            supports_thinking=True,
-            supports_tools=True,
-            deployment_id="dep-1",
-            route_id="route-1",
-            routing_version=1,
-            status="VERIFIED",
-        ),
-    )
-    settings = Settings(
-        llm_base_url="https://gateway.example.test",
-        llm_api_key="k",
-        llm_model="qwen3-14b",
-        analysis_llm_enable_thinking=False,
-        analysis_token_count_max_attempts=3,
-        analysis_project_split_max_depth=3,
-        analysis_project_split_max_calls=8,
-        analysis_core_output_ratio=0.25,
-        analysis_core_split_max_depth=3,
-        analysis_core_split_max_calls=16,
-        analysis_project_output_ratio=0.35,
-        analysis_token_safety_ratio=0.05,
-    )
-    repo = MagicMock()
-    repo.list_active_codes.return_value = [
-        SimpleNamespace(
-            code="JOB-MGT-PL", code_type="JOB", name="PL",
-            is_active=True, parent_code=None,
-        ),
-        SimpleNamespace(
-            code="TECH-LANG-PYTHON", code_type="TECH", name="Python",
-            is_active=True, parent_code=None,
-        ),
-        SimpleNamespace(
-            code="EXP-MGT", code_type="EXP", name="사업관리",
-            is_active=True, parent_code=None,
-        ),
-    ]
-    repo.list_aliases_for_codes.return_value = []
-    service = AnalysisService.__new__(AnalysisService)
-    service.repo = repo
-    service.settings = settings
-    service.llm = FakeLLM()
-    service.db = MagicMock()
-    service.storage = MagicMock()
-
+    service = _service_with_llm(monkeypatch, FakeLLM())
     blocks = (
         _doc_block(doc_a, pages="[PAGE 1]\n" + ("문서A 경력 본문 " * 30))
         + _doc_block(doc_b, pages="[PAGE 1]\n" + ("문서B 경력 본문 " * 30))
     )
+    from app.modules.analysis.source_builder import DocumentSnapshot, PageSnapshot
+
     docs = (
         DocumentSnapshot(
             id=__import__("uuid").UUID(doc_a),
@@ -416,11 +368,7 @@ def test_v31_without_presplit_flag_still_chats_combined_root(monkeypatch):
             document_type_name="프로필",
             version_no=1,
             person_id=__import__("uuid").uuid4(),
-            pages=[
-                PageSnapshot(
-                    page_no=1, extracted_text="문서A", layout_json=None
-                )
-            ],
+            pages=[PageSnapshot(page_no=1, extracted_text="문서A", layout_json=None)],
         ),
         DocumentSnapshot(
             id=__import__("uuid").UUID(doc_b),
@@ -433,11 +381,180 @@ def test_v31_without_presplit_flag_still_chats_combined_root(monkeypatch):
             document_type_name="프로필",
             version_no=1,
             person_id=__import__("uuid").uuid4(),
-            pages=[
-                PageSnapshot(
-                    page_no=1, extracted_text="문서B", layout_json=None
-                )
-            ],
+            pages=[PageSnapshot(page_no=1, extracted_text="문서B", layout_json=None)],
+        ),
+    )
+    service._extract_staged_compact_candidate(
+        prompt=resolve_profile_prompt(SOURCE_FIRST_V32_PROMPT_VERSION),
+        document_blocks=blocks,
+        catalog_map={
+            "JOB-MGT-PL": ("JOB", True),
+            "TECH-LANG-PYTHON": ("TECH", True),
+            "EXP-MGT": ("EXP", True),
+        },
+        allowed_documents={doc_a: {1}, doc_b: {1}},
+        page_texts={(doc_a, 1): "문서A", (doc_b, 1): "문서B"},
+        documents=docs,
+        source_char_count=1200,
+        base_log={"analysis_run_id": "v32-root-fit"},
+        vlm_pages=0,
+        skip_projects=True,
+        core_length_presplit=True,
+    )
+    assert len(chat_prompts) == 1
+    assert chat_prompts[0].count("[DOCUMENT") >= 2
+
+
+def test_v32_presplit_skips_when_call_budget_insufficient(monkeypatch):
+    """Insufficient remaining core-split calls → Chat the fitting multi-page doc."""
+    from app.ai.providers.token_count import TokenCountResult
+
+    doc_a = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    doc_b = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    chat_prompts: list[str] = []
+
+    class FakeLLM:
+        def count_prompt_tokens(self, *, system_prompt, user_prompt, log_context=None):
+            docs = user_prompt.count("[DOCUMENT")
+            pages = user_prompt.count("[PAGE ")
+            if docs >= 2:
+                tokens = 9000
+            elif pages >= 2:
+                tokens = 7000
+            else:
+                tokens = 500
+            return TokenCountResult(
+                model="qwen3-14b",
+                prompt_tokens=tokens,
+                context_window=10_000,
+                status="VERIFIED",
+                deployment_id="dep-1",
+                route_id="route-1",
+                routing_version=1,
+            )
+
+        def complete_json(
+            self,
+            *,
+            system_prompt,
+            user_prompt,
+            log_context=None,
+            max_completion_tokens=None,
+        ):
+            chat_prompts.append(user_prompt)
+            return _core_payload()
+
+    # Two fitting multi-page docs need >=4 page chats after expand; cap at 2
+    # so each doc keeps one slot and cannot expand.
+    service = _service_with_llm(
+        monkeypatch, FakeLLM(), settings_kwargs={"analysis_core_split_max_calls": 2}
+    )
+    blocks = (
+        _doc_block(
+            doc_a,
+            pages=(
+                "[PAGE 1]\n" + ("A1 경력 본문 " * 30)
+                + "\n[PAGE 2]\n" + ("A2 경력 본문 " * 30)
+            ),
+        )
+        + _doc_block(
+            doc_b,
+            pages=(
+                "[PAGE 1]\n" + ("B1 경력 본문 " * 30)
+                + "\n[PAGE 2]\n" + ("B2 경력 본문 " * 30)
+            ),
+        )
+    )
+    service._extract_staged_compact_candidate(
+        prompt=resolve_profile_prompt(SOURCE_FIRST_V32_PROMPT_VERSION),
+        document_blocks=blocks,
+        catalog_map={
+            "JOB-MGT-PL": ("JOB", True),
+            "TECH-LANG-PYTHON": ("TECH", True),
+            "EXP-MGT": ("EXP", True),
+        },
+        allowed_documents={doc_a: {1, 2}, doc_b: {1, 2}},
+        page_texts={
+            (doc_a, 1): "A1",
+            (doc_a, 2): "A2",
+            (doc_b, 1): "B1",
+            (doc_b, 2): "B2",
+        },
+        documents=(_two_page_doc_snapshot(doc_a), _two_page_doc_snapshot(doc_b)),
+        source_char_count=4000,
+        base_log={"analysis_run_id": "v32-budget"},
+        vlm_pages=0,
+        skip_projects=True,
+        core_length_presplit=True,
+    )
+    assert len(chat_prompts) == 2
+    assert all(p.count("[PAGE ") >= 2 for p in chat_prompts)
+
+
+def test_v31_without_presplit_flag_still_chats_combined_root(monkeypatch):
+    """V31 default path must keep single-path Chat when root fits."""
+    from app.ai.providers.token_count import TokenCountResult
+
+    doc_a = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    doc_b = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    chat_prompts: list[str] = []
+
+    class FakeLLM:
+        def count_prompt_tokens(self, *, system_prompt, user_prompt, log_context=None):
+            return TokenCountResult(
+                model="qwen3-14b",
+                prompt_tokens=800,
+                context_window=10_000,
+                status="VERIFIED",
+                deployment_id="dep-1",
+                route_id="route-1",
+                routing_version=1,
+            )
+
+        def complete_json(
+            self,
+            *,
+            system_prompt,
+            user_prompt,
+            log_context=None,
+            max_completion_tokens=None,
+        ):
+            chat_prompts.append(user_prompt)
+            return _core_payload()
+
+    service = _service_with_llm(monkeypatch, FakeLLM())
+    blocks = (
+        _doc_block(doc_a, pages="[PAGE 1]\n" + ("문서A 경력 본문 " * 30))
+        + _doc_block(doc_b, pages="[PAGE 1]\n" + ("문서B 경력 본문 " * 30))
+    )
+    from app.modules.analysis.source_builder import DocumentSnapshot, PageSnapshot
+
+    docs = (
+        DocumentSnapshot(
+            id=__import__("uuid").UUID(doc_a),
+            original_filename="a.pdf",
+            extension="pdf",
+            mime_type="application/pdf",
+            storage_key="k1",
+            preview_storage_key=None,
+            document_type_code="DOC-PROFILE",
+            document_type_name="프로필",
+            version_no=1,
+            person_id=__import__("uuid").uuid4(),
+            pages=[PageSnapshot(page_no=1, extracted_text="문서A", layout_json=None)],
+        ),
+        DocumentSnapshot(
+            id=__import__("uuid").UUID(doc_b),
+            original_filename="b.pdf",
+            extension="pdf",
+            mime_type="application/pdf",
+            storage_key="k2",
+            preview_storage_key=None,
+            document_type_code="DOC-PROFILE",
+            document_type_name="프로필",
+            version_no=1,
+            person_id=__import__("uuid").uuid4(),
+            pages=[PageSnapshot(page_no=1, extracted_text="문서B", layout_json=None)],
         ),
     )
     service._extract_staged_compact_candidate(

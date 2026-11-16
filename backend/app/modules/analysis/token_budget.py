@@ -368,19 +368,20 @@ def plan_core_length_risk_presplit(
     budget_for_blocks,
     max_chunks: int,
 ) -> list[str] | None:
-    """Opt-in CORE pre-split when input fits but spans many source units.
+    """Refine a fitting multi-doc/page CORE chunk into verified-fit leaves.
 
-    Length truncations waste a full Chat on a combined source that already
-    fits the verified input budget. When the same source has two or more
-    original document/page boundaries and every leaf also fits by
-    ``/v1/token-count``, return those leaves so the caller can Chat smaller
-    CORE outputs first.
+    Intended for the ``root_over_budget`` planner path: a document (or
+    multi-doc block) may still fit by ``/v1/token-count`` while spanning
+    multiple original page boundaries, so a single Chat often truncates on
+    length. When every structural leaf also fits and the leaf count fits
+    ``max_chunks``, return those leaves.
 
     Returns ``None`` when pre-split must not run:
-    - root does not fit (existing over-budget planner owns that path)
+    - the chunk itself does not fit
     - fewer than two document/page units
     - any leaf would require body-char splitting or fails verified fit
     - packing to ``max_chunks`` cannot keep every leaf fitting
+    - ``max_chunks < 2`` (caller lacks call budget for a split)
 
     Never estimates tokens locally and never forces unconditional splits.
     """

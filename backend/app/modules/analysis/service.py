@@ -1722,8 +1722,8 @@ class AnalysisService:
         ``skip_projects=True`` runs CORE only (V31 native-first success path).
         ``precomputed_core`` reuses a prior CORE and runs PROJECT only (V31
         assembly-failure fallback). The two flags are mutually exclusive.
-        ``core_length_presplit`` (V32) structurally pre-splits fitting multi
-        document/page CORE sources before the first Chat.
+        ``core_length_presplit`` (V32) refines fitting multi-page chunks on the
+        root_over_budget path before Chat, within remaining call/depth budget.
         """
         if skip_projects and precomputed_core is not None:
             raise AIProviderError(
@@ -2591,7 +2591,6 @@ class AnalysisService:
         ) -> ProfileCandidateDocument:
             """Extract one CORE chunk; shrink only on oversize/length."""
             nonlocal last_token_count, core_length_truncations
-            nonlocal core_presplit_applications, core_presplit_chunk_total
 
             def _shrink_and_retry(cause: Exception) -> ProfileCandidateDocument:
                 max_depth = int(self.settings.analysis_core_split_max_depth)
@@ -2611,15 +2610,6 @@ class AnalysisService:
                         )
                     )
                 return merge_core_chunk_candidates(nested)
-
-            def _structural_children(source: str) -> list[str]:
-                docs = split_document_blocks(source)
-                if len(docs) > 1:
-                    return docs
-                pages = split_block_by_pages(source)
-                if len(pages) > 1:
-                    return pages
-                return [source]
 
             try:
                 budget = _core_budget_for_blocks(
@@ -2647,53 +2637,6 @@ class AnalysisService:
                 return _shrink_and_retry(
                     CorePromptOverBudgetError("core chunk exceeds token budget")
                 )
-
-            # V32: before first Chat on a fitting multi-doc/page leaf, verify
-            # each child fits and pre-split so length truncations are avoided.
-            if core_length_presplit and not recovery_retry:
-                children = _structural_children(blocks)
-                if len(children) > 1:
-                    child_ok = True
-                    for child in children:
-                        try:
-                            if not _core_budget_for_blocks(
-                                child,
-                                recovery_retry=False,
-                                force_recount=True,
-                            ).fits:
-                                child_ok = False
-                                break
-                        except AIProviderError:
-                            child_ok = False
-                            break
-                    if child_ok:
-                        max_depth = int(self.settings.analysis_core_split_max_depth)
-                        if split_depth >= max_depth:
-                            raise InsufficientCandidateError()
-                        core_presplit_applications += 1
-                        core_presplit_chunk_total += len(children)
-                        logger.info(
-                            "analysis core chunk length-risk presplit "
-                            "analysis_run_id=%s split_depth=%s chunk_index=%s "
-                            "child_count=%s prompt_tokens=%s context_window=%s",
-                            base_log.get("analysis_run_id"),
-                            split_depth,
-                            chunk_index,
-                            len(children),
-                            budget.prompt_tokens,
-                            budget.context_window,
-                        )
-                        nested: list[ProfileCandidateDocument] = []
-                        for sub_i, child in enumerate(children):
-                            nested.append(
-                                _extract_core_chunk(
-                                    child,
-                                    split_depth=split_depth + 1,
-                                    chunk_index=sub_i,
-                                    recovery_retry=recovery_retry,
-                                )
-                            )
-                        return merge_core_chunk_candidates(nested)
 
             try:
                 raw = _phase_call(
@@ -2742,53 +2685,84 @@ class AnalysisService:
             root_budget: PromptChatBudget,
             reason: str,
             force_structural_split: bool = False,
-            preplanned_chunks: list[str] | None = None,
         ) -> ProfileCandidateDocument:
             """Document/page(+bounded body) adaptive CORE path."""
             nonlocal used_core_adaptive_split
+            nonlocal core_presplit_applications, core_presplit_chunk_total
             used_core_adaptive_split = True
             logger.info(
                 "analysis core adaptive split enter analysis_run_id=%s "
                 "reason=%s context_window=%s prompt_tokens=%s "
-                "force_structural_split=%s preplanned=%s",
+                "force_structural_split=%s",
                 base_log.get("analysis_run_id"),
                 reason,
                 root_budget.context_window,
                 root_budget.prompt_tokens,
                 force_structural_split,
-                preplanned_chunks is not None,
             )
             def _core_plan_budget(blocks: str) -> PromptChatBudget:
                 return _core_budget_for_blocks(
                     blocks, recovery_retry=False, force_recount=True
                 )
 
-            if preplanned_chunks is not None:
-                planned = list(preplanned_chunks)
-            else:
-                try:
-                    planned = plan_phase_source_chunks(
-                        aliased_blocks,
-                        budget_for_blocks=_core_plan_budget,
-                    )
-                except AIProviderError as exc:
-                    # Token-count outage while planning — fail closed, no fan-out.
-                    raise InsufficientCandidateError() from exc
-                # length-driven escalate may still "fit" by token-count; force
-                # document/page/body partition so we do not re-chat the same source.
-                if force_structural_split and len(planned) <= 1:
-                    docs = split_document_blocks(aliased_blocks)
-                    if len(docs) > 1:
-                        planned = docs
+            try:
+                planned = plan_phase_source_chunks(
+                    aliased_blocks,
+                    budget_for_blocks=_core_plan_budget,
+                )
+            except AIProviderError as exc:
+                # Token-count outage while planning — fail closed, no fan-out.
+                raise InsufficientCandidateError() from exc
+            # length-driven escalate may still "fit" by token-count; force
+            # document/page/body partition so we do not re-chat the same source.
+            if force_structural_split and len(planned) <= 1:
+                docs = split_document_blocks(aliased_blocks)
+                if len(docs) > 1:
+                    planned = docs
+                else:
+                    pages = split_block_by_pages(aliased_blocks)
+                    if len(pages) > 1:
+                        planned = pages
                     else:
-                        pages = split_block_by_pages(aliased_blocks)
-                        if len(pages) > 1:
-                            planned = pages
-                        else:
-                            body_parts = _subsplit_phase_chunk(aliased_blocks)
-                            if len(body_parts) > 1:
-                                planned = body_parts
+                        body_parts = _subsplit_phase_chunk(aliased_blocks)
+                        if len(body_parts) > 1:
+                            planned = body_parts
             max_calls = int(self.settings.analysis_core_split_max_calls)
+            # V32: on root_over_budget, expand fitting multi-page planned
+            # chunks into verified page leaves before any Chat, only when the
+            # remaining call slots can cover the expansion + later chunks.
+            if core_length_presplit and reason == "root_over_budget":
+                refined: list[str] = []
+                for index, chunk in enumerate(planned):
+                    rest_after = len(planned) - index - 1
+                    slots_left = max_calls - len(refined)
+                    max_for_this = slots_left - rest_after
+                    expanded = None
+                    if max_for_this >= 2:
+                        try:
+                            expanded = plan_core_length_risk_presplit(
+                                chunk,
+                                budget_for_blocks=_core_plan_budget,
+                                max_chunks=max_for_this,
+                            )
+                        except AIProviderError as exc:
+                            raise InsufficientCandidateError() from exc
+                    if expanded is not None and len(expanded) > 1:
+                        refined.extend(expanded)
+                        core_presplit_applications += 1
+                        core_presplit_chunk_total += len(expanded)
+                        logger.info(
+                            "analysis core root_over_budget length-risk "
+                            "presplit analysis_run_id=%s planned_index=%s "
+                            "child_count=%s slots_left=%s",
+                            base_log.get("analysis_run_id"),
+                            index,
+                            len(expanded),
+                            slots_left,
+                        )
+                    else:
+                        refined.append(chunk)
+                planned = refined
             if len(planned) > max_calls:
                 try:
                     planned = pack_phase_source_chunks(
@@ -2823,7 +2797,6 @@ class AnalysisService:
         def _run_core_adaptive() -> ProfileCandidateDocument:
             nonlocal used_core_adaptive_split, recovery_budget
             nonlocal core_length_truncations
-            nonlocal core_presplit_applications, core_presplit_chunk_total
             _refresh_capabilities(reason="core_phase")
             try:
                 root_budget = _core_budget_for_blocks(
@@ -2832,44 +2805,10 @@ class AnalysisService:
             except AIProviderError as exc:
                 raise InsufficientCandidateError() from exc
 
-            def _core_plan_budget(blocks: str) -> PromptChatBudget:
-                return _core_budget_for_blocks(
-                    blocks, recovery_retry=False, force_recount=True
-                )
-
-            # V32: when input already fits but spans multiple original
-            # document/page units that each fit, Chat the leaves first.
-            if core_length_presplit and root_budget.fits:
-                try:
-                    planned = plan_core_length_risk_presplit(
-                        aliased_blocks,
-                        budget_for_blocks=_core_plan_budget,
-                        max_chunks=int(self.settings.analysis_core_split_max_calls),
-                    )
-                except AIProviderError as exc:
-                    raise InsufficientCandidateError() from exc
-                if planned is not None and len(planned) > 1:
-                    core_presplit_applications += 1
-                    core_presplit_chunk_total += len(planned)
-                    logger.info(
-                        "analysis core length-risk presplit before chat "
-                        "analysis_run_id=%s chunk_count=%s prompt_tokens=%s "
-                        "context_window=%s requested_output_tokens=%s",
-                        base_log.get("analysis_run_id"),
-                        len(planned),
-                        root_budget.prompt_tokens,
-                        root_budget.context_window,
-                        root_budget.output_reserve_tokens,
-                    )
-                    return _run_core_split_path(
-                        root_budget=root_budget,
-                        reason="length_risk_presplit",
-                        preplanned_chunks=planned,
-                    )
-
             # Budget-fit → try single CORE first pass. length / pre-chat
             # over-budget escalate to adaptive split (no full-source recovery).
             # Sparse/validation recovery semantics remain for non-length cases.
+            # V32 does not pre-split here: preserve the single-Chat success path.
             if root_budget.fits:
                 try:
                     raw = _phase_call(
