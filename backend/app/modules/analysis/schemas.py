@@ -48,6 +48,8 @@ class CreateAnalysisRequest(BaseModel):
     source_first_v30: bool = Field(default=False, strict=True)
     # Independent native-first opt-in (PROJECT LLM skipped only on success).
     source_first_v31: bool = Field(default=False, strict=True)
+    # Native-first + CORE length-risk structural pre-split before first Chat.
+    source_first_v32: bool = Field(default=False, strict=True)
 
     @field_validator("document_ids")
     @classmethod
@@ -58,9 +60,18 @@ class CreateAnalysisRequest(BaseModel):
 
     @model_validator(mode="after")
     def exclusive_source_first_opt_ins(self) -> CreateAnalysisRequest:
-        if self.source_first_v30 and self.source_first_v31:
+        selected = sum(
+            1
+            for flag in (
+                self.source_first_v30,
+                self.source_first_v31,
+                self.source_first_v32,
+            )
+            if flag
+        )
+        if selected > 1:
             raise ValueError(
-                "source_first_v30과 source_first_v31은 동시에 사용할 수 없습니다."
+                "source_first_v30/v31/v32는 동시에 사용할 수 없습니다."
             )
         return self
 

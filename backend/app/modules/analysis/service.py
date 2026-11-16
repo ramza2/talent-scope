@@ -19,6 +19,7 @@ from app.ai.prompts.profile_extract import (
     UnknownProfilePromptVersionError,
     SOURCE_FIRST_V30_PROMPT_VERSION,
     SOURCE_FIRST_V31_PROMPT_VERSION,
+    SOURCE_FIRST_V32_PROMPT_VERSION,
     current_profile_prompt,
     resolve_profile_prompt,
 )
@@ -105,6 +106,7 @@ from app.modules.analysis.token_budget import (
     PromptChatBudget,
     compute_prompt_chat_budget,
     pack_phase_source_chunks,
+    plan_core_length_risk_presplit,
     plan_phase_source_chunks,
     plan_project_source_chunks,
     plan_project_recall_page_chunks,
@@ -346,11 +348,19 @@ class AnalysisService:
         *,
         source_first_v30: bool = False,
         source_first_v31: bool = False,
+        source_first_v32: bool = False,
     ) -> ProfilePromptSpec:
-        if source_first_v30 and source_first_v31:
+        selected = sum(
+            1
+            for flag in (source_first_v30, source_first_v31, source_first_v32)
+            if flag
+        )
+        if selected > 1:
             raise ValidationAppError(
-                "source_first_v30과 source_first_v31은 동시에 사용할 수 없습니다."
+                "source_first_v30/v31/v32는 동시에 사용할 수 없습니다."
             )
+        if source_first_v32:
+            return resolve_profile_prompt(SOURCE_FIRST_V32_PROMPT_VERSION)
         if source_first_v31:
             return resolve_profile_prompt(SOURCE_FIRST_V31_PROMPT_VERSION)
         if source_first_v30 or self.settings.analysis_source_first_v30_enabled:
@@ -397,6 +407,7 @@ class AnalysisService:
         prompt = self._selected_profile_prompt(
             source_first_v30=payload.source_first_v30,
             source_first_v31=payload.source_first_v31,
+            source_first_v32=payload.source_first_v32,
         )
         run = self.repo.create_run(
             person_id=payload.person_id,
@@ -419,6 +430,7 @@ class AnalysisService:
                 "prompt_version": prompt.prompt_version,
                 "source_first_v30_opt_in": payload.source_first_v30,
                 "source_first_v31_opt_in": payload.source_first_v31,
+                "source_first_v32_opt_in": payload.source_first_v32,
             },
         )
         self.db.commit()
@@ -912,8 +924,11 @@ class AnalysisService:
                         self.db.commit()
                 return snap
 
-            if claimed.prompt_version == SOURCE_FIRST_V31_PROMPT_VERSION:
-                # V31 needs the confirmed snapshot before native assembly / guards.
+            if claimed.prompt_version in {
+                SOURCE_FIRST_V31_PROMPT_VERSION,
+                SOURCE_FIRST_V32_PROMPT_VERSION,
+            }:
+                # V31/V32 need the confirmed snapshot before native assembly / guards.
                 base_snap = _load_base_snapshot()
                 if base_snap is None:
                     return "FAILED"
@@ -1469,6 +1484,9 @@ class AnalysisService:
             collect_native_source_rows,
         )
 
+        core_length_presplit = (
+            prompt.prompt_version == SOURCE_FIRST_V32_PROMPT_VERSION
+        )
         native_rows: list[dict[str, Any]] | None = None
         probe_failure: str | None = None
         try:
@@ -1496,6 +1514,7 @@ class AnalysisService:
                 source_char_count=source_char_count,
                 base_log=base_log,
                 vlm_pages=vlm_pages,
+                core_length_presplit=core_length_presplit,
             )
             original_candidate = candidate
             candidate = apply_candidate_quality_guards(
@@ -1558,6 +1577,7 @@ class AnalysisService:
             base_log=base_log,
             vlm_pages=vlm_pages,
             skip_projects=True,
+            core_length_presplit=core_length_presplit,
         )
         core_guarded = apply_candidate_quality_guards(
             core_only,
@@ -1608,6 +1628,7 @@ class AnalysisService:
                 base_log=base_log,
                 vlm_pages=vlm_pages,
                 precomputed_core=core_for_native,
+                core_length_presplit=core_length_presplit,
             )
             original_candidate = candidate
             candidate = apply_candidate_quality_guards(
@@ -1694,12 +1715,15 @@ class AnalysisService:
         vlm_pages: int,
         skip_projects: bool = False,
         precomputed_core: ProfileCandidateDocument | None = None,
+        core_length_presplit: bool = False,
     ) -> ProfileCandidateDocument:
         """Compact staged extraction (v8+): aliases + short keys; max 1 recovery.
 
         ``skip_projects=True`` runs CORE only (V31 native-first success path).
         ``precomputed_core`` reuses a prior CORE and runs PROJECT only (V31
         assembly-failure fallback). The two flags are mutually exclusive.
+        ``core_length_presplit`` (V32) structurally pre-splits fitting multi
+        document/page CORE sources before the first Chat.
         """
         if skip_projects and precomputed_core is not None:
             raise AIProviderError(
@@ -1743,6 +1767,9 @@ class AnalysisService:
         project_split_calls = 0
         core_split_calls = 0
         token_count_calls = 0
+        core_length_truncations = 0
+        core_presplit_applications = 0
+        core_presplit_chunk_total = 0
         used_project_adaptive_split = False
         used_core_adaptive_split = False
         capabilities: ModelCapabilities | None = None
@@ -2563,7 +2590,8 @@ class AnalysisService:
             recovery_retry: bool,
         ) -> ProfileCandidateDocument:
             """Extract one CORE chunk; shrink only on oversize/length."""
-            nonlocal last_token_count
+            nonlocal last_token_count, core_length_truncations
+            nonlocal core_presplit_applications, core_presplit_chunk_total
 
             def _shrink_and_retry(cause: Exception) -> ProfileCandidateDocument:
                 max_depth = int(self.settings.analysis_core_split_max_depth)
@@ -2583,6 +2611,15 @@ class AnalysisService:
                         )
                     )
                 return merge_core_chunk_candidates(nested)
+
+            def _structural_children(source: str) -> list[str]:
+                docs = split_document_blocks(source)
+                if len(docs) > 1:
+                    return docs
+                pages = split_block_by_pages(source)
+                if len(pages) > 1:
+                    return pages
+                return [source]
 
             try:
                 budget = _core_budget_for_blocks(
@@ -2611,6 +2648,53 @@ class AnalysisService:
                     CorePromptOverBudgetError("core chunk exceeds token budget")
                 )
 
+            # V32: before first Chat on a fitting multi-doc/page leaf, verify
+            # each child fits and pre-split so length truncations are avoided.
+            if core_length_presplit and not recovery_retry:
+                children = _structural_children(blocks)
+                if len(children) > 1:
+                    child_ok = True
+                    for child in children:
+                        try:
+                            if not _core_budget_for_blocks(
+                                child,
+                                recovery_retry=False,
+                                force_recount=True,
+                            ).fits:
+                                child_ok = False
+                                break
+                        except AIProviderError:
+                            child_ok = False
+                            break
+                    if child_ok:
+                        max_depth = int(self.settings.analysis_core_split_max_depth)
+                        if split_depth >= max_depth:
+                            raise InsufficientCandidateError()
+                        core_presplit_applications += 1
+                        core_presplit_chunk_total += len(children)
+                        logger.info(
+                            "analysis core chunk length-risk presplit "
+                            "analysis_run_id=%s split_depth=%s chunk_index=%s "
+                            "child_count=%s prompt_tokens=%s context_window=%s",
+                            base_log.get("analysis_run_id"),
+                            split_depth,
+                            chunk_index,
+                            len(children),
+                            budget.prompt_tokens,
+                            budget.context_window,
+                        )
+                        nested: list[ProfileCandidateDocument] = []
+                        for sub_i, child in enumerate(children):
+                            nested.append(
+                                _extract_core_chunk(
+                                    child,
+                                    split_depth=split_depth + 1,
+                                    chunk_index=sub_i,
+                                    recovery_retry=recovery_retry,
+                                )
+                            )
+                        return merge_core_chunk_candidates(nested)
+
             try:
                 raw = _phase_call(
                     phase="core",
@@ -2628,6 +2712,7 @@ class AnalysisService:
                 return _normalize_core(raw)
             except AIResponseTruncatedError as trunc_exc:
                 last_token_count = None
+                core_length_truncations += 1
                 logger.info(
                     "analysis core chunk truncated analysis_run_id=%s "
                     "split_depth=%s chunk_index=%s finish_reason=%s "
@@ -2657,6 +2742,7 @@ class AnalysisService:
             root_budget: PromptChatBudget,
             reason: str,
             force_structural_split: bool = False,
+            preplanned_chunks: list[str] | None = None,
         ) -> ProfileCandidateDocument:
             """Document/page(+bounded body) adaptive CORE path."""
             nonlocal used_core_adaptive_split
@@ -2664,40 +2750,44 @@ class AnalysisService:
             logger.info(
                 "analysis core adaptive split enter analysis_run_id=%s "
                 "reason=%s context_window=%s prompt_tokens=%s "
-                "force_structural_split=%s",
+                "force_structural_split=%s preplanned=%s",
                 base_log.get("analysis_run_id"),
                 reason,
                 root_budget.context_window,
                 root_budget.prompt_tokens,
                 force_structural_split,
+                preplanned_chunks is not None,
             )
             def _core_plan_budget(blocks: str) -> PromptChatBudget:
                 return _core_budget_for_blocks(
                     blocks, recovery_retry=False, force_recount=True
                 )
 
-            try:
-                planned = plan_phase_source_chunks(
-                    aliased_blocks,
-                    budget_for_blocks=_core_plan_budget,
-                )
-            except AIProviderError as exc:
-                # Token-count outage while planning — fail closed, no fan-out.
-                raise InsufficientCandidateError() from exc
-            # length-driven escalate may still "fit" by token-count; force
-            # document/page/body partition so we do not re-chat the same source.
-            if force_structural_split and len(planned) <= 1:
-                docs = split_document_blocks(aliased_blocks)
-                if len(docs) > 1:
-                    planned = docs
-                else:
-                    pages = split_block_by_pages(aliased_blocks)
-                    if len(pages) > 1:
-                        planned = pages
+            if preplanned_chunks is not None:
+                planned = list(preplanned_chunks)
+            else:
+                try:
+                    planned = plan_phase_source_chunks(
+                        aliased_blocks,
+                        budget_for_blocks=_core_plan_budget,
+                    )
+                except AIProviderError as exc:
+                    # Token-count outage while planning — fail closed, no fan-out.
+                    raise InsufficientCandidateError() from exc
+                # length-driven escalate may still "fit" by token-count; force
+                # document/page/body partition so we do not re-chat the same source.
+                if force_structural_split and len(planned) <= 1:
+                    docs = split_document_blocks(aliased_blocks)
+                    if len(docs) > 1:
+                        planned = docs
                     else:
-                        body_parts = _subsplit_phase_chunk(aliased_blocks)
-                        if len(body_parts) > 1:
-                            planned = body_parts
+                        pages = split_block_by_pages(aliased_blocks)
+                        if len(pages) > 1:
+                            planned = pages
+                        else:
+                            body_parts = _subsplit_phase_chunk(aliased_blocks)
+                            if len(body_parts) > 1:
+                                planned = body_parts
             max_calls = int(self.settings.analysis_core_split_max_calls)
             if len(planned) > max_calls:
                 try:
@@ -2732,6 +2822,8 @@ class AnalysisService:
 
         def _run_core_adaptive() -> ProfileCandidateDocument:
             nonlocal used_core_adaptive_split, recovery_budget
+            nonlocal core_length_truncations
+            nonlocal core_presplit_applications, core_presplit_chunk_total
             _refresh_capabilities(reason="core_phase")
             try:
                 root_budget = _core_budget_for_blocks(
@@ -2739,6 +2831,42 @@ class AnalysisService:
                 )
             except AIProviderError as exc:
                 raise InsufficientCandidateError() from exc
+
+            def _core_plan_budget(blocks: str) -> PromptChatBudget:
+                return _core_budget_for_blocks(
+                    blocks, recovery_retry=False, force_recount=True
+                )
+
+            # V32: when input already fits but spans multiple original
+            # document/page units that each fit, Chat the leaves first.
+            if core_length_presplit and root_budget.fits:
+                try:
+                    planned = plan_core_length_risk_presplit(
+                        aliased_blocks,
+                        budget_for_blocks=_core_plan_budget,
+                        max_chunks=int(self.settings.analysis_core_split_max_calls),
+                    )
+                except AIProviderError as exc:
+                    raise InsufficientCandidateError() from exc
+                if planned is not None and len(planned) > 1:
+                    core_presplit_applications += 1
+                    core_presplit_chunk_total += len(planned)
+                    logger.info(
+                        "analysis core length-risk presplit before chat "
+                        "analysis_run_id=%s chunk_count=%s prompt_tokens=%s "
+                        "context_window=%s requested_output_tokens=%s",
+                        base_log.get("analysis_run_id"),
+                        len(planned),
+                        root_budget.prompt_tokens,
+                        root_budget.context_window,
+                        root_budget.output_reserve_tokens,
+                    )
+                    return _run_core_split_path(
+                        root_budget=root_budget,
+                        reason="length_risk_presplit",
+                        preplanned_chunks=planned,
+                    )
+
             # Budget-fit → try single CORE first pass. length / pre-chat
             # over-budget escalate to adaptive split (no full-source recovery).
             # Sparse/validation recovery semantics remain for non-length cases.
@@ -2754,6 +2882,7 @@ class AnalysisService:
                     )
                     candidate = _normalize_core(raw)
                 except AIResponseTruncatedError as trunc_exc:
+                    core_length_truncations += 1
                     logger.info(
                         "analysis core single-path truncated → adaptive "
                         "analysis_run_id=%s finish_reason=%s",
@@ -2789,6 +2918,7 @@ class AnalysisService:
                         )
                         candidate = _normalize_core(raw)
                     except AIResponseTruncatedError as trunc_exc:
+                        core_length_truncations += 1
                         logger.info(
                             "analysis core sparse-recovery truncated → "
                             "adaptive analysis_run_id=%s finish_reason=%s",
@@ -2831,7 +2961,9 @@ class AnalysisService:
             "document_count=%s vlm_pages=%s empty=%s sparse=%s quality_score=%s "
             "skills=%s expertise=%s jobs=%s employment=%s education=%s "
             "certifications=%s projects=%s core_split_calls=%s "
-            "used_adaptive_split=%s token_count_calls=%s",
+            "used_adaptive_split=%s token_count_calls=%s "
+            "core_length_truncations=%s core_presplit_applications=%s "
+            "core_presplit_chunk_total=%s core_length_presplit=%s",
             base_log.get("analysis_run_id"),
             compact_tag,
             base_log.get("document_count"),
@@ -2851,6 +2983,10 @@ class AnalysisService:
             core_split_calls,
             used_core_adaptive_split,
             token_count_calls,
+            core_length_truncations,
+            core_presplit_applications,
+            core_presplit_chunk_total,
+            core_length_presplit,
         )
 
         if skip_projects:
@@ -3615,6 +3751,7 @@ class AnalysisService:
             if prior_prompt_version not in {
                 SOURCE_FIRST_V30_PROMPT_VERSION,
                 SOURCE_FIRST_V31_PROMPT_VERSION,
+                SOURCE_FIRST_V32_PROMPT_VERSION,
             }:
                 raise ValueError("SOURCE_FIRST_FALLBACK_PROMPT_VERSION_MISMATCH")
             # Fallback rows use the normal v25 UI, not Source-First labels.
@@ -3642,6 +3779,11 @@ class AnalysisService:
                 "source_first_v31_fallback_class": (
                     source_first_fallback
                     if prior_prompt_version == SOURCE_FIRST_V31_PROMPT_VERSION
+                    else None
+                ),
+                "source_first_v32_fallback_class": (
+                    source_first_fallback
+                    if prior_prompt_version == SOURCE_FIRST_V32_PROMPT_VERSION
                     else None
                 ),
             },

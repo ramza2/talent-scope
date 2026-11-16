@@ -362,6 +362,98 @@ def plan_phase_source_chunks(
     return chunks or [document_blocks]
 
 
+def plan_core_length_risk_presplit(
+    document_blocks: str,
+    *,
+    budget_for_blocks,
+    max_chunks: int,
+) -> list[str] | None:
+    """Opt-in CORE pre-split when input fits but spans many source units.
+
+    Length truncations waste a full Chat on a combined source that already
+    fits the verified input budget. When the same source has two or more
+    original document/page boundaries and every leaf also fits by
+    ``/v1/token-count``, return those leaves so the caller can Chat smaller
+    CORE outputs first.
+
+    Returns ``None`` when pre-split must not run:
+    - root does not fit (existing over-budget planner owns that path)
+    - fewer than two document/page units
+    - any leaf would require body-char splitting or fails verified fit
+    - packing to ``max_chunks`` cannot keep every leaf fitting
+
+    Never estimates tokens locally and never forces unconditional splits.
+    """
+    if max_chunks < 2:
+        return None
+    text = document_blocks or ""
+    if not text.strip():
+        return None
+    try:
+        root_budget = budget_for_blocks(text)
+    except Exception:
+        return None
+    if not root_budget.fits:
+        return None
+
+    docs = split_document_blocks(text) or [text]
+    leaves: list[str] = []
+    if len(docs) > 1:
+        for doc in docs:
+            try:
+                doc_budget = budget_for_blocks(doc)
+            except Exception:
+                return None
+            if doc_budget.fits:
+                leaves.append(doc)
+                continue
+            pages = split_block_by_pages(doc)
+            if len(pages) <= 1:
+                # Would need body deepening — not a safe pre-Chat split.
+                return None
+            for page in pages:
+                try:
+                    page_budget = budget_for_blocks(page)
+                except Exception:
+                    return None
+                if not page_budget.fits:
+                    return None
+                leaves.append(page)
+    else:
+        pages = split_block_by_pages(docs[0])
+        if len(pages) <= 1:
+            return None
+        for page in pages:
+            try:
+                page_budget = budget_for_blocks(page)
+            except Exception:
+                return None
+            if not page_budget.fits:
+                return None
+            leaves.append(page)
+
+    if len(leaves) < 2:
+        return None
+    if len(leaves) > max_chunks:
+        try:
+            leaves = pack_phase_source_chunks(
+                leaves,
+                max_chunks=max_chunks,
+                budget_for_blocks=budget_for_blocks,
+            )
+        except Exception:
+            return None
+    if len(leaves) < 2 or len(leaves) > max_chunks:
+        return None
+    for leaf in leaves:
+        try:
+            if not budget_for_blocks(leaf).fits:
+                return None
+        except Exception:
+            return None
+    return leaves
+
+
 def merge_adjacent_source_chunks(left: str, right: str) -> str:
     """Merge adjacent prompt blocks, collapsing same-document page headers."""
     a = left or ""
