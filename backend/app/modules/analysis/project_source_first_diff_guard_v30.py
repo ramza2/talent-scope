@@ -14,6 +14,7 @@ There are no writes or review decisions.
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any
@@ -33,18 +34,27 @@ class SourceFirstDiff:
     collision_review_indices: list[int]
 
 
+def _stable_identity_text(value: Any) -> str:
+    """NFKC + Unicode whitespace removal only; keep punctuation and case.
+
+    Never use the more permissive punctuation-stripping grouping fold for
+    linking to a confirmed record.
+    """
+    if not isinstance(value, str):
+        return ""
+    return "".join(unicodedata.normalize("NFKC", value).split())
+
+
 def _exact_identity(project: Any, target: dict[str, Any]) -> bool:
-    """Require exact native title/customer and compatible period to auto-link."""
+    """Require unique formatting-equivalent title/customer and dates."""
     if not isinstance(target, dict):
         return False
-    name = project.project_name
-    customer = project.customer_name
-    # Never allow generic/substring/Levenshtein name matching here.
-    if not isinstance(name, str) or not isinstance(customer, str):
-        return False
+    name = _stable_identity_text(project.project_name)
+    customer = _stable_identity_text(project.customer_name)
     if (
-        name.strip() != str(target.get("project_name") or "").strip()
-        or customer.strip() != str(target.get("customer_name") or "").strip()
+        not name or not customer
+        or name != _stable_identity_text(target.get("project_name"))
+        or customer != _stable_identity_text(target.get("customer_name"))
     ):
         return False
     return (
@@ -55,6 +65,63 @@ def _exact_identity(project: Any, target: dict[str, Any]) -> bool:
             candidate=project.end_date, existing=target.get("end_date")
         )
     )
+
+
+def _responsibilities_formatting_equivalent(old_value: Any, new_value: Any) -> bool:
+    """True when both sides are non-empty and equal under NFKC + whitespace fold."""
+    if not isinstance(old_value, str) or not isinstance(new_value, str):
+        return False
+    left = _stable_identity_text(old_value)
+    right = _stable_identity_text(new_value)
+    return bool(left) and left == right
+
+
+def _soften_format_only_responsibility_conflicts(
+    specs: list[DiffSpec],
+    *,
+    safe_linked_indices: set[int],
+) -> list[DiffSpec]:
+    """Rewrite format-only responsibilities CONFLICT → SAME for safe matches.
+
+    Confirmed ``old_value`` is preserved. The DiffSpec itself is kept so every
+    source project remains represented. Real content differences and projects
+    that are not uniquely/safely linked stay CONFLICT.
+    """
+    if not safe_linked_indices:
+        return specs
+    softened: list[DiffSpec] = []
+    for spec in specs:
+        if (
+            spec.entity_type == "PROJECT"
+            and spec.field_name == "responsibilities"
+            and spec.change_type == "CONFLICT"
+        ):
+            found = _PATH.match(spec.candidate_path or "")
+            if (
+                found is not None
+                and int(found.group(1)) in safe_linked_indices
+                and _responsibilities_formatting_equivalent(
+                    spec.old_value, spec.new_value
+                )
+            ):
+                softened.append(
+                    DiffSpec(
+                        entity_type=spec.entity_type,
+                        change_type="SAME",
+                        candidate_path=spec.candidate_path,
+                        existing_target_id=spec.existing_target_id,
+                        field_name=spec.field_name,
+                        old_value=spec.old_value,
+                        new_value=spec.new_value,
+                        confidence=spec.confidence,
+                        evidence_type=spec.evidence_type,
+                        source_refs=list(spec.source_refs),
+                        review_status=spec.review_status,
+                    )
+                )
+                continue
+        softened.append(spec)
+    return softened
 
 
 def build_source_first_review_safe_diffs(
@@ -121,6 +188,13 @@ def build_source_first_review_safe_diffs(
             raise ValueError(f"V30_SAFE_DIFF_TARGET_MISSING:{index}")
         if not _exact_identity(project, old):
             variant.add(index)
+        elif sum(
+            _exact_identity(project, existing)
+            for existing in latest_snapshot["projects"]
+        ) != 1:
+            # Formatting-equivalent confirmed records are ambiguous even
+            # if the legacy diff happened to select just one of them.
+            variant.add(index)
         elif non_root or any(s.change_type == "SAME" for s in specs):
             linked[index] = target_id
 
@@ -135,8 +209,15 @@ def build_source_first_review_safe_diffs(
         for idx in group
     }
     unsafe = variant | collision
+    safe_linked = {idx for idx in linked if idx not in unsafe}
     if not unsafe:
-        return SourceFirstDiff(raw, [], [])
+        return SourceFirstDiff(
+            _soften_format_only_responsibility_conflicts(
+                raw, safe_linked_indices=safe_linked
+            ),
+            [],
+            [],
+        )
 
     result: list[DiffSpec] = []
     rewritten: set[int] = set()
@@ -166,7 +247,9 @@ def build_source_first_review_safe_diffs(
     if rewritten != unsafe:
         raise ValueError("V30_SAFE_DIFF_REWRITE_INCOMPLETE")
     return SourceFirstDiff(
-        specs=result,
+        specs=_soften_format_only_responsibility_conflicts(
+            result, safe_linked_indices=safe_linked
+        ),
         variant_review_indices=sorted(variant),
         collision_review_indices=sorted(collision),
     )
