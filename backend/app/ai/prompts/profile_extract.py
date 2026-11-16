@@ -40,6 +40,8 @@ SOURCE_FIRST_V30_PROMPT_VERSION = "profile-source-first-v30-native-direct"
 # V31: same v25 extraction contract; runtime skips PROJECT LLM when native-first
 # assembly succeeds. Distinct version keeps V30 post-LLM swap behavior unchanged.
 SOURCE_FIRST_V31_PROMPT_VERSION = "profile-source-first-v31-native-first"
+# V32: V31 native-first plus CORE length-risk structural pre-split before Chat.
+SOURCE_FIRST_V32_PROMPT_VERSION = "profile-source-first-v32-core-presplit"
 
 ExtractionMode = Literal["single", "staged"]
 
@@ -257,6 +259,11 @@ _REGISTRY[SOURCE_FIRST_V30_PROMPT_VERSION] = replace(
 _REGISTRY[SOURCE_FIRST_V31_PROMPT_VERSION] = replace(
     _REGISTRY[CURRENT_PROFILE_PROMPT_VERSION],
     prompt_version=SOURCE_FIRST_V31_PROMPT_VERSION,
+)
+# v32 reuses v31/v25 prompts; CORE pre-split is selected by prompt_version only.
+_REGISTRY[SOURCE_FIRST_V32_PROMPT_VERSION] = replace(
+    _REGISTRY[CURRENT_PROFILE_PROMPT_VERSION],
+    prompt_version=SOURCE_FIRST_V32_PROMPT_VERSION,
 )
 
 
