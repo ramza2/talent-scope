@@ -67,6 +67,63 @@ def _exact_identity(project: Any, target: dict[str, Any]) -> bool:
     )
 
 
+def _responsibilities_formatting_equivalent(old_value: Any, new_value: Any) -> bool:
+    """True when both sides are non-empty and equal under NFKC + whitespace fold."""
+    if not isinstance(old_value, str) or not isinstance(new_value, str):
+        return False
+    left = _stable_identity_text(old_value)
+    right = _stable_identity_text(new_value)
+    return bool(left) and left == right
+
+
+def _soften_format_only_responsibility_conflicts(
+    specs: list[DiffSpec],
+    *,
+    safe_linked_indices: set[int],
+) -> list[DiffSpec]:
+    """Rewrite format-only responsibilities CONFLICT → SAME for safe matches.
+
+    Confirmed ``old_value`` is preserved. The DiffSpec itself is kept so every
+    source project remains represented. Real content differences and projects
+    that are not uniquely/safely linked stay CONFLICT.
+    """
+    if not safe_linked_indices:
+        return specs
+    softened: list[DiffSpec] = []
+    for spec in specs:
+        if (
+            spec.entity_type == "PROJECT"
+            and spec.field_name == "responsibilities"
+            and spec.change_type == "CONFLICT"
+        ):
+            found = _PATH.match(spec.candidate_path or "")
+            if (
+                found is not None
+                and int(found.group(1)) in safe_linked_indices
+                and _responsibilities_formatting_equivalent(
+                    spec.old_value, spec.new_value
+                )
+            ):
+                softened.append(
+                    DiffSpec(
+                        entity_type=spec.entity_type,
+                        change_type="SAME",
+                        candidate_path=spec.candidate_path,
+                        existing_target_id=spec.existing_target_id,
+                        field_name=spec.field_name,
+                        old_value=spec.old_value,
+                        new_value=spec.new_value,
+                        confidence=spec.confidence,
+                        evidence_type=spec.evidence_type,
+                        source_refs=list(spec.source_refs),
+                        review_status=spec.review_status,
+                    )
+                )
+                continue
+        softened.append(spec)
+    return softened
+
+
 def build_source_first_review_safe_diffs(
     candidate: ProfileCandidateDocument,
     latest_snapshot: dict[str, Any],
@@ -152,8 +209,15 @@ def build_source_first_review_safe_diffs(
         for idx in group
     }
     unsafe = variant | collision
+    safe_linked = {idx for idx in linked if idx not in unsafe}
     if not unsafe:
-        return SourceFirstDiff(raw, [], [])
+        return SourceFirstDiff(
+            _soften_format_only_responsibility_conflicts(
+                raw, safe_linked_indices=safe_linked
+            ),
+            [],
+            [],
+        )
 
     result: list[DiffSpec] = []
     rewritten: set[int] = set()
@@ -183,7 +247,9 @@ def build_source_first_review_safe_diffs(
     if rewritten != unsafe:
         raise ValueError("V30_SAFE_DIFF_REWRITE_INCOMPLETE")
     return SourceFirstDiff(
-        specs=result,
+        specs=_soften_format_only_responsibility_conflicts(
+            result, safe_linked_indices=safe_linked
+        ),
         variant_review_indices=sorted(variant),
         collision_review_indices=sorted(collision),
     )
