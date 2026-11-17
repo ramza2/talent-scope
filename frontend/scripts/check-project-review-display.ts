@@ -1,5 +1,8 @@
 /** Run in frontend: npx tsx --tsconfig tsconfig.app.json scripts/check-project-review-display.ts */
-import { projectReviewView } from '../src/api/projectReviewDisplay'
+import {
+  projectPptxSourceLocations,
+  projectReviewView,
+} from '../src/api/projectReviewDisplay'
 
 function check(condition: unknown, label: string): asserts condition {
   if (!condition) throw new Error(label)
@@ -84,5 +87,56 @@ const views = many.map((candidate, index) => projectReviewView({
 check(views.length === 36, 'all 36 native roots represented')
 check(new Set(views.map(v => v.projectName)).size === 36, 'names remain independent')
 check(many[0].project_name === '프로젝트0', 'candidate object remains unchanged')
+
+const withLocs = {
+  ...project,
+  native_source_locations: [
+    {
+      document_id: 'doc1',
+      page_no: 1,
+      table_index: 1,
+      row_index: 1,
+      row_id: 'row-a',
+    },
+    {
+      document_id: 'doc2',
+      page_no: 2,
+      table_index: 1,
+      row_index: 1,
+      row_id: 'row-b',
+    },
+  ],
+}
+const locCore = { projects: [withLocs] }
+const rootLocs = projectPptxSourceLocations({
+  candidate_path: 'projects[0]',
+  new_value: withLocs,
+}, locCore)
+check(rootLocs.length === 2, 'root diff exposes pptx locations')
+check(rootLocs[0].document_id === 'doc1', 'first locator document')
+check(rootLocs[1].page_no === 2, 'second locator slide')
+
+const fieldLocs = projectPptxSourceLocations({
+  candidate_path: 'projects[0].responsibilities',
+  new_value: '수행역할: PL',
+}, locCore)
+check(fieldLocs.length === 2, 'field diff reads parent project locations')
+check(
+  projectPptxSourceLocations({
+    candidate_path: 'projects[0]',
+    new_value: project,
+  }, core).length === 0,
+  'missing locations keep empty list',
+)
+check(
+  projectPptxSourceLocations({
+    candidate_path: 'projects[0]',
+    new_value: {
+      ...project,
+      native_source_locations: [{ document_id: 'x', page_no: 0, table_index: 1, row_index: 1, row_id: 'bad' }],
+    },
+  }, core).length === 0,
+  'invalid locator blocked',
+)
 
 console.log('projectReviewDisplay checks: OK')

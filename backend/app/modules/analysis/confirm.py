@@ -59,7 +59,9 @@ from app.modules.people.repository import PeopleRepository
 from app.modules.people.snapshot import build_confirmed_profile_snapshot
 from app.modules.projects.repository import ProjectRepository
 
-_METADATA_KEYS = frozenset({"source_refs", "confidence", "analysis", "notes"})
+_METADATA_KEYS = frozenset(
+    {"source_refs", "confidence", "analysis", "notes", "native_source_locations"}
+)
 
 _PROFILE_SCALAR_FIELDS = frozenset(
     {

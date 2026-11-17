@@ -31,6 +31,7 @@ export const MODIFIED_DEFAULT_STRIP_KEYS = new Set([
   'analysis',
   'notes',
   'raw_value',
+  'native_source_locations',
 ])
 
 export function isProfileScalarDiff(diff: DecisionDiffLike): boolean {
