@@ -23,6 +23,8 @@ ID_F3='5353535353535353535353535353535353535353535353535353535353535353'
 ID_FOLD='5454545454545454545454545454545454545454545454545454545454545454'
 # Duplicate-tag shared id (two rollback tags → one ID).
 ID_DUP='eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'
+# Unused image id used only for mid-flight tag retarget regression.
+ID_RETARGET='ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff'
 
 assert_eq() {
   local label="$1" expected="$2" actual="$3"
@@ -75,6 +77,10 @@ fail_ps() {
 case "$cmd" in
   images)
     # Real shape: docker images --no-trunc --format '...'
+    if [[ -f "${STATE_DIR}/images_hook.sh" ]]; then
+      # shellcheck disable=SC1091
+      source "${STATE_DIR}/images_hook.sh"
+    fi
     cat "${STATE_DIR}/images_format.tsv"
     exit 0
     ;;
@@ -341,6 +347,31 @@ run_script --apply
 assert_eq "reverify-abort:exit" "1" "$LAST_EC"
 assert_contains "reverify-abort:msg" "re-verification failed" "$LAST_OUT"
 assert_not_contains "reverify-abort:no-delete" "deleted_tag:" "$LAST_OUT"
+cleanup_mock
+
+echo "== candidate tag retargeted to different unused image id aborts =="
+prepare_mock
+: >"${MOCK_STATE_DIR}/ids/${ID_RETARGET}"
+# After initial selection (1st images call), retarget rollback-ddd to an unused id.
+cat >"${MOCK_STATE_DIR}/images_hook.sh" <<EOF
+n=0
+[[ -f "\${STATE_DIR}/images_count" ]] && n=\$(cat "\${STATE_DIR}/images_count")
+n=\$((n + 1))
+echo "\$n" >"\${STATE_DIR}/images_count"
+if [[ "\$n" -ge 2 ]]; then
+  awk -F '\t' -v OFS='\t' -v nid='${ID_RETARGET}' '
+    \$1=="talent-scope-api" && \$2=="rollback-ddd" { \$3=nid }
+    { print }
+  ' "\${STATE_DIR}/images_format.tsv" >"\${STATE_DIR}/images_format.tsv.tmp"
+  mv "\${STATE_DIR}/images_format.tsv.tmp" "\${STATE_DIR}/images_format.tsv"
+fi
+EOF
+run_script --apply
+assert_eq "retarget-abort:exit" "1" "$LAST_EC"
+assert_contains "retarget-abort:msg" "id changed for talent-scope-api:rollback-ddd" "$LAST_OUT"
+assert_contains "retarget-abort:initial" "sha256:${ID_D}" "$LAST_OUT"
+assert_contains "retarget-abort:now" "sha256:${ID_RETARGET}" "$LAST_OUT"
+assert_not_contains "retarget-abort:no-delete" "deleted_tag:" "$LAST_OUT"
 cleanup_mock
 
 echo

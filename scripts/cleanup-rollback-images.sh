@@ -96,6 +96,8 @@ CANDIDATE_IDS="${WORKDIR}/candidate_ids.txt"
 PLAN="${WORKDIR}/plan.tsv"
 SNAPSHOT_CANDIDATES="${WORKDIR}/snapshot_candidates.txt"
 SNAPSHOT_PROTECTED="${WORKDIR}/snapshot_protected.txt"
+# First-selection tag → full sha256 map (never rewritten after initial save).
+INITIAL_CANDIDATE_MAP="${WORKDIR}/initial_candidate_map.tsv"
 
 : >"$PROTECTED_IDS"
 : >"$UNCERTAIN_IDS"
@@ -103,6 +105,7 @@ SNAPSHOT_PROTECTED="${WORKDIR}/snapshot_protected.txt"
 : >"$CANDIDATE_TAGS"
 : >"$CANDIDATE_IDS"
 : >"$PLAN"
+: >"$INITIAL_CANDIDATE_MAP"
 
 is_target_repo() {
   [[ "$1" =~ $REPO_REGEX ]]
@@ -382,6 +385,41 @@ select_keep_and_candidates() {
   fi
 }
 
+save_initial_candidate_map() {
+  # Persist first-pass candidate tag → full sha256 mapping only once.
+  if [[ -s "$INITIAL_CANDIDATE_MAP" ]]; then
+    return 0
+  fi
+  : >"$INITIAL_CANDIDATE_MAP"
+  if [[ ! -s "$PLAN" ]]; then
+    return 0
+  fi
+  awk -F '\t' '$1 == "candidate" && $2 != "" && $3 != "" { print $2 "\t" $3 }' \
+    "$PLAN" | sort -u >"$INITIAL_CANDIDATE_MAP"
+}
+
+initial_id_for_ref() {
+  local ref="$1"
+  local id
+  id="$(awk -F '\t' -v ref="$ref" '$1 == ref { print $2; found=1; exit } END { exit !found }' \
+    "$INITIAL_CANDIDATE_MAP")" || return 1
+  canonical_id "$id"
+}
+
+assert_matches_initial_id() {
+  local phase="$1"
+  local ref="$2"
+  local current="$3"
+  local expected
+  expected="$(initial_id_for_ref "$ref")" \
+    || die "${phase}: missing initial tag→id mapping for $ref"
+  current="$(canonical_id "$current")" \
+    || die "${phase}: non-full current id for $ref"
+  if ! ids_equal "$current" "$expected"; then
+    die "${phase}: id changed for $ref (initial $expected now $current)"
+  fi
+}
+
 snapshot_state() {
   cp "$CANDIDATE_TAGS" "$SNAPSHOT_CANDIDATES"
   cp "$PROTECTED_IDS" "$SNAPSHOT_PROTECTED"
@@ -501,6 +539,7 @@ reverify_or_die() {
       || die "re-verification failed: missing image tag: $ref"
     full="$(canonical_id "$full")" \
       || die "re-verification failed: non-full id for $ref"
+    assert_matches_initial_id "re-verification failed" "$ref" "$full"
     id_is_protected "$full" \
       && die "re-verification failed: $ref id is protected: $full"
   done <<<"$old_candidates"
@@ -524,7 +563,8 @@ reverify_or_die() {
 verify_ref_still_deletable() {
   local ref="$1"
   local full expected
-  expected="$2"
+  expected="$(initial_id_for_ref "$ref")" \
+    || die "pre-delete aborted: missing initial tag→id mapping for $ref"
 
   [[ "$LOOKUP_FAILED" -eq 0 ]] || die "pre-delete aborted: lookup failure"
   grep -qxF "$ref" "$CANDIDATE_TAGS" \
@@ -533,8 +573,7 @@ verify_ref_still_deletable() {
     || die "pre-delete aborted: cannot inspect $ref"
   full="$(canonical_id "$full")" \
     || die "pre-delete aborted: non-full id for $ref"
-  ids_equal "$full" "$expected" \
-    || die "pre-delete aborted: id changed for $ref (was $expected now $full)"
+  assert_matches_initial_id "pre-delete aborted" "$ref" "$full"
   id_is_protected "$full" \
     && die "pre-delete aborted: $ref resolves to protected id $full"
 
@@ -572,13 +611,25 @@ apply_deletions() {
   for ref in "${candidates[@]}"; do
     [[ -n "$ref" ]] || continue
     local id
-    id="$("$DOCKER_BIN" image inspect --format '{{.Id}}' "$ref" 2>/dev/null || true)"
-    id="$(canonical_id "${id:-}")" || {
-      echo "ABORT: cannot canonicalize id for $ref"
+    id="$(initial_id_for_ref "$ref")" || {
+      echo "ABORT: missing initial tag→id mapping for $ref"
       failed=1
       break
     }
-    if ! verify_ref_still_deletable "$ref" "$id"; then
+    if ! verify_ref_still_deletable "$ref"; then
+      failed=1
+      break
+    fi
+    # Final ID check immediately before rmi (tag may have been retargeted).
+    local live
+    live="$("$DOCKER_BIN" image inspect --format '{{.Id}}' "$ref" 2>/dev/null || true)"
+    live="$(canonical_id "${live:-}")" || {
+      echo "ABORT: cannot inspect $ref immediately before rmi"
+      failed=1
+      break
+    }
+    if ! ids_equal "$live" "$id"; then
+      echo "ABORT: id changed for $ref immediately before rmi (initial $id now $live)"
       failed=1
       break
     fi
@@ -613,6 +664,7 @@ apply_deletions() {
 
 # --- main ---
 rebuild_plan
+save_initial_candidate_map
 snapshot_state
 
 if [[ "$APPLY" -eq 0 ]]; then
@@ -627,6 +679,8 @@ if [[ "$APPLY" -eq 0 ]]; then
 fi
 
 [[ "$LOOKUP_FAILED" -eq 0 ]] || die "refusing --apply: ${LOOKUP_FAIL_REASON}"
+[[ -s "$INITIAL_CANDIDATE_MAP" || ! -s "$CANDIDATE_TAGS" ]] \
+  || die "refusing --apply: initial candidate tag→id map was not recorded"
 
 echo "Re-verifying candidates before --apply..."
 reverify_or_die
