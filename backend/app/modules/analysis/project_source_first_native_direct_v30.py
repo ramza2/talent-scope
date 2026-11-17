@@ -20,7 +20,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.ai.schemas.profile_candidate import (
-    ProfileCandidateDocument, ProjectCandidate, SourceRef,
+    NativeSourceLocation,
+    ProfileCandidateDocument,
+    ProjectCandidate,
+    SourceRef,
 )
 from app.modules.analysis.candidate_quality_guards import apply_candidate_quality_guards
 from app.modules.analysis.diff_engine import DiffSpec
@@ -55,6 +58,63 @@ GOOD_STATUS = {
     "single_source_unmatched",
     "ambiguous_same_document_key",
 }
+
+
+def verified_pptx_source_locations(
+    sources: list[dict[str, Any]],
+) -> list[NativeSourceLocation]:
+    """Public PPTX locators only; never invent or repair incomplete provenance.
+
+    Each source must already pass ``verified_native_source_location``. PPTX rows
+    contribute document/slide/table/row identity; PDF-native rows contribute
+    nothing here (no OOXML table_index). Duplicate identities are collapsed.
+    """
+    if not isinstance(sources, list) or not sources:
+        raise ValueError("NATIVE_V30_NO_NATIVE_PROVENANCE")
+    locations: list[NativeSourceLocation] = []
+    seen: set[tuple[str, int, int, int, str]] = set()
+    for src in sources:
+        if not verified_native_source_location(src):
+            raise ValueError("NATIVE_V30_INVALID_ROW_PROVENANCE")
+        if src.get("source") != "pptx-native-table":
+            continue
+        locator = src.get("pptx_locator")
+        if not isinstance(locator, dict):
+            raise ValueError("NATIVE_V30_INVALID_PPTX_LOCATOR")
+        table_index = locator.get("table_index")
+        row_index = src.get("row_index")
+        row_id = src.get("row_id")
+        document_id = src.get("document_id")
+        page_no = src.get("page_no")
+        if (
+            not isinstance(document_id, str)
+            or not document_id
+            or type(page_no) is not int
+            or page_no < 1
+            or type(table_index) is not int
+            or table_index < 1
+            or type(row_index) is not int
+            or row_index < 0
+            or not isinstance(row_id, str)
+            or not row_id
+            or locator.get("slide_no") != page_no
+            or locator.get("row_index") != row_index
+        ):
+            raise ValueError("NATIVE_V30_INVALID_PPTX_LOCATOR")
+        key = (document_id, page_no, table_index, row_index, row_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        locations.append(
+            NativeSourceLocation(
+                document_id=document_id,
+                page_no=page_no,
+                table_index=table_index,
+                row_index=row_index,
+                row_id=row_id,
+            )
+        )
+    return locations
 
 
 @dataclass
@@ -140,6 +200,10 @@ def assemble_native_direct(
             if not verified_native_source_location(src):
                 raise ValueError(f"NATIVE_V30_INVALID_ROW_PROVENANCE:{idx}")
             source_pages.add((src["document_id"], src["page_no"]))
+        try:
+            pptx_locations = verified_pptx_source_locations(sources)
+        except ValueError as exc:
+            raise ValueError(f"{exc.args[0]}:{idx}") from exc
 
         titles = group["project_names"]
         customers = group["customers"]
@@ -193,6 +257,7 @@ def assemble_native_direct(
             end_date=group["period_months"][1],
             responsibilities=responsibilities,
             source_refs=refs,
+            native_source_locations=pptx_locations,
         )
         projects.append(project)
         private_sources.append({
@@ -264,6 +329,9 @@ def assemble_native_direct(
             "candidate_project_count": len(projects),
             "represented_project_candidates": len(mapped_indices),
             "source_roles_preserved_count": source_role_count,
+            "native_pptx_location_count": sum(
+                len(p.native_source_locations) for p in projects
+            ),
             "native_group_root_quotes_reverified_count": evidence_bound_count,
             "literal_quote_ref_count": preserved_quote_ref_count,
             "unique_identity_ai_suggestion_group_count": sum(len(h) == 1 for h in group_ai),

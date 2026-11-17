@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_serializer
 
 from app.core.person_name import normalize_person_name
 
@@ -303,6 +303,18 @@ class CodeRefCandidate(BaseModel):
     source_refs: list[SourceRef] = Field(default_factory=list)
 
 
+class NativeSourceLocation(BaseModel):
+    """Verified native table-row locator (PPTX OOXML). Not citation Evidence."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    document_id: str
+    page_no: int
+    table_index: int
+    row_index: int
+    row_id: str
+
+
 class ProjectCandidate(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -320,6 +332,8 @@ class ProjectCandidate(BaseModel):
     customer_types: list[CodeRefCandidate] = Field(default_factory=list)
     confidence: float | None = Field(default=None, ge=0, le=1)
     source_refs: list[SourceRef] = Field(default_factory=list)
+    # Opt-in native assembly only; omitted from dump when empty (V25 unchanged).
+    native_source_locations: list[NativeSourceLocation] = Field(default_factory=list)
 
     @field_validator("responsibilities", "project_summary", mode="before")
     @classmethod
@@ -330,6 +344,22 @@ class ProjectCandidate(BaseModel):
     @classmethod
     def _confidence(cls, value: object) -> float | None:
         return coerce_confidence(value)
+
+    @field_validator("native_source_locations", mode="before")
+    @classmethod
+    def _native_source_locations(cls, value: object) -> list[Any]:
+        if not isinstance(value, list):
+            return []
+        return value
+
+    @model_serializer(mode="wrap")
+    def _serialize_project(
+        self, serializer: Callable[[Any], dict[str, Any]]
+    ) -> dict[str, Any]:
+        data = serializer(self)
+        if not data.get("native_source_locations"):
+            data.pop("native_source_locations", None)
+        return data
 
 
 class SummaryCandidate(BaseModel):

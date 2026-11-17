@@ -25,8 +25,12 @@ import {
   formatDiffValueSummary,
   formatValue,
 } from '@/api/diffValueDisplay'
-import { projectReviewView } from '@/api/projectReviewDisplay'
+import {
+  projectPptxSourceLocations,
+  projectReviewView,
+} from '@/api/projectReviewDisplay'
 import { DiffEvidenceGroups } from '@/pages/analysisDiffEvidence'
+import { ProjectPptxSourceLocations } from '@/pages/projectPptxSourceLocations'
 import { readAnalysesReturnTo } from '@/pages/analysesListState'
 import {
   bulkReviewDiffs,
@@ -623,8 +627,39 @@ export function AnalysisDetailPage() {
         </Typography.Paragraph>
       ),
     },
-    // Retain existing evidence and review status; actions moved beside name.
-    ...columns.filter((_, idx) => [5, 7].includes(idx)),
+    {
+      title: '문서 근거',
+      key: 'project_evidence',
+      width: 280,
+      render: (_, row) => {
+        const locations = projectPptxSourceLocations(
+          row,
+          analysis?.candidate_json ?? {},
+        )
+        const evidence = row.evidence ?? []
+        if (!evidence.length && !locations.length) {
+          return <Typography.Text type="secondary">—</Typography.Text>
+        }
+        return (
+          <div style={{ maxWidth: 280, minWidth: 0 }}>
+            {evidence.length ? (
+              <DiffEvidenceGroups
+                evidence={evidence}
+                documents={analysis?.documents ?? []}
+                rowId={row.id}
+                onOpenEvidence={(ev) => void openEvidence(ev)}
+              />
+            ) : null}
+            <ProjectPptxSourceLocations
+              locations={locations}
+              documents={analysis?.documents ?? []}
+            />
+          </div>
+        )
+      },
+    },
+    // Retain review status; actions moved beside name. Evidence is above.
+    ...columns.filter((_, idx) => idx === 7),
   ]
 
   if (detailQuery.isLoading || !analysis) {
