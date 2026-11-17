@@ -107,6 +107,55 @@ jobs:
             tests/test_analysis.py \
             -k "diff_evidence_bulk_guard or test_bulk_conflict_reject_and_foreign_diff"
 
+      - name: Create and migrate V36 isolated database
+        env:
+          APP_ENV: test
+          APP_SECRET_KEY: ci-test-secret
+          REDIS_URL: redis://127.0.0.1:6379/0
+        run: |
+          python <<'PY'
+          from sqlalchemy import create_engine, text
+
+          admin = create_engine(
+              "postgresql+psycopg://talentscope:talentscope@127.0.0.1:5432/postgres",
+              isolation_level="AUTOCOMMIT",
+          )
+          with admin.connect() as conn:
+              exists = conn.execute(
+                  text(
+                      "SELECT 1 FROM pg_database "
+                      "WHERE datname = 'talentscope_v36_e2e'"
+                  )
+              ).scalar()
+              if not exists:
+                  conn.execute(
+                      text(
+                          "CREATE DATABASE talentscope_v36_e2e OWNER talentscope"
+                      )
+                  )
+
+          db = create_engine(
+              "postgresql+psycopg://talentscope:talentscope@127.0.0.1:5432/"
+              "talentscope_v36_e2e",
+              isolation_level="AUTOCOMMIT",
+          )
+          with db.connect() as conn:
+              conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+              conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
+              conn.execute(text("CREATE EXTENSION IF NOT EXISTS pgcrypto"))
+          PY
+          DATABASE_URL=postgresql+psycopg://talentscope:talentscope@127.0.0.1:5432/talentscope_v36_e2e \
+            alembic upgrade head
+
+      - name: Run V36 confirm→index E2E
+        env:
+          APP_ENV: test
+          APP_SECRET_KEY: ci-test-secret
+          DATABASE_URL: postgresql+psycopg://talentscope:talentscope@127.0.0.1:5432/talentscope_v36_e2e
+          REDIS_URL: redis://127.0.0.1:6379/0
+        run: |
+          python -m pytest -q tests/test_analysis_confirm_index_e2e.py
+
   frontend-evidence:
     name: Diff evidence UI check (Node 22)
     runs-on: ubuntu-latest
