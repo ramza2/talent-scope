@@ -321,12 +321,13 @@ Docker Compose + Traefik Label 기반 구조를 방해하는 구현을 하지 �
 ### Rollback image retention
 
 운영 롤백을 위해 `talent-scope-api` / `talent-scope-worker` / `talent-scope-frontend`
-이미지의 **현재 운영 버전 + 직전 2개 버전**을 보존한다.
+이미지의 **현재 운영 버전 + 직전 2개 버전(서로 다른 이미지 ID 2개)**을 보존한다.
 
 - 롤백용 태그는 `rollback-*` 형식을 사용한다.
 - 정리 대상은 위 세 서비스의 `rollback-*` 태그만으로 한정한다.
-- 실행 중·중지된 컨테이너가 참조하는 이미지, 현재 운영 이미지, 직전 2개
-  버전, 다른 태그와 공유 중인 이미지 ID는 삭제하지 않는다.
+- 실행 중·중지된 컨테이너가 참조하는 이미지(전체 sha256 ID), 현재 운영 이미지,
+  직전 2개 과거 이미지 ID, 다른 태그와 공유 중인 이미지 ID는 삭제하지 않는다.
+- 생성시각 판별이 불확실하거나 컨테이너/이미지 조회가 실패하면 삭제하지 않는다.
 - `docker image prune`, `rmi --force`, 볼륨 삭제로 디스크를 강제 회수하지 않는다.
 - 기본은 dry-run이며, 삭제는 `scripts/cleanup-rollback-images.sh --apply`를
   명시한 경우에만 수행한다. 태그 제거와 실제 디스크 회수는 구분해서 보고한다.

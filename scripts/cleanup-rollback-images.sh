@@ -9,10 +9,13 @@ set -Eeuo pipefail
 KEEP_PREVIOUS=2
 APPLY=0
 DOCKER_BIN="${DOCKER_BIN:-docker}"
+LOOKUP_FAILED=0
+LOOKUP_FAIL_REASON=""
 
 REPO_SUFFIXES=(api worker frontend)
 REPO_REGEX='^(.*\/)?talent-scope-(api|worker|frontend)$'
 TAG_REGEX='^rollback-.+'
+FULL_ID_REGEX='^[a-f0-9]{64}$'
 
 usage() {
   cat <<'EOF'
@@ -22,15 +25,17 @@ Usage:
   ./scripts/cleanup-rollback-images.sh [--keep N] [--apply]
 
 Options:
-  --keep N   Keep the N newest rollback-* tags per repository (default: 2),
-             in addition to current production / container-referenced images.
+  --keep N   Keep N distinct past rollback image IDs per repository
+             (default: 2), in addition to current/container-referenced IDs.
   --apply    Delete candidate tags after re-verification. Default is dry-run.
   -h, --help Show this help
 
 Safety:
   - Only talent-scope api/worker/frontend rollback-* tags are candidates.
-  - Protects running and stopped container image IDs, current ops images,
-    the newest --keep rollback tags per repo, and shared image IDs.
+  - Protects running and stopped container image IDs (via ps -aq + inspect),
+    current ops images, --keep distinct past image IDs, and shared IDs.
+  - Uses full sha256 image IDs. Uncertain timestamps or lookup failures
+    forbid deletion (fail closed).
   - Never uses docker image prune, rmi --force, or volume delete.
   - Tag removal and actual disk reclaim are reported separately.
 EOF
@@ -43,6 +48,12 @@ die() {
 
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+mark_lookup_failed() {
+  LOOKUP_FAILED=1
+  LOOKUP_FAIL_REASON="$1"
+  printf 'WARNING: %s (deletion disabled)\n' "$1" >&2
 }
 
 while [[ $# -gt 0 ]]; do
@@ -70,21 +81,24 @@ done
 require_cmd "$DOCKER_BIN"
 require_cmd awk
 require_cmd sort
+require_cmd grep
 
-# Temporary working files (cleaned on exit).
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/ts-rollback-clean.XXXXXX")"
 cleanup() { rm -rf "$WORKDIR"; }
 trap cleanup EXIT
 
 IMAGES_RAW="${WORKDIR}/images.tsv"
-CONTAINERS_RAW="${WORKDIR}/containers.tsv"
 PROTECTED_IDS="${WORKDIR}/protected_ids.txt"
+UNCERTAIN_IDS="${WORKDIR}/uncertain_ids.txt"
 KEEP_TAGS="${WORKDIR}/keep_tags.txt"
 CANDIDATE_TAGS="${WORKDIR}/candidate_tags.txt"
 CANDIDATE_IDS="${WORKDIR}/candidate_ids.txt"
 PLAN="${WORKDIR}/plan.tsv"
+SNAPSHOT_CANDIDATES="${WORKDIR}/snapshot_candidates.txt"
+SNAPSHOT_PROTECTED="${WORKDIR}/snapshot_protected.txt"
 
 : >"$PROTECTED_IDS"
+: >"$UNCERTAIN_IDS"
 : >"$KEEP_TAGS"
 : >"$CANDIDATE_TAGS"
 : >"$CANDIDATE_IDS"
@@ -98,125 +112,331 @@ is_rollback_tag() {
   [[ "$1" =~ $TAG_REGEX ]]
 }
 
-normalize_id() {
-  # Prefer short 12-char id when docker returns sha256:...
+# Canonical full image id: sha256: + 64 lowercase hex. Returns non-zero if short/unknown.
+canonical_id() {
+  local raw="${1:-}"
+  raw="${raw#sha256:}"
+  raw="$(printf '%s' "$raw" | tr 'A-F' 'a-f')"
+  if [[ "$raw" =~ $FULL_ID_REGEX ]]; then
+    printf 'sha256:%s\n' "$raw"
+    return 0
+  fi
+  return 1
+}
+
+ids_equal() {
+  local a b
+  a="$(canonical_id "$1")" || return 1
+  b="$(canonical_id "$2")" || return 1
+  [[ "$a" == "$b" ]]
+}
+
+parse_created_epoch() {
+  # Accept Docker CreatedAt / inspect .Created. Print epoch or return non-zero.
+  local created="${1:-}"
+  local norm epoch
+  [[ -n "$created" ]] || return 1
+  norm="${created% UTC}"
+  norm="${norm% utc}"
+  # inspect often returns 2026-11-17T10:00:00.123456789Z
+  if [[ "$norm" == *T* ]]; then
+    norm="${norm%%.*}Z"
+    norm="${norm/Z/}"
+    if epoch="$(date -u -d "${norm}Z" +%s 2>/dev/null)"; then
+      printf '%s\n' "$epoch"
+      return 0
+    fi
+    if epoch="$(date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "${norm}Z" +%s 2>/dev/null)"; then
+      printf '%s\n' "$epoch"
+      return 0
+    fi
+  fi
+  if epoch="$(date -u -d "$norm" +%s 2>/dev/null)"; then
+    printf '%s\n' "$epoch"
+    return 0
+  fi
+  if epoch="$(date -u -j -f '%Y-%m-%d %H:%M:%S %z' "$norm" +%s 2>/dev/null)"; then
+    printf '%s\n' "$epoch"
+    return 0
+  fi
+  return 1
+}
+
+image_created_epoch() {
   local id="$1"
-  id="${id#sha256:}"
-  printf '%s\n' "${id:0:12}"
+  local created
+  created="$("$DOCKER_BIN" image inspect --format '{{.Created}}' "$id" 2>/dev/null)" \
+    || return 1
+  parse_created_epoch "$created"
 }
 
 collect_images() {
-  # repo\ttag\tid\tcreated_epoch\tsize_bytes
-  "$DOCKER_BIN" images --no-trunc --format \
+  # Output rows: repo\ttag\tfull_id\tlist_epoch_or_empty\tsize
+  if ! "$DOCKER_BIN" images --no-trunc --format \
     '{{.Repository}}\t{{.Tag}}\t{{.ID}}\t{{.CreatedAt}}\t{{.Size}}' \
-    >"$IMAGES_RAW.raw" || die "docker images failed"
+    >"$IMAGES_RAW.raw"; then
+    mark_lookup_failed "docker images failed"
+    : >"$IMAGES_RAW"
+    return 0
+  fi
 
   : >"$IMAGES_RAW"
-  local repo tag id created size epoch
+  local repo tag id created size full list_epoch inspect_epoch
   while IFS=$'\t' read -r repo tag id created size; do
     [[ -n "${repo:-}" ]] || continue
     [[ "$repo" == "<none>" ]] && continue
     [[ "$tag" == "<none>" ]] && continue
     is_target_repo "$repo" || continue
     is_rollback_tag "$tag" || continue
-    id="$(normalize_id "$id")"
-    # CreatedAt looks like "2026-11-17 03:17:00 +0000 UTC"; strip trailing zone name.
-    created_norm="${created% UTC}"
-    created_norm="${created_norm% utc}"
-    if epoch="$(date -u -d "$created_norm" +%s 2>/dev/null)"; then
-      :
-    elif epoch="$(date -u -j -f '%Y-%m-%d %H:%M:%S %z' "$created_norm" +%s 2>/dev/null)"; then
+    if ! full="$(canonical_id "$id")"; then
+      mark_lookup_failed "non-full image id for ${repo}:${tag} ($id)"
+      continue
+    fi
+    list_epoch=""
+    if list_epoch="$(parse_created_epoch "$created")"; then
       :
     else
-      epoch=0
+      list_epoch=""
     fi
-    # Size field is human; keep raw for display only. Disk reclaim uses inspect later.
-    printf '%s\t%s\t%s\t%s\t%s\n' "$repo" "$tag" "$id" "$epoch" "$size" >>"$IMAGES_RAW"
+    # Prefer inspect .Created; if list and inspect disagree, mark uncertain.
+    if inspect_epoch="$(image_created_epoch "$full")"; then
+      if [[ -n "$list_epoch" && "$list_epoch" != "$inspect_epoch" ]]; then
+        printf '%s\n' "$full" >>"$UNCERTAIN_IDS"
+        mark_lookup_failed \
+          "image vs tag/list created time mismatch for $full (${repo}:${tag})"
+      fi
+      printf '%s\t%s\t%s\t%s\t%s\n' \
+        "$repo" "$tag" "$full" "$inspect_epoch" "$size" >>"$IMAGES_RAW"
+    elif [[ -n "$list_epoch" ]]; then
+      # Inspect failed → uncertain; keep row for reporting but protect.
+      printf '%s\n' "$full" >>"$UNCERTAIN_IDS"
+      mark_lookup_failed "image inspect Created failed for $full (${repo}:${tag})"
+      printf '%s\t%s\t%s\t%s\t%s\n' \
+        "$repo" "$tag" "$full" "$list_epoch" "$size" >>"$IMAGES_RAW"
+    else
+      printf '%s\n' "$full" >>"$UNCERTAIN_IDS"
+      mark_lookup_failed "cannot determine created time for $full (${repo}:${tag})"
+      printf '%s\t%s\t%s\t%s\t%s\n' \
+        "$repo" "$tag" "$full" "0" "$size" >>"$IMAGES_RAW"
+    fi
   done <"$IMAGES_RAW.raw"
+
+  if [[ -s "$UNCERTAIN_IDS" ]]; then
+    sort -u "$UNCERTAIN_IDS" -o "$UNCERTAIN_IDS"
+  fi
 }
 
 collect_container_refs() {
-  # name\timage\tid\tstatus
-  "$DOCKER_BIN" ps -a --no-trunc --format \
-    '{{.Names}}\t{{.Image}}\t{{.ImageID}}\t{{.Status}}' \
-    >"$CONTAINERS_RAW" || die "docker ps failed"
+  # Collect image IDs for every running and stopped container via ps -aq + inspect.
+  # Never uses docker ps --format .ImageID (unsupported on some CLI versions).
+  local cid_file="${WORKDIR}/container_cids.txt"
+  local cid img full repo_guess image_name
 
-  local name image image_id status short
-  while IFS=$'\t' read -r name image image_id status; do
-    [[ -n "${image_id:-}" ]] || continue
-    short="$(normalize_id "$image_id")"
-    printf '%s\n' "$short" >>"$PROTECTED_IDS"
+  if ! "$DOCKER_BIN" ps -aq >"$cid_file"; then
+    mark_lookup_failed "docker ps -aq failed"
+    return 0
+  fi
 
-    # Current ops: containers whose image repo matches our three services.
-    local repo_guess="${image%%:*}"
-    if is_target_repo "$repo_guess"; then
-      printf '%s\n' "$short" >>"$PROTECTED_IDS"
-      # Also protect the exact repo:tag if present.
-      if [[ "$image" == *:* ]]; then
-        printf '%s\n' "$image" >>"$KEEP_TAGS"
+  while IFS= read -r cid; do
+    [[ -n "${cid:-}" ]] || continue
+    if ! img="$("$DOCKER_BIN" inspect --format '{{.Image}}' "$cid" 2>/dev/null)"; then
+      mark_lookup_failed "docker inspect Image failed for container $cid"
+      continue
+    fi
+    if ! full="$(canonical_id "$img")"; then
+      mark_lookup_failed "container $cid returned non-full image id ($img)"
+      continue
+    fi
+    printf '%s\n' "$full" >>"$PROTECTED_IDS"
+
+    image_name="$("$DOCKER_BIN" inspect --format '{{.Config.Image}}' "$cid" 2>/dev/null || true)"
+    repo_guess="${image_name%%:*}"
+    if [[ -n "$image_name" ]] && is_target_repo "$repo_guess"; then
+      printf '%s\n' "$full" >>"$PROTECTED_IDS"
+      if [[ "$image_name" == *:* && "$image_name" != *sha256:* ]]; then
+        printf '%s\n' "$image_name" >>"$KEEP_TAGS"
       fi
     fi
-  done <"$CONTAINERS_RAW"
+  done <"$cid_file"
 
   sort -u "$PROTECTED_IDS" -o "$PROTECTED_IDS"
-  sort -u "$KEEP_TAGS" -o "$KEEP_TAGS"
+  if [[ -s "$KEEP_TAGS" ]]; then
+    sort -u "$KEEP_TAGS" -o "$KEEP_TAGS"
+  fi
+}
+
+id_is_protected() {
+  grep -qxF "$1" "$PROTECTED_IDS"
+}
+
+id_is_uncertain() {
+  [[ -s "$UNCERTAIN_IDS" ]] && grep -qxF "$1" "$UNCERTAIN_IDS"
 }
 
 select_keep_and_candidates() {
-  local repo
+  local suffix
   for suffix in "${REPO_SUFFIXES[@]}"; do
-    repo="talent-scope-${suffix}"
-    # Match exact or registry-prefixed repository ending with talent-scope-<svc>
     awk -F '\t' -v suffix="$suffix" '
       BEGIN { re = "^(.*\\/)?talent-scope-" suffix "$" }
       $1 ~ re { print }
-    ' "$IMAGES_RAW" | sort -t $'\t' -k4,4nr -k2,2 >"${WORKDIR}/repo_${suffix}.tsv"
+    ' "$IMAGES_RAW" >"${WORKDIR}/repo_${suffix}_tags.tsv"
 
-    local kept=0
-    while IFS=$'\t' read -r r tag id epoch size; do
-      [[ -n "${r:-}" ]] || continue
-      local ref="${r}:${tag}"
-      if grep -qxF "$id" "$PROTECTED_IDS"; then
-        printf '%s\n' "$ref" >>"$KEEP_TAGS"
-        printf 'protect\t%s\t%s\tcontainer-or-shared-id\t%s\t%s\n' \
-          "$ref" "$id" "$epoch" "$size" >>"$PLAN"
+    # Distinct image IDs with max epoch among their tags (for ordering).
+    : >"${WORKDIR}/repo_${suffix}_ids.tsv"
+    if [[ -s "${WORKDIR}/repo_${suffix}_tags.tsv" ]]; then
+      awk -F '\t' '
+        {
+          id=$3; epoch=$4+0
+          if (!(id in max) || epoch > max[id]) max[id]=epoch
+          # Track if any row for id has epoch 0 / missing certainty flag via file later
+          count[id]++
+        }
+        END {
+          for (id in max) printf "%s\t%s\n", max[id], id
+        }
+      ' "${WORKDIR}/repo_${suffix}_tags.tsv" \
+        | sort -t $'\t' -k1,1nr -k2,2 >"${WORKDIR}/repo_${suffix}_ids.tsv"
+    fi
+
+    local kept_ids=0
+    local epoch id
+    : >"${WORKDIR}/repo_${suffix}_keep_ids.txt"
+    while IFS=$'\t' read -r epoch id; do
+      [[ -n "${id:-}" ]] || continue
+      if id_is_protected "$id" || id_is_uncertain "$id" || [[ "$epoch" -eq 0 ]]; then
+        printf '%s\n' "$id" >>"${WORKDIR}/repo_${suffix}_keep_ids.txt"
+        if id_is_uncertain "$id" || [[ "$epoch" -eq 0 ]]; then
+          printf '%s\n' "$id" >>"$PROTECTED_IDS"
+        fi
         continue
       fi
-      if [[ "$kept" -lt "$KEEP_PREVIOUS" ]]; then
+      if [[ "$kept_ids" -lt "$KEEP_PREVIOUS" ]]; then
+        printf '%s\n' "$id" >>"${WORKDIR}/repo_${suffix}_keep_ids.txt"
+        printf '%s\n' "$id" >>"$PROTECTED_IDS"
+        kept_ids=$((kept_ids + 1))
+        continue
+      fi
+      # Past ID beyond keep window → candidate (unless later protected globally).
+      printf '%s\n' "$id" >>"${WORKDIR}/repo_${suffix}_candidate_ids.txt"
+    done <"${WORKDIR}/repo_${suffix}_ids.tsv"
+
+    sort -u "${WORKDIR}/repo_${suffix}_keep_ids.txt" -o "${WORKDIR}/repo_${suffix}_keep_ids.txt" 2>/dev/null || true
+    : >>"${WORKDIR}/repo_${suffix}_candidate_ids.txt"
+    sort -u "${WORKDIR}/repo_${suffix}_candidate_ids.txt" -o "${WORKDIR}/repo_${suffix}_candidate_ids.txt" 2>/dev/null || true
+
+    # Map tags → protect or candidate by ID membership.
+    local r tag full size reason
+    while IFS=$'\t' read -r r tag full epoch size; do
+      [[ -n "${r:-}" ]] || continue
+      local ref="${r}:${tag}"
+      if id_is_uncertain "$full" || [[ "$epoch" -eq 0 ]]; then
         printf '%s\n' "$ref" >>"$KEEP_TAGS"
-        printf 'protect\t%s\t%s\tkeep-previous-%s\t%s\t%s\n' \
-          "$ref" "$id" "$((kept + 1))" "$epoch" "$size" >>"$PLAN"
-        kept=$((kept + 1))
+        printf 'protect\t%s\t%s\tuncertain-created-time\t%s\t%s\n' \
+          "$ref" "$full" "$epoch" "$size" >>"$PLAN"
+        continue
+      fi
+      if grep -qxF "$full" "${WORKDIR}/repo_${suffix}_keep_ids.txt"; then
+        printf '%s\n' "$ref" >>"$KEEP_TAGS"
+        if id_is_protected "$full" && ! grep -qxF "$full" "${WORKDIR}/repo_${suffix}_candidate_ids.txt" 2>/dev/null; then
+          # Distinguish container vs keep-previous in plan when possible.
+          reason="protected-or-keep-id"
+          printf 'protect\t%s\t%s\t%s\t%s\t%s\n' \
+            "$ref" "$full" "$reason" "$epoch" "$size" >>"$PLAN"
+        else
+          printf 'protect\t%s\t%s\tkeep-previous-id\t%s\t%s\n' \
+            "$ref" "$full" "$epoch" "$size" >>"$PLAN"
+        fi
+        continue
+      fi
+      # Candidate only when lookup is healthy and ID is beyond keep window.
+      if [[ "$LOOKUP_FAILED" -ne 0 ]]; then
+        printf '%s\n' "$ref" >>"$KEEP_TAGS"
+        printf 'protect\t%s\t%s\tlookup-failed-no-delete\t%s\t%s\n' \
+          "$ref" "$full" "$epoch" "$size" >>"$PLAN"
+        continue
+      fi
+      if id_is_protected "$full"; then
+        printf '%s\n' "$ref" >>"$KEEP_TAGS"
+        printf 'protect\t%s\t%s\tcontainer-referenced\t%s\t%s\n' \
+          "$ref" "$full" "$epoch" "$size" >>"$PLAN"
         continue
       fi
       printf '%s\n' "$ref" >>"$CANDIDATE_TAGS"
-      printf '%s\n' "$id" >>"$CANDIDATE_IDS"
-      printf 'candidate\t%s\t%s\tolder-than-keep\t%s\t%s\n' \
-        "$ref" "$id" "$epoch" "$size" >>"$PLAN"
-    done <"${WORKDIR}/repo_${suffix}.tsv"
+      printf '%s\n' "$full" >>"$CANDIDATE_IDS"
+      printf 'candidate\t%s\t%s\tolder-than-keep-ids\t%s\t%s\n' \
+        "$ref" "$full" "$epoch" "$size" >>"$PLAN"
+    done <"${WORKDIR}/repo_${suffix}_tags.tsv"
   done
 
-  sort -u "$KEEP_TAGS" -o "$KEEP_TAGS"
-  sort -u "$CANDIDATE_TAGS" -o "$CANDIDATE_TAGS"
-  sort -u "$CANDIDATE_IDS" -o "$CANDIDATE_IDS"
+  sort -u "$PROTECTED_IDS" -o "$PROTECTED_IDS"
+  sort -u "$KEEP_TAGS" -o "$KEEP_TAGS" 2>/dev/null || :
+  sort -u "$CANDIDATE_TAGS" -o "$CANDIDATE_TAGS" 2>/dev/null || :
+  sort -u "$CANDIDATE_IDS" -o "$CANDIDATE_IDS" 2>/dev/null || :
+
+  # Fail closed: never allow candidates when lookup failed.
+  if [[ "$LOOKUP_FAILED" -ne 0 && -s "$CANDIDATE_TAGS" ]]; then
+    cat "$CANDIDATE_TAGS" >>"$KEEP_TAGS"
+    : >"$CANDIDATE_TAGS"
+    : >"$CANDIDATE_IDS"
+    sort -u "$KEEP_TAGS" -o "$KEEP_TAGS"
+  fi
 }
 
-# Count remaining tags (any repo) pointing at an image id after planned deletions.
+snapshot_state() {
+  cp "$CANDIDATE_TAGS" "$SNAPSHOT_CANDIDATES"
+  cp "$PROTECTED_IDS" "$SNAPSHOT_PROTECTED"
+  : >>"$SNAPSHOT_CANDIDATES"
+  : >>"$SNAPSHOT_PROTECTED"
+  sort -u "$SNAPSHOT_CANDIDATES" -o "$SNAPSHOT_CANDIDATES"
+  sort -u "$SNAPSHOT_PROTECTED" -o "$SNAPSHOT_PROTECTED"
+}
+
+state_unchanged_or_die() {
+  local label="$1"
+  local now_cand="${WORKDIR}/now_candidates.txt"
+  local now_prot="${WORKDIR}/now_protected.txt"
+  cp "$CANDIDATE_TAGS" "$now_cand"
+  cp "$PROTECTED_IDS" "$now_prot"
+  sort -u "$now_cand" -o "$now_cand"
+  sort -u "$now_prot" -o "$now_prot"
+  if ! cmp -s "$SNAPSHOT_CANDIDATES" "$now_cand"; then
+    die "re-verification failed (${label}): candidate set changed"
+  fi
+  if ! cmp -s "$SNAPSHOT_PROTECTED" "$now_prot"; then
+    die "re-verification failed (${label}): protected id set changed"
+  fi
+}
+
+rebuild_plan() {
+  LOOKUP_FAILED=0
+  LOOKUP_FAIL_REASON=""
+  : >"$PROTECTED_IDS"
+  : >"$UNCERTAIN_IDS"
+  : >"$KEEP_TAGS"
+  : >"$CANDIDATE_TAGS"
+  : >"$CANDIDATE_IDS"
+  : >"$PLAN"
+  for suffix in "${REPO_SUFFIXES[@]}"; do
+    : >"${WORKDIR}/repo_${suffix}_candidate_ids.txt"
+  done
+  collect_images
+  collect_container_refs
+  select_keep_and_candidates
+}
+
 remaining_tags_for_id() {
   local target_id="$1"
   shift
   local -a delete_refs=("$@")
-  local count=0
-  local repo tag id
-  # Re-query live images for accurate share detection.
+  local count=0 repo tag id full ref skip d
+  target_id="$(canonical_id "$target_id")" || { printf '0\n'; return 0; }
   while IFS=$'\t' read -r repo tag id _; do
     [[ -n "${repo:-}" ]] || continue
     [[ "$repo" == "<none>" && "$tag" == "<none>" ]] && continue
-    id="$(normalize_id "$id")"
-    [[ "$id" == "$target_id" ]] || continue
-    local ref="${repo}:${tag}"
-    local skip=0
-    local d
+    full="$(canonical_id "$id")" || continue
+    [[ "$full" == "$target_id" ]] || continue
+    ref="${repo}:${tag}"
+    skip=0
     for d in "${delete_refs[@]:-}"; do
       if [[ "$d" == "$ref" ]]; then
         skip=1
@@ -232,7 +452,10 @@ remaining_tags_for_id() {
 print_report() {
   local mode="$1"
   echo "=== TalentScope rollback image cleanup (${mode}) ==="
-  echo "Keep previous rollback tags per repo: ${KEEP_PREVIOUS}"
+  echo "Keep previous distinct rollback image IDs per repo: ${KEEP_PREVIOUS}"
+  if [[ "$LOOKUP_FAILED" -ne 0 ]]; then
+    echo "Lookup/safety failure: ${LOOKUP_FAIL_REASON:-unknown} (deletion disabled)"
+  fi
   echo
   echo "-- Protection / plan --"
   if [[ ! -s "$PLAN" ]]; then
@@ -251,37 +474,84 @@ print_report() {
 }
 
 reverify_or_die() {
-  # Rebuild protection from live docker state and ensure every candidate is still
-  # a deletable rollback tag that is not newly protected.
-  local ref repo tag
-  local old_candidates
+  local old_candidates old_protected
   old_candidates="$(cat "$CANDIDATE_TAGS")"
+  old_protected="$(cat "$PROTECTED_IDS")"
+  snapshot_state
 
-  : >"$PROTECTED_IDS"
-  : >"$KEEP_TAGS"
-  : >"$CANDIDATE_TAGS"
-  : >"$CANDIDATE_IDS"
-  : >"$PLAN"
-  collect_images
-  collect_container_refs
-  select_keep_and_candidates
+  rebuild_plan
+  [[ "$LOOKUP_FAILED" -eq 0 ]] \
+    || die "re-verification failed: lookup failure: ${LOOKUP_FAIL_REASON}"
 
+  # Candidate/protected membership must be identical (full sha256 lines).
+  local ref
   while IFS= read -r ref; do
     [[ -n "$ref" ]] || continue
-    if ! grep -qxF "$ref" "$CANDIDATE_TAGS"; then
-      die "re-verification failed: candidate no longer deletable: $ref"
-    fi
-    if grep -qxF "$ref" "$KEEP_TAGS"; then
-      die "re-verification failed: candidate is now protected: $ref"
-    fi
+    grep -qxF "$ref" "$CANDIDATE_TAGS" \
+      || die "re-verification failed: candidate no longer deletable: $ref"
+    grep -qxF "$ref" "$KEEP_TAGS" \
+      && die "re-verification failed: candidate is now protected: $ref"
+    local repo tag
     repo="${ref%:*}"
     tag="${ref##*:}"
     is_target_repo "$repo" || die "re-verification failed: out-of-scope repo: $ref"
     is_rollback_tag "$tag" || die "re-verification failed: non-rollback tag: $ref"
-    if ! "$DOCKER_BIN" image inspect "$ref" >/dev/null 2>&1; then
-      die "re-verification failed: missing image tag: $ref"
-    fi
+    local full
+    full="$("$DOCKER_BIN" image inspect --format '{{.Id}}' "$ref" 2>/dev/null)" \
+      || die "re-verification failed: missing image tag: $ref"
+    full="$(canonical_id "$full")" \
+      || die "re-verification failed: non-full id for $ref"
+    id_is_protected "$full" \
+      && die "re-verification failed: $ref id is protected: $full"
   done <<<"$old_candidates"
+
+  # Any newly protected IDs vs snapshot → abort.
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] || continue
+    grep -qxF "$pid" <<<"$old_protected" \
+      || die "re-verification failed: new protected id appeared: $pid"
+  done <"$PROTECTED_IDS"
+
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] || continue
+    grep -qxF "$pid" "$PROTECTED_IDS" \
+      || die "re-verification failed: protected id disappeared: $pid"
+  done <<<"$old_protected"
+
+  state_unchanged_or_die "post-rebuild"
+}
+
+verify_ref_still_deletable() {
+  local ref="$1"
+  local full expected
+  expected="$2"
+
+  [[ "$LOOKUP_FAILED" -eq 0 ]] || die "pre-delete aborted: lookup failure"
+  grep -qxF "$ref" "$CANDIDATE_TAGS" \
+    || die "pre-delete aborted: $ref no longer a candidate"
+  full="$("$DOCKER_BIN" image inspect --format '{{.Id}}' "$ref" 2>/dev/null)" \
+    || die "pre-delete aborted: cannot inspect $ref"
+  full="$(canonical_id "$full")" \
+    || die "pre-delete aborted: non-full id for $ref"
+  ids_equal "$full" "$expected" \
+    || die "pre-delete aborted: id changed for $ref (was $expected now $full)"
+  id_is_protected "$full" \
+    && die "pre-delete aborted: $ref resolves to protected id $full"
+
+  # Refresh container protection just before delete.
+  local cid_file="${WORKDIR}/pre_delete_cids.txt" cid img
+  "$DOCKER_BIN" ps -aq >"$cid_file" \
+    || die "pre-delete aborted: docker ps -aq failed"
+  while IFS= read -r cid; do
+    [[ -n "$cid" ]] || continue
+    img="$("$DOCKER_BIN" inspect --format '{{.Image}}' "$cid" 2>/dev/null)" \
+      || die "pre-delete aborted: inspect failed for container $cid"
+    img="$(canonical_id "$img")" \
+      || die "pre-delete aborted: non-full container image id"
+    if ids_equal "$img" "$full"; then
+      die "pre-delete aborted: $ref is referenced by container $cid"
+    fi
+  done <"$cid_file"
 }
 
 apply_deletions() {
@@ -289,6 +559,8 @@ apply_deletions() {
   local -a deleted_refs=()
   local -a deleted_ids=()
   local failed=0
+
+  [[ "$LOOKUP_FAILED" -eq 0 ]] || die "deletion forbidden: ${LOOKUP_FAIL_REASON}"
 
   mapfile -t candidates <"$CANDIDATE_TAGS"
   if [[ "${#candidates[@]}" -eq 0 || -z "${candidates[0]:-}" ]]; then
@@ -301,18 +573,15 @@ apply_deletions() {
     [[ -n "$ref" ]] || continue
     local id
     id="$("$DOCKER_BIN" image inspect --format '{{.Id}}' "$ref" 2>/dev/null || true)"
-    id="$(normalize_id "${id:-}")"
-    if [[ -z "$id" ]]; then
-      echo "ABORT: cannot inspect $ref"
+    id="$(canonical_id "${id:-}")" || {
+      echo "ABORT: cannot canonicalize id for $ref"
+      failed=1
+      break
+    }
+    if ! verify_ref_still_deletable "$ref" "$id"; then
       failed=1
       break
     fi
-    if grep -qxF "$id" "$PROTECTED_IDS"; then
-      echo "ABORT: $ref resolves to protected id $id"
-      failed=1
-      break
-    fi
-    # Explicitly refuse force / prune style flags — plain rmi only.
     if ! "$DOCKER_BIN" rmi "$ref"; then
       echo "ABORT: docker rmi failed for $ref (deletion stopped)"
       failed=1
@@ -325,22 +594,17 @@ apply_deletions() {
 
   echo
   echo "-- Disk reclaim assessment --"
-  local i
+  local i dref did remaining
   for i in "${!deleted_refs[@]}"; do
-    local dref="${deleted_refs[$i]}"
-    local did="${deleted_ids[$i]}"
-    local remaining
+    dref="${deleted_refs[$i]}"
+    did="${deleted_ids[$i]}"
     remaining="$(remaining_tags_for_id "$did" "${deleted_refs[@]}")"
     if [[ "$remaining" -gt 0 ]]; then
       echo "tag_deleted_not_reclaimed: $dref id=$did remaining_tags=$remaining (shared image retained)"
+    elif "$DOCKER_BIN" image inspect "$did" >/dev/null 2>&1; then
+      echo "tag_deleted_image_still_present: $dref id=$did (not pruned; no force reclaim)"
     else
-      # Image may still exist as dangling <none> if containers or cache hold it;
-      # we never prune. Report based on inspect.
-      if "$DOCKER_BIN" image inspect "$did" >/dev/null 2>&1; then
-        echo "tag_deleted_image_still_present: $dref id=$did (not pruned; no force reclaim)"
-      else
-        echo "tag_deleted_and_reclaimed: $dref id=$did"
-      fi
+      echo "tag_deleted_and_reclaimed: $dref id=$did"
     fi
   done
 
@@ -348,16 +612,21 @@ apply_deletions() {
 }
 
 # --- main ---
-collect_images
-collect_container_refs
-select_keep_and_candidates
+rebuild_plan
+snapshot_state
 
 if [[ "$APPLY" -eq 0 ]]; then
   print_report "dry-run"
   echo
-  echo "Dry-run only. Re-run with --apply to delete candidate tags."
+  if [[ "$LOOKUP_FAILED" -ne 0 ]]; then
+    echo "Dry-run only; deletion disabled due to lookup/safety failure."
+  else
+    echo "Dry-run only. Re-run with --apply to delete candidate tags."
+  fi
   exit 0
 fi
+
+[[ "$LOOKUP_FAILED" -eq 0 ]] || die "refusing --apply: ${LOOKUP_FAIL_REASON}"
 
 echo "Re-verifying candidates before --apply..."
 reverify_or_die
