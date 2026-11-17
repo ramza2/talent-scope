@@ -9,21 +9,80 @@ from __future__ import annotations
 import os
 import uuid
 
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import delete, select
+from sqlalchemy.engine.url import make_url
 
-# Prefer caller-provided isolated DATABASE_URL; never invent a production DSN.
-os.environ.setdefault(
-    "DATABASE_URL",
-    "postgresql+psycopg://talentscope:talentscope@127.0.0.1:5432/talentscope_v36_e2e",
+V36_E2E_DB_NAME = "talentscope_v36_e2e"
+V36_E2E_DATABASE_URL = (
+    "postgresql+psycopg://talentscope:talentscope@127.0.0.1:5432/"
+    f"{V36_E2E_DB_NAME}"
 )
+
+
+def assert_v36_isolated_database_url(url: str | None = None) -> str:
+    """Fail-closed: only the dedicated V36 E2E database name is allowed."""
+    raw = (url if url is not None else os.environ.get("DATABASE_URL") or "").strip()
+    if not raw:
+        raise RuntimeError(
+            "V36 E2E requires DATABASE_URL pointing at "
+            f"{V36_E2E_DB_NAME!r} (fail-closed; empty DSN blocked)."
+        )
+    try:
+        database = make_url(raw).database
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(
+            f"V36 E2E DATABASE_URL is not parseable (fail-closed): {raw!r}"
+        ) from exc
+    if database != V36_E2E_DB_NAME:
+        raise RuntimeError(
+            "V36 E2E refuse DATABASE_URL database="
+            f"{database!r}; only {V36_E2E_DB_NAME!r} is allowed "
+            "(fail-closed; ops/default DSN blocked)."
+        )
+    return raw
+
+
+# Default only to the dedicated V36 DB; guard rejects any other DSN.
+os.environ.setdefault("DATABASE_URL", V36_E2E_DATABASE_URL)
 os.environ.setdefault("REDIS_URL", "redis://127.0.0.1:6379/0")
 os.environ.setdefault("APP_SECRET_KEY", "test-secret")
 os.environ["APP_ENV"] = "test"
+assert_v36_isolated_database_url()
 
 pytest_plugins = ["tests.test_analysis"]
 
 SOURCE_FIRST_V32 = "profile-source-first-v32-core-presplit"
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    del config
+    assert_v36_isolated_database_url()
+
+
+@pytest.fixture(autouse=True)
+def _v36_fail_closed_database_guard() -> None:
+    """Block fixture/DB work unless DATABASE_URL is the dedicated V36 DB."""
+    assert_v36_isolated_database_url()
+    yield
+
+
+def test_v36_database_url_guard_fail_closed() -> None:
+    with pytest.raises(RuntimeError, match="fail-closed"):
+        assert_v36_isolated_database_url(
+            "postgresql+psycopg://talentscope:talentscope@127.0.0.1:5432/talentscope"
+        )
+    with pytest.raises(RuntimeError, match="fail-closed"):
+        assert_v36_isolated_database_url("")
+    with pytest.raises(RuntimeError, match="fail-closed"):
+        assert_v36_isolated_database_url(
+            "postgresql+psycopg://talentscope:talentscope@127.0.0.1:5432/postgres"
+        )
+    assert (
+        assert_v36_isolated_database_url(V36_E2E_DATABASE_URL)
+        == V36_E2E_DATABASE_URL
+    )
 
 
 def _cleanup_e2e(db_session, person_id, user_id) -> None:
@@ -303,7 +362,8 @@ def test_source_first_v32_bulk_review_confirm_rebuild_index_e2e(
     by_type = {i.object_type: i for i in items}
     assert "PROFILE" in by_type
     assert by_type["PROFILE"].metadata_json.get("profile_version") == 2
-    assert "데이터팀" in (by_type["PROFILE"].search_text or "") or profile.department == "데이터팀"
+    profile_search_text = by_type["PROFILE"].search_text or ""
+    assert "데이터팀" in profile_search_text
     assert any(i.object_type == "PROJECT" for i in items)
     assert not any(
         "V36RejectProject" in (i.search_text or "") for i in items if i.object_type == "PROJECT"
@@ -312,7 +372,14 @@ def test_source_first_v32_bulk_review_confirm_rebuild_index_e2e(
         "V36KeepProject" in (i.search_text or "") for i in items if i.object_type == "PROJECT"
     )
 
-    # Idempotent re-confirm: no extra version / no extra PENDING index job.
+    index_jobs_before_reconfirm = list(
+        db_session.execute(
+            select(SearchIndexJob).where(SearchIndexJob.person_id == person.id)
+        ).scalars()
+    )
+    index_job_count_before_reconfirm = len(index_jobs_before_reconfirm)
+
+    # Idempotent re-confirm: no extra version / no new index jobs at all.
     again = client.post(
         f"/api/v1/analyses/{analysis_id}/confirm",
         headers={"X-CSRF-Token": csrf},
@@ -338,6 +405,12 @@ def test_source_first_v32_bulk_review_confirm_rebuild_index_e2e(
         ).scalars()
     )
     assert pending_after == []
+    index_jobs_after_reconfirm = list(
+        db_session.execute(
+            select(SearchIndexJob).where(SearchIndexJob.person_id == person.id)
+        ).scalars()
+    )
+    assert len(index_jobs_after_reconfirm) == index_job_count_before_reconfirm
     run_row = db_session.get(AnalysisRun, uuid.UUID(analysis_id))
     assert run_row is not None and run_row.status == "CONFIRMED"
 
