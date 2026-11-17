@@ -26,6 +26,10 @@ import {
   formatValue,
 } from '@/api/diffValueDisplay'
 import {
+  allSelectablePendingSelected,
+  selectablePendingDiffIds,
+} from '@/api/diffSelection'
+import {
   projectPptxSourceLocations,
   projectReviewView,
 } from '@/api/projectReviewDisplay'
@@ -852,6 +856,29 @@ export function AnalysisDetailPage() {
                 선택 {selectedKeys.length}건
               </Tag>
               <Button
+                disabled={
+                  bulkMutation.isPending ||
+                  selectablePendingDiffIds(diffsQuery.data?.data).length === 0 ||
+                  allSelectablePendingSelected(
+                    diffsQuery.data?.data,
+                    selectedKeys,
+                  )
+                }
+                loading={bulkMutation.isPending}
+                onClick={() => {
+                  const ids = selectablePendingDiffIds(diffsQuery.data?.data)
+                  setSelectedKeys(ids)
+                }}
+              >
+                {`미검토 전체 선택 (${selectablePendingDiffIds(diffsQuery.data?.data).length})`}
+              </Button>
+              <Button
+                disabled={selectedKeys.length === 0 || bulkMutation.isPending}
+                onClick={() => setSelectedKeys([])}
+              >
+                선택 해제
+              </Button>
+              <Button
                 disabled={selectedKeys.length === 0}
                 loading={bulkMutation.isPending}
                 onClick={() => {
@@ -962,9 +989,11 @@ export function AnalysisDetailPage() {
                 canReview
                   ? {
                       selectedRowKeys: selectedKeys,
+                      preserveSelectedRowKeys: true,
                       onChange: setSelectedKeys,
                       getCheckboxProps: (row) => ({
-                        disabled: row.change_type === 'SAME',
+                        disabled:
+                          row.change_type === 'SAME' || bulkMutation.isPending,
                       }),
                     }
                   : undefined
