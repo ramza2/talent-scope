@@ -1079,7 +1079,10 @@ export function AnalysisDetailPage() {
             </div>
             <Button
               type="primary"
-              href={documentPreviewUrl(evidenceDetail.document.id)}
+              href={documentPreviewUrl(
+                evidenceDetail.document.id,
+                evidenceDetail.page_no,
+              )}
               target="_blank"
               rel="noreferrer"
             >

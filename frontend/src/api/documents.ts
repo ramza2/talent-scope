@@ -278,8 +278,20 @@ export function documentDownloadUrl(documentId: string) {
   return `/api/v1/documents/${documentId}/download`
 }
 
-export function documentPreviewUrl(documentId: string) {
-  return `/api/v1/documents/${documentId}/preview`
+/** Preview URL; optional pageNo appends `#page=N` for valid positive integers only. */
+export function documentPreviewUrl(
+  documentId: string,
+  pageNo?: number | null,
+) {
+  const base = `/api/v1/documents/${documentId}/preview`
+  if (
+    typeof pageNo === 'number' &&
+    Number.isInteger(pageNo) &&
+    pageNo >= 1
+  ) {
+    return `${base}#page=${pageNo}`
+  }
+  return base
 }
 
 export async function downloadDocumentBlob(documentId: string): Promise<Blob> {

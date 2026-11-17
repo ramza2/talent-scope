@@ -56,7 +56,7 @@ export function ProjectPptxSourceLocations({
                 type="link"
                 size="small"
                 style={{ paddingInline: 0, height: 'auto' }}
-                href={documentPreviewUrl(loc.document_id)}
+                href={documentPreviewUrl(loc.document_id, loc.page_no)}
                 target="_blank"
                 rel="noopener noreferrer"
               >
