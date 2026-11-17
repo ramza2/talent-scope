@@ -26,6 +26,11 @@ import {
   formatValue,
 } from '@/api/diffValueDisplay'
 import {
+  isSourceFirstPromptVersion,
+  shouldSkipInvalidValuesOnConfirm,
+  summarizeReviewDecisions,
+} from '@/api/confirmPolicy'
+import {
   allSelectablePendingSelected,
   selectablePendingDiffIds,
 } from '@/api/diffSelection'
@@ -306,8 +311,10 @@ export function AnalysisDetailPage() {
     mutationFn: () =>
       confirmAnalysis(analysisId, {
         expected_profile_version: analysis!.base_profile_version!,
-        // Native Source-First projects must not be partially skipped on Confirm.
-        skip_invalid_values: analysis!.prompt_version !== 'profile-source-first-v30-native-direct',
+        // Source-First (v30+): never partially skip invalid rows on Confirm.
+        skip_invalid_values: shouldSkipInvalidValuesOnConfirm(
+          analysis!.prompt_version,
+        ),
       }),
     onSuccess: async (res) => {
       setConfirmOpen(false)
@@ -351,7 +358,12 @@ export function AnalysisDetailPage() {
           content: (
             <div>
               <Typography.Paragraph>
-                확정할 수 없는 데이터 관계나 시스템 제약이 있습니다. 아래 내용을 확인해 주세요.
+                확정할 수 없는 데이터 관계나 시스템 제약이 있습니다. 아래 오류 내용을
+                확인한 뒤, 필터로 Diff를 찾아 결정을 수정해 주세요.
+              </Typography.Paragraph>
+              <Typography.Paragraph type="secondary">
+                이 안내는 특정 오류 행으로 이동하지 않습니다. 분석은 REVIEWING 상태로
+                유지되며 기존 검토 결정은 그대로 남습니다.
               </Typography.Paragraph>
               <div style={{ maxHeight: '45vh', overflowY: 'auto' }}>
                 <Typography.Paragraph style={{ whiteSpace: 'pre-wrap', marginBottom: 0 }}>
@@ -363,9 +375,10 @@ export function AnalysisDetailPage() {
               </div>
             </div>
           ),
-          okText: '오류 항목 보기',
+          okText: '검토 계속',
           onOk: () => {
             setConfirmOpen(false)
+            setEntityFilter('')
             setFilterTab('all')
             setSelectedKeys([])
           },
@@ -375,6 +388,19 @@ export function AnalysisDetailPage() {
       message.error(apiErrorMessage(error, '최종 확정에 실패했습니다.'))
     },
   })
+
+  const reviewDecisionSummary = summarizeReviewDecisions(allDiffs)
+  const sourceFirstConfirm = isSourceFirstPromptVersion(analysis?.prompt_version)
+  const confirmBusy =
+    confirmMutation.isPending ||
+    allDiffsQuery.isLoading ||
+    allDiffsQuery.isFetching ||
+    allDiffsQuery.isError
+  const showPendingReviewShortcut = () => {
+    setEntityFilter('')
+    setFilterTab('pending')
+    setSelectedKeys([])
+  }
 
   const cancelMutation = useMutation({
     mutationFn: () => cancelAnalysis(analysisId),
@@ -749,7 +775,12 @@ export function AnalysisDetailPage() {
                 인력 상세 보기
               </Button>
             ) : analysis.status === 'REVIEWING' ? (
-              <Button type="primary" disabled={!canConfirm} onClick={() => setConfirmOpen(true)}>
+              <Button
+                type="primary"
+                disabled={!canConfirm || confirmBusy}
+                loading={confirmMutation.isPending}
+                onClick={() => setConfirmOpen(true)}
+              >
                 최종 확정
               </Button>
             ) : null}
@@ -791,6 +822,11 @@ export function AnalysisDetailPage() {
               showIcon
               style={{ marginBottom: 16 }}
               message={`미검토 항목 ${pendingActionable}건 — 모두 결정한 뒤 최종 확정할 수 있습니다.`}
+              action={
+                <Button size="small" onClick={showPendingReviewShortcut}>
+                  미검토 탭 보기
+                </Button>
+              }
             />
           ) : null}
           {analysis.status === 'CONFIRMED' ? (
@@ -1007,23 +1043,47 @@ export function AnalysisDetailPage() {
       <Modal
         title="최종 확정"
         open={confirmOpen}
-        onCancel={() => setConfirmOpen(false)}
-        onOk={() => confirmMutation.mutate()}
+        onCancel={() => {
+          if (confirmMutation.isPending) return
+          setConfirmOpen(false)
+        }}
+        onOk={() => {
+          if (!canConfirm || confirmBusy || pendingActionable > 0) return
+          confirmMutation.mutate()
+        }}
         confirmLoading={confirmMutation.isPending}
+        okButtonProps={{
+          disabled: !canConfirm || confirmBusy || pendingActionable > 0,
+        }}
+        cancelButtonProps={{ disabled: confirmMutation.isPending }}
         okText="확정"
         destroyOnHidden
       >
         <Typography.Paragraph>
           승인된 AI 분석 결과를 운영 프로필에 반영합니다.
         </Typography.Paragraph>
-        {analysis?.prompt_version === 'profile-source-first-v30-native-direct' ? (
+        <Typography.Paragraph>
+          검토 결정 요약 — 승인 {reviewDecisionSummary.accepted} · 수정{' '}
+          {reviewDecisionSummary.modified} · 병합 {reviewDecisionSummary.merged} · 반려{' '}
+          {reviewDecisionSummary.rejected} · 미검토{' '}
+          {reviewDecisionSummary.pendingActionable}
+          {reviewDecisionSummary.same > 0
+            ? ` · SAME(정보) ${reviewDecisionSummary.same}`
+            : ''}
+        </Typography.Paragraph>
+        <Typography.Paragraph type="secondary">
+          위 숫자는 현재 검토 결정 집계이며, 실제 적용 성공 건수와 같다고 보장하지 않습니다.
+          반려는 운영 프로필에 반영되지 않으며 SAME은 정보성입니다.
+        </Typography.Paragraph>
+        {sourceFirstConfirm ? (
           <Typography.Paragraph type="secondary">
-            v30 원본 프로젝트는 모두 정상 등록돼야 합니다.
-            저장할 수 없는 항목이 있으면 일부만 반영하지 않고 확정 전체를 중단합니다.
+            Source-First 분석은 승인·수정·병합한 항목만 반영하고 반려는 반영하지 않습니다.
+            오류 값을 건너뛰며 부분 확정하지 않으며, 저장·검증 오류가 있으면 확정 전체를
+            중단하고 분석은 REVIEWING으로 유지합니다.
           </Typography.Paragraph>
         ) : (
           <Typography.Paragraph type="secondary">
-            날짜·코드 등 형식 오류가 있는 항목은 자동 제외하고 확정합니다.
+            일반 분석은 날짜·코드 등 형식 오류 항목을 자동 제외하고 확정할 수 있습니다.
             제외된 항목은 확정 결과에 표시되며, 인력 상세화면에서 추가·수정할 수 있습니다.
           </Typography.Paragraph>
         )}
