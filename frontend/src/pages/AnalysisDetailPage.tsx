@@ -1077,8 +1077,9 @@ export function AnalysisDetailPage() {
         </Typography.Paragraph>
         {sourceFirstConfirm ? (
           <Typography.Paragraph type="secondary">
-            Source-First 분석은 원본 프로젝트를 빠짐없이 반영해야 합니다.
-            저장 오류가 있으면 확정 전체를 중단하고 분석은 REVIEWING으로 유지합니다.
+            Source-First 분석은 승인·수정·병합한 항목만 반영하고 반려는 반영하지 않습니다.
+            오류 값을 건너뛰며 부분 확정하지 않으며, 저장·검증 오류가 있으면 확정 전체를
+            중단하고 분석은 REVIEWING으로 유지합니다.
           </Typography.Paragraph>
         ) : (
           <Typography.Paragraph type="secondary">
