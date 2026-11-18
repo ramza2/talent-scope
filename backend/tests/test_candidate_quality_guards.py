@@ -2121,3 +2121,128 @@ def test_normal_resume_employer_period_not_dropped_without_project_evidence() ->
     )
     assert len(result.employment_history) == 1
     assert result.employment_history[0].company_name == "오픈링크"
+
+
+def test_employment_overlapping_project_period_preserved() -> None:
+    """Longer 근무경력 overlapping a project window must not be deleted."""
+    page_texts = {
+        (_KOSA, 1): (
+            "근무경력\n"
+            "오픈링크 2018.01.01 ~ 2022.12.31 책임\n"
+            "기술경력 프로젝트 수행경력 참여기간 사업명 발주처 소속회사\n"
+            "2019.03.01 ~ 2019.08.31 사업A 고객A 오픈링크\n"
+        ),
+    }
+    candidate = ProfileCandidateDocument(
+        employment_history=[
+            EmploymentCandidate(
+                company_name="오픈링크",
+                start_date="2018.01.01",
+                end_date="2022.12.31",
+                title="책임",
+            ),
+            # Exact 참여기간 clone — drop.
+            EmploymentCandidate(
+                company_name="오픈링크",
+                start_date="2019.03.01",
+                end_date="2019.08.31",
+                title="책임",
+            ),
+        ],
+        projects=[
+            ProjectCandidate(
+                project_name="사업A",
+                customer_name="고객A",
+                start_date="2019.03.01",
+                end_date="2019.08.31",
+            )
+        ],
+    )
+    result = apply_candidate_quality_guards(
+        candidate,
+        page_texts=page_texts,
+        document_type_by_id={_KOSA: "DOC-KOSA"},
+    )
+    kept = [(e.start_date, e.end_date) for e in result.employment_history]
+    assert kept == [("2018.01.01", "2022.12.31")]
+
+
+def test_kosa_p1_employment_to_tech_p2_tech_continues() -> None:
+    """KOSA p1 근무→기술, p2 기술 지속: real employers kept, clones dropped."""
+    page_texts = {
+        (_KOSA, 1): (
+            "근무경력\n"
+            "알파소프트 2015.01.01 ~ 2018.12.31 과장\n"
+            "베타시스템 2019.01.01 ~ 2023.12.31 수석\n"
+            "기술경력 프로젝트 수행경력 참여기간 사업명 발주처 소속회사 직위\n"
+            "2019.04.01 ~ 2019.09.30 클라우드전환 공공기관A 베타시스템 수석\n"
+        ),
+        (_KOSA, 2): (
+            "기술경력 계속 참여기간 사업명 발주처 소속회사\n"
+            "2020.02.01 ~ 2020.07.31 데이터플랫폼 공공기관B 베타시스템 수석\n"
+            "2021.01.01 ~ 2021.06.30 관제고도화 공공기관C 베타시스템 수석\n"
+        ),
+    }
+    candidate = ProfileCandidateDocument(
+        employment_history=[
+            EmploymentCandidate(
+                company_name="알파소프트",
+                start_date="2015.01.01",
+                end_date="2018.12.31",
+            ),
+            EmploymentCandidate(
+                company_name="베타시스템",
+                start_date="2019.01.01",
+                end_date="2023.12.31",
+            ),
+            EmploymentCandidate(
+                company_name="베타시스템",
+                start_date="2019.04.01",
+                end_date="2019.09.30",
+            ),
+            EmploymentCandidate(
+                company_name="베타시스템",
+                start_date="2020.02.01",
+                end_date="2020.07.31",
+            ),
+            EmploymentCandidate(
+                company_name="베타시스템",
+                start_date="2021.01.01",
+                end_date="2021.06.30",
+            ),
+        ],
+        projects=[
+            ProjectCandidate(
+                project_name="클라우드전환",
+                customer_name="공공기관A",
+                start_date="2019.04.01",
+                end_date="2019.09.30",
+            ),
+            ProjectCandidate(
+                project_name="데이터플랫폼",
+                customer_name="공공기관B",
+                start_date="2020.02.01",
+                end_date="2020.07.31",
+            ),
+            ProjectCandidate(
+                project_name="관제고도화",
+                customer_name="공공기관C",
+                start_date="2021.01.01",
+                end_date="2021.06.30",
+            ),
+        ],
+    )
+    result = apply_candidate_quality_guards(
+        candidate,
+        page_texts=page_texts,
+        document_type_by_id={_KOSA: "DOC-KOSA"},
+    )
+    kept = [
+        (e.company_name, e.start_date, e.end_date)
+        for e in result.employment_history
+    ]
+    assert kept == [
+        ("알파소프트", "2015.01.01", "2018.12.31"),
+        ("베타시스템", "2019.01.01", "2023.12.31"),
+    ]
+    assert len(result.projects) == 3

@@ -85,3 +85,45 @@ def test_expand_compact_projects_drops_overlong_root_quote() -> None:
     assert refs
     assert "quote_text" not in refs[0]
     SourceRef.model_validate(refs[0])
+
+
+def test_semantic_core_exp_span_skips_overlong_unsupportive_quote() -> None:
+    """Distant companions yield >500 span → skip enrich (no ValidationError)."""
+    from app.ai.schemas.profile_candidate import ProfileCandidateDocument
+    from app.modules.analysis.compact_v8 import (
+        _semantic_core_exp_span_page_match,
+        supplement_semantic_core_expertise_from_source,
+    )
+
+    filler = "패" * 520
+    page = f"시스템구축 및 운영 {filler} IT시스템기술지원"
+    # Extracted companion window exceeds 500 and clipped quote loses meaning.
+    match = _semantic_core_exp_span_page_match(
+        "EXP-INFRA",
+        page_texts={(_DOC, 1): page},
+        allowed_documents={_DOC: {1}},
+    )
+    assert match is None
+
+    out = supplement_semantic_core_expertise_from_source(
+        ProfileCandidateDocument(),
+        page_texts={(_DOC, 1): page},
+        allowed_documents={_DOC: {1}},
+    )
+    assert out.expertise == []
+
+
+def test_semantic_core_exp_span_keeps_short_supportive_quote() -> None:
+    from app.modules.analysis.compact_v8 import _semantic_core_exp_span_page_match
+
+    page = "시스템구축 및 운영 > IT시스템기술지원"
+    match = _semantic_core_exp_span_page_match(
+        "EXP-INFRA",
+        page_texts={(_DOC, 1): page},
+        allowed_documents={_DOC: {1}},
+    )
+    assert match is not None
+    assert match.quote_text is not None
+    assert len(match.quote_text) <= SOURCE_REF_QUOTE_MAX_LEN
+    assert match.quote_text in page
+    SourceRef.model_validate(match.model_dump())

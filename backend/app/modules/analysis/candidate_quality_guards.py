@@ -781,22 +781,58 @@ def _matches_project_participation_period(
     row: EmploymentCandidate,
     projects: list[ProjectCandidate],
 ) -> bool:
-    """True when employer dates mirror a project 참여기간 (any customer).
+    """True when employer dates are a full 참여기간 clone of some project.
 
-    Used to reject 소속회사 + 참여기간 rows misread as 근무경력. Does not
-    require customer_name == company_name.
+    Both start and end must be present on each side and compatible. Period
+    overlap alone (longer 근무경력 containing a project window, or missing
+    ends) does **not** match — those rows must be preserved as employment.
+    Does not require customer_name == company_name.
     """
-    if not (row.start_date or "").strip():
+    if not (row.start_date or "").strip() or not (row.end_date or "").strip():
         return False
     for project in projects:
-        if not (project.start_date or "").strip():
+        if not (project.start_date or "").strip() or not (
+            project.end_date or ""
+        ).strip():
             continue
         if not dates_compatible(row.start_date, project.start_date):
             continue
-        if row.end_date and project.end_date:
-            if not dates_compatible(row.end_date, project.end_date):
-                continue
+        if not dates_compatible(row.end_date, project.end_date):
+            continue
         return True
+    return False
+
+
+def _kosa_project_span_attests_affiliation_period(
+    row: EmploymentCandidate,
+    *,
+    spans: list[_ContextSpan],
+) -> bool:
+    """KOSA project/participation span carries company + the row's period.
+
+    Fail-closed: non-KOSA documents never qualify. Used with
+    ``_matches_project_participation_period`` so 소속회사+참여기간 mix-ins
+    need document/row/company evidence, not period equality alone.
+    """
+    company = (row.company_name or "").strip()
+    if not company:
+        return False
+    if not any(
+        (span.doc_type or "").strip().upper() == "DOC-KOSA" for span in spans
+    ):
+        return False
+    for span in spans:
+        if (span.doc_type or "").strip().upper() != "DOC-KOSA":
+            continue
+        if _classify_span(span.text, section=span.section) != "project":
+            continue
+        if not _line_has_company(span.text, company):
+            continue
+        for start, end in _extract_range_dates(span.text):
+            if _employment_period_compatible(
+                row.start_date, row.end_date, start, end
+            ):
+                return True
     return False
 
 
@@ -1337,8 +1373,13 @@ def _guard_employment_history(
         mirrors_participation = _matches_project_participation_period(
             row, projects
         )
+        kosa_affiliation_row = _kosa_project_span_attests_affiliation_period(
+            row, spans=spans
+        )
         # Certain mix-in only: project customer with no employer evidence, or
-        # 소속회사+참여기간 rows whose period is not attested in 근무경력.
+        # KOSA 소속회사+참여기간 clones lacking matching 근무경력 period evidence.
+        # Overlapping longer employer tenures are preserved (not a full clone,
+        # or has_matching_employment_period).
         if (
             is_customer_name
             and not has_employment_evidence
@@ -1346,8 +1387,8 @@ def _guard_employment_history(
         ):
             continue
         if (
-            has_project_evidence
-            and mirrors_participation
+            mirrors_participation
+            and kosa_affiliation_row
             and not has_matching_employment_period
         ):
             continue

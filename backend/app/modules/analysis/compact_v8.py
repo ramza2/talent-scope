@@ -1541,7 +1541,12 @@ def _semantic_core_exp_span_page_match(
     page_texts: dict[tuple[str, int], str],
     allowed_documents: dict[str, set[int]],
 ) -> SourceRef | None:
-    """Strongest page match whose quote span itself supports the EXP code."""
+    """Strongest page match whose quote span itself supports the EXP code.
+
+    Only ≤``SOURCE_REF_QUOTE_MAX_LEN`` quotes that remain an exact page
+    substring and still support the EXP meaning are used. Distant companion
+    spans that cannot be bounded while keeping meaning → skip (no enrich).
+    """
     patterns = _EXP_SEMANTIC_PATTERNS.get(code)
     if not patterns:
         return None
@@ -1558,7 +1563,13 @@ def _semantic_core_exp_span_page_match(
         quote = _extract_semantic_exp_quote(code, page_text)
         if not quote:
             continue
-        # Prefer higher-strength pattern family via phrase presence.
+        bounded = bounded_verified_quote_text(quote, page_text=page_text)
+        if bounded is None:
+            continue
+        # Clipped/overlong companion windows must still support the EXP code.
+        if not _quote_supports_semantic_exp(code, bounded):
+            continue
+        # Prefer higher-strength pattern family via phrase presence on page.
         strength = 0
         for s, phrase, companions in patterns:
             if phrase not in page_text:
@@ -1568,7 +1579,7 @@ def _semantic_core_exp_span_page_match(
             strength = max(strength, s)
         if strength <= 0:
             continue
-        key = (-strength, doc_id, page_no, quote)
+        key = (-strength, doc_id, page_no, bounded)
         if best is None or key < best:
             best = key
     if best is None:
