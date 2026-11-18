@@ -26,17 +26,25 @@ def test_kosa_work_history_then_technical_projects_never_reopen_on_header() -> N
     spans = list(_iter_context_spans({(_DOC, 1): text}, {_DOC: "DOC-KOSA"}))
 
     work = [span for span in spans if "에이회사" in span.text]
-    technical_header = next(
-        span for span in spans if "회사명 | 입사일 | 퇴사일" in span.text
-    )
+    technical_headers = [
+        span for span in spans
+        if any(label in span.text for label in ("회사명", "입사일", "퇴사일"))
+    ]
     technical_last = next(
         span for span in spans if "법률 지원 설계" in span.text
     )
     assert len(work) == 7
-    assert all(_classify_span(span.text, section=span.section) == "employment" for span in work)
-    assert technical_header.section == "project"
+    assert all(
+        _classify_span(span.text, section=span.section) == "employment"
+        for span in work
+    )
+    assert technical_headers
+    assert all(span.section == "project" for span in technical_headers)
+    assert all(
+        _classify_span(span.text, section=span.section) == "project"
+        for span in technical_headers
+    )
     assert technical_last.section == "project"
-    assert _classify_span(technical_header.text, section=technical_header.section) == "project"
 
 
 def test_explicit_new_kosa_employment_section_can_reopen_after_projects() -> None:
