@@ -262,6 +262,15 @@ def _classify_span(text: str, *, section: str) -> str:
     if has_proj_section and not has_emp_section:
         return "project"
     if has_emp_section and not has_proj_section:
+        # A generic column header (회사명/입사일/퇴사일) can appear in
+        # misread KOSA technical-history tables. Sticky project context
+        # remains authoritative unless a real employment-section heading
+        # is present. The source span classifier supplies that context.
+        if section == "project" and not re.search(
+            r"근\s*무\s*경\s*력|재\s*직\s*기\s*간|경\s*력\s*사\s*항",
+            text,
+        ):
+            return "project"
         return "employment"
     if has_proj_section and has_emp_section:
         return "project"
