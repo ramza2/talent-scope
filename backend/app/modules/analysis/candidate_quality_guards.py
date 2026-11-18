@@ -248,7 +248,7 @@ def _line_has_company(line: str, company: str) -> bool:
 
 
 def _classify_span(text: str, *, section: str, doc_type: str | None = None) -> str:
-    """Classify a span using sticky section context; never doc-type alone."""
+    """Classify with sticky context; only KOSA technical headers get an override."""
     has_participation = bool(_PROJECT_PARTICIPATION_TABLE_RE.search(text))
     has_emp_section = bool(_EMPLOYMENT_SECTION_RE.search(text))
     has_proj_section = bool(_PROJECT_SECTION_RE.search(text))
@@ -270,7 +270,7 @@ def _classify_span(text: str, *, section: str, doc_type: str | None = None) -> s
             section == "project"
             and (doc_type or "").strip().upper() == "DOC-KOSA"
             and not re.search(
-            r"근\s*무\s*경\s*력|재\s*직\s*기\s*간|경\s*력\s*사\s*항",
+                r"근\s*무\s*경\s*력|재\s*직\s*기\s*간|경\s*력\s*사\s*항",
                 text,
             )
         ):
