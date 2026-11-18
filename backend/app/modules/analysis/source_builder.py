@@ -17,6 +17,7 @@ from app.core.config import Settings, get_settings
 from app.modules.analysis.vlm_table_banding import (
     detect_table_row_bands,
     is_kosa_empty_markdown_table_vlm_quality_issue,
+    is_plausible_kosa_employment_recovery,
     is_valid_table_band_transcription,
     normalize_table_band_transcription,
 )
@@ -385,9 +386,39 @@ class AnalysisSourceBuilder:
                                 remaining_calls=table_budget - table_calls_used,
                             )
                             table_calls_used += calls
+                            # An empty KOSA employment page must not be replaced
+                            # with another empty table or a project-only answer.
+                            if kosa_empty_table and banded_text is not None:
+                                if not is_plausible_kosa_employment_recovery(banded_text):
+                                    banded_text = None
+                            if kosa_empty_table and banded_text is None:
+                                # Real KOSA scans can have no detectable table
+                                # rules. Read three overlapping page strips.
+                                # Both paths share the existing call budget.
+                                remaining = min(
+                                    table_budget - table_calls_used,
+                                    max(
+                                        0,
+                                        int(self.settings.analysis_vlm_table_banding_max_calls_per_page)
+                                        - calls,
+                                    ),
+                                )
+                                banded_text, tile_calls = (
+                                    self._try_transcribe_kosa_empty_page_tiles(
+                                        pdf_doc.load_page(page.page_no - 1),
+                                        log_context={
+                                            **(log_context or {}),
+                                            "document_id": doc_id,
+                                            "page_no": page.page_no,
+                                            "kosa_empty_page_tiles": True,
+                                        },
+                                        remaining_calls=remaining,
+                                    )
+                                )
+                                table_calls_used += tile_calls
                             if banded_text is not None:
-                                # Memory-only for analysis prompt; no VLM
-                                # transcription persist / stored page rewrite.
+                                # Analysis-only replacement; never persist or
+                                # rewrite the original DocumentPage text.
                                 text = banded_text
                                 vlm_used += 1
                             # Fail closed: keep stored extracted_text as-is.
@@ -558,6 +589,82 @@ class AnalysisSourceBuilder:
         except Exception as exc:
             logger.info(
                 "analysis table-banding fallback document_id=%s page_no=%s err=%s",
+                log_context.get("document_id"),
+                log_context.get("page_no"),
+                type(exc).__name__,
+            )
+            return None, calls
+
+    def _try_transcribe_kosa_empty_page_tiles(
+        self,
+        page: pymupdf.Page,
+        *,
+        log_context: dict,
+        remaining_calls: int,
+    ) -> tuple[str | None, int]:
+        """Rule-free fallback for a scanned DOC-KOSA page with empty VLM text.
+
+        Three overlapping vertical strips make dense career rows legible.
+        Only completed, plausible transcription replaces the in-memory text.
+        This never alters DocumentPage or persisted source files.
+        """
+        if self.vlm is None or remaining_calls < 3:
+            return None, 0
+        rect = page.rect
+        if rect.width <= 0 or rect.height <= 0:
+            return None, 0
+        calls = 0
+        parts: list[str] = []
+        # Small overlaps avoid losing rows at crop boundaries. The prompt
+        # explicitly forbids reconstructing rows that are only partly visible.
+        ranges = ((0.00, 0.36), (0.32, 0.69), (0.65, 1.00))
+        prompt = (
+            "KOSA 경력증명서의 스캔 이미지 일부입니다. 보이는 글자만 전사하세요. "
+            "근무경력 표의 회사명, 입사일, 퇴사일, 근무기간 등 각 셀을 "
+            "원문 순서와 행 구분에 맞춰 기록하세요. "
+            "표 선이 없거나 글자가 흐려도 보이지 않는 행, 회사명, 날짜를 "
+            "추측하거나 생성하지 마세요. 잘린 행은 복원하지 마세요. "
+            "프로젝트 참여기간을 근무경력으로 바꾸지 마세요. "
+            "빈 칸을 반복 출력하거나 Markdown 빈 표를 생성하지 마세요."
+        )
+        try:
+            dpi = min(240, max(180, int(self.settings.analysis_pdf_render_dpi)))
+            zoom = dpi / 72.0
+            for index, (top, bottom) in enumerate(ranges, 1):
+                clip = pymupdf.Rect(
+                    rect.x0,
+                    rect.y0 + rect.height * top,
+                    rect.x1,
+                    rect.y0 + rect.height * bottom,
+                )
+                pix = page.get_pixmap(
+                    matrix=pymupdf.Matrix(zoom, zoom),
+                    clip=clip,
+                    alpha=False,
+                )
+                calls += 1
+                result = self.vlm.transcribe_image(
+                    image_bytes=pix.tobytes("png"),
+                    mime_type="image/png",
+                    log_context={
+                        **log_context,
+                        "page_tile": f"{index}/3",
+                    },
+                    user_prompt=prompt,
+                )
+                cleaned = (result or "").strip()
+                if not cleaned or len(cleaned) > 8000:
+                    return None, calls
+                parts.append(cleaned)
+            # Keep original source order and every visible row. Duplicated
+            # boundary rows are safer for review than silently lost rows.
+            recovered = "\n".join(parts)
+            if not is_plausible_kosa_employment_recovery(recovered):
+                return None, calls
+            return recovered, calls
+        except Exception as exc:
+            logger.info(
+                "KOSA page-tile fallback failed document_id=%s page_no=%s err=%s",
                 log_context.get("document_id"),
                 log_context.get("page_no"),
                 type(exc).__name__,
