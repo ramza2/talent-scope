@@ -803,16 +803,154 @@ def _matches_project_participation_period(
     return False
 
 
+_KOSA_PROJECT_FIELD_LABEL_RE = re.compile(
+    r"^(확인|사업명|사\s*업\s*명|참여기간|수행기간|기간|발주처|발주기관|"
+    r"고객사|소속회사|소속기관|직위|담당업무)\s*[:：]?\s*(.*)$"
+)
+_KOSA_PROJECT_STATUS_ONLY_RE = re.compile(r"^확인$")
+
+
+def _iter_kosa_project_windows(
+    spans: list[_ContextSpan],
+) -> list[tuple[str, int, list[str]]]:
+    """Group consecutive DOC-KOSA project lines on the same page.
+
+    Multi-line VLM rows often emit one field per line
+    (확인 / 사업명 / 기간 / 발주처 / 소속회사 / 직위). Same-line attestation
+    misses those; windows reconnect company + period.
+    """
+    windows: list[tuple[str, int, list[str]]] = []
+    current_key: tuple[str, int] | None = None
+    buf: list[str] = []
+
+    def flush() -> None:
+        nonlocal buf, current_key
+        if current_key is not None and buf:
+            windows.append((current_key[0], current_key[1], list(buf)))
+        buf = []
+        current_key = None
+
+    for span in spans:
+        if (span.doc_type or "").strip().upper() != "DOC-KOSA":
+            flush()
+            continue
+        if _classify_span(span.text, section=span.section) != "project":
+            flush()
+            continue
+        key = (span.doc_id, span.page_no)
+        line = span.text.strip()
+        if not line:
+            continue
+        if current_key != key:
+            flush()
+            current_key = key
+        # Start a new logical row on blank-separated '확인' markers.
+        if buf and _KOSA_PROJECT_STATUS_ONLY_RE.match(line):
+            flush()
+            current_key = key
+        buf.append(line)
+        # Keep windows small so unrelated rows do not merge.
+        if len(buf) >= 8:
+            flush()
+    flush()
+    return windows
+
+
+def _parse_kosa_project_window_affiliation(
+    lines: list[str],
+) -> list[tuple[str, str, str]]:
+    """Extract (company, start, end) from one multi-line project window."""
+    labeled: dict[str, str] = {}
+    unlabeled: list[str] = []
+    for raw in lines:
+        match = _KOSA_PROJECT_FIELD_LABEL_RE.match(raw.strip())
+        if match:
+            label = re.sub(r"\s+", "", match.group(1))
+            value = (match.group(2) or "").strip()
+            if label in {"소속회사", "소속기관"} and value:
+                labeled["employer"] = value
+            elif label in {"참여기간", "수행기간", "기간"} and value:
+                labeled["period"] = value
+            elif label == "확인" and value:
+                unlabeled.append(value)
+            continue
+        if _KOSA_PROJECT_STATUS_ONLY_RE.match(raw.strip()):
+            continue
+        unlabeled.append(raw.strip())
+
+    period_text = labeled.get("period") or ""
+    ranges = _extract_range_dates(period_text)
+    if not ranges:
+        for item in unlabeled:
+            ranges = _extract_range_dates(item)
+            if ranges:
+                break
+    if not ranges:
+        return []
+    start, end = ranges[0]
+    if not start or not end:
+        return []
+
+    company = labeled.get("employer")
+    if not company:
+        # Unlabeled shape: status, name, period, customer, employer, title.
+        # Prefer the line after the period that looks like a company and is
+        # not itself another date range.
+        period_idx = None
+        for idx, item in enumerate(unlabeled):
+            if _extract_range_dates(item):
+                period_idx = idx
+                break
+        if period_idx is not None:
+            for item in unlabeled[period_idx + 1 :]:
+                if _extract_range_dates(item):
+                    continue
+                if _EMPLOYMENT_HEADER_CELL_RE.match(item):
+                    continue
+                if len(item) < 2:
+                    continue
+                company = item
+                # Prefer the second non-date after period (employer) when a
+                # customer line precedes 소속회사.
+                for later in unlabeled[period_idx + 2 :]:
+                    if _extract_range_dates(later):
+                        break
+                    if _EMPLOYMENT_HEADER_CELL_RE.match(later):
+                        continue
+                    if len(later) >= 2:
+                        company = later
+                        break
+                break
+    if not company:
+        return []
+    return [(company, start, end)]
+
+
+def _kosa_source_affiliation_periods(
+    spans: list[_ContextSpan],
+) -> list[tuple[str, str, str]]:
+    """Strong source-only 소속회사+참여기간 hits (candidate projects optional)."""
+    out: list[tuple[str, str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for _doc_id, _page_no, lines in _iter_kosa_project_windows(spans):
+        for company, start, end in _parse_kosa_project_window_affiliation(lines):
+            key = (_company_match_key(company) or company, start, end)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append((company, start, end))
+    return out
+
+
 def _kosa_project_span_attests_affiliation_period(
     row: EmploymentCandidate,
     *,
     spans: list[_ContextSpan],
 ) -> bool:
-    """KOSA project/participation span carries company + the row's period.
+    """KOSA project evidence carries company + the row's period.
 
-    Fail-closed: non-KOSA documents never qualify. Used with
-    ``_matches_project_participation_period`` so 소속회사+참여기간 mix-ins
-    need document/row/company evidence, not period equality alone.
+    Accepts same-line spans or multi-line windows (확인/사업명/기간/발주처/
+    소속회사/직위). Fail-closed for non-KOSA documents.
     """
     company = (row.company_name or "").strip()
     if not company:
@@ -821,6 +959,7 @@ def _kosa_project_span_attests_affiliation_period(
         (span.doc_type or "").strip().upper() == "DOC-KOSA" for span in spans
     ):
         return False
+    # Same-line (legacy) attestation.
     for span in spans:
         if (span.doc_type or "").strip().upper() != "DOC-KOSA":
             continue
@@ -833,6 +972,61 @@ def _kosa_project_span_attests_affiliation_period(
                 row.start_date, row.end_date, start, end
             ):
                 return True
+    # Multi-line grouped windows.
+    for hit_company, start, end in _kosa_source_affiliation_periods(spans):
+        if not (
+            _line_has_company(hit_company, company)
+            or _company_match_key(hit_company) == _company_match_key(company)
+        ):
+            continue
+        if _employment_period_compatible(
+            row.start_date, row.end_date, start, end
+        ):
+            return True
+    return False
+
+
+def _matches_kosa_source_participation_period(
+    row: EmploymentCandidate,
+    *,
+    spans: list[_ContextSpan],
+) -> bool:
+    """True when row is a full 참여기간 clone attested in KOSA source text.
+
+    Does not require the period to exist in candidate.projects — multi-line
+    windows or same-line project spans with company + exact period suffice.
+    """
+    if not (row.start_date or "").strip() or not (row.end_date or "").strip():
+        return False
+    company = (row.company_name or "").strip()
+    if not company:
+        return False
+    for hit_company, start, end in _kosa_source_affiliation_periods(spans):
+        if not (
+            _line_has_company(hit_company, company)
+            or _company_match_key(hit_company) == _company_match_key(company)
+        ):
+            continue
+        if not dates_compatible(row.start_date, start):
+            continue
+        if not dates_compatible(row.end_date, end):
+            continue
+        return True
+    for span in spans:
+        if (span.doc_type or "").strip().upper() != "DOC-KOSA":
+            continue
+        if _classify_span(span.text, section=span.section) != "project":
+            continue
+        if not _line_has_company(span.text, company):
+            continue
+        for start, end in _extract_range_dates(span.text):
+            if not start or not end:
+                continue
+            if not dates_compatible(row.start_date, start):
+                continue
+            if not dates_compatible(row.end_date, end):
+                continue
+            return True
     return False
 
 
@@ -1373,11 +1567,15 @@ def _guard_employment_history(
         mirrors_participation = _matches_project_participation_period(
             row, projects
         )
+        mirrors_source_participation = (
+            _matches_kosa_source_participation_period(row, spans=spans)
+        )
         kosa_affiliation_row = _kosa_project_span_attests_affiliation_period(
             row, spans=spans
         )
         # Certain mix-in only: project customer with no employer evidence, or
         # KOSA 소속회사+참여기간 clones lacking matching 근무경력 period evidence.
+        # Source multi-line grouping can drop without candidate.projects.
         # Overlapping longer employer tenures are preserved (not a full clone,
         # or has_matching_employment_period).
         if (
@@ -1387,7 +1585,7 @@ def _guard_employment_history(
         ):
             continue
         if (
-            mirrors_participation
+            (mirrors_participation or mirrors_source_participation)
             and kosa_affiliation_row
             and not has_matching_employment_period
         ):

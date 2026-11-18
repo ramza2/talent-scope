@@ -16,6 +16,7 @@ from app.ai.prompts.vlm_transcribe_table_v2 import VLM_TABLE_BAND_USER
 from app.core.config import Settings, get_settings
 from app.modules.analysis.vlm_table_banding import (
     detect_table_row_bands,
+    is_kosa_empty_markdown_table_vlm_quality_issue,
     is_valid_table_band_transcription,
     normalize_table_band_transcription,
 )
@@ -342,12 +343,20 @@ class AnalysisSourceBuilder:
                         layout_json=page.layout_json,
                     )
 
-                    # A completed VLM page normally stays untouched. For an
-                    # explicitly opted-in analysis, try better table banding
-                    # in memory only; retain the stored text on any fallback.
+                    # A completed VLM page normally stays untouched. Opt-in
+                    # table banding may refresh text in memory only (never
+                    # mutate stored DocumentPage): explicit reprocess flag, or
+                    # DOC-KOSA empty Markdown-table quality failure.
+                    is_kosa = (doc.document_type_code or "").strip().upper() == "DOC-KOSA"
+                    kosa_empty_table = is_kosa and is_kosa_empty_markdown_table_vlm_quality_issue(
+                        text
+                    )
                     if (
                         self.settings.analysis_vlm_table_banding_enabled
-                        and self.settings.analysis_vlm_table_banding_reprocess_done
+                        and (
+                            self.settings.analysis_vlm_table_banding_reprocess_done
+                            or kosa_empty_table
+                        )
                         and not needs_vlm
                         and _already_vlm_transcribed(
                             extraction_method=page.extraction_method,
@@ -368,14 +377,20 @@ class AnalysisSourceBuilder:
                                     **(log_context or {}),
                                     "document_id": doc_id,
                                     "page_no": page.page_no,
-                                    "reprocess_done": True,
+                                    "reprocess_done": bool(
+                                        self.settings.analysis_vlm_table_banding_reprocess_done
+                                    ),
+                                    "kosa_empty_table": kosa_empty_table,
                                 },
                                 remaining_calls=table_budget - table_calls_used,
                             )
                             table_calls_used += calls
                             if banded_text is not None:
+                                # Memory-only for analysis prompt; no VLM
+                                # transcription persist / stored page rewrite.
                                 text = banded_text
                                 vlm_used += 1
+                            # Fail closed: keep stored extracted_text as-is.
 
                     if needs_vlm and self.vlm is not None and vlm_used < vlm_budget:
                         if pdf_doc is None:

@@ -6,9 +6,16 @@ No data is written here; callers decide whether to use the resulting crops.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 import pymupdf
+
+# KOSA career pages that lost real cells often keep only Markdown scaffolding.
+_MD_PIPE_LINE_RE = re.compile(r"\|")
+_MD_EMPTYISH_LINE_RE = re.compile(r"^[\s|:\-]+$")
+_YEAR_TOKEN_RE = re.compile(r"(?:19|20)\d{2}")
+_CAREER_ANCHOR_RE = re.compile(r"근무경력|재직기간|경력사항")
 
 
 @dataclass(frozen=True)
@@ -175,3 +182,44 @@ def is_valid_table_band_transcription(
     if expected_columns is not None and expected != expected_columns:
         return False
     return all(any(cell.strip() for cell in cells) for cells in rows)
+
+
+def is_kosa_empty_markdown_table_vlm_quality_issue(text: str) -> bool:
+    """Detect DOC-KOSA VLM pages that are mostly empty Markdown table chrome.
+
+    Real failure shape: thousands of characters / hundreds of lines that are
+    almost only ``|`` scaffolding, while career anchors (근무경력) and year
+    tokens (1990/2009) are missing. Fail closed on ambiguous pages.
+    """
+    raw = text or ""
+    lines = raw.splitlines()
+    if len(lines) < 40:
+        return False
+    pipe_lines = sum(1 for line in lines if _MD_PIPE_LINE_RE.search(line))
+    if pipe_lines < len(lines) * 0.45:
+        return False
+    emptyish = 0
+    content_chars = 0
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or _MD_EMPTYISH_LINE_RE.match(stripped):
+            emptyish += 1
+            continue
+        cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+        nonempty = [
+            cell
+            for cell in cells
+            if cell and not re.fullmatch(r"[\-:]+", cell)
+        ]
+        if not nonempty:
+            emptyish += 1
+        else:
+            content_chars += sum(len(cell) for cell in nonempty)
+    if emptyish < len(lines) * 0.50:
+        return False
+    if content_chars > max(220, int(len(raw) * 0.08)):
+        return False
+    has_career = bool(_CAREER_ANCHOR_RE.search(raw))
+    has_year = bool(_YEAR_TOKEN_RE.search(raw))
+    # Empty chrome pages typically lack both career headers and year tokens.
+    return not (has_career and has_year)

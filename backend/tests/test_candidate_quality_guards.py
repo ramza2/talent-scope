@@ -2246,3 +2246,220 @@ def test_kosa_p1_employment_to_tech_p2_tech_continues() -> None:
         ("베타시스템", "2019.01.01", "2023.12.31"),
     ]
     assert len(result.projects) == 3
+
+
+def test_kosa_multiline_project_rows_drop_without_candidate_projects() -> None:
+    """p2 multi-line 확인/사업명/기간/발주처/소속회사/직위; projects 누락해도 drop.
+
+    Real-log shape: six 소속회사+참여기간 mix-ins plus seven real employers.
+    """
+    page_texts = {
+        (_KOSA, 1): (
+            "근무경력\n"
+            "에이회사 2008.03.01 ~ 2010.02.28 사원\n"
+            "비이회사 2010.03.01 ~ 2012.06.30 대리\n"
+            "씨이회사 2012.07.01 ~ 2014.12.31 과장\n"
+            "디이회사 2015.01.01 ~ 2016.12.31 차장\n"
+            "이이회사 2017.01.01 ~ 2018.12.31 부장\n"
+            "에프회사 2019.01.01 ~ 2021.06.30 수석\n"
+            "지이회사 2021.07.01 ~ 2024.12.31 이사\n"
+        ),
+        (_KOSA, 2): (
+            "기술경력 프로젝트 수행경력\n"
+            "확인\n"
+            "사업명 공공클라우드구축\n"
+            "참여기간 2019.03.01 ~ 2019.08.31\n"
+            "발주처 한국환경공단\n"
+            "소속회사 에프회사\n"
+            "직위 수석\n"
+            "확인\n"
+            "사업명 데이터표준화\n"
+            "참여기간 2020.01.01 ~ 2020.06.30\n"
+            "발주처 국방부\n"
+            "소속회사 에프회사\n"
+            "직위 수석\n"
+            "확인\n"
+            "사업명 지능형관제\n"
+            "참여기간 2022.01.01 ~ 2022.12.31\n"
+            "발주처 서울시\n"
+            "소속회사 지이회사\n"
+            "직위 이사\n"
+            "확인\n"
+            "사업명 보안관제고도화\n"
+            "참여기간 2023.01.01 ~ 2023.06.30\n"
+            "발주처 인천시\n"
+            "소속회사 지이회사\n"
+            "직위 이사\n"
+            "확인\n"
+            "사업명 빅데이터플랫폼\n"
+            "참여기간 2021.01.01 ~ 2021.06.30\n"
+            "발주처 경기도\n"
+            "소속회사 지이회사\n"
+            "직위 이사\n"
+            "확인\n"
+            "사업명 클라우드이전\n"
+            "참여기간 2019.09.01 ~ 2019.12.31\n"
+            "발주처 부산시\n"
+            "소속회사 에프회사\n"
+            "직위 수석\n"
+        ),
+    }
+    employment = [
+        EmploymentCandidate(
+            company_name="에이회사",
+            start_date="2008.03.01",
+            end_date="2010.02.28",
+        ),
+        EmploymentCandidate(
+            company_name="비이회사",
+            start_date="2010.03.01",
+            end_date="2012.06.30",
+        ),
+        EmploymentCandidate(
+            company_name="씨이회사",
+            start_date="2012.07.01",
+            end_date="2014.12.31",
+        ),
+        EmploymentCandidate(
+            company_name="디이회사",
+            start_date="2015.01.01",
+            end_date="2016.12.31",
+        ),
+        EmploymentCandidate(
+            company_name="이이회사",
+            start_date="2017.01.01",
+            end_date="2018.12.31",
+        ),
+        EmploymentCandidate(
+            company_name="에프회사",
+            start_date="2019.01.01",
+            end_date="2021.06.30",
+        ),
+        EmploymentCandidate(
+            company_name="지이회사",
+            start_date="2021.07.01",
+            end_date="2024.12.31",
+        ),
+        EmploymentCandidate(
+            company_name="에프회사",
+            start_date="2019.03.01",
+            end_date="2019.08.31",
+            title="수석",
+        ),
+        EmploymentCandidate(
+            company_name="에프회사",
+            start_date="2020.01.01",
+            end_date="2020.06.30",
+            title="수석",
+        ),
+        EmploymentCandidate(
+            company_name="에프회사",
+            start_date="2019.09.01",
+            end_date="2019.12.31",
+            title="수석",
+        ),
+        EmploymentCandidate(
+            company_name="지이회사",
+            start_date="2022.01.01",
+            end_date="2022.12.31",
+            title="이사",
+        ),
+        EmploymentCandidate(
+            company_name="지이회사",
+            start_date="2023.01.01",
+            end_date="2023.06.30",
+            title="이사",
+        ),
+        EmploymentCandidate(
+            company_name="지이회사",
+            start_date="2021.01.01",
+            end_date="2021.06.30",
+            title="이사",
+        ),
+    ]
+    projects = [
+        ProjectCandidate(
+            project_name="공공클라우드구축",
+            customer_name="한국환경공단",
+            start_date="2019.03.01",
+            end_date="2019.08.31",
+        ),
+        ProjectCandidate(
+            project_name="데이터표준화",
+            customer_name="국방부",
+            start_date="2020.01.01",
+            end_date="2020.06.30",
+        ),
+    ]
+    candidate = ProfileCandidateDocument(
+        employment_history=employment,
+        # Deliberately sparse vs six source project windows.
+        projects=projects,
+    )
+    result = apply_candidate_quality_guards(
+        candidate,
+        page_texts=page_texts,
+        document_type_by_id={_KOSA: "DOC-KOSA"},
+    )
+    kept = [
+        (e.company_name, e.start_date, e.end_date)
+        for e in result.employment_history
+    ]
+    assert kept == [
+        ("에이회사", "2008.03.01", "2010.02.28"),
+        ("비이회사", "2010.03.01", "2012.06.30"),
+        ("씨이회사", "2012.07.01", "2014.12.31"),
+        ("디이회사", "2015.01.01", "2016.12.31"),
+        ("이이회사", "2017.01.01", "2018.12.31"),
+        ("에프회사", "2019.01.01", "2021.06.30"),
+        ("지이회사", "2021.07.01", "2024.12.31"),
+    ]
+    assert len(result.employment_history) == 7
+    # Project preservation: candidate projects untouched.
+    assert len(result.projects) == 2
+    assert result.projects[0].project_name == "공공클라우드구축"
+    assert result.projects[1].project_name == "데이터표준화"
+
+
+def test_kosa_multiline_unlabeled_project_window_drops_mixin() -> None:
+    """Unlabeled multi-line row (확인/사업명/기간/발주처/소속/직위) drops mixin."""
+    page_texts = {
+        (_KOSA, 1): (
+            "근무경력\n"
+            "오픈링크 2018.01.01 ~ 2022.12.31 책임\n"
+        ),
+        (_KOSA, 2): (
+            "기술경력 프로젝트 수행경력\n"
+            "확인\n"
+            "공공클라우드구축\n"
+            "2019.03.01 ~ 2019.08.31\n"
+            "한국환경공단\n"
+            "오픈링크\n"
+            "수석\n"
+        ),
+    }
+    candidate = ProfileCandidateDocument(
+        employment_history=[
+            EmploymentCandidate(
+                company_name="오픈링크",
+                start_date="2018.01.01",
+                end_date="2022.12.31",
+                title="책임",
+            ),
+            EmploymentCandidate(
+                company_name="오픈링크",
+                start_date="2019.03.01",
+                end_date="2019.08.31",
+                title="수석",
+            ),
+        ],
+        projects=[],
+    )
+    result = apply_candidate_quality_guards(
+        candidate,
+        page_texts=page_texts,
+        document_type_by_id={_KOSA: "DOC-KOSA"},
+    )
+    assert len(result.employment_history) == 1
+    assert result.employment_history[0].end_date == "2022.12.31"
+    assert result.projects == []
