@@ -33,6 +33,10 @@ _DOCUMENT_BLOCK_RE = re.compile(
     r"(document_type:\s*[^\n]+\n)",
 )
 
+# Matches ``SourceRef.quote_text`` Field(max_length=500). Overlong quotes must
+# never reach Pydantic validation; only ≤500 original-substring evidence is kept.
+SOURCE_REF_QUOTE_MAX_LEN = 500
+
 # Compact profile scalar keys → canonical field names.
 _PROFILE_KEY_MAP: dict[str, str] = {
     "n": "name",
@@ -524,7 +528,9 @@ def _expand_ref(item: Any, alias_to_id: dict[str, str]) -> dict[str, Any] | None
     out: dict[str, Any] = {"document_id": doc_id}
     if page_no is not None and page_no > 0:
         out["page_no"] = page_no
-    if quote is not None:
+    # Fail-closed without page context: drop unverifiable overlong quotes so
+    # later SourceRef.model_validate cannot raise max_length ValidationError.
+    if quote is not None and len(quote) <= SOURCE_REF_QUOTE_MAX_LEN:
         out["quote_text"] = quote
     return out
 
@@ -1307,8 +1313,11 @@ def _exact_page_match(
         if pages and page_no not in pages:
             continue
         page_text = page_texts.get((doc_id, page_no)) or ""
-        if text in page_text:
-            return SourceRef(document_id=doc_id, page_no=page_no, quote_text=text)
+        quote = bounded_verified_quote_text(text, page_text=page_text)
+        if quote is not None:
+            return SourceRef(
+                document_id=doc_id, page_no=page_no, quote_text=quote
+            )
     return None
 
 
@@ -1532,7 +1541,12 @@ def _semantic_core_exp_span_page_match(
     page_texts: dict[tuple[str, int], str],
     allowed_documents: dict[str, set[int]],
 ) -> SourceRef | None:
-    """Strongest page match whose quote span itself supports the EXP code."""
+    """Strongest page match whose quote span itself supports the EXP code.
+
+    Only ≤``SOURCE_REF_QUOTE_MAX_LEN`` quotes that remain an exact page
+    substring and still support the EXP meaning are used. Distant companion
+    spans that cannot be bounded while keeping meaning → skip (no enrich).
+    """
     patterns = _EXP_SEMANTIC_PATTERNS.get(code)
     if not patterns:
         return None
@@ -1549,7 +1563,13 @@ def _semantic_core_exp_span_page_match(
         quote = _extract_semantic_exp_quote(code, page_text)
         if not quote:
             continue
-        # Prefer higher-strength pattern family via phrase presence.
+        bounded = bounded_verified_quote_text(quote, page_text=page_text)
+        if bounded is None:
+            continue
+        # Clipped/overlong companion windows must still support the EXP code.
+        if not _quote_supports_semantic_exp(code, bounded):
+            continue
+        # Prefer higher-strength pattern family via phrase presence on page.
         strength = 0
         for s, phrase, companions in patterns:
             if phrase not in page_text:
@@ -1559,7 +1579,7 @@ def _semantic_core_exp_span_page_match(
             strength = max(strength, s)
         if strength <= 0:
             continue
-        key = (-strength, doc_id, page_no, quote)
+        key = (-strength, doc_id, page_no, bounded)
         if best is None or key < best:
             best = key
     if best is None:
@@ -2760,6 +2780,37 @@ def find_unique_whitespace_insensitive_span(
     return None
 
 
+def bounded_verified_quote_text(
+    quote: str | None,
+    *,
+    page_text: str | None = None,
+    max_len: int = SOURCE_REF_QUOTE_MAX_LEN,
+) -> str | None:
+    """Return ≤max_len quote text that is an exact substring of ``page_text``.
+
+    When ``page_text`` is provided, exact or unique whitespace-insensitive
+    matches are accepted, then clipped to ``max_len`` only if the clipped
+    prefix remains an exact page substring. Overlong quotes without a
+    verifiable page span are dropped (fail-closed).
+    """
+    text = (quote or "").strip()
+    if not text:
+        return None
+    if page_text is None:
+        return text if len(text) <= max_len else None
+    resolved: str | None
+    if text in page_text:
+        resolved = text
+    else:
+        resolved = find_unique_whitespace_insensitive_span(page_text, text)
+    if resolved is None:
+        return None
+    if len(resolved) <= max_len:
+        return resolved
+    clipped = resolved[:max_len]
+    return clipped if clipped in page_text else None
+
+
 def _repair_ref_quote_whitespace(
     ref: dict[str, Any],
     *,
@@ -2782,14 +2833,21 @@ def _repair_ref_quote_whitespace(
     if not isinstance(page_text, str) or not page_text:
         return ref, False
     if quote in page_text:
-        return ref, False
+        # Exact hit may still exceed SourceRef max_length — clip to verified prefix.
+        bounded = bounded_verified_quote_text(quote, page_text=page_text)
+        if bounded is None or bounded == quote:
+            return ref, False
+        repaired = dict(ref)
+        repaired["quote_text"] = bounded
+        return repaired, True
     span = find_unique_whitespace_insensitive_span(page_text, quote)
     if span is None:
         return ref, False
-    if span == quote:
+    bounded = bounded_verified_quote_text(span, page_text=page_text)
+    if bounded is None or bounded == quote:
         return ref, False
     repaired = dict(ref)
-    repaired["quote_text"] = span
+    repaired["quote_text"] = bounded
     return repaired, True
 
 
@@ -4034,8 +4092,13 @@ def backfill_project_biz_evidence(
                 new_biz.append(rel)
                 continue
             doc_id, page_no, line = row
+            page_text = (page_texts or {}).get((doc_id, page_no)) or ""
+            quote = bounded_verified_quote_text(line, page_text=page_text)
+            if quote is None:
+                new_biz.append(rel)
+                continue
             match = SourceRef(
-                document_id=doc_id, page_no=page_no, quote_text=line
+                document_id=doc_id, page_no=page_no, quote_text=quote
             )
             project_changed = True
             new_biz.append(rel.model_copy(update={"source_refs": [match]}))
