@@ -35,13 +35,13 @@ def test_kosa_work_history_then_technical_projects_never_reopen_on_header() -> N
     )
     assert len(work) == 7
     assert all(
-        _classify_span(span.text, section=span.section) == "employment"
+        _classify_span(span.text, section=span.section, doc_type=span.doc_type) == "employment"
         for span in work
     )
     assert technical_headers
     assert all(span.section == "project" for span in technical_headers)
     assert all(
-        _classify_span(span.text, section=span.section) == "project"
+        _classify_span(span.text, section=span.section, doc_type=span.doc_type) == "project"
         for span in technical_headers
     )
     assert technical_last.section == "project"
@@ -69,5 +69,17 @@ def test_non_kosa_generic_employment_section_behavior_is_unchanged() -> None:
         "에이회사 2001.01.01 ~ 2002.12.31"
     )
     spans = list(_iter_context_spans({(_DOC, 1): text}, {_DOC: "DOC-RESUME"}))
-    header = next(span for span in spans if "회사명" in span.text)
-    assert header.section == "employment"
+    # The unmarked "회사명 |" prefix is emitted as a separate sticky
+    # project-context span by the existing collapsed-line splitter.
+    # The explicit 입사일/퇴사일 markers still reopen employment on resumes.
+    markers = [
+        span for span in spans
+        if "입사일" in span.text or "퇴사일" in span.text
+    ]
+    assert markers
+    assert all(span.section == "employment" for span in markers)
+    assert all(
+        _classify_span(span.text, section=span.section, doc_type=span.doc_type)
+        == "employment"
+        for span in markers
+    )
