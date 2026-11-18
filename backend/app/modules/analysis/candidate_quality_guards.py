@@ -247,7 +247,7 @@ def _line_has_company(line: str, company: str) -> bool:
         start = idx + 1
 
 
-def _classify_span(text: str, *, section: str) -> str:
+def _classify_span(text: str, *, section: str, doc_type: str | None = None) -> str:
     """Classify a span using sticky section context; never doc-type alone."""
     has_participation = bool(_PROJECT_PARTICIPATION_TABLE_RE.search(text))
     has_emp_section = bool(_EMPLOYMENT_SECTION_RE.search(text))
@@ -266,9 +266,13 @@ def _classify_span(text: str, *, section: str) -> str:
         # misread KOSA technical-history tables. Sticky project context
         # remains authoritative unless a real employment-section heading
         # is present. The source span classifier supplies that context.
-        if section == "project" and not re.search(
+        if (
+            section == "project"
+            and (doc_type or "").strip().upper() == "DOC-KOSA"
+            and not re.search(
             r"근\s*무\s*경\s*력|재\s*직\s*기\s*간|경\s*력\s*사\s*항",
-            text,
+                text,
+            )
         ):
             return "project"
         return "employment"
@@ -505,7 +509,7 @@ def _collect_kosa_exact_day_employment_periods(
     for span in spans:
         if (span.doc_type or "").strip().upper() != "DOC-KOSA":
             continue
-        if _classify_span(span.text, section=span.section) != "employment":
+        if _classify_span(span.text, section=span.section, doc_type=span.doc_type) != "employment":
             continue
         if not _span_matches_employment_company(span.text, raw=raw, stem=stem):
             continue
@@ -857,7 +861,7 @@ def _iter_kosa_project_windows(
         if (span.doc_type or "").strip().upper() != "DOC-KOSA":
             flush()
             continue
-        if _classify_span(span.text, section=span.section) != "project":
+        if _classify_span(span.text, section=span.section, doc_type=span.doc_type) != "project":
             flush()
             continue
         key = (span.doc_id, span.page_no)
@@ -986,7 +990,7 @@ def _kosa_project_span_attests_affiliation_period(
     for span in spans:
         if (span.doc_type or "").strip().upper() != "DOC-KOSA":
             continue
-        if _classify_span(span.text, section=span.section) != "project":
+        if _classify_span(span.text, section=span.section, doc_type=span.doc_type) != "project":
             continue
         if not _line_has_company(span.text, company):
             continue
@@ -1038,7 +1042,7 @@ def _matches_kosa_source_participation_period(
     for span in spans:
         if (span.doc_type or "").strip().upper() != "DOC-KOSA":
             continue
-        if _classify_span(span.text, section=span.section) != "project":
+        if _classify_span(span.text, section=span.section, doc_type=span.doc_type) != "project":
             continue
         if not _line_has_company(span.text, company):
             continue
@@ -1297,7 +1301,7 @@ def _clear_employment_evidence_hits(
     # Walk original span order — never skip project/other/ambiguous neighbors
     # by filtering to employment-only indices first.
     for index, span in enumerate(spans):
-        span_kind = _classify_span(span.text, section=span.section)
+        span_kind = _classify_span(span.text, section=span.section, doc_type=span.doc_type)
         if span_kind != "employment":
             continue
         if not _span_matches_employment_company(span.text, raw=raw, stem=stem):
@@ -1336,7 +1340,7 @@ def _clear_employment_evidence_hits(
         nxt = spans[index + 1]
         if nxt.doc_id != span.doc_id or nxt.page_no != span.page_no:
             continue
-        nxt_kind = _classify_span(nxt.text, section=nxt.section)
+        nxt_kind = _classify_span(nxt.text, section=nxt.section, doc_type=nxt.doc_type)
         if nxt_kind != "employment":
             continue
         range_pair = _line_is_single_date_range(nxt.text)
@@ -1572,7 +1576,7 @@ def _guard_employment_history(
         for span in spans:
             if not _line_has_company(span.text, company):
                 continue
-            kind = _classify_span(span.text, section=span.section)
+            kind = _classify_span(span.text, section=span.section, doc_type=span.doc_type)
             if kind == "employment":
                 has_employment_evidence = True
                 ranges = _extract_range_dates(span.text)
@@ -2414,11 +2418,11 @@ def _v25_prune_cross_section_rows(
     )
     project_spans = [
         span for span in spans
-        if _classify_span(span.text, section=span.section) == "project"
+        if _classify_span(span.text, section=span.section, doc_type=span.doc_type) == "project"
     ]
     employer_spans = [
         span for span in spans
-        if _classify_span(span.text, section=span.section) == "employment"
+        if _classify_span(span.text, section=span.section, doc_type=span.doc_type) == "employment"
     ]
 
     def is_project_table_misread_as_employment(row: EmploymentCandidate) -> bool:
@@ -2483,7 +2487,7 @@ def _v25_prune_cross_section_rows(
         has_unknown = bool(company) and any(
             _line_has_company(span.text, company)
             for span in spans
-            if _classify_span(span.text, section=span.section) == "ambiguous"
+            if _classify_span(span.text, section=span.section, doc_type=span.doc_type) == "ambiguous"
         )
         if (
             has_employer_table
