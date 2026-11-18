@@ -17,7 +17,8 @@ _MD_EMPTYISH_LINE_RE = re.compile(r"^[\s|:\-]+$")
 _YEAR_TOKEN_RE = re.compile(r"(?:19|20)\d{2}")
 _CAREER_ANCHOR_RE = re.compile(r"근무경력|재직기간|경력사항")
 _KOSA_EMPLOYMENT_ANCHOR_RE = re.compile(
-    r"근\s*무\s*경\s*력|재\s*직\s*기\s*간|경\s*력\s*사\s*항|근\s*무\s*처|회\s*사\s*명"
+    r"근\s*무\s*경\s*력|재\s*직\s*기\s*간|경\s*력\s*사\s*항|"
+    r"근\s*무\s*처|근\s*무\s*기\s*간|입\s*사\s*일|퇴\s*사\s*일"
 )
 _KOSA_DATED_CELL_RE = re.compile(r"(?:19|20)\d{2}[./-]\d{1,2}(?:[./-]\d{1,2})?")
 
