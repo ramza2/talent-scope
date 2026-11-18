@@ -362,7 +362,7 @@ def test_kosa_empty_table_triggers_memory_only_banding_without_reprocess_flag(
     """DOC-KOSA empty MD-table VLM quality → band in memory; never rewrite page."""
     prior = _empty_kosa_md_table_vlm_text()
     rows = "\n".join(
-        f"확인 | 프로젝트{i} | 2025.01 | 발주처 | 소속사 | 개발 | SW개발"
+        f"근무경력 | 에이회사{i} | 201{i}.01.01 | 201{i}.12.31 | 사원"
         for i in range(5)
     )
     vlm = FakeVLMProvider(rows if valid else "not a table row")
@@ -403,10 +403,10 @@ def test_kosa_empty_table_triggers_memory_only_banding_without_reprocess_flag(
     assert page.layout_json == {"needs_vlm": False, "vlm_transcribed": True}
     if valid:
         assert vlm.calls == 3
-        assert result.blocks[0].text.startswith("[PAGE 1]\n확인 | 프로젝트0")
+        assert result.blocks[0].text.startswith("[PAGE 1]\n근무경력 | 에이회사0")
     else:
         # Fail closed: keep stored empty-table text for analysis prompt.
-        assert vlm.calls == 1
+        assert vlm.calls == 4
         assert result.blocks[0].text == f"[PAGE 1]\n{prior}"
 
 
