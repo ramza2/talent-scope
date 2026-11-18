@@ -1967,3 +1967,157 @@ def test_kosa_contiguous_other_doc_overlapping_period_keeps_review() -> None:
     assert employment_candidate_dates_need_review(emp) is True
     assert "2013.01.02" in (emp.end_date or "")
     assert "2014.09.30" in (emp.end_date or "")
+
+
+def test_kosa_affiliation_participation_not_employment_keeps_work_history() -> None:
+    """김준수-shaped KOSA: 근무경력 stays; 소속회사+참여기간 is project-only."""
+    page_texts = {
+        (_KOSA, 1): (
+            "근무경력\n"
+            "에이회사 2008.03.01 ~ 2010.02.28 사원\n"
+            "비이회사 2010.03.01 ~ 2012.06.30 대리\n"
+            "씨이회사 2012.07.01 ~ 2014.12.31 과장\n"
+            "디이회사 2015.01.01 ~ 2016.12.31 차장\n"
+            "이이회사 2017.01.01 ~ 2018.12.31 부장\n"
+            "에프회사 2019.01.01 ~ 2021.06.30 수석\n"
+            "지이회사 2021.07.01 ~ 2024.12.31 이사\n"
+            "기술경력 프로젝트 수행경력 연번 참여기간 사업명 발주처 소속회사 직위\n"
+            "1 2019.03.01 ~ 2019.08.31 공공클라우드구축 한국환경공단 에프회사 수석\n"
+            "2 2020.01.01 ~ 2020.06.30 데이터표준화 국방부 에프회사 수석\n"
+            "3 2022.01.01 ~ 2022.12.31 지능형관제 서울시 지이회사 이사\n"
+        ),
+    }
+    employment = [
+        EmploymentCandidate(
+            company_name="에이회사",
+            start_date="2008.03.01",
+            end_date="2010.02.28",
+        ),
+        EmploymentCandidate(
+            company_name="비이회사",
+            start_date="2010.03.01",
+            end_date="2012.06.30",
+        ),
+        EmploymentCandidate(
+            company_name="씨이회사",
+            start_date="2012.07.01",
+            end_date="2014.12.31",
+        ),
+        EmploymentCandidate(
+            company_name="디이회사",
+            start_date="2015.01.01",
+            end_date="2016.12.31",
+        ),
+        EmploymentCandidate(
+            company_name="이이회사",
+            start_date="2017.01.01",
+            end_date="2018.12.31",
+        ),
+        EmploymentCandidate(
+            company_name="에프회사",
+            start_date="2019.01.01",
+            end_date="2021.06.30",
+        ),
+        EmploymentCandidate(
+            company_name="지이회사",
+            start_date="2021.07.01",
+            end_date="2024.12.31",
+        ),
+        # Fabricated from 소속회사 + 참여기간 (must drop).
+        EmploymentCandidate(
+            company_name="에프회사",
+            start_date="2019.03.01",
+            end_date="2019.08.31",
+            title="수석",
+        ),
+        EmploymentCandidate(
+            company_name="에프회사",
+            start_date="2020.01.01",
+            end_date="2020.06.30",
+            title="수석",
+        ),
+        EmploymentCandidate(
+            company_name="지이회사",
+            start_date="2022.01.01",
+            end_date="2022.12.31",
+            title="이사",
+        ),
+    ]
+    projects = [
+        ProjectCandidate(
+            project_name="공공클라우드구축",
+            customer_name="한국환경공단",
+            start_date="2019.03.01",
+            end_date="2019.08.31",
+        ),
+        ProjectCandidate(
+            project_name="데이터표준화",
+            customer_name="국방부",
+            start_date="2020.01.01",
+            end_date="2020.06.30",
+        ),
+        ProjectCandidate(
+            project_name="지능형관제",
+            customer_name="서울시",
+            start_date="2022.01.01",
+            end_date="2022.12.31",
+        ),
+    ]
+    candidate = ProfileCandidateDocument(
+        employment_history=employment,
+        projects=projects,
+    )
+    result = apply_candidate_quality_guards(
+        candidate,
+        page_texts=page_texts,
+        document_type_by_id={_KOSA: "DOC-KOSA"},
+    )
+    kept = [
+        (e.company_name, e.start_date, e.end_date)
+        for e in result.employment_history
+    ]
+    assert kept == [
+        ("에이회사", "2008.03.01", "2010.02.28"),
+        ("비이회사", "2010.03.01", "2012.06.30"),
+        ("씨이회사", "2012.07.01", "2014.12.31"),
+        ("디이회사", "2015.01.01", "2016.12.31"),
+        ("이이회사", "2017.01.01", "2018.12.31"),
+        ("에프회사", "2019.01.01", "2021.06.30"),
+        ("지이회사", "2021.07.01", "2024.12.31"),
+    ]
+    assert len(result.employment_history) == 7
+    assert len(result.projects) == 3
+
+
+def test_normal_resume_employer_period_not_dropped_without_project_evidence() -> None:
+    """General resume: employer+period with 근무경력 evidence stays."""
+    page_texts = {
+        (_DOCX, 1): (
+            "근무경력\n"
+            "오픈링크 2018.01 ~ 2020.12 엔지니어\n"
+        ),
+    }
+    row = EmploymentCandidate(
+        company_name="오픈링크",
+        start_date="2018.01",
+        end_date="2020.12",
+        title="엔지니어",
+    )
+    candidate = ProfileCandidateDocument(
+        employment_history=[row],
+        projects=[
+            ProjectCandidate(
+                project_name="내부시스템",
+                customer_name="다른고객",
+                start_date="2018.01",
+                end_date="2020.12",
+            )
+        ],
+    )
+    result = apply_candidate_quality_guards(
+        candidate,
+        page_texts=page_texts,
+        document_type_by_id={_DOCX: "DOC-PROFILE"},
+    )
+    assert len(result.employment_history) == 1
+    assert result.employment_history[0].company_name == "오픈링크"

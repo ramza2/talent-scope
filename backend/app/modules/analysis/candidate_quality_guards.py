@@ -40,25 +40,29 @@ _CAREER_DURATION_RE = re.compile(
     r"(?:\d+\s*년(?:\s*\d+\s*개월)?|\d+\s*개월)"
 )
 
+# NOTE: Do NOT treat 소속회사 as an employment section/row marker. KOSA
+# 기술경력 / 프로젝트 수행 tables use 소속회사 + 참여기간 columns; matching
+# them as 근무경력 flips sticky section context and fabricates employers.
 _EMPLOYMENT_SECTION_RE = re.compile(
-    r"근무경력|재직기간|경력사항|직장명|근무처|소속회사|근무기관|재직회사|"
+    r"근무경력|재직기간|경력사항|직장명|근무처|근무기관|재직회사|"
     r"회사명\s*기간\s*직위|최종직급|입사\s*일|퇴사\s*일"
 )
 _PROJECT_SECTION_RE = re.compile(
-    r"프로젝트\s*수행내역|프로젝트\s*경력|수행내역|참여사업|수행사업|"
+    r"프로젝트\s*수행내역|프로젝트\s*수행\s*경력|프로젝트\s*경력|기술경력|"
+    r"수행내역|참여사업|수행사업|"
     r"경력기술서|경력기술|발주처|발주기관|고객사|사업명|수행역할|업무내용|"
-    r"수행\s*프로젝트"
+    r"수행\s*프로젝트|참여기간"
 )
 _PROJECT_ROW_RE = re.compile(
     r"발주처|발주기관|고객사|사업명|프로젝트\s*수행|수행내역|정보화|"
-    r"시스템\s*구축|BIA|BCP|이전통합"
+    r"시스템\s*구축|BIA|BCP|이전통합|참여기간|소속회사"
 )
 # Participation tables include 소속회사/직위 columns, but their rows are
 # projects, not employer-history dates. Require this explicit source heading
 # before dropping a malformed v25 employer candidate.
 _PROJECT_PARTICIPATION_TABLE_RE = re.compile(
-    r"프로젝트\s*수행\s*(?:경력|내역)|"
-    r"(?:참여기간|사업명|사\s*업\s*명).*?발주처",
+    r"프로젝트\s*수행\s*(?:경력|내역)|기술경력|"
+    r"(?:참여기간|사업명|사\s*업\s*명).*?(?:발주처|소속회사)",
     re.DOTALL,
 )
 _PROJECT_ROLE_AS_END_RE = re.compile(
@@ -67,7 +71,7 @@ _PROJECT_ROLE_AS_END_RE = re.compile(
 # Bare "프로젝트" alone is too weak for row classification — it often appears
 # as the start of a following section header on collapsed KOSA lines.
 _EMPLOYMENT_ROW_RE = re.compile(
-    r"근무경력|재직기간|직장명|근무처|소속회사|근무기관|재직회사|"
+    r"근무경력|재직기간|직장명|근무처|근무기관|재직회사|"
     r"회사명|최종직급|담당업무|직위|재직"
 )
 # Avoid bare "전공"/"학위" — they appear inside majors like 유전공학.
@@ -245,16 +249,22 @@ def _line_has_company(line: str, company: str) -> bool:
 
 def _classify_span(text: str, *, section: str) -> str:
     """Classify a span using sticky section context; never doc-type alone."""
+    has_participation = bool(_PROJECT_PARTICIPATION_TABLE_RE.search(text))
     has_emp_section = bool(_EMPLOYMENT_SECTION_RE.search(text))
     has_proj_section = bool(_PROJECT_SECTION_RE.search(text))
     has_emp_row = bool(_EMPLOYMENT_ROW_RE.search(text))
     has_proj_row = bool(_PROJECT_ROW_RE.search(text))
 
+    # Participation / 기술경력 tables win over any 소속회사-like residue.
+    if has_participation:
+        return "project"
     # Explicit section headers win; mixed supply of both stays sticky-driven.
     if has_proj_section and not has_emp_section:
         return "project"
     if has_emp_section and not has_proj_section:
         return "employment"
+    if has_proj_section and has_emp_section:
+        return "project"
     if section == "project":
         return "project"
     if has_proj_row and not has_emp_row and not has_emp_section:
@@ -350,12 +360,16 @@ def _iter_context_spans(
             for section_hint, span_text in _split_collapsed_line(
                 line, page_section=sticky
             ):
-                if _EMPLOYMENT_SECTION_RE.search(span_text):
-                    sticky = "employment"
-                    section = "employment"
-                elif _PROJECT_SECTION_RE.search(span_text):
+                # Prefer 기술경력 / 참여기간 participation tables over employment
+                # sticky so 소속회사 columns never re-open 근무경력 context.
+                if _PROJECT_PARTICIPATION_TABLE_RE.search(
+                    span_text
+                ) or _PROJECT_SECTION_RE.search(span_text):
                     sticky = "project"
                     section = "project"
+                elif _EMPLOYMENT_SECTION_RE.search(span_text):
+                    sticky = "employment"
+                    section = "employment"
                 else:
                     section = section_hint if section_hint != "unknown" else sticky
                 yield _ContextSpan(
@@ -756,6 +770,29 @@ def _matches_project_customer_period(
         if not dates_compatible(row.start_date, project.start_date):
             continue
         # End may be omitted on either side; compatible ends strengthen the hit.
+        if row.end_date and project.end_date:
+            if not dates_compatible(row.end_date, project.end_date):
+                continue
+        return True
+    return False
+
+
+def _matches_project_participation_period(
+    row: EmploymentCandidate,
+    projects: list[ProjectCandidate],
+) -> bool:
+    """True when employer dates mirror a project 참여기간 (any customer).
+
+    Used to reject 소속회사 + 참여기간 rows misread as 근무경력. Does not
+    require customer_name == company_name.
+    """
+    if not (row.start_date or "").strip():
+        return False
+    for project in projects:
+        if not (project.start_date or "").strip():
+            continue
+        if not dates_compatible(row.start_date, project.start_date):
+            continue
         if row.end_date and project.end_date:
             if not dates_compatible(row.end_date, project.end_date):
                 continue
@@ -1276,6 +1313,7 @@ def _guard_employment_history(
 
         emp_dates: list[tuple[str | None, str | None]] = []
         has_employment_evidence = False
+        has_matching_employment_period = False
         has_project_evidence = False
 
         for span in spans:
@@ -1284,18 +1322,33 @@ def _guard_employment_history(
             kind = _classify_span(span.text, section=span.section)
             if kind == "employment":
                 has_employment_evidence = True
-                emp_dates.extend(_extract_range_dates(span.text))
+                ranges = _extract_range_dates(span.text)
+                emp_dates.extend(ranges)
+                for start, end in ranges:
+                    if _employment_period_compatible(
+                        row.start_date, row.end_date, start, end
+                    ):
+                        has_matching_employment_period = True
             elif kind == "project":
                 has_project_evidence = True
 
         is_customer_name = company_key in customer_keys
         mirrors_project = _matches_project_customer_period(row, projects)
-        # Certain mix-in only: project customer with project-page/period evidence
-        # and no employer-table / KOSA employment-section evidence.
+        mirrors_participation = _matches_project_participation_period(
+            row, projects
+        )
+        # Certain mix-in only: project customer with no employer evidence, or
+        # 소속회사+참여기간 rows whose period is not attested in 근무경력.
         if (
             is_customer_name
             and not has_employment_evidence
             and (has_project_evidence or mirrors_project)
+        ):
+            continue
+        if (
+            has_project_evidence
+            and mirrors_participation
+            and not has_matching_employment_period
         ):
             continue
 
