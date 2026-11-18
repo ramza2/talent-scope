@@ -368,8 +368,22 @@ def _iter_context_spans(
                     sticky = "project"
                     section = "project"
                 elif _EMPLOYMENT_SECTION_RE.search(span_text):
-                    sticky = "employment"
-                    section = "employment"
+                    # KOSA 기술경력 can contain a table header such as
+                    # "회사명 | 입사일 | 퇴사일 | 근무기간". A generic column
+                    # label must not re-open employment after 기술경력.
+                    # Only an explicit work-history section may do so.
+                    explicit_work_section = bool(
+                        re.search(r"근\s*무\s*경\s*력|재\s*직\s*기\s*간|경\s*력\s*사\s*항", span_text)
+                    )
+                    if (
+                        (doc_type or "").strip().upper() == "DOC-KOSA"
+                        and sticky == "project"
+                        and not explicit_work_section
+                    ):
+                        section = "project"
+                    else:
+                        sticky = "employment"
+                        section = "employment"
                 else:
                     section = section_hint if section_hint != "unknown" else sticky
                 yield _ContextSpan(
