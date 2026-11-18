@@ -16,6 +16,10 @@ _MD_PIPE_LINE_RE = re.compile(r"\|")
 _MD_EMPTYISH_LINE_RE = re.compile(r"^[\s|:\-]+$")
 _YEAR_TOKEN_RE = re.compile(r"(?:19|20)\d{2}")
 _CAREER_ANCHOR_RE = re.compile(r"근무경력|재직기간|경력사항")
+_KOSA_EMPLOYMENT_ANCHOR_RE = re.compile(
+    r"근\s*무\s*경\s*력|재\s*직\s*기\s*간|경\s*력\s*사\s*항|근\s*무\s*처|회\s*사\s*명"
+)
+_KOSA_DATED_CELL_RE = re.compile(r"(?:19|20)\d{2}[./-]\d{1,2}(?:[./-]\d{1,2})?")
 
 
 @dataclass(frozen=True)
@@ -223,3 +227,24 @@ def is_kosa_empty_markdown_table_vlm_quality_issue(text: str) -> bool:
     has_year = bool(_YEAR_TOKEN_RE.search(raw))
     # Empty chrome pages typically lack both career headers and year tokens.
     return not (has_career and has_year)
+
+
+
+def is_plausible_kosa_employment_recovery(text: str) -> bool:
+    """Accept a re-read scanned career table only with independently visible dates.
+
+    A lone birth date, a heading-only answer, empty Markdown scaffolding, or
+    a project-only transcription must never replace the stored page content.
+    This is a quality gate, not an employer-row count assertion.
+    """
+    raw = (text or "").strip()
+    if not raw or len(raw) > 24000:
+        return False
+    if is_kosa_empty_markdown_table_vlm_quality_issue(raw):
+        return False
+    if not _KOSA_EMPLOYMENT_ANCHOR_RE.search(raw):
+        return False
+    dated = _KOSA_DATED_CELL_RE.findall(raw)
+    if len(set(dated)) < 4:
+        return False
+    return sum(bool(_KOSA_DATED_CELL_RE.search(line)) for line in raw.splitlines()) >= 2
