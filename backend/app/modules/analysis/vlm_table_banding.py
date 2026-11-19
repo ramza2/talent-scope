@@ -267,6 +267,71 @@ _KOSA_PROJECT_ONLY_FIELD_RE = re.compile(
 )
 
 
+
+def normalize_kosa_cropped_project_rows(text: str) -> str | None:
+    """Validate a KOSA p1 *lower* technical-history crop independently.
+
+    Keep six original fields verbatim: project, period, client, affiliation,
+    title, responsibility. Never manufacture project names/dates from the
+    employer table. An uncertain or incomplete crop is not authoritative.
+    """
+    raw = (text or "").strip()
+    if not raw or len(raw) > 12000 or is_kosa_empty_markdown_table_vlm_quality_issue(raw):
+        return None
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    if lines and lines[0].replace(" ", "") == "기술경력":
+        lines = lines[1:]
+    if not 1 <= len(lines) <= 30:
+        return None
+    rows: list[str] = []
+    for line in lines:
+        if len(line) > 500:
+            return None
+        cells = [cell.strip() for cell in line.strip("|").split("|")]
+        if len(cells) != 6:
+            return None
+        project, period, customer, company, _title, _duty = cells
+        if (
+            not 2 <= len(project) <= 150
+            or not 2 <= len(customer) <= 150
+            or not 2 <= len(company) <= 150
+            or "근무경력" in project
+        ):
+            return None
+        match = _KOSA_COMPLETE_WORK_RANGE_RE.fullmatch(period)
+        if match is None:
+            return None
+        try:
+            start = date(*(int(part) for part in re.split(r"[./-]", match[1])))
+            end = date(*(int(part) for part in re.split(r"[./-]", match[2])))
+        except ValueError:
+            return None
+        if end < start:
+            return None
+        rows.append(line)
+    if len(rows) != len(set(rows)):
+        return None
+    return "기술경력\n" + "\n".join(rows)
+
+
+def split_verified_kosa_p1_sections(text: str) -> tuple[str, str] | None:
+    """Return validated employer and technical sections of the same p1 scan.
+
+    Work-only text (old V38 diagnostics) is accepted; if a technical marker is
+    present, the lower rows must also pass strict independent validation.
+    """
+    raw = (text or "").strip()
+    upper, sep, lower = raw.partition("\n기술경력\n")
+    work = normalize_kosa_cropped_employment_rows(upper)
+    if work is None:
+        return None
+    if not sep:
+        return (work, "")
+    projects = normalize_kosa_cropped_project_rows(lower)
+    if projects is None:
+        return None
+    return (work, projects)
+
 def normalize_kosa_cropped_employment_rows(text: str) -> str | None:
     """Validate rule-free KOSA p1 work-table crop before replacing LLM input.
 
