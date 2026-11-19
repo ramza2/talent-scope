@@ -50,7 +50,8 @@ def verified_kosa_core_output_ratio(
     3584 of 8192 context tokens; the 2048-token default repeatedly truncated.
     Match the 7/16 fraction, not a global model or service configuration.
     The override requires exactly one DOC-KOSA, a structurally verified
-    employment-only p1 table, and explicitly disabled thinking. All other
+    employer p1 table (including independently validated lower projects),
+    and explicitly disabled thinking. All other
     document flows retain their configured ratio.
     """
     if enable_thinking is not False or not page_texts:
@@ -64,11 +65,11 @@ def verified_kosa_core_output_ratio(
         return float(configured_ratio)
 
     from app.modules.analysis.vlm_table_banding import (
-        normalize_kosa_cropped_employment_rows,
+        split_verified_kosa_p1_sections,
     )
 
     p1_text = page_texts.get((doc_id, 1), "")
-    if normalize_kosa_cropped_employment_rows(p1_text) is None:
+    if split_verified_kosa_p1_sections(p1_text) is None:
         return float(configured_ratio)
     return max(float(configured_ratio), 7.0 / 16.0)
 
