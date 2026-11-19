@@ -1575,6 +1575,40 @@ def _verified_kosa_p1_employment_companies(
     return doc_id, {company for company, _, _ in seen}
 
 
+def _has_verified_kosa_p1_employment_period(
+    row: EmploymentCandidate,
+    *,
+    verified: tuple[str, set[str]] | None,
+    spans: list[_ContextSpan],
+) -> bool:
+    """Protect exact p1 employer+period evidence even when duty text looks project-like.
+
+    A work-table row such as '회사 | 날짜 | 시스템구축 및 운영' may be
+    classified as a project because of the duty description. Its p1 source
+    section and matching company+period are stronger evidence than that
+    keyword. Never infer employers from p2 project periods or customer names.
+    """
+    if verified is None:
+        return False
+    company = (row.company_name or "").strip()
+    key = _company_match_key(company)
+    if not key or key not in verified[1]:
+        return False
+    return any(
+        span.doc_id == verified[0]
+        and span.page_no == 1
+        and span.section == "employment"
+        and _line_has_company(span.text, company)
+        and any(
+            _employment_period_compatible(
+                row.start_date, row.end_date, start, end
+            )
+            for start, end in _extract_range_dates(span.text)
+        )
+        for span in spans
+    )
+
+
 def _guard_employment_history(
     candidate: ProfileCandidateDocument,
     *,
@@ -1633,6 +1667,14 @@ def _guard_employment_history(
                         has_matching_employment_period = True
             elif kind == "project":
                 has_project_evidence = True
+
+        if _has_verified_kosa_p1_employment_period(
+            row, verified=verified_kosa_work, spans=spans
+        ):
+            # This is actual employer-table evidence regardless of whether
+            # '시스템구축' in the responsibilities misclassified the span.
+            has_employment_evidence = True
+            has_matching_employment_period = True
 
         # After a structured KOSA p1 work table is recovered, do not
         # keep a different company's p2+ technical-project row as employment
