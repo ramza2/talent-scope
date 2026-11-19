@@ -2585,3 +2585,94 @@ def test_v38_kosa_project_only_drop_requires_complete_single_kosa_context() -> N
         document_type_by_id={_KOSA: "DOC-KOSA"},
     )
     assert len(kept_unlinked.employment_history) == 1
+
+
+
+def test_v38_kosa_p1_real_employer_with_project_like_duties_kept() -> None:
+    """A real KOSA employer must survive when its duty says '시스템구축'."""
+    company = "(재)가상통관진흥원"
+    p1_rows = [
+        f"{company} | 2008.06.24 ~ 2009.06.25 | 시스템구축 및 운영",
+        "가상기업2 | 2007.03.12 ~ 2008.02.28 | 기획",
+        "가상기업3 | 2006.03.04 ~ 2006.08.30 | 기획",
+        "가상기업4 | 2004.08.01 ~ 2005.04.29 | 마케팅",
+        "가상기업5 | 2001.06.01 ~ 2003.12.31 | 마케팅",
+        "가상기업6 | 1999.10.01 ~ 2001.05.30 | 마케팅",
+        "가상기업7 | 1990.05.07 ~ 1999.09.30 | 마케팅",
+    ]
+    pages = {
+        (_KOSA, 1): "근무경력\n" + "\n".join(p1_rows),
+        (_KOSA, 2): (
+            "기술경력\n확인\n기술사업 수행\n2019.10.01 ~ 2020.04.30\n"
+            "발주기관A\n타쓰리큐 주식회사\n컨설턴트\n"
+            "확인\n품질관리사업\n2014.05.31 ~ 2014.12.01\n"
+            "발주기관B\n(주)케이씨넷\n개발\n"
+        ),
+    }
+    work = []
+    for line in p1_rows:
+        name, period, _duty = [cell.strip() for cell in line.split("|")]
+        start, end = [item.strip() for item in period.split("~")]
+        work.append(
+            EmploymentCandidate(
+                company_name=name,
+                start_date=start,
+                end_date=end,
+                source_refs=[
+                    SourceRef(document_id=_KOSA, page_no=1, quote_text=line)
+                ],
+            )
+        )
+    contaminations = [
+        EmploymentCandidate(
+            company_name="타쓰리큐 주식회사",
+            start_date="2019.10.01",
+            end_date="2020.10.30",
+            source_refs=[
+                SourceRef(
+                    document_id=_KOSA,
+                    page_no=2,
+                    quote_text="타쓰리큐 주식회사",
+                )
+            ],
+        ),
+        EmploymentCandidate(
+            company_name="(주)케이씨넷",
+            start_date="2013.05.31",
+            end_date="2014.12.01",
+            source_refs=[
+                SourceRef(
+                    document_id=_KOSA,
+                    page_no=2,
+                    quote_text="(주)케이씨넷",
+                )
+            ],
+        ),
+    ]
+    projects = [
+        ProjectCandidate(
+            project_name="가상IT사업",
+            customer_name=company,
+            start_date="2024.01.01",
+            end_date="2024.12.31",
+        )
+    ]
+    candidate = ProfileCandidateDocument(
+        employment_history=[*work, *contaminations],
+        projects=projects,
+    )
+    after = apply_candidate_quality_guards(
+        candidate,
+        page_texts=pages,
+        document_type_by_id={_KOSA: "DOC-KOSA"},
+    )
+    assert len(after.employment_history) == 7
+    assert [
+        (row.company_name, row.start_date, row.end_date)
+        for row in after.employment_history
+    ] == [
+        (row.company_name, row.start_date, row.end_date)
+        for row in work
+    ]
+    assert after.projects == projects
+    assert len(candidate.employment_history) == 9
