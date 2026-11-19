@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import date
 
 import pymupdf
 
@@ -249,3 +250,55 @@ def is_plausible_kosa_employment_recovery(text: str) -> bool:
     if len(set(dated)) < 4:
         return False
     return sum(bool(_KOSA_DATED_CELL_RE.search(line)) for line in raw.splitlines()) >= 2
+
+
+
+_KOSA_COMPLETE_WORK_RANGE_RE = re.compile(
+    r"^\s*((?:19|20)\d{2}[./-]\d{1,2}[./-]\d{1,2})"
+    r"\s*[~～\-–—]\s*"
+    r"((?:19|20)\d{2}[./-]\d{1,2}[./-]\d{1,2})\s*$"
+)
+_KOSA_PROJECT_ONLY_FIELD_RE = re.compile(
+    r"참여사업|참여기간|발주처|발주기관|고객사|프로젝트|기술경력|사업명"
+)
+
+
+def normalize_kosa_cropped_employment_rows(text: str) -> str | None:
+    """Validate rule-free KOSA p1 work-table crop before replacing LLM input.
+
+    A *dedicated, top-of-page* KOSA crop must transcribe at least three
+    company / complete start-end date rows. Reject partial or mixed project
+    tables. The leading section label is metadata for downstream source
+    classification, never a reconstructed employer, date, or quote.
+    This cannot assert that every row on the original image was recovered.
+    """
+    raw = (text or "").strip()
+    if not raw or len(raw) > 12000 or is_kosa_empty_markdown_table_vlm_quality_issue(raw):
+        return None
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    if lines and lines[0].strip().replace(" ", "") == "근무경력":
+        lines = lines[1:]
+    if not 3 <= len(lines) <= 20:
+        return None
+    rows: list[str] = []
+    for line in lines:
+        cells = [part.strip() for part in line.strip("|").split("|")]
+        if len(cells) not in (2, 3):
+            return None
+        company, period = cells[0], cells[1]
+        if not 2 <= len(company) <= 100 or _KOSA_PROJECT_ONLY_FIELD_RE.search(line):
+            return None
+        match = _KOSA_COMPLETE_WORK_RANGE_RE.fullmatch(period)
+        if not match:
+            return None
+        try:
+            start = date.fromisoformat(match[1].replace(".", "-").replace("/", "-"))
+            end = date.fromisoformat(match[2].replace(".", "-").replace("/", "-"))
+        except ValueError:
+            return None
+        if end < start:
+            return None
+        rows.append(line)
+    if len(set(rows)) != len(rows):
+        return None
+    return "근무경력\n" + "\n".join(rows)
