@@ -292,8 +292,8 @@ def normalize_kosa_cropped_employment_rows(text: str) -> str | None:
         if not match:
             return None
         try:
-            start = date.fromisoformat(match[1].replace(".", "-").replace("/", "-"))
-            end = date.fromisoformat(match[2].replace(".", "-").replace("/", "-"))
+            start = date(*(int(part) for part in re.split(r"[./-]", match[1])))
+            end = date(*(int(part) for part in re.split(r"[./-]", match[2])))
         except ValueError:
             return None
         if end < start:
