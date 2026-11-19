@@ -1676,12 +1676,11 @@ def _guard_employment_history(
             has_employment_evidence = True
             has_matching_employment_period = True
 
-        # After a structured KOSA p1 work table is recovered, do not
-        # keep a different company's p2+ technical-project row as employment
-        # merely because the LLM merged several project periods together.
-        # This check is only for a KOSA-only analysis with strong p1 rows;
-        # a mixed KOSA/DOCX analysis, missing references, or a p1 employer
-        # is always kept for normal review.
+        # After a structured KOSA p1 work table is recovered, a
+        # technical-history affiliation must not become a new employer.
+        # p2+ project-only rows remain filtered as before; p1 entries are
+        # filtered only when the independently verified lower 기술경력
+        # section actually contains the company and matching period.
         if (
             verified_kosa_work is not None
             and _company_match_key(company) not in verified_kosa_work[1]
@@ -1691,7 +1690,25 @@ def _guard_employment_history(
             and all(
                 (ref.document_id or "").strip() == verified_kosa_work[0]
                 and ref.page_no is not None
-                and ref.page_no >= 2
+                and (
+                    ref.page_no >= 2
+                    or (
+                        ref.page_no == 1
+                        and any(
+                            span.doc_id == verified_kosa_work[0]
+                            and span.page_no == 1
+                            and span.section == "project"
+                            and _line_has_company(span.text, company)
+                            and any(
+                                _employment_period_compatible(
+                                    row.start_date, row.end_date, start, end
+                                )
+                                for start, end in _extract_range_dates(span.text)
+                            )
+                            for span in spans
+                        )
+                    )
+                )
                 for ref in row.source_refs
             )
         ):
