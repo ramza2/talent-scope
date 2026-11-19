@@ -2723,6 +2723,92 @@ def _v25_prune_cross_section_rows(
     )
 
 
+
+
+def _verified_kosa_p1_employment_project_mirrors(
+    page_texts: dict[tuple[str, int], str] | None,
+    document_type_by_id: dict[str, str] | None,
+) -> set[tuple[str, str, str, str]]:
+    """Exact (duty, employer, start, end) signatures from verified KOSA p1.
+
+    The V38 work crop is *not* a project table. An LLM may still emit its
+    IT컨설팅/IT마케팅 responsibilities as project titles; only a match on
+    all four observed values permits discarding that false project.
+    """
+    if not page_texts:
+        return set()
+    doc_ids = {str(doc_id) for doc_id, _ in page_texts}
+    if len(doc_ids) != 1:
+        return set()
+    doc_id = next(iter(doc_ids))
+    if (document_type_by_id or {}).get(doc_id, "").strip().upper() != "DOC-KOSA":
+        return set()
+    from app.modules.analysis.vlm_table_banding import (
+        split_verified_kosa_p1_sections,
+    )
+
+    sections = split_verified_kosa_p1_sections(page_texts.get((doc_id, 1), ""))
+    if sections is None:
+        return set()
+
+    mirrors: set[tuple[str, str, str, str]] = set()
+    for line in sections[0].splitlines()[1:]:
+        cells = [cell.strip() for cell in line.strip("|").split("|")]
+        if len(cells) != 3:
+            continue  # An absent duty never proves a false project.
+        company, period, duties = cells
+        duty_title = duties.split(">", 1)[0].strip()
+        employer = _company_match_key(company)
+        dates = _extract_range_dates(period)
+        if not duty_title or not employer or len(dates) != 1:
+            continue
+        start, end = dates[0]
+        start_key, end_key = _normalize_date_token(start), _normalize_date_token(end)
+        if start_key and end_key:
+            mirrors.add((_key(duty_title), employer, start_key, end_key))
+    return mirrors
+
+
+def _guard_kosa_p1_employment_mirror_projects(
+    projects: list[ProjectCandidate],
+    *,
+    page_texts: dict[tuple[str, int], str] | None,
+    document_type_by_id: dict[str, str] | None,
+) -> list[ProjectCandidate]:
+    mirrors = _verified_kosa_p1_employment_project_mirrors(
+        page_texts, document_type_by_id
+    )
+    if not mirrors:
+        return projects
+
+    # A genuine technical-history row on p1 or p2+ overrides any coincidence
+    # with an employer's duty title and dates; do not delete supported work.
+    spans = list(_iter_context_spans(page_texts, document_type_by_id))
+    retained: list[ProjectCandidate] = []
+    for project in projects:
+        name = _key(project.project_name)
+        employer = _company_match_key(project.customer_name)
+        start = _normalize_date_token(project.start_date)
+        end = _normalize_date_token(project.end_date)
+        key = (name, employer, start, end)
+        if not all(key) or key not in mirrors:
+            retained.append(project)
+            continue
+
+        independently_supported = any(
+            span.section == "project"
+            and _line_has_company(span.text, project.project_name or "")
+            and any(
+                _normalize_date_token(s) == start
+                and _normalize_date_token(e) == end
+                for s, e in _extract_range_dates(span.text)
+            )
+            for span in spans
+        )
+        if independently_supported:
+            retained.append(project)
+    return retained
+
 def apply_candidate_quality_guards(
     candidate: ProfileCandidateDocument,
     *,
@@ -2790,6 +2876,12 @@ def apply_candidate_quality_guards(
         ):
             continue
         kept_projects.append(project)
+
+    kept_projects = _guard_kosa_p1_employment_mirror_projects(
+        kept_projects,
+        page_texts=page_texts,
+        document_type_by_id=document_type_by_id,
+    )
 
     kept_employment = _guard_employment_history(
         candidate,
