@@ -113,6 +113,12 @@ def test_scanned_page_recovery_quality_gate() -> None:
         "기술경력\n2001.01.01 ~ 2003.02.01\n2003.03.01 ~ 2005.06.01"
     )
     assert not is_plausible_kosa_employment_recovery(_empty_kosa_page())
+    assert not is_plausible_kosa_employment_recovery(
+        "근무경력\n에이회사 2001.01.01 ~ 2003.02.01\n"
+        "비이회사 2003.03.01 ~ 2005.06.01\n"
+        "기술경력\n참여사업명 프로젝트 A\n"
+        "2024.05.01 ~ 2024.06.30"
+    )
 
 
 @pytest.mark.parametrize("quality_ok", [True, False])
