@@ -1533,6 +1533,48 @@ def _dedupe_employment_history(
     return merged
 
 
+def _verified_kosa_p1_employment_companies(
+    page_texts: dict[tuple[str, int], str] | None,
+    document_type_by_id: dict[str, str] | None,
+    *,
+    spans: list[_ContextSpan],
+) -> tuple[str, set[str]] | None:
+    """Employer keys in a structured, recovered KOSA p1 employment table.
+
+    Only one DOC-KOSA input and >=3 independent company/date rows qualify.
+    This is deliberately unavailable for a blank VLM page or a mixed DOCX
+    analysis, to avoid treating a partial employer list as exhaustive.
+    """
+    if not page_texts:
+        return None
+    doc_ids = {str(doc_id) for doc_id, _ in page_texts}
+    if len(doc_ids) != 1:
+        return None
+    doc_id = next(iter(doc_ids))
+    if (document_type_by_id or {}).get(doc_id, "").strip().upper() != "DOC-KOSA":
+        return None
+    seen: set[tuple[str, str, str]] = set()
+    for span in spans:
+        if span.doc_id != doc_id or span.page_no != 1 or span.section != "employment":
+            continue
+        cells = [cell.strip() for cell in span.text.strip("|").split("|")]
+        if len(cells) not in (2, 3):
+            continue
+        company = _company_match_key(cells[0])
+        if not company:
+            continue
+        ranges = _extract_range_dates(cells[1])
+        if len(ranges) != 1:
+            continue
+        start, end = ranges[0]
+        if not start or not end:
+            continue
+        seen.add((company, start, end))
+    if len(seen) < 3:
+        return None
+    return doc_id, {company for company, _, _ in seen}
+
+
 def _guard_employment_history(
     candidate: ProfileCandidateDocument,
     *,
@@ -1559,6 +1601,9 @@ def _guard_employment_history(
         if (key := _key(project.customer_name)) is not None
     }
     spans = list(_iter_context_spans(page_texts, document_type_by_id))
+    verified_kosa_work = _verified_kosa_p1_employment_companies(
+        page_texts, document_type_by_id, spans=spans
+    )
     kept: list[EmploymentCandidate] = []
 
     for row in rows:
@@ -1588,6 +1633,27 @@ def _guard_employment_history(
                         has_matching_employment_period = True
             elif kind == "project":
                 has_project_evidence = True
+
+        # After a structured KOSA p1 work table is recovered, do not
+        # keep a different company's p2+ technical-project row as employment
+        # merely because the LLM merged several project periods together.
+        # This check is only for a KOSA-only analysis with strong p1 rows;
+        # a mixed KOSA/DOCX analysis, missing references, or a p1 employer
+        # is always kept for normal review.
+        if (
+            verified_kosa_work is not None
+            and _company_match_key(company) not in verified_kosa_work[1]
+            and not has_employment_evidence
+            and has_project_evidence
+            and row.source_refs
+            and all(
+                (ref.document_id or "").strip() == verified_kosa_work[0]
+                and ref.page_no is not None
+                and ref.page_no >= 2
+                for ref in row.source_refs
+            )
+        ):
+            continue
 
         is_customer_name = company_key in customer_keys
         mirrors_project = _matches_project_customer_period(row, projects)
