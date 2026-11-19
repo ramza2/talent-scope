@@ -18,6 +18,7 @@ from app.modules.analysis.vlm_table_banding import (
     detect_table_row_bands,
     is_kosa_empty_markdown_table_vlm_quality_issue,
     is_plausible_kosa_employment_recovery,
+    normalize_kosa_cropped_employment_rows,
     is_valid_table_band_transcription,
     normalize_table_band_transcription,
 )
@@ -392,9 +393,9 @@ class AnalysisSourceBuilder:
                                 if not is_plausible_kosa_employment_recovery(banded_text):
                                     banded_text = None
                             if kosa_empty_table and banded_text is None:
-                                # Real KOSA scans can have no detectable table
-                                # rules. Read three overlapping page strips.
-                                # Both paths share the existing call budget.
+                                # KOSA p1 work-table crop is validated first.
+                                # The observed scan has no detectable ruling;
+                                # this narrow crop excludes lower project rows.
                                 remaining = min(
                                     table_budget - table_calls_used,
                                     max(
@@ -403,19 +404,45 @@ class AnalysisSourceBuilder:
                                         - calls,
                                     ),
                                 )
-                                banded_text, tile_calls = (
-                                    self._try_transcribe_kosa_empty_page_tiles(
-                                        pdf_doc.load_page(page.page_no - 1),
-                                        log_context={
-                                            **(log_context or {}),
-                                            "document_id": doc_id,
-                                            "page_no": page.page_no,
-                                            "kosa_empty_page_tiles": True,
-                                        },
-                                        remaining_calls=remaining,
+                                crop_calls = 0
+                                if page.page_no == 1:
+                                    banded_text, crop_calls = (
+                                        self._try_transcribe_kosa_work_table_crop(
+                                            pdf_doc.load_page(page.page_no - 1),
+                                            log_context={
+                                                **(log_context or {}),
+                                                "document_id": doc_id,
+                                                "page_no": page.page_no,
+                                                "kosa_work_table_crop": True,
+                                            },
+                                            remaining_calls=remaining,
+                                        )
                                     )
-                                )
-                                table_calls_used += tile_calls
+                                    table_calls_used += crop_calls
+                                if banded_text is None:
+                                    # Conservative fallback to the existing
+                                    # tiled transcription on crop failure.
+                                    remaining = min(
+                                        table_budget - table_calls_used,
+                                        max(
+                                            0,
+                                            int(self.settings.analysis_vlm_table_banding_max_calls_per_page)
+                                            - calls - crop_calls,
+                                        ),
+                                    )
+                                    banded_text, tile_calls = (
+                                        self._try_transcribe_kosa_empty_page_tiles(
+                                            pdf_doc.load_page(page.page_no - 1),
+                                            log_context={
+                                                **(log_context or {}),
+                                                "document_id": doc_id,
+                                                "page_no": page.page_no,
+                                                "kosa_empty_page_tiles": True,
+                                            },
+                                            remaining_calls=remaining,
+                                        )
+                                    )
+                                    table_calls_used += tile_calls
                             if banded_text is not None:
                                 # Analysis-only replacement; never persist or
                                 # rewrite the original DocumentPage text.
@@ -589,6 +616,65 @@ class AnalysisSourceBuilder:
         except Exception as exc:
             logger.info(
                 "analysis table-banding fallback document_id=%s page_no=%s err=%s",
+                log_context.get("document_id"),
+                log_context.get("page_no"),
+                type(exc).__name__,
+            )
+            return None, calls
+
+    def _try_transcribe_kosa_work_table_crop(
+        self,
+        page: pymupdf.Page,
+        *,
+        log_context: dict,
+        remaining_calls: int,
+    ) -> tuple[str | None, int]:
+        """One rule-free KOSA p1 work-table region call, memory-only.
+
+        The normalized rectangle is a cautious fallback for empty VLM scans,
+        not a general KOSA layout assumption: unverified crops are discarded.
+        """
+        if self.vlm is None or remaining_calls < 1 or page.number != 0:
+            return None, 0
+        rect = page.rect
+        if rect.width <= 0 or rect.height <= 0:
+            return None, 0
+        calls = 0
+        try:
+            clip = pymupdf.Rect(
+                rect.x0,
+                rect.y0 + rect.height * 0.14,
+                rect.x1,
+                rect.y0 + rect.height * 0.51,
+            )
+            # The dedicated work-table crop was validated at 240 dpi on a
+            # scanned KOSA PDF (no PDF text or detectable table rules).
+            pix = page.get_pixmap(
+                matrix=pymupdf.Matrix(240 / 72, 240 / 72),
+                clip=clip,
+                alpha=False,
+            )
+            prompt = (
+                "이미지의 근무경력 표만 정확히 전사하세요. "
+                "각 행은 '회사명 | 시작일 ~ 종료일 | 담당업무' 형식으로 "
+                "한 줄씩 출력하세요. "
+                "표에서 보이는 회사명과 날짜를 원문 그대로 옮기세요. "
+                "날짜가 두 줄로 나뉘어 있으면 같은 셀의 값으로 읽으세요. "
+                "추측하거나 날짜를 보정하지 마세요. "
+                "이미지에 없는 행은 만들지 마세요. "
+                "상단 신원정보나 다른 표는 출력하지 마세요."
+            )
+            calls = 1
+            transcribed = self.vlm.transcribe_image(
+                image_bytes=pix.tobytes("png"),
+                mime_type="image/png",
+                user_prompt=prompt,
+                log_context=log_context,
+            )
+            return normalize_kosa_cropped_employment_rows(transcribed), calls
+        except Exception as exc:
+            logger.info(
+                "KOSA work-table crop fallback failed document_id=%s page_no=%s err=%s",
                 log_context.get("document_id"),
                 log_context.get("page_no"),
                 type(exc).__name__,
