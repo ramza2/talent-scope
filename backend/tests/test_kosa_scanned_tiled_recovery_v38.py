@@ -71,10 +71,11 @@ def _source(vlm, *, call_cap: int = 16) -> tuple[AnalysisSourceBuilder, PageSnap
 
 
 class TileVLM:
-    def __init__(self, quality_ok: bool) -> None:
+    def __init__(self, quality_ok: bool, *, projects_ok: bool = True) -> None:
         self.calls = 0
         self.contexts: list[dict] = []
         self.quality_ok = quality_ok
+        self.projects_ok = projects_ok
 
     def transcribe_image(
         self, *, image_bytes, mime_type="image/png", log_context=None, user_prompt=None
@@ -91,6 +92,15 @@ class TileVLM:
                     for i in range(1, 8)
                 )
             return "프로젝트 참여기간 | 2024.01.01 ~ 2024.06.01"
+        if context.get("kosa_project_table_crop"):
+            if not self.projects_ok:
+                return "원본 프로젝트 행 전사 불가"
+            return (
+                "가상 제조 데이터 융합 | 2024.11.18 ~ 2025.01.10 | "
+                "기관A | 수행회사 | 이사 | 컨설팅\n"
+                "가상 재판 AI 설계 | 2024.05.09 ~ 2024.09.30 | "
+                "기관B | 수행회사 | 이사 | 컨설팅"
+            )
         if context.get("page_tile"):
             if self.quality_ok:
                 return [
@@ -135,12 +145,16 @@ def test_scanned_kosa_without_ruling_recovered_in_memory_only(quality_ok) -> Non
     assert page.layout_json == layout
     assert vlm.contexts[0].get("kosa_work_table_crop") is True
     if quality_ok:
-        assert vlm.calls == 1
+        assert vlm.calls == 2
         assert result.blocks[0].text.startswith("[PAGE 1]\n근무경력\n")
         assert "가상회사1 | 2001.01.01" in result.blocks[0].text
         assert "가상회사7 | 2007.01.01" in result.blocks[0].text
+        assert "\n기술경력\n" in result.blocks[0].text
+        assert "가상 제조 데이터 융합" in result.blocks[0].text
+        assert "가상 재판 AI 설계" in result.blocks[0].text
+        assert vlm.contexts[1].get("kosa_project_table_crop") is True
         assert result.blocks[0].vlm_pages_used == 1
-        assert result.blocks[0].vlm_table_band_calls_used == 1
+        assert result.blocks[0].vlm_table_band_calls_used == 2
     else:
         # Bad one-crop evidence causes a conservative fallback (three tiles).
         assert vlm.calls == 4
@@ -234,3 +248,131 @@ def test_kosa_core_output_reserve_scoped_to_verified_p1() -> None:
     assert ratio({
         (doc_id, 1): p1 + "\n기술경력\n참여사업 2024.01.01",
     }, kinds) == 0.25
+
+
+
+def test_kosa_p1_missing_lower_crop_fails_closed_without_losing_projects() -> None:
+    vlm = TileVLM(True, projects_ok=False)
+    source, page, doc = _source(vlm)
+    result = source.build([doc])
+    assert vlm.calls == 2
+    assert result.blocks[0].text == f"[PAGE 1]\n{page.extracted_text.strip()}"
+    assert result.blocks[0].vlm_pages_used == 0
+    assert result.blocks[0].vlm_table_band_calls_used == 2
+    assert result.vlm_transcriptions == []
+
+
+def test_kosa_p1_one_call_budget_never_publishes_work_only_page() -> None:
+    vlm = TileVLM(True)
+    source, page, doc = _source(vlm, call_cap=1)
+    result = source.build([doc])
+    assert vlm.calls == 1
+    assert result.blocks[0].text == f"[PAGE 1]\n{page.extracted_text.strip()}"
+    assert result.blocks[0].vlm_table_band_calls_used == 1
+    assert result.blocks[0].vlm_pages_used == 0
+
+
+def test_kosa_p1_combined_work_project_validation_and_recall() -> None:
+    from app.ai.schemas.profile_candidate import ProfileCandidateDocument
+    from app.modules.analysis.kosa_project_recall import supplement_kosa_table_projects
+    from app.modules.analysis.vlm_table_banding import (
+        normalize_kosa_cropped_project_rows,
+        split_verified_kosa_p1_sections,
+    )
+    from app.modules.analysis.token_budget import verified_kosa_core_output_ratio
+
+    doc_id = "00000000-0000-0000-0000-000000000038"
+    work = "근무경력\n" + "\n".join(
+        f"가상회사{i} | 200{i}.01.01 ~ 200{i}.12.31 | 개발"
+        for i in range(1, 8)
+    )
+    rows = (
+        "제조 데이터 융합 | 2024.11.18 ~ 2025.01.10 | 기관A | 수행회사 | 이사 | 컨설팅\n"
+        "재판 AI 설계 | 2024.05.09 ~ 2024.09.30 | 기관B | 수행회사 | 이사 | 컨설팅"
+    )
+    technical = normalize_kosa_cropped_project_rows(rows)
+    assert technical == "기술경력\n" + rows
+    combined = work + "\n" + technical
+    assert split_verified_kosa_p1_sections(combined) == (work, technical)
+    assert verified_kosa_core_output_ratio(
+        0.25, page_texts={(doc_id, 1): combined},
+        document_type_by_id={doc_id: "DOC-KOSA"}, enable_thinking=False,
+    ) == 7 / 16
+
+    base = ProfileCandidateDocument()
+    result, metrics = supplement_kosa_table_projects(
+        base, page_texts={(doc_id, 1): combined},
+        document_type_by_id={doc_id: "DOC-KOSA"},
+    )
+    assert metrics == {"table_rows": 2, "matched_rows": 0, "supplemented_rows": 2}
+    assert len(result.projects) == 2
+    assert [p.project_name for p in result.projects] == [
+        "제조 데이터 융합", "재판 AI 설계"
+    ]
+    assert all(
+        ref.document_id == doc_id and ref.page_no == 1
+        for project in result.projects for ref in project.source_refs
+    )
+    assert all(project.source_refs[0].quote_text in rows for project in result.projects)
+
+    duplicate, metrics_again = supplement_kosa_table_projects(
+        result, page_texts={(doc_id, 1): combined},
+        document_type_by_id={doc_id: "DOC-KOSA"},
+    )
+    assert len(duplicate.projects) == 2
+    assert metrics_again == {"table_rows": 2, "matched_rows": 2, "supplemented_rows": 0}
+
+    invalid = (
+        "제조 데이터 융합 | 2024.11.18 ~ 2025.01.10 | 기관A | 수행회사 | 이사 | 컨설팅\n"
+        "재판 AI 설계 | 2024.05.09 ~ 2024.02.30 | 기관B | 수행회사 | 이사 | 컨설팅"
+    )
+    assert normalize_kosa_cropped_project_rows(invalid) is None
+    assert split_verified_kosa_p1_sections(work + "\n기술경력\n" + invalid) is None
+    unchanged, bad_metrics = supplement_kosa_table_projects(
+        base, page_texts={(doc_id, 1): work + "\n기술경력\n" + invalid},
+        document_type_by_id={doc_id: "DOC-KOSA"},
+    )
+    assert not unchanged.projects
+    assert bad_metrics["table_rows"] == 0
+
+
+def test_kosa_p1_project_only_rows_are_not_employers() -> None:
+    from app.ai.schemas.profile_candidate import (
+        EmploymentCandidate, ProfileCandidateDocument, SourceRef
+    )
+    from app.modules.analysis.candidate_quality_guards import (
+        apply_candidate_quality_guards,
+    )
+    doc_id = "00000000-0000-0000-0000-000000000038"
+    work = "근무경력\n" + "\n".join(
+        f"가상회사{i} | 200{i}.01.01 ~ 200{i}.12.31 | 개발"
+        for i in range(1, 8)
+    )
+    technical = (
+        "기술경력\n"
+        "제조 데이터 융합 | 2024.11.18 ~ 2025.01.10 | "
+        "기관A | 수행회사 | 이사 | 컨설팅"
+    )
+    fake_employer = EmploymentCandidate(
+        company_name="수행회사", start_date="2024.11.18",
+        end_date="2025.01.10",
+        source_refs=[SourceRef(
+            document_id=doc_id, page_no=1,
+            quote_text="수행회사",
+        )],
+    )
+    real_employer = EmploymentCandidate(
+        company_name="가상회사1", start_date="2001.01.01",
+        end_date="2001.12.31",
+        source_refs=[SourceRef(
+            document_id=doc_id, page_no=1,
+            quote_text="가상회사1 | 2001.01.01 ~ 2001.12.31 | 개발",
+        )],
+    )
+    result = apply_candidate_quality_guards(
+        ProfileCandidateDocument(employment_history=[real_employer, fake_employer]),
+        page_texts={(doc_id, 1): work + "\n" + technical},
+        document_type_by_id={doc_id: "DOC-KOSA"},
+    )
+    assert len(result.employment_history) == 1
+    assert result.employment_history[0].company_name == "가상회사1"
