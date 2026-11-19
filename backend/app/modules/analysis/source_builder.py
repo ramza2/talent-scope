@@ -19,6 +19,8 @@ from app.modules.analysis.vlm_table_banding import (
     is_kosa_empty_markdown_table_vlm_quality_issue,
     is_plausible_kosa_employment_recovery,
     normalize_kosa_cropped_employment_rows,
+    normalize_kosa_cropped_project_rows,
+    split_verified_kosa_p1_sections,
     is_valid_table_band_transcription,
     normalize_table_band_transcription,
 )
@@ -392,6 +394,12 @@ class AnalysisSourceBuilder:
                             if kosa_empty_table and banded_text is not None:
                                 if not is_plausible_kosa_employment_recovery(banded_text):
                                     banded_text = None
+                                elif page.page_no == 1:
+                                    # A p1 employer-only table is not enough:
+                                    # the same physical page can contain projects.
+                                    sections = split_verified_kosa_p1_sections(banded_text)
+                                    if sections is None or not sections[1]:
+                                        banded_text = None
                             if kosa_empty_table and banded_text is None:
                                 # KOSA p1 work-table crop is validated first.
                                 # The observed scan has no detectable ruling;
@@ -405,6 +413,7 @@ class AnalysisSourceBuilder:
                                     ),
                                 )
                                 crop_calls = 0
+                                suppress_tiles = False
                                 if page.page_no == 1:
                                     banded_text, crop_calls = (
                                         self._try_transcribe_kosa_work_table_crop(
@@ -419,7 +428,38 @@ class AnalysisSourceBuilder:
                                         )
                                     )
                                     table_calls_used += crop_calls
-                                if banded_text is None:
+                                    if banded_text is not None:
+                                        # A real KOSA p1 has an independent
+                                        # lower 기술경력 table. Never replace p1
+                                        # with employment-only text, even if
+                                        # the work crop itself was valid.
+                                        lower_remaining = min(
+                                            table_budget - table_calls_used,
+                                            max(
+                                                0,
+                                                int(self.settings.analysis_vlm_table_banding_max_calls_per_page)
+                                                - calls - crop_calls,
+                                            ),
+                                        )
+                                        projects, project_calls = (
+                                            self._try_transcribe_kosa_project_table_crop(
+                                                pdf_doc.load_page(page.page_no - 1),
+                                                log_context={
+                                                    **(log_context or {}),
+                                                    "document_id": doc_id,
+                                                    "page_no": page.page_no,
+                                                    "kosa_project_table_crop": True,
+                                                },
+                                                remaining_calls=lower_remaining,
+                                            )
+                                        )
+                                        table_calls_used += project_calls
+                                        if projects is not None:
+                                            banded_text += "\n" + projects
+                                        else:
+                                            banded_text = None
+                                            suppress_tiles = True
+                                if banded_text is None and not suppress_tiles:
                                     # Conservative fallback to the existing
                                     # tiled transcription on crop failure.
                                     remaining = min(
@@ -675,6 +715,64 @@ class AnalysisSourceBuilder:
         except Exception as exc:
             logger.info(
                 "KOSA work-table crop fallback failed document_id=%s page_no=%s err=%s",
+                log_context.get("document_id"),
+                log_context.get("page_no"),
+                type(exc).__name__,
+            )
+            return None, calls
+
+    def _try_transcribe_kosa_project_table_crop(
+        self,
+        page: pymupdf.Page,
+        *,
+        log_context: dict,
+        remaining_calls: int,
+    ) -> tuple[str | None, int]:
+        """Separately transcribe lower p1 technical-history rows, memory-only.
+
+        A failed or unbudgeted lower crop rejects the paired work-only
+        replacement, preserving the original stored page rather than hiding
+        projects. The screenshot region was measured on the KOSA scan.
+        """
+        if self.vlm is None or remaining_calls < 1 or page.number != 0:
+            return None, 0
+        rect = page.rect
+        if rect.width <= 0 or rect.height <= 0:
+            return None, 0
+        calls = 0
+        try:
+            clip = pymupdf.Rect(
+                rect.x0,
+                rect.y0 + rect.height * 0.49,
+                rect.x1,
+                rect.y0 + rect.height * 0.995,
+            )
+            pix = page.get_pixmap(
+                matrix=pymupdf.Matrix(240 / 72, 240 / 72),
+                clip=clip,
+                alpha=False,
+            )
+            prompt = (
+                "이미지는 KOSA 경력증명서 1페이지 하단입니다. "
+                "기술경력 표에 실제로 보이는 프로젝트 행을 전사하세요. "
+                "각 행을 '사업명 | 참여기간 | 발주처 | 소속회사 | 직위 | 담당업무' "
+                "형식으로 한 줄씩 출력하세요. "
+                "줄바꿈된 셀은 같은 행에 연결하되, 서로 다른 행을 합치지 마세요. "
+                "보이지 않거나 불확실한 값은 추측하지 말고 빈 값으로 두세요. "
+                "근무경력 회사명과 입퇴사일을 프로젝트로 변환하지 마세요. "
+                "개인 신원정보와 문서 발급정보는 출력하지 마세요."
+            )
+            calls = 1
+            transcribed = self.vlm.transcribe_image(
+                image_bytes=pix.tobytes("png"),
+                mime_type="image/png",
+                user_prompt=prompt,
+                log_context=log_context,
+            )
+            return normalize_kosa_cropped_project_rows(transcribed), calls
+        except Exception as exc:
+            logger.info(
+                "KOSA project-table crop fallback failed document_id=%s page_no=%s err=%s",
                 log_context.get("document_id"),
                 log_context.get("page_no"),
                 type(exc).__name__,
