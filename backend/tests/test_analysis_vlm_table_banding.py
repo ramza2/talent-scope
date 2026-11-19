@@ -405,8 +405,8 @@ def test_kosa_empty_table_triggers_memory_only_banding_without_reprocess_flag(
         assert vlm.calls == 3
         assert result.blocks[0].text.startswith("[PAGE 1]\n근무경력 | 에이회사0")
     else:
-        # Fail closed: keep stored empty-table text for analysis prompt.
-        assert vlm.calls == 4
+        # Failed band, failed work-table crop, and three rejected fallback tiles.
+        assert vlm.calls == 5
         assert result.blocks[0].text == f"[PAGE 1]\n{prior}"
 
 
