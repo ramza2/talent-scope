@@ -402,8 +402,11 @@ def test_kosa_empty_table_triggers_memory_only_banding_without_reprocess_flag(
     assert page.extracted_text == prior
     assert page.layout_json == {"needs_vlm": False, "vlm_transcribed": True}
     if valid:
-        assert vlm.calls == 3
-        assert result.blocks[0].text.startswith("[PAGE 1]\n근무경력 | 에이회사0")
+        # A complete employment-only band is no longer enough to replace
+        # KOSA p1: the same page can carry lower technical projects.
+        # Three successful bands + one rejected work crop; keep original.
+        assert vlm.calls == 4
+        assert result.blocks[0].text == f"[PAGE 1]\n{prior}"
     else:
         # Failed band, failed work-table crop, and three rejected fallback tiles.
         assert vlm.calls == 5
