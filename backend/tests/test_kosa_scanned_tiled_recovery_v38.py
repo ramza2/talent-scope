@@ -376,3 +376,170 @@ def test_kosa_p1_project_only_rows_are_not_employers() -> None:
     )
     assert len(result.employment_history) == 1
     assert result.employment_history[0].company_name == "가상회사1"
+
+
+
+def test_v38_kosa_work_duties_are_not_projects() -> None:
+    """Exactly seven KOSA work rows must not become seven pseudo projects."""
+    from app.ai.schemas.profile_candidate import (
+        EmploymentCandidate, ProfileCandidateDocument, ProjectCandidate, SourceRef
+    )
+    from app.modules.analysis.candidate_quality_guards import (
+        apply_candidate_quality_guards,
+    )
+    doc_id = "00000000-0000-0000-0000-000000000038"
+    work_rows = [
+        ("가상회사A", "2008.06.24", "2009.06.25", "시스템구축 및 운영"),
+        ("가상회사B", "2007.03.12", "2008.02.28", "IT컨설팅"),
+        ("가상회사C", "2006.03.04", "2006.08.30", "IT컨설팅"),
+        ("가상회사D", "2004.08.01", "2005.04.29", "IT마케팅"),
+        ("가상회사E", "2001.06.01", "2003.12.31", "IT마케팅"),
+        ("가상회사F", "1999.10.01", "2001.05.30", "IT마케팅"),
+        ("가상회사G", "1990.05.07", "1999.09.30", "IT마케팅"),
+    ]
+    p1_work = "근무경력\n" + "\n".join(
+        f"{company} | {start} ~ {end} | {duty} > 원문분야"
+        for company, start, end, duty in work_rows
+    )
+    p1_projects = (
+        "기술경력\n"
+        "제조 데이터 융합 | 2024.11.18 ~ 2025.01.10 | 기관A | 수행회사 | 이사 | 컨설팅\n"
+        "재판 AI 설계 | 2024.05.09 ~ 2024.09.30 | 기관B | 수행회사 | 이사 | 컨설팅"
+    )
+    page_texts = {
+        (doc_id, 1): p1_work + "\n" + p1_projects,
+        (doc_id, 2): "기술경력\n독립 사업 | 2022.01.01 ~ 2022.12.31 | 기관C",
+    }
+    employers = [
+        EmploymentCandidate(company_name=company, start_date=start, end_date=end)
+        for company, start, end, _duty in work_rows
+    ]
+    false_projects = [
+        ProjectCandidate(
+            project_name=duty,
+            customer_name=company,
+            start_date=start.replace(".", "-"),
+            end_date=end.replace(".", "-"),
+            source_refs=[SourceRef(
+                document_id=doc_id, page_no=1,
+                quote_text=f"{company} | {start} ~ {end} | {duty} > 원문분야",
+            )],
+        )
+        for company, start, end, duty in work_rows
+    ]
+    real_projects = [
+        ProjectCandidate(
+            project_name="제조 데이터 융합",
+            customer_name="기관A",
+            start_date="2024.11.18",
+            end_date="2025.01.10",
+        ),
+        ProjectCandidate(
+            project_name="재판 AI 설계",
+            customer_name="기관B",
+            start_date="2024.05.09",
+            end_date="2024.09.30",
+        ),
+        ProjectCandidate(
+            project_name="독립 사업",
+            customer_name="기관C",
+            start_date="2022.01.01",
+            end_date="2022.12.31",
+        ),
+        # A genuine project with the same generic title is not a work mirror
+        # when its actual participation dates differ from employment dates.
+        ProjectCandidate(
+            project_name="IT컨설팅",
+            customer_name="가상회사B",
+            start_date="2010.01.01",
+            end_date="2010.12.31",
+        ),
+    ]
+    original = ProfileCandidateDocument(
+        employment_history=employers,
+        projects=false_projects + real_projects,
+    )
+    got = apply_candidate_quality_guards(
+        original, page_texts=page_texts,
+        document_type_by_id={doc_id: "DOC-KOSA"},
+        strict_section_authority=True,
+    )
+    assert len(got.employment_history) == 7
+    assert len(got.projects) == len(real_projects)
+    assert [p.project_name for p in got.projects] == [
+        p.project_name for p in real_projects
+    ]
+    # Idempotent; never mutate original or fabricate project rows.
+    assert len(original.projects) == 11
+    twice = apply_candidate_quality_guards(
+        got, page_texts=page_texts,
+        document_type_by_id={doc_id: "DOC-KOSA"},
+        strict_section_authority=True,
+    )
+    assert len(twice.projects) == len(got.projects)
+
+
+def test_v38_work_project_mirror_guard_requires_verified_single_kosa() -> None:
+    from app.ai.schemas.profile_candidate import (
+        ProfileCandidateDocument, ProjectCandidate,
+    )
+    from app.modules.analysis.candidate_quality_guards import (
+        apply_candidate_quality_guards,
+    )
+    doc_id = "00000000-0000-0000-0000-000000000038"
+    other_id = "00000000-0000-0000-0000-000000000039"
+    work = "근무경력\n" + "\n".join(
+        f"가상회사{i} | 200{i}.01.01 ~ 200{i}.12.31 | IT컨설팅"
+        for i in range(1, 8)
+    )
+    project = ProjectCandidate(
+        project_name="IT컨설팅",
+        customer_name="가상회사1",
+        start_date="2001.01.01",
+        end_date="2001.12.31",
+    )
+    original = ProfileCandidateDocument(projects=[project])
+    cases = [
+        ({(doc_id, 1): work}, {doc_id: "DOC-RESUME"}),
+        ({(doc_id, 1): "근무경력\n가상회사1 | 2001.01.01 ~ 2001.12.31 | IT컨설팅"},
+         {doc_id: "DOC-KOSA"}),
+        ({(doc_id, 1): work, (other_id, 1): "another document"},
+         {doc_id: "DOC-KOSA", other_id: "DOC-RESUME"}),
+    ]
+    for pages, types in cases:
+        result = apply_candidate_quality_guards(
+            original, page_texts=pages, document_type_by_id=types,
+        )
+        assert len(result.projects) == 1
+
+
+def test_v38_matching_real_project_span_overrides_employment_mirror() -> None:
+    from app.ai.schemas.profile_candidate import (
+        ProfileCandidateDocument, ProjectCandidate,
+    )
+    from app.modules.analysis.candidate_quality_guards import (
+        apply_candidate_quality_guards,
+    )
+
+    doc_id = "00000000-0000-0000-0000-000000000038"
+    work = "근무경력\n" + "\n".join(
+        f"가상회사{i} | 200{i}.01.01 ~ 200{i}.12.31 | IT컨설팅"
+        for i in range(1, 8)
+    )
+    independent = "IT컨설팅 | 2001.01.01 ~ 2001.12.31 | 고객기관"
+    project = ProjectCandidate(
+        project_name="IT컨설팅",
+        customer_name="가상회사1",
+        start_date="2001.01.01",
+        end_date="2001.12.31",
+    )
+    result = apply_candidate_quality_guards(
+        ProfileCandidateDocument(projects=[project]),
+        page_texts={
+            (doc_id, 1): work,
+            (doc_id, 2): "기술경력\n" + independent,
+        },
+        document_type_by_id={doc_id: "DOC-KOSA"},
+        strict_section_authority=True,
+    )
+    assert len(result.projects) == 1
