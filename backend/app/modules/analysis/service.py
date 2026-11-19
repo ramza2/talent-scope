@@ -114,6 +114,7 @@ from app.modules.analysis.token_budget import (
     split_document_blocks,
     split_page_block_text,
     token_count_route_changed,
+    verified_kosa_core_output_ratio,
 )
 from app.modules.analysis.schemas import (
     AnalysisDetail,
@@ -1762,6 +1763,16 @@ class AnalysisService:
             base_log.get("document_count"),
         )
 
+        # This KOSA-only override is based on an independently verified
+        # in-memory p1 employer table. Other resumes and mixed documents
+        # continue using the configured CORE output ratio.
+        core_output_ratio = verified_kosa_core_output_ratio(
+            self.settings.analysis_core_output_ratio,
+            page_texts=page_texts,
+            document_type_by_id=document_type_by_id,
+            enable_thinking=self.settings.analysis_llm_enable_thinking,
+        )
+
         call_count = 0
         recovery_budget = 1
         project_split_calls = 0
@@ -1971,7 +1982,7 @@ class AnalysisService:
                     phase=phase,
                     system_prompt=system_prompt,
                     user_prompt=user_prompt,
-                    output_reserve_ratio=self.settings.analysis_core_output_ratio,
+                    output_reserve_ratio=core_output_ratio,
                     split_depth=split_depth,
                     chunk_index=chunk_index,
                     force_recount=True,
@@ -2576,7 +2587,7 @@ class AnalysisService:
                 phase="core",
                 system_prompt=prompt.core_system_prompt or "",
                 user_prompt=user_prompt,
-                output_reserve_ratio=self.settings.analysis_core_output_ratio,
+                output_reserve_ratio=core_output_ratio,
                 split_depth=split_depth,
                 chunk_index=chunk_index,
                 force_recount=force_recount,
