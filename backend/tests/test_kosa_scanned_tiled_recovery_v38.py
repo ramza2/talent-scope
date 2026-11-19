@@ -193,3 +193,44 @@ def test_kosa_work_crop_rejects_invalid_dates_and_project_rows() -> None:
     assert normalize_kosa_cropped_employment_rows(
         "가상회사 | 2001.01.01 ~ 2003.02.01 | 업무"
     ) is None
+
+
+
+def test_kosa_core_output_reserve_scoped_to_verified_p1() -> None:
+    from app.modules.analysis.token_budget import (
+        verified_kosa_core_output_ratio,
+    )
+
+    doc_id = "00000000-0000-0000-0000-000000000038"
+    other_id = "00000000-0000-0000-0000-000000000039"
+    p1 = "근무경력\n" + "\n".join(
+        f"가상회사{i} | 200{i}.01.01 ~ 200{i}.12.31 | 개발"
+        for i in range(1, 8)
+    )
+    texts = {
+        (doc_id, 1): p1,
+        (doc_id, 2): "기술경력\n프로젝트 A | 2020.01.01 ~ 2020.12.31",
+    }
+    def ratio(
+        page_texts, types, thinking=False, configured=0.25,
+    ) -> float:
+        return verified_kosa_core_output_ratio(
+            configured,
+            page_texts=page_texts,
+            document_type_by_id=types,
+            enable_thinking=thinking,
+        )
+
+    kinds = {doc_id: "DOC-KOSA"}
+    assert ratio(texts, kinds) == 7.0 / 16.0
+    assert ratio(texts, kinds, configured=0.5) == 0.5
+    assert ratio(texts, kinds, thinking=True) == 0.25
+    assert ratio(texts, kinds, thinking=None) == 0.25
+    assert ratio(texts, {doc_id: "DOC-RESUME"}) == 0.25
+    assert ratio({(doc_id, 1): "근무경력\n| | |"}, kinds) == 0.25
+    assert ratio({
+        **texts, (other_id, 1): "other resume",
+    }, {**kinds, other_id: "DOC-RESUME"}) == 0.25
+    assert ratio({
+        (doc_id, 1): p1 + "\n기술경력\n참여사업 2024.01.01",
+    }, kinds) == 0.25
