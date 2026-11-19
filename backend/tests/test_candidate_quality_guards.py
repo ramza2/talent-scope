@@ -2463,3 +2463,125 @@ def test_kosa_multiline_unlabeled_project_window_drops_mixin() -> None:
     assert len(result.employment_history) == 1
     assert result.employment_history[0].end_date == "2022.12.31"
     assert result.projects == []
+
+
+
+def _v38_kosa_recovered_work_source() -> dict:
+    # Synthetic equivalent of KOSA p1 seven work rows + p2 technical lines.
+    work = "\n".join(
+        f"가상고용{i} | 199{i}.01.01 ~ 199{i}.12.31 | 개발"
+        for i in range(1, 8)
+    )
+    return {
+        (_KOSA, 1): "근무경력\n" + work,
+        (_KOSA, 2): (
+            "기술경력\n"
+            "확인\nAI 기술 서비스\n2019.10.01 ~ 2020.04.30\n"
+            "기관 A\n타쓰리큐 주식회사\n컨설턴트\n"
+            "확인\n정보 품질 고도화\n2019.04.15 ~ 2019.07.31\n"
+            "기관 B\n타쓰리큐 주식회사\n컨설턴트\n"
+            "확인\n고객 시스템 고도화\n2013.05.31 ~ 2013.12.01\n"
+            "기관 C\n(주)케이씨넷\n개발\n"
+            "확인\n고객 시스템 유지보수\n2014.05.31 ~ 2014.12.01\n"
+            "기관 D\n(주)케이씨넷\n개발\n"
+        ),
+    }
+
+
+def _v38_kosa_long_project_mixins() -> list[EmploymentCandidate]:
+    # LLM invents broader employer tenures by combining multiple projects.
+    return [
+        EmploymentCandidate(
+            company_name="타쓰리큐 주식회사",
+            start_date="2019.10.01",
+            end_date="2020.10.30",
+            source_refs=[
+                SourceRef(document_id=_KOSA, page_no=2, quote_text="타쓰리큐 주식회사")
+            ],
+        ),
+        EmploymentCandidate(
+            company_name="(주)케이씨넷",
+            start_date="2013.05.31",
+            end_date="2014.12.01",
+            source_refs=[
+                SourceRef(document_id=_KOSA, page_no=2, quote_text="(주)케이씨넷")
+            ],
+        ),
+    ]
+
+
+def test_v38_verified_p1_kosa_work_drops_long_p2_project_only_mixins() -> None:
+    pages = _v38_kosa_recovered_work_source()
+    real = [
+        EmploymentCandidate(
+            company_name=f"가상고용{i}",
+            start_date=f"199{i}.01.01",
+            end_date=f"199{i}.12.31",
+            source_refs=[
+                SourceRef(
+                    document_id=_KOSA,
+                    page_no=1,
+                    quote_text=f"가상고용{i} | 199{i}.01.01 ~ 199{i}.12.31",
+                )
+            ],
+        )
+        for i in range(1, 8)
+    ]
+    projects = [
+        ProjectCandidate(
+            project_name="AI 기술 서비스",
+            customer_name="기관 A",
+            start_date="2019.10.01",
+            end_date="2020.04.30",
+        )
+    ]
+    before = ProfileCandidateDocument(
+        employment_history=[*real, *_v38_kosa_long_project_mixins()],
+        projects=projects,
+    )
+    after = apply_candidate_quality_guards(
+        before,
+        page_texts=pages,
+        document_type_by_id={_KOSA: "DOC-KOSA"},
+    )
+    assert len(after.employment_history) == 7
+    assert [r.company_name for r in after.employment_history] == [
+        f"가상고용{i}" for i in range(1, 8)
+    ]
+    assert len(after.projects) == len(projects)
+    assert len(before.employment_history) == 9  # no mutation
+
+
+def test_v38_kosa_project_only_drop_requires_complete_single_kosa_context() -> None:
+    mixed = _v38_kosa_long_project_mixins()
+    pages = _v38_kosa_recovered_work_source()
+
+    # A second DOCX input may have additional real employers; no KOSA-only rule.
+    mixed_docs = {
+        **pages,
+        (_DOCX, 1): "근무경력\n테크파트너 2019.01.01 ~ 2021.12.31",
+    }
+    kept_mixed = apply_candidate_quality_guards(
+        ProfileCandidateDocument(employment_history=mixed),
+        page_texts=mixed_docs,
+        document_type_by_id={_KOSA: "DOC-KOSA", _DOCX: "DOC-PROFILE"},
+    )
+    assert len(kept_mixed.employment_history) == 2
+
+    # A missing/blank work table must not be treated as exhaustive.
+    blank = {**pages, (_KOSA, 1): "근무경력\n| | |"}
+    kept_blank = apply_candidate_quality_guards(
+        ProfileCandidateDocument(employment_history=mixed),
+        page_texts=blank,
+        document_type_by_id={_KOSA: "DOC-KOSA"},
+    )
+    assert len(kept_blank.employment_history) == 2
+
+    # Even with good p1 evidence, a row without p2 provenance is retained.
+    unlinked = [mixed[0].model_copy(update={"source_refs": []})]
+    kept_unlinked = apply_candidate_quality_guards(
+        ProfileCandidateDocument(employment_history=unlinked),
+        page_texts=pages,
+        document_type_by_id={_KOSA: "DOC-KOSA"},
+    )
+    assert len(kept_unlinked.employment_history) == 1
