@@ -82,16 +82,24 @@ class TileVLM:
         assert image_bytes and mime_type == "image/png"
         assert user_prompt and "근무경력" in user_prompt
         self.calls += 1
-        self.contexts.append(log_context or {})
-        if self.quality_ok:
-            texts = [
-                "근무경력\n회사명 | 재직기간\n에이회사 | 2001.01.01 ~ 2003.02.01",
-                "비이회사 | 2003.03.01 ~ 2005.06.01",
-                "씨이회사 | 2005.07.01 ~ 2008.12.31",
-            ]
-        else:
-            texts = ["확인\n| | |", "프로젝트\n| | |", "추출할 수 없음"]
-        return texts[self.calls - 1]
+        context = log_context or {}
+        self.contexts.append(context)
+        if context.get("kosa_work_table_crop"):
+            if self.quality_ok:
+                return "\n".join(
+                    f"가상회사{i} | 200{i}.01.01 ~ 200{i}.12.31 | 개발"
+                    for i in range(1, 8)
+                )
+            return "프로젝트 참여기간 | 2024.01.01 ~ 2024.06.01"
+        if context.get("page_tile"):
+            if self.quality_ok:
+                return [
+                    "근무경력\n회사명 | 재직기간\n에이회사 | 2001.01.01 ~ 2003.02.01",
+                    "비이회사 | 2003.03.01 ~ 2005.06.01",
+                    "씨이회사 | 2005.07.01 ~ 2008.12.31",
+                ][int(context["page_tile"].split("/")[0]) - 1]
+            return "추출할 수 없음"
+        raise AssertionError("Unexpected VLM call")
 
 
 def test_scanned_page_recovery_quality_gate() -> None:
@@ -116,19 +124,23 @@ def test_scanned_kosa_without_ruling_recovered_in_memory_only(quality_ok) -> Non
 
     result = source.build([doc])
 
-    assert vlm.calls == 3
-    assert [ctx.get("page_tile") for ctx in vlm.contexts] == [
-        "1/3", "2/3", "3/3"
-    ]
     assert result.vlm_transcriptions == []
     assert page.extracted_text == prior
     assert page.layout_json == layout
+    assert vlm.contexts[0].get("kosa_work_table_crop") is True
     if quality_ok:
-        assert "에이회사 | 2001.01.01" in result.blocks[0].text
-        assert "씨이회사 | 2005.07.01" in result.blocks[0].text
+        assert vlm.calls == 1
+        assert result.blocks[0].text.startswith("[PAGE 1]\n근무경력\n")
+        assert "가상회사1 | 2001.01.01" in result.blocks[0].text
+        assert "가상회사7 | 2007.01.01" in result.blocks[0].text
         assert result.blocks[0].vlm_pages_used == 1
-        assert result.blocks[0].vlm_table_band_calls_used == 3
+        assert result.blocks[0].vlm_table_band_calls_used == 1
     else:
+        # Bad one-crop evidence causes a conservative fallback (three tiles).
+        assert vlm.calls == 4
+        assert [ctx.get("page_tile") for ctx in vlm.contexts[1:]] == [
+            "1/3", "2/3", "3/3"
+        ]
         assert result.blocks[0].text == f"[PAGE 1]\n{prior.strip()}"
         assert result.blocks[0].vlm_pages_used == 0
 
@@ -139,6 +151,39 @@ def test_scanned_kosa_tiles_respect_total_call_cap() -> None:
 
     result = source.build([doc])
 
-    assert vlm.calls == 0
+    assert vlm.calls == 1  # Crop consumes one call; three-tile fallback stays capped.
     assert result.vlm_transcriptions == []
     assert result.blocks[0].text == f"[PAGE 1]\n{page.extracted_text.strip()}"
+
+
+
+def test_kosa_work_crop_rejects_invalid_dates_and_project_rows() -> None:
+    from app.modules.analysis.vlm_table_banding import (
+        normalize_kosa_cropped_employment_rows,
+    )
+
+    good = "\n".join(
+        f"가상회사{i} | 199{i}.02.01 ~ 199{i}.12.31 | 업무"
+        for i in range(1, 8)
+    )
+    assert normalize_kosa_cropped_employment_rows(good) == (
+        "근무경력\n" + good
+    )
+    assert normalize_kosa_cropped_employment_rows(
+        "가상회사 | 2001.01.01 ~ 2003.02.31 | 개발\n"
+        "나회사 | 2004.01.01 ~ 2005.01.01 | 개발\n"
+        "다회사 | 2006.01.01 ~ 2007.01.01 | 개발"
+    ) is None
+    assert normalize_kosa_cropped_employment_rows(
+        "가상회사 | 2009.01.01 ~ 2001.02.01 | 개발\n"
+        "나회사 | 2004.01.01 ~ 2005.01.01 | 개발\n"
+        "다회사 | 2006.01.01 ~ 2007.01.01 | 개발"
+    ) is None
+    assert normalize_kosa_cropped_employment_rows(
+        "프로젝트 | 2023.01.01 ~ 2023.12.31 | 참여기간\n"
+        "나회사 | 2004.01.01 ~ 2005.01.01 | 개발\n"
+        "다회사 | 2006.01.01 ~ 2007.01.01 | 개발"
+    ) is None
+    assert normalize_kosa_cropped_employment_rows(
+        "가상회사 | 2001.01.01 ~ 2003.02.01 | 업무"
+    ) is None
