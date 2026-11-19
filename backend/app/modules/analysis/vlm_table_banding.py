@@ -244,6 +244,10 @@ def is_plausible_kosa_employment_recovery(text: str) -> bool:
         return False
     if is_kosa_empty_markdown_table_vlm_quality_issue(raw):
         return False
+    # A full-page fallback containing technical/project sections is not a
+    # clean employment-only recovery; leave the stored VLM text untouched.
+    if _KOSA_PROJECT_ONLY_FIELD_RE.search(raw):
+        return False
     if not _KOSA_EMPLOYMENT_ANCHOR_RE.search(raw):
         return False
     dated = _KOSA_DATED_CELL_RE.findall(raw)
@@ -273,7 +277,11 @@ def normalize_kosa_cropped_employment_rows(text: str) -> str | None:
     This cannot assert that every row on the original image was recovered.
     """
     raw = (text or "").strip()
-    if not raw or len(raw) > 12000 or is_kosa_empty_markdown_table_vlm_quality_issue(raw):
+    if (
+        not raw
+        or len(raw) > 12000
+        or is_kosa_empty_markdown_table_vlm_quality_issue(raw)
+    ):
         return None
     lines = [line.strip() for line in raw.splitlines() if line.strip()]
     if lines and lines[0].strip().replace(" ", "") == "근무경력":
