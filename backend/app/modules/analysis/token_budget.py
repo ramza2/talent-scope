@@ -46,9 +46,10 @@ def verified_kosa_core_output_ratio(
 ) -> float:
     """Give only verified KOSA p1 work tables the measured CORE output room.
 
-    A real qwen3-14b V25 CORE-only test extracted all seven employers with
-    3584 of 8192 context tokens; the 2048-token default repeatedly truncated.
-    Match the 7/16 fraction, not a global model or service configuration.
+    A real qwen3-14b V25 CORE-only probe recovered all seven employers
+    when its output reserve was 7/16 of the reported context window;
+    the lower default ratio repeatedly truncated. This fraction does not
+    hardcode a model context window or change global service configuration.
     The override requires exactly one DOC-KOSA, a structurally verified
     employer p1 table (including independently validated lower projects),
     and explicitly disabled thinking. All other
