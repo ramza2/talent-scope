@@ -6,9 +6,22 @@ No data is written here; callers decide whether to use the resulting crops.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
+from datetime import date
 
 import pymupdf
+
+# KOSA career pages that lost real cells often keep only Markdown scaffolding.
+_MD_PIPE_LINE_RE = re.compile(r"\|")
+_MD_EMPTYISH_LINE_RE = re.compile(r"^[\s|:\-]+$")
+_YEAR_TOKEN_RE = re.compile(r"(?:19|20)\d{2}")
+_CAREER_ANCHOR_RE = re.compile(r"근무경력|재직기간|경력사항")
+_KOSA_EMPLOYMENT_ANCHOR_RE = re.compile(
+    r"근\s*무\s*경\s*력|재\s*직\s*기\s*간|경\s*력\s*사\s*항|"
+    r"근\s*무\s*처|근\s*무\s*기\s*간|입\s*사\s*일|퇴\s*사\s*일"
+)
+_KOSA_DATED_CELL_RE = re.compile(r"(?:19|20)\d{2}[./-]\d{1,2}(?:[./-]\d{1,2})?")
 
 
 @dataclass(frozen=True)
@@ -175,3 +188,190 @@ def is_valid_table_band_transcription(
     if expected_columns is not None and expected != expected_columns:
         return False
     return all(any(cell.strip() for cell in cells) for cells in rows)
+
+
+def is_kosa_empty_markdown_table_vlm_quality_issue(text: str) -> bool:
+    """Detect DOC-KOSA VLM pages that are mostly empty Markdown table chrome.
+
+    Real failure shape: thousands of characters / hundreds of lines that are
+    almost only ``|`` scaffolding, while career anchors (근무경력) and year
+    tokens (1990/2009) are missing. Fail closed on ambiguous pages.
+    """
+    raw = text or ""
+    lines = raw.splitlines()
+    if len(lines) < 40:
+        return False
+    pipe_lines = sum(1 for line in lines if _MD_PIPE_LINE_RE.search(line))
+    if pipe_lines < len(lines) * 0.45:
+        return False
+    emptyish = 0
+    content_chars = 0
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or _MD_EMPTYISH_LINE_RE.match(stripped):
+            emptyish += 1
+            continue
+        cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+        nonempty = [
+            cell
+            for cell in cells
+            if cell and not re.fullmatch(r"[\-:]+", cell)
+        ]
+        if not nonempty:
+            emptyish += 1
+        else:
+            content_chars += sum(len(cell) for cell in nonempty)
+    if emptyish < len(lines) * 0.50:
+        return False
+    if content_chars > max(220, int(len(raw) * 0.08)):
+        return False
+    has_career = bool(_CAREER_ANCHOR_RE.search(raw))
+    has_year = bool(_YEAR_TOKEN_RE.search(raw))
+    # Empty chrome pages typically lack both career headers and year tokens.
+    return not (has_career and has_year)
+
+
+
+def is_plausible_kosa_employment_recovery(text: str) -> bool:
+    """Accept a re-read scanned career table only with independently visible dates.
+
+    A lone birth date, a heading-only answer, empty Markdown scaffolding, or
+    a project-only transcription must never replace the stored page content.
+    This is a quality gate, not an employer-row count assertion.
+    """
+    raw = (text or "").strip()
+    if not raw or len(raw) > 24000:
+        return False
+    if is_kosa_empty_markdown_table_vlm_quality_issue(raw):
+        return False
+    # A full-page fallback containing technical/project sections is not a
+    # clean employment-only recovery; leave the stored VLM text untouched.
+    if _KOSA_PROJECT_ONLY_FIELD_RE.search(raw):
+        return False
+    if not _KOSA_EMPLOYMENT_ANCHOR_RE.search(raw):
+        return False
+    dated = _KOSA_DATED_CELL_RE.findall(raw)
+    if len(set(dated)) < 4:
+        return False
+    return sum(bool(_KOSA_DATED_CELL_RE.search(line)) for line in raw.splitlines()) >= 2
+
+
+
+_KOSA_COMPLETE_WORK_RANGE_RE = re.compile(
+    r"^\s*((?:19|20)\d{2}[./-]\d{1,2}[./-]\d{1,2})"
+    r"\s*[~～\-–—]\s*"
+    r"((?:19|20)\d{2}[./-]\d{1,2}[./-]\d{1,2})\s*$"
+)
+_KOSA_PROJECT_ONLY_FIELD_RE = re.compile(
+    r"참여사업|참여기간|발주처|발주기관|고객사|프로젝트|기술경력|사업명"
+)
+
+
+
+def normalize_kosa_cropped_project_rows(text: str) -> str | None:
+    """Validate a KOSA p1 *lower* technical-history crop independently.
+
+    Keep six original fields verbatim: project, period, client, affiliation,
+    title, responsibility. Never manufacture project names/dates from the
+    employer table. An uncertain or incomplete crop is not authoritative.
+    """
+    raw = (text or "").strip()
+    if not raw or len(raw) > 12000 or is_kosa_empty_markdown_table_vlm_quality_issue(raw):
+        return None
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    if lines and lines[0].replace(" ", "") == "기술경력":
+        lines = lines[1:]
+    if not 1 <= len(lines) <= 30:
+        return None
+    rows: list[str] = []
+    for line in lines:
+        if len(line) > 500:
+            return None
+        cells = [cell.strip() for cell in line.strip("|").split("|")]
+        if len(cells) != 6:
+            return None
+        project, period, customer, company, _title, _duty = cells
+        if (
+            not 2 <= len(project) <= 150
+            or not 2 <= len(customer) <= 150
+            or not 2 <= len(company) <= 150
+            or "근무경력" in project
+        ):
+            return None
+        match = _KOSA_COMPLETE_WORK_RANGE_RE.fullmatch(period)
+        if match is None:
+            return None
+        try:
+            start = date(*(int(part) for part in re.split(r"[./-]", match[1])))
+            end = date(*(int(part) for part in re.split(r"[./-]", match[2])))
+        except ValueError:
+            return None
+        if end < start:
+            return None
+        rows.append(line)
+    if len(rows) != len(set(rows)):
+        return None
+    return "기술경력\n" + "\n".join(rows)
+
+
+def split_verified_kosa_p1_sections(text: str) -> tuple[str, str] | None:
+    """Return validated employer and technical sections of the same p1 scan.
+
+    Work-only text (old V38 diagnostics) is accepted; if a technical marker is
+    present, the lower rows must also pass strict independent validation.
+    """
+    raw = (text or "").strip()
+    upper, sep, lower = raw.partition("\n기술경력\n")
+    work = normalize_kosa_cropped_employment_rows(upper)
+    if work is None:
+        return None
+    if not sep:
+        return (work, "")
+    projects = normalize_kosa_cropped_project_rows(lower)
+    if projects is None:
+        return None
+    return (work, projects)
+
+def normalize_kosa_cropped_employment_rows(text: str) -> str | None:
+    """Validate rule-free KOSA p1 work-table crop before replacing LLM input.
+
+    A *dedicated, top-of-page* KOSA crop must transcribe at least three
+    company / complete start-end date rows. Reject partial or mixed project
+    tables. The leading section label is metadata for downstream source
+    classification, never a reconstructed employer, date, or quote.
+    This cannot assert that every row on the original image was recovered.
+    """
+    raw = (text or "").strip()
+    if (
+        not raw
+        or len(raw) > 12000
+        or is_kosa_empty_markdown_table_vlm_quality_issue(raw)
+    ):
+        return None
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    if lines and lines[0].strip().replace(" ", "") == "근무경력":
+        lines = lines[1:]
+    if not 3 <= len(lines) <= 20:
+        return None
+    rows: list[str] = []
+    for line in lines:
+        cells = [part.strip() for part in line.strip("|").split("|")]
+        if len(cells) not in (2, 3):
+            return None
+        company, period = cells[0], cells[1]
+        if not 2 <= len(company) <= 100 or _KOSA_PROJECT_ONLY_FIELD_RE.search(line):
+            return None
+        match = _KOSA_COMPLETE_WORK_RANGE_RE.fullmatch(period)
+        if not match:
+            return None
+        try:
+            start = date(*(int(part) for part in re.split(r"[./-]", match[1])))
+            end = date(*(int(part) for part in re.split(r"[./-]", match[2])))
+        except ValueError:
+            return None
+        if end < start:
+            return None
+        rows.append(line)
+    if len(set(rows)) != len(rows):
+        return None
+    return "근무경력\n" + "\n".join(rows)

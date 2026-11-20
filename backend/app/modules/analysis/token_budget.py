@@ -37,6 +37,44 @@ def _validate_ratios(*, output_ratio: float, safety_ratio: float) -> None:
         raise ValueError("output_ratio + safety_ratio must be < 1")
 
 
+def verified_kosa_core_output_ratio(
+    configured_ratio: float,
+    *,
+    page_texts: dict[tuple[str, int], str] | None,
+    document_type_by_id: dict[str, str] | None,
+    enable_thinking: bool | None,
+) -> float:
+    """Give only verified KOSA p1 work tables the measured CORE output room.
+
+    A real qwen3-14b V25 CORE-only probe recovered all seven employers
+    when its output reserve was 7/16 of the reported context window;
+    the lower default ratio repeatedly truncated. This fraction does not
+    hardcode a model context window or change global service configuration.
+    The override requires exactly one DOC-KOSA, a structurally verified
+    employer p1 table (including independently validated lower projects),
+    and explicitly disabled thinking. All other
+    document flows retain their configured ratio.
+    """
+    if enable_thinking is not False or not page_texts:
+        return float(configured_ratio)
+    doc_ids = {str(document_id) for document_id, _ in page_texts}
+    if len(doc_ids) != 1:
+        return float(configured_ratio)
+    doc_id = next(iter(doc_ids))
+    doc_type = (document_type_by_id or {}).get(doc_id, "")
+    if doc_type.strip().upper() != "DOC-KOSA":
+        return float(configured_ratio)
+
+    from app.modules.analysis.vlm_table_banding import (
+        split_verified_kosa_p1_sections,
+    )
+
+    p1_text = page_texts.get((doc_id, 1), "")
+    if split_verified_kosa_p1_sections(p1_text) is None:
+        return float(configured_ratio)
+    return max(float(configured_ratio), 7.0 / 16.0)
+
+
 def compute_prompt_chat_budget(
     count: TokenCountResult,
     *,

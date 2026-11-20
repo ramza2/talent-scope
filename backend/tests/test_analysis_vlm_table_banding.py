@@ -16,6 +16,7 @@ from app.modules.analysis.source_builder import (
 )
 from app.modules.analysis.vlm_table_banding import (
     detect_table_row_bands,
+    is_kosa_empty_markdown_table_vlm_quality_issue,
     is_valid_table_band_transcription,
     normalize_table_band_transcription,
 )
@@ -328,3 +329,123 @@ def test_opt_in_reprocesses_existing_vlm_table_in_memory_only(valid):
         assert vlm.calls == 1
         assert result.blocks[0].text == f"[PAGE 1]\n{prior}"
         assert result.blocks[0].vlm_pages_used == 0
+
+
+def _empty_kosa_md_table_vlm_text(*, lines: int = 428) -> str:
+    """Real-log shape: hundreds of mostly empty Markdown table lines."""
+    rows: list[str] = []
+    for index in range(lines):
+        if index % 6 == 0:
+            rows.append("| --- | --- | --- | --- | --- | --- |")
+        elif index % 17 == 0:
+            rows.append("| 성명 |  |  |  |  |  |")
+        else:
+            rows.append("|  |  |  |  |  |  |")
+    return "\n".join(rows)
+
+
+def test_empty_markdown_table_quality_detector_matches_real_log_shape() -> None:
+    empty = _empty_kosa_md_table_vlm_text()
+    assert len(empty) > 4000
+    assert empty.count("\n") + 1 >= 400
+    assert is_kosa_empty_markdown_table_vlm_quality_issue(empty) is True
+    # Career content present → not a quality issue.
+    rich = empty + "\n근무경력\n에이회사 1990.03 ~ 2009.12\n"
+    assert is_kosa_empty_markdown_table_vlm_quality_issue(rich) is False
+    assert is_kosa_empty_markdown_table_vlm_quality_issue("짧은 표\n| a | b |") is False
+
+
+@pytest.mark.parametrize("valid", [True, False])
+def test_kosa_empty_table_triggers_memory_only_banding_without_reprocess_flag(
+    valid,
+) -> None:
+    """DOC-KOSA empty MD-table VLM quality → band in memory; never rewrite page."""
+    prior = _empty_kosa_md_table_vlm_text()
+    rows = "\n".join(
+        f"근무경력 | 에이회사{i} | 201{i}.01.01 | 201{i}.12.31 | 사원"
+        for i in range(5)
+    )
+    vlm = FakeVLMProvider(rows if valid else "not a table row")
+    settings = Settings(
+        _env_file=None,
+        analysis_vlm_table_banding_enabled=True,
+        # Intentionally off: quality detector alone must trigger.
+        analysis_vlm_table_banding_reprocess_done=False,
+    )
+    source = AnalysisSourceBuilder(object(), settings=settings, vlm=vlm)
+    source._open_render_source = (  # type: ignore[method-assign]
+        lambda _snapshot: pymupdf.open(stream=_pdf_bytes(), filetype="pdf")
+    )
+    page = PageSnapshot(
+        page_no=1,
+        extracted_text=prior,
+        layout_json={"needs_vlm": False, "vlm_transcribed": True},
+        extraction_method="VLM",
+    )
+    document = DocumentSnapshot(
+        id=uuid4(),
+        original_filename="kosa-empty-p1.pdf",
+        extension="pdf",
+        mime_type="application/pdf",
+        storage_key="unused",
+        preview_storage_key=None,
+        document_type_code="DOC-KOSA",
+        document_type_name="KOSA",
+        version_no=1,
+        person_id=uuid4(),
+        pages=[page],
+    )
+
+    result = source.build([document])
+
+    assert result.vlm_transcriptions == []
+    assert page.extracted_text == prior
+    assert page.layout_json == {"needs_vlm": False, "vlm_transcribed": True}
+    if valid:
+        # A complete employment-only band is no longer enough to replace
+        # KOSA p1: the same page can carry lower technical projects.
+        # Three successful bands + one rejected work crop; keep original.
+        assert vlm.calls == 4
+        assert result.blocks[0].text == f"[PAGE 1]\n{prior}"
+    else:
+        # Failed band, failed work-table crop, and three rejected fallback tiles.
+        assert vlm.calls == 5
+        assert result.blocks[0].text == f"[PAGE 1]\n{prior}"
+
+
+def test_non_kosa_empty_table_does_not_reband_without_reprocess_flag() -> None:
+    prior = _empty_kosa_md_table_vlm_text(lines=80)
+    vlm = FakeVLMProvider("should not be called")
+    settings = Settings(
+        _env_file=None,
+        analysis_vlm_table_banding_enabled=True,
+        analysis_vlm_table_banding_reprocess_done=False,
+    )
+    source = AnalysisSourceBuilder(object(), settings=settings, vlm=vlm)
+    source._open_render_source = (  # type: ignore[method-assign]
+        lambda _snapshot: pymupdf.open(stream=_pdf_bytes(), filetype="pdf")
+    )
+    document = DocumentSnapshot(
+        id=uuid4(),
+        original_filename="resume.pdf",
+        extension="pdf",
+        mime_type="application/pdf",
+        storage_key="unused",
+        preview_storage_key=None,
+        document_type_code="DOC-PROFILE",
+        document_type_name="이력서",
+        version_no=1,
+        person_id=uuid4(),
+        pages=[
+            PageSnapshot(
+                page_no=1,
+                extracted_text=prior,
+                layout_json={"needs_vlm": False, "vlm_transcribed": True},
+                extraction_method="VLM",
+            )
+        ],
+    )
+    result = source.build([document])
+    assert vlm.calls == 0
+    assert result.blocks[0].text == f"[PAGE 1]\n{prior}"
+    assert result.vlm_transcriptions == []

@@ -81,6 +81,33 @@ def _validated_rows(text: str) -> list[tuple[str, str, str, str, str]]:
     return rows
 
 
+def _validated_cropped_p1_projects(
+    text: str,
+) -> list[tuple[str, str, str, str, str]]:
+    """Recover six-cell technical rows only from a validated dual-section p1.
+
+    The work table, section boundary, and lower project table must all pass
+    their dedicated structural validators. Unlabeled or partial OCR is ignored.
+    """
+    from app.modules.analysis.vlm_table_banding import (
+        split_verified_kosa_p1_sections,
+    )
+
+    sections = split_verified_kosa_p1_sections(text)
+    if sections is None or not sections[1]:
+        return []
+    out: list[tuple[str, str, str, str, str]] = []
+    for quote in sections[1].splitlines()[1:]:
+        cells = [cell.strip() for cell in quote.strip("|").split("|")]
+        project, period, customer, _affiliation, _title, _duty = cells
+        match = _PERIOD_RE.fullmatch(period)
+        if match is None:
+            return []
+        start, end = match.group(1, 2)
+        out.append((project, customer, start, end, quote))
+    return out
+
+
 def supplement_kosa_table_projects(
     candidate: ProfileCandidateDocument,
     *,
@@ -102,6 +129,8 @@ def supplement_kosa_table_projects(
         if document_type_by_id.get(document_id) != "DOC-KOSA":
             continue
         rows = _validated_rows(text)
+        if not rows and page_no == 1:
+            rows = _validated_cropped_p1_projects(text)
         for title, customer, start, end, quote in rows:
             metrics["table_rows"] += 1
             ref = SourceRef(document_id=document_id, page_no=page_no, quote_text=quote)
