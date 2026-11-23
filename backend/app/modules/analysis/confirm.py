@@ -911,6 +911,10 @@ class _ConfirmContext:
         self.project_ids_by_index: dict[int, UUID] = {}
         self.skipped_diff_ids: set[UUID] = set()
         self.skipped_paths: list[str] = []
+        # (project_id, relation_field, code) already staged in this Confirm TX.
+        # SELECT alone misses unflushed session.new rows, so same-payload
+        # duplicates and MERGED base+decided repeats would PK-collide on flush.
+        self._pending_project_relation_keys: set[tuple[UUID, str, str]] = set()
         self.locked_employment = locked_employment or {}
         self.locked_education = locked_education or {}
         self.locked_certifications = locked_certifications or {}
@@ -980,6 +984,7 @@ class _ConfirmContext:
         if diff.review_status in {"REJECTED", "SAME", "PENDING"}:
             return
         project_ids_before = self.project_ids_by_index.copy()
+        pending_relations_before = self._pending_project_relation_keys.copy()
         try:
             # Flush inside the savepoint so DB constraints fail on this one
             # candidate, not after other valid candidates have been applied.
@@ -992,6 +997,7 @@ class _ConfirmContext:
                 self.db.flush()
         except (ConfirmValidationError, IntegrityError, DataError):
             self.project_ids_by_index = project_ids_before
+            self._pending_project_relation_keys = pending_relations_before
             self.applied._items.pop(diff.id, None)
             self.db.expire_all()
             self._mark_skipped(diff)
@@ -1786,11 +1792,16 @@ class _ConfirmContext:
             items = data.get(field) or []
             if not isinstance(items, list):
                 continue
+            # First occurrence wins within one payload list.
+            seen_in_payload: set[str] = set()
             for raw in items:
                 item = raw if isinstance(raw, dict) else {"code": raw}
                 code = _extract_code(item)
                 if not code:
                     continue  # skip null codes
+                if code in seen_in_payload:
+                    continue
+                seen_in_payload.add(code)
                 self._insert_project_relation(project_id, field, item)
 
     def _insert_project_relation(
@@ -1811,6 +1822,10 @@ class _ConfirmContext:
         expected = type_map[field]
         _require_active_code(self.people_repo, code, expected)
 
+        pending_key = (project_id, field, code)
+        if pending_key in self._pending_project_relation_keys:
+            return
+
         if field == "jobs":
             exists = self.db.execute(
                 select(ProjectJob).where(
@@ -1819,6 +1834,7 @@ class _ConfirmContext:
             ).scalar_one_or_none()
             if exists is None:
                 self.db.add(ProjectJob(project_id=project_id, job_code=code))
+                self._pending_project_relation_keys.add(pending_key)
         elif field == "skills":
             exists = self.db.execute(
                 select(ProjectSkill).where(
@@ -1828,6 +1844,7 @@ class _ConfirmContext:
             ).scalar_one_or_none()
             if exists is None:
                 self.db.add(ProjectSkill(project_id=project_id, tech_code=code))
+                self._pending_project_relation_keys.add(pending_key)
         elif field == "expertise":
             exists = self.db.execute(
                 select(ProjectExpertise).where(
@@ -1837,6 +1854,7 @@ class _ConfirmContext:
             ).scalar_one_or_none()
             if exists is not None:
                 # Additive no-op — never mutate existing evidence_type.
+                self._pending_project_relation_keys.add(pending_key)
                 return
             evidence = _parse_evidence_type(item)
             self.db.add(
@@ -1846,6 +1864,7 @@ class _ConfirmContext:
                     evidence_type=evidence,
                 )
             )
+            self._pending_project_relation_keys.add(pending_key)
         elif field == "business_domains":
             exists = self.db.execute(
                 select(ProjectBusinessDomain).where(
@@ -1857,6 +1876,7 @@ class _ConfirmContext:
                 self.db.add(
                     ProjectBusinessDomain(project_id=project_id, biz_code=code)
                 )
+                self._pending_project_relation_keys.add(pending_key)
         elif field == "customer_types":
             exists = self.db.execute(
                 select(ProjectCustomerType).where(
@@ -1870,6 +1890,7 @@ class _ConfirmContext:
                         project_id=project_id, customer_type_code=code
                     )
                 )
+                self._pending_project_relation_keys.add(pending_key)
 
 
 __all__ = [
