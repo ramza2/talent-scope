@@ -30,6 +30,7 @@ def test_confirm_skips_invalid_diff_with_savepoint_unit() -> None:
         ctx.project_ids_by_index = {}
         ctx.skipped_diff_ids = set()
         ctx.skipped_paths = []
+        ctx._pending_project_relation_keys = set()
         ctx.applied = AppliedTargetRegistry()
 
         bad_date = AnalysisDiffItem(

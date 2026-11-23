@@ -93,6 +93,9 @@ from app.modules.analysis.compact_v8 import (
     supplement_root_job_exp_evidence_from_project_relations,
     supplement_semantic_project_relations_from_source,
 )
+from app.modules.analysis.docx_career_project_table import (
+    supplement_docx_career_table_projects,
+)
 from app.modules.analysis.kosa_project_recall import supplement_kosa_table_projects
 from app.modules.analysis.candidate_quality_guards import apply_candidate_quality_guards
 from app.modules.analysis.diff_evidence import (
@@ -3431,6 +3434,11 @@ class AnalysisService:
             )
 
         projects_doc = _run_projects_adaptive()
+        document_extension_by_id = {
+            str(doc.id): str(doc.extension or "").lower().lstrip(".")
+            for doc in documents
+            if getattr(doc, "extension", None)
+        }
         if prompt.project_page_recall_split:
             projects_doc, kosa_recall = supplement_kosa_table_projects(
                 projects_doc,
@@ -3514,6 +3522,29 @@ class AnalysisService:
             call_count,
             used_project_adaptive_split,
         )
+
+        # After second-pass (or when it is skipped): re-validate DOCX career /
+        # resume project tables so employment fakes cannot reappear. No LLM.
+        if prompt.project_page_recall_split:
+            projects_doc, docx_recall = supplement_docx_career_table_projects(
+                projects_doc,
+                page_texts=page_texts,
+                document_type_by_id=document_type_by_id,
+                document_extension_by_id=document_extension_by_id,
+            )
+            logger.info(
+                "analysis v39 docx career table project recall "
+                "analysis_run_id=%s table_rows=%s matched_rows=%s "
+                "supplemented_rows=%s corrected_titles=%s "
+                "dropped_employment_fakes=%s after_second_pass=%s",
+                base_log.get("analysis_run_id"),
+                docx_recall["table_rows"],
+                docx_recall["matched_rows"],
+                docx_recall["supplemented_rows"],
+                docx_recall["corrected_titles"],
+                docx_recall["dropped_employment_fakes"],
+                project_recall_second_pass,
+            )
 
         merged = core.model_copy(update={"projects": list(projects_doc.projects)})
         merged, root_rel_report = supplement_root_job_exp_evidence_from_project_relations(
