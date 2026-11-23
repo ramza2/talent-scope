@@ -1,6 +1,7 @@
-"""DOCX 경력기술서 project-table structuring and candidate recall.
+"""DOCX project-table structuring and candidate recall (경력기술서/이력서).
 
-Limited to DOCX → PDF extraction / DOC-CAREER analysis. Does not alter
+DOCX → PDF extraction + DOC-CAREER / DOC-RESUME analysis only when a verified
+사업명/기간/(역할|담당업무|발주처) table is present. Does not alter
 PDF/HWP/PPTX/KOSA native paths. Never mutates Confirmed Profile tables.
 """
 
@@ -18,6 +19,7 @@ from app.ai.schemas.profile_candidate import (
 
 CAREER_TABLE_MARKER = "[CAREER_PROJECT_TABLE]"
 _LAYOUT_KEY = "docx_career_project_table"
+_DOCX_PROJECT_TABLE_TYPES = frozenset({"DOC-CAREER", "DOC-RESUME"})
 
 _NON_WORD_RE = re.compile(r"[^0-9a-z가-힣]+")
 _PERIOD_FULL_RE = re.compile(
@@ -48,7 +50,11 @@ def _match_key(value: str | None) -> str:
 
 
 def career_project_header_columns(cells: Sequence[object]) -> dict[str, int]:
-    """Map 사업명/기간/역할/담당업무 상세/발주처 headers. Fail closed otherwise."""
+    """Map 사업명/기간/역할/담당업무 상세/발주처 headers. Fail closed otherwise.
+
+    Requires project_name + period and at least one of role/duty/customer so
+    ordinary resume tables (회사명·학력 등) never match by accident.
+    """
     found: dict[str, int] = {}
     for index, cell in enumerate(cells):
         key = _label(cell)
@@ -68,9 +74,11 @@ def career_project_header_columns(cells: Sequence[object]) -> dict[str, int]:
             found.setdefault("duty", index)
         elif any(token in key for token in ("발주처", "고객사", "발주기관")):
             found.setdefault("customer", index)
-    if {"project_name", "period"} <= found.keys():
-        return found
-    return {}
+    if not {"project_name", "period"} <= found.keys():
+        return {}
+    if not ({"role", "duty", "customer"} & found.keys()):
+        return {}
+    return found
 
 
 def parse_career_period(period: str) -> tuple[str, str] | None:
@@ -114,9 +122,8 @@ def _row_dict(
     if dates is None or len(title) < 4:
         return None
     start, end = dates
-    quote = " | ".join(cell for cell in cells if cell)
-    if not quote or len(quote) > 500:
-        quote = f"{title} | {period_raw}"
+    # quote_text is resolved later against original DocumentPage text —
+    # never persist synthetic pipe-joined rows as Evidence quotes.
     return {
         "page_no": page_no,
         "row_index": row_index,
@@ -128,7 +135,6 @@ def _row_dict(
         "duty": _at("duty") or None,
         "customer_name": _at("customer") or None,
         "cells": cells,
-        "quote_text": quote,
     }
 
 
@@ -282,17 +288,61 @@ def rows_from_layout(layout_json: Mapping[str, Any] | None) -> list[dict[str, An
     return out
 
 
+def original_page_body(text: str) -> str:
+    """Strip the analysis-only structured block; keep DocumentPage text."""
+    body = text or ""
+    if CAREER_TABLE_MARKER in body:
+        body = body.split(CAREER_TABLE_MARKER, 1)[0]
+    return body.rstrip()
+
+
+def literal_quote_from_page(
+    original_text: str, *, title: str, period_raw: str
+) -> str | None:
+    """Return a contiguous original-page substring suitable for Evidence.
+
+    Never returns synthetic ``|``-joined table rows. Prefers the project title,
+    then a whitespace-flexible title match (preserving original newlines),
+    then the period token when it appears literally.
+    """
+    original = original_text or ""
+    title = _flat(title)
+    period = _flat(period_raw)
+    if title and title in original:
+        return title[:500]
+    if title:
+        pattern = re.compile(
+            re.escape(title).replace(r"\ ", r"\s+"),
+            flags=re.MULTILINE,
+        )
+        match = pattern.search(original)
+        if match is not None:
+            return original[match.start() : match.end()][:500]
+    if period and period in original:
+        return period[:500]
+    # Period may appear with spacing artifacts from PDF extract (2022 .04~12).
+    if period:
+        loose = re.compile(
+            re.escape(period).replace(r"\ ", r"\s*").replace(r"\.", r"\s*\.\s*"),
+        )
+        match = loose.search(original)
+        if match is not None:
+            return original[match.start() : match.end()][:500]
+    return None
+
+
 def parse_career_table_rows_from_text(
     text: str, *, page_no: int, document_id: str | None = None
 ) -> list[dict[str, Any]]:
-    """Parse the structured LLM block back into verified rows."""
+    """Parse the structured LLM block; quotes resolved against original body."""
     if CAREER_TABLE_MARKER not in (text or ""):
         return []
+    original = original_page_body(text)
     section = text.split(CAREER_TABLE_MARKER, 1)[1]
     rows: list[dict[str, Any]] = []
     for raw_line in section.splitlines():
         line = raw_line.strip()
-        if not line.startswith("|") or "사업명" in line and "기간" in line:
+        if not line.startswith("|") or ("사업명" in line and "기간" in line):
             continue
         cells = [cell.strip() for cell in line.strip("|").split("|")]
         if len(cells) < 2:
@@ -302,22 +352,29 @@ def parse_career_table_rows_from_text(
             cells.append("")
         name, period_raw, role, duty, customer = cells[:5]
         dates = parse_career_period(period_raw)
-        if dates is None or len(_flat(name)) < 4:
+        title = _flat(name)
+        period = _flat(period_raw)
+        if dates is None or len(title) < 4:
             continue
         start, end = dates
-        quote = " | ".join(c for c in cells[:5] if c)
+        quote = literal_quote_from_page(
+            original, title=title, period_raw=period
+        )
+        if quote is None or "|" in quote:
+            # No verified contiguous original quote → skip (fail closed).
+            continue
         rows.append(
             {
                 "document_id": document_id,
                 "page_no": page_no,
-                "project_name": _flat(name),
-                "period_raw": _flat(period_raw),
+                "project_name": title,
+                "period_raw": period,
                 "start_date": start,
                 "end_date": end,
                 "role": _flat(role) or None,
                 "duty": _flat(duty) or None,
                 "customer_name": _flat(customer) or None,
-                "quote_text": quote[:500],
+                "quote_text": quote,
             }
         )
     return rows
@@ -358,6 +415,10 @@ def _employment_duty_keys(candidate: ProfileCandidateDocument) -> set[str]:
     return keys
 
 
+def is_docx_project_table_doc_type(doc_type: str | None) -> bool:
+    return (doc_type or "").strip().upper() in _DOCX_PROJECT_TABLE_TYPES
+
+
 def supplement_docx_career_table_projects(
     candidate: ProfileCandidateDocument,
     *,
@@ -365,7 +426,11 @@ def supplement_docx_career_table_projects(
     document_type_by_id: Mapping[str, str],
     document_extension_by_id: Mapping[str, str] | None = None,
 ) -> tuple[ProfileCandidateDocument, dict[str, int]]:
-    """Recover / correct DOC-CAREER table projects; drop employment fakes."""
+    """Recover / correct verified DOCX table projects; drop employment fakes.
+
+    Runs for DOC-CAREER and DOC-RESUME only when structured table rows parse
+    successfully (header + dated project rows + literal original quotes).
+    """
     metrics = {
         "table_rows": 0,
         "matched_rows": 0,
@@ -379,7 +444,7 @@ def supplement_docx_career_table_projects(
     verified: list[dict[str, Any]] = []
     for (document_id, page_no), text in sorted(page_texts.items()):
         doc_type = (document_type_by_id.get(document_id) or "").strip().upper()
-        if doc_type != "DOC-CAREER":
+        if not is_docx_project_table_doc_type(doc_type):
             continue
         ext = (document_extension_by_id or {}).get(document_id, "docx")
         if ext and ext.lower().lstrip(".") != "docx":
@@ -502,6 +567,9 @@ __all__ = [
     "extract_docx_career_project_rows_from_page",
     "extract_docx_career_project_rows_from_pdf",
     "format_career_table_block",
+    "is_docx_project_table_doc_type",
+    "literal_quote_from_page",
+    "original_page_body",
     "parse_career_period",
     "parse_career_table_rows_from_text",
     "rows_from_layout",

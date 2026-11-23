@@ -23,10 +23,12 @@ from app.modules.analysis.docx_career_project_table import (
     career_project_header_columns,
     extract_docx_career_project_rows_from_page,
     format_career_table_block,
+    literal_quote_from_page,
     parse_career_period,
     parse_career_table_rows_from_text,
     supplement_docx_career_table_projects,
 )
+from app.modules.analysis.compact_v8 import supplement_projects_from_second_pass
 from app.modules.document_processing.types import ExtractedPage
 
 _DOC = "a1111111-1111-1111-1111-111111111111"
@@ -101,7 +103,7 @@ def _candidate(
     )
 
 
-def test_header_requires_project_name_and_period() -> None:
+def test_header_requires_project_name_period_and_role_or_duty_or_customer() -> None:
     assert career_project_header_columns(
         ["사업명", "기간", "역할", "담당업무 상세", "발주처"]
     ) == {
@@ -111,8 +113,35 @@ def test_header_requires_project_name_and_period() -> None:
         "duty": 3,
         "customer": 4,
     }
-    # Bare 기간 without 사업명 stays fail-closed (non-career tables).
+    # Ordinary resume / generic tables must not match.
     assert career_project_header_columns(["기간", "구분", "내용"]) == {}
+    assert career_project_header_columns(["사업명", "기간"]) == {}
+    assert career_project_header_columns(
+        ["회사명", "기간", "직위", "담당업무"]
+    ) == {}
+
+
+def _original_p2_body() -> str:
+    """Simulate DocumentPage text where titles/periods appear literally."""
+    lines = ["경력 기술서", "사업명 기간 역할 담당업무 상세 발주처"]
+    for name, period, role, duty, customer in _PROJECTS:
+        lines.append(f"{name}")
+        lines.append(f"{period} {role} {duty} {customer}")
+    return "\n".join(lines)
+
+
+def _page2_with_table_block() -> str:
+    rows = [
+        {
+            "project_name": name,
+            "period_raw": period,
+            "role": role,
+            "duty": duty,
+            "customer_name": customer,
+        }
+        for name, period, role, duty, customer in _PROJECTS
+    ]
+    return append_career_table_block(_original_p2_body(), rows)
 
 
 @pytest.mark.parametrize(
@@ -187,23 +216,8 @@ def test_no_table_docx_keeps_text_unchanged() -> None:
     assert parse_career_table_rows_from_text(original, page_no=2) == []
 
 
-def test_supplement_recovers_four_projects_and_drops_employment_fake() -> None:
-    block = format_career_table_block(
-        [
-            {
-                "project_name": name,
-                "period_raw": period,
-                "role": role,
-                "duty": duty,
-                "customer_name": customer,
-            }
-            for name, period, role, duty, customer in _PROJECTS
-        ]
-    )
-    page1 = "근무경력\n회사명 테스트소프트\n기간 2020.01~2024.12\n담당업무 앱 개발"
-    page2 = f"경력 기술서\n{block}"
-    # AI produced only 3 projects: fake employment duty + 2 truncated reals.
-    candidate = _candidate(
+def _sparse_ai_candidate() -> ProfileCandidateDocument:
+    return _candidate(
         employment=[
             EmploymentCandidate(
                 company_name="테스트소프트",
@@ -249,12 +263,9 @@ def test_supplement_recovers_four_projects_and_drops_employment_fake() -> None:
             ),
         ],
     )
-    out, metrics = supplement_docx_career_table_projects(
-        candidate,
-        page_texts={(_DOC, 1): page1, (_DOC, 2): page2},
-        document_type_by_id={_DOC: "DOC-CAREER"},
-        document_extension_by_id={_DOC: "docx"},
-    )
+
+
+def _assert_four_real_projects(out: ProfileCandidateDocument, metrics: dict) -> None:
     assert metrics["table_rows"] == 4
     assert metrics["dropped_employment_fakes"] == 1
     assert metrics["supplemented_rows"] >= 2
@@ -267,22 +278,134 @@ def test_supplement_recovers_four_projects_and_drops_employment_fake() -> None:
     assert "기존 델파이 기반 응용 소프트웨어를 AOS로 구현" in names
     assert len(out.projects) == 4
     assert len(out.employment_history) == 1
+    original = _original_p2_body()
     for project in out.projects:
-        assert any(ref.page_no == 2 for ref in project.source_refs)
+        p2_refs = [ref for ref in project.source_refs if ref.page_no == 2]
+        assert p2_refs
+        for ref in p2_refs:
+            quote = ref.quote_text or ""
+            assert "|" not in quote
+            assert quote in original
+
+
+def test_literal_quote_never_uses_pipe_rows() -> None:
+    original = _original_p2_body()
+    quote = literal_quote_from_page(
+        original,
+        title="모바일 퍼즐 게임",
+        period_raw="2023.06~2024.02",
+    )
+    assert quote == "모바일 퍼즐 게임"
+    assert quote in original
+    assert "|" not in quote
+    # Multiline title still returns an original contiguous slice.
+    multiline = "출장 업무 스케줄 관리\n애플리케이션\n2022.04~12"
+    quote2 = literal_quote_from_page(
+        multiline,
+        title="출장 업무 스케줄 관리 애플리케이션",
+        period_raw="2022.04~12",
+    )
+    assert quote2 == "출장 업무 스케줄 관리\n애플리케이션"
+    assert quote2 in multiline
+
+
+def test_parse_rows_require_original_substring_quotes() -> None:
+    # Pipe block alone (no original titles) → fail closed.
+    block_only = format_career_table_block(
+        [
+            {
+                "project_name": name,
+                "period_raw": period,
+                "role": role,
+                "duty": duty,
+                "customer_name": customer,
+            }
+            for name, period, role, duty, customer in _PROJECTS
+        ]
+    )
+    assert parse_career_table_rows_from_text(block_only, page_no=2) == []
+    rows = parse_career_table_rows_from_text(
+        _page2_with_table_block(), page_no=2, document_id=_DOC
+    )
+    assert len(rows) == 4
+    for row in rows:
+        assert "|" not in row["quote_text"]
+        assert row["quote_text"] in _original_p2_body()
+
+
+@pytest.mark.parametrize("doc_type", ["DOC-CAREER", "DOC-RESUME"])
+def test_supplement_recovers_four_projects_and_drops_employment_fake(
+    doc_type: str,
+) -> None:
+    page1 = "근무경력\n회사명 테스트소프트\n기간 2020.01~2024.12\n담당업무 앱 개발"
+    page2 = _page2_with_table_block()
+    out, metrics = supplement_docx_career_table_projects(
+        _sparse_ai_candidate(),
+        page_texts={(_DOC, 1): page1, (_DOC, 2): page2},
+        document_type_by_id={_DOC: doc_type},
+        document_extension_by_id={_DOC: "docx"},
+    )
+    _assert_four_real_projects(out, metrics)
+
+
+def test_second_pass_union_cannot_revive_employment_fake() -> None:
+    """Table validation after second-pass merge drops reintroduced fakes."""
+    page1 = "근무경력\n회사명 테스트소프트\n기간 2020.01~2024.12\n담당업무 앱 개발"
+    page2 = _page2_with_table_block()
+    first, _ = supplement_docx_career_table_projects(
+        _sparse_ai_candidate(),
+        page_texts={(_DOC, 1): page1, (_DOC, 2): page2},
+        document_type_by_id={_DOC: "DOC-RESUME"},
+        document_extension_by_id={_DOC: "docx"},
+    )
+    assert "앱 개발" not in [p.project_name for p in first.projects]
+
+    second = _candidate(
+        employment=list(first.employment_history),
+        projects=list(first.projects)
+        + [
+            ProjectCandidate(
+                project_name="앱 개발",
+                start_date="2020.01",
+                end_date="2024.12",
+                customer_name="테스트소프트",
+                source_refs=[
+                    SourceRef(document_id=_DOC, page_no=1, quote_text="앱 개발")
+                ],
+            )
+        ],
+    )
+    merged, _added = supplement_projects_from_second_pass(first, second)
+    assert any(p.project_name == "앱 개발" for p in merged.projects)
+
+    final, metrics = supplement_docx_career_table_projects(
+        merged,
+        page_texts={(_DOC, 1): page1, (_DOC, 2): page2},
+        document_type_by_id={_DOC: "DOC-RESUME"},
+        document_extension_by_id={_DOC: "docx"},
+    )
+    assert metrics["dropped_employment_fakes"] >= 1
+    assert "앱 개발" not in [p.project_name for p in final.projects]
+    assert len(final.projects) == 4
+    assert len(final.employment_history) == 1
+
+
+def test_resume_without_verified_project_table_is_noop() -> None:
+    """DOC-RESUME without 사업명/기간… header must not invent projects."""
+    page = "이력서\n학력\n학교명 기간 전공\nOO대학교 2010.03~2014.02 컴퓨터"
+    candidate = _sparse_ai_candidate()
+    out, metrics = supplement_docx_career_table_projects(
+        candidate,
+        page_texts={(_DOC, 1): page},
+        document_type_by_id={_DOC: "DOC-RESUME"},
+        document_extension_by_id={_DOC: "docx"},
+    )
+    assert metrics["table_rows"] == 0
+    assert out.projects == candidate.projects
 
 
 def test_non_career_or_non_docx_paths_untouched() -> None:
-    block = format_career_table_block(
-        [
-            {
-                "project_name": "출장 업무 스케줄 관리 애플리케이션",
-                "period_raw": "2022.04~12",
-                "role": "개발",
-                "duty": "UI",
-                "customer_name": "내부",
-            }
-        ]
-    )
+    page2 = _page2_with_table_block()
     candidate = _candidate(
         projects=[
             ProjectCandidate(
@@ -303,7 +426,7 @@ def test_non_career_or_non_docx_paths_untouched() -> None:
     # KOSA / PDF must not consume the DOCX career block.
     out, metrics = supplement_docx_career_table_projects(
         candidate,
-        page_texts={(_DOC, 2): block},
+        page_texts={(_DOC, 2): page2},
         document_type_by_id={_DOC: "DOC-KOSA"},
         document_extension_by_id={_DOC: "pdf"},
     )

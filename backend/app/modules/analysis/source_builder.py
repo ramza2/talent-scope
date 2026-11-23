@@ -557,36 +557,36 @@ class AnalysisSourceBuilder:
                                 transcriptions.append(item)
                                 text = item.persisted_text
 
-                    # DOCX 경력기술서: keep original page text, append structured
-                    # project-table rows so LLM/recall see all verified lines.
+                    # DOCX DOC-CAREER / DOC-RESUME: keep original page text,
+                    # append structured project-table rows only when verified.
                     if (
                         text
                         and (doc.extension or "").lower().strip() == "docx"
-                        and (doc.document_type_code or "").strip().upper()
-                        == "DOC-CAREER"
                     ):
                         from app.modules.analysis.docx_career_project_table import (
                             append_career_table_block,
                             extract_docx_career_project_rows_from_page,
+                            is_docx_project_table_doc_type,
                             rows_from_layout,
                         )
 
-                        career_rows = rows_from_layout(page.layout_json)
-                        if not career_rows:
-                            if pdf_doc is None:
-                                pdf_doc = self._open_render_source(doc)
-                            if (
-                                pdf_doc is not None
-                                and 0 < page.page_no <= len(pdf_doc)
-                            ):
-                                career_rows = (
-                                    extract_docx_career_project_rows_from_page(
-                                        pdf_doc.load_page(page.page_no - 1),
-                                        page_no=page.page_no,
+                        if is_docx_project_table_doc_type(doc.document_type_code):
+                            career_rows = rows_from_layout(page.layout_json)
+                            if not career_rows:
+                                if pdf_doc is None:
+                                    pdf_doc = self._open_render_source(doc)
+                                if (
+                                    pdf_doc is not None
+                                    and 0 < page.page_no <= len(pdf_doc)
+                                ):
+                                    career_rows = (
+                                        extract_docx_career_project_rows_from_page(
+                                            pdf_doc.load_page(page.page_no - 1),
+                                            page_no=page.page_no,
+                                        )
                                     )
-                                )
-                        if career_rows:
-                            text = append_career_table_block(text, career_rows)
+                            if career_rows:
+                                text = append_career_table_block(text, career_rows)
 
                     if text:
                         parts.append(f"[PAGE {page.page_no}]\n{text}")
