@@ -378,6 +378,14 @@ class DocumentProcessingService:
             raise ConverterError("변환 결과가 유효한 PDF가 아닙니다.")
 
         result = extract_pdf_pages(pdf_bytes)
+        # DOCX → PDF only: structure 경력기술서 project tables in layout_json
+        # without replacing extracted_text (Evidence stays on original text).
+        if extension == "docx":
+            from app.modules.analysis.docx_career_project_table import (
+                attach_docx_career_tables_to_pages,
+            )
+
+            attach_docx_career_tables_to_pages(pdf_bytes, result.pages)
         result.preview_pdf_bytes = pdf_bytes
         result.uses_original_as_preview = False
         return result
