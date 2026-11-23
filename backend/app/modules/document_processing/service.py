@@ -385,7 +385,9 @@ class DocumentProcessingService:
                 attach_docx_career_tables_to_pages,
             )
 
-            attach_docx_career_tables_to_pages(pdf_bytes, result.pages)
+            attach_docx_career_tables_to_pages(
+                pdf_bytes, result.pages, docx_bytes=original_bytes
+            )
         result.preview_pdf_bytes = pdf_bytes
         result.uses_original_as_preview = False
         return result

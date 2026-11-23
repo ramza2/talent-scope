@@ -7,8 +7,11 @@ PDF/HWP/PPTX/KOSA native paths. Never mutates Confirmed Profile tables.
 
 from __future__ import annotations
 
+import io
 import re
 import unicodedata
+import xml.etree.ElementTree as ET
+import zipfile
 from typing import Any, Mapping, Sequence
 
 from app.ai.schemas.profile_candidate import (
@@ -193,6 +196,104 @@ def extract_docx_career_project_rows_from_page(
     return rows
 
 
+def extract_docx_career_project_rows_from_docx(
+    docx_bytes: bytes,
+) -> list[dict[str, Any]]:
+    """Read real DOCX OOXML table rows when PDF find_tables loses the header.
+
+    Only a verified project header + dated rows are accepted. Bounded document
+    XML decompression avoids oversized/untrusted input; no external entities.
+    """
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    try:
+        with zipfile.ZipFile(io.BytesIO(docx_bytes)) as archive:
+            info = archive.getinfo("word/document.xml")
+            if info.file_size > 16 * 1024 * 1024:
+                return []
+            root = ET.fromstring(archive.read(info))
+    except (ValueError, KeyError, zipfile.BadZipFile, ET.ParseError, OSError):
+        return []
+
+    result: list[dict[str, Any]] = []
+    for table in root.findall(".//w:tbl", ns)[:500]:
+        table_rows = table.findall("./w:tr", ns)
+        if len(table_rows) > 200:
+            continue
+        header: dict[str, int] = {}
+        header_index: int | None = None
+        extracted: list[list[str]] = []
+        for row in table_rows:
+            values: list[str] = []
+            cells = row.findall("./w:tc", ns)
+            if len(cells) > 40:
+                break
+            for cell in cells:
+                segments = []
+                for paragraph in cell.findall("./w:p", ns):
+                    text = "".join(
+                        node.text or "" for node in paragraph.findall(".//w:t", ns)
+                    )
+                    if text.strip():
+                        segments.append(text)
+                values.append(_flat(" ".join(segments)))
+            extracted.append(values)
+        for i, cells in enumerate(extracted[:8]):
+            columns = career_project_header_columns(cells)
+            if columns:
+                header, header_index = columns, i
+                break
+        if header_index is None:
+            continue
+        for index in range(header_index + 1, len(extracted)):
+            cells = extracted[index]
+            if len(cells) <= max(header.values()):
+                continue
+            row = _row_dict(
+                page_no=0, row_index=index, cells=cells, columns=header
+            )
+            if row is not None:
+                result.append(row)
+    return result
+
+
+def extract_docx_career_project_rows_by_page(
+    docx_bytes: bytes, pages: Sequence[Any]
+) -> dict[int, list[dict[str, Any]]]:
+    """Locate native DOCX rows on a unique PDF-extracted page, quote-verified.
+
+    Page assignment is never guessed. Titles are preferred; a literal period
+    is allowed only when exactly one page matches.
+    """
+    rows = extract_docx_career_project_rows_from_docx(docx_bytes)
+    by_page: dict[int, list[dict[str, Any]]] = {}
+    for row in rows:
+        title_matches = [
+            int(page.page_no)
+            for page in pages
+            if literal_quote_from_page(
+                getattr(page, "extracted_text", None) or "",
+                title=row["project_name"],
+                period_raw="",
+            )
+        ]
+        matches = title_matches
+        if not matches:
+            matches = [
+                int(page.page_no)
+                for page in pages
+                if literal_quote_from_page(
+                    getattr(page, "extracted_text", None) or "",
+                    title="",
+                    period_raw=row["period_raw"],
+                )
+            ]
+        if len(matches) != 1:
+            continue
+        page_no = matches[0]
+        by_page.setdefault(page_no, []).append({**row, "page_no": page_no})
+    return by_page
+
+
 def extract_docx_career_project_rows_from_pdf(
     pdf_bytes: bytes,
 ) -> dict[int, list[dict[str, Any]]]:
@@ -215,10 +316,14 @@ def extract_docx_career_project_rows_from_pdf(
 
 
 def attach_docx_career_tables_to_pages(
-    pdf_bytes: bytes, pages: Sequence[Any]
+    pdf_bytes: bytes, pages: Sequence[Any], *, docx_bytes: bytes | None = None
 ) -> None:
-    """Store structured rows on page ``layout_json`` without altering text."""
+    """Store verified rows on layout_json; prefer native DOCX if PDF loses rows."""
     by_page = extract_docx_career_project_rows_from_pdf(pdf_bytes)
+    if docx_bytes is not None:
+        native = extract_docx_career_project_rows_by_page(docx_bytes, pages)
+        if sum(map(len, native.values())) > sum(map(len, by_page.values())):
+            by_page = native
     if not by_page:
         return
     for page in pages:
@@ -415,6 +520,36 @@ def _employment_duty_keys(candidate: ProfileCandidateDocument) -> set[str]:
     return keys
 
 
+def _is_proven_employment_mirror_on_page_one(
+    project: ProjectCandidate,
+    candidate: ProfileCandidateDocument,
+    document_ids: set[str],
+) -> bool:
+    """Exclude a false project only with same DOCX p1 provenance and job period.
+
+    A generic project title or matching employer department alone is NOT enough.
+    Genuine projects with page-2 or other-document evidence remain untouched.
+    """
+    refs = list(project.source_refs or [])
+    if not refs or not all(
+        str(ref.document_id or "") in document_ids and ref.page_no == 1
+        for ref in refs
+    ):
+        return False
+    title = _title_key(project.project_name)
+    months = _month_pair(project.start_date, project.end_date)
+    if not title or months is None:
+        return False
+    for employment in candidate.employment_history or []:
+        if months != _month_pair(employment.start_date, employment.end_date):
+            continue
+        for field in (employment.department, employment.responsibilities):
+            for part in re.split(r"[,/·\n|;]", field or ""):
+                if title == _title_key(part):
+                    return True
+    return False
+
+
 def is_docx_project_table_doc_type(doc_type: str | None) -> bool:
     return (doc_type or "").strip().upper() in _DOCX_PROJECT_TABLE_TYPES
 
@@ -528,11 +663,11 @@ def supplement_docx_career_table_projects(
         if updates:
             projects[match_idx] = project.model_copy(update=updates)
 
-    duty_keys = _employment_duty_keys(candidate)
     verified_title_keys = {_title_key(row["project_name"]) for row in verified}
     verified_months = {
         _month_pair(row["start_date"], row["end_date"]) for row in verified
     }
+    verified_document_ids = {str(row.get("document_id") or "") for row in verified}
     retained: list[ProjectCandidate] = []
     for project in projects:
         title = _title_key(project.project_name)
@@ -540,12 +675,13 @@ def supplement_docx_career_table_projects(
         in_table = title in verified_title_keys or (
             months is not None and months in verified_months
         )
+        if title not in verified_title_keys and _is_proven_employment_mirror_on_page_one(
+            project, candidate, verified_document_ids
+        ):
+            metrics["dropped_employment_fakes"] += 1
+            continue
         if in_table:
             retained.append(project)
-            continue
-        # Employment-duty mirror with no career-table grounding → drop.
-        if title and title in duty_keys:
-            metrics["dropped_employment_fakes"] += 1
             continue
         retained.append(project)
 
@@ -565,6 +701,8 @@ __all__ = [
     "attach_docx_career_tables_to_pages",
     "career_project_header_columns",
     "extract_docx_career_project_rows_from_page",
+    "extract_docx_career_project_rows_from_docx",
+    "extract_docx_career_project_rows_by_page",
     "extract_docx_career_project_rows_from_pdf",
     "format_career_table_block",
     "is_docx_project_table_doc_type",
