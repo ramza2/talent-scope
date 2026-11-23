@@ -338,6 +338,7 @@ class AnalysisSourceBuilder:
             vlm_used = 0
             table_calls_used = 0
             pdf_doc: pymupdf.Document | None = None
+            native_career_by_page: dict[int, list[dict[str, Any]]] | None = None
             try:
                 for page in pages:
                     text = (page.extracted_text or "").strip()
@@ -568,6 +569,7 @@ class AnalysisSourceBuilder:
                             extract_docx_career_project_rows_from_page,
                             is_docx_project_table_doc_type,
                             rows_from_layout,
+                            extract_docx_career_project_rows_by_page,
                         )
 
                         if is_docx_project_table_doc_type(doc.document_type_code):
@@ -585,6 +587,21 @@ class AnalysisSourceBuilder:
                                             page_no=page.page_no,
                                         )
                                     )
+                            if not career_rows:
+                                if native_career_by_page is None:
+                                    try:
+                                        native_career_by_page = (
+                                            extract_docx_career_project_rows_by_page(
+                                                self._download(doc.storage_key), pages
+                                            )
+                                        )
+                                    except Exception:
+                                        native_career_by_page = {}
+                                        logger.info(
+                                            "native DOCX project table unavailable document_id=%s",
+                                            doc.id,
+                                        )
+                                career_rows = native_career_by_page.get(page.page_no, [])
                             if career_rows:
                                 text = append_career_table_block(text, career_rows)
 
