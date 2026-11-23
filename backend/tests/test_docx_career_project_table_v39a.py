@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pymupdf
@@ -32,7 +33,19 @@ from app.modules.analysis.compact_v8 import supplement_projects_from_second_pass
 from app.modules.document_processing.types import ExtractedPage
 
 _DOC = "a1111111-1111-1111-1111-111111111111"
-_FONT = "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc"
+# The isolated test image installs Nanum/Noto CJK, not necessarily WQY.
+_FONT_CANDIDATES = (
+    Path("/usr/share/fonts/truetype/nanum/NanumGothic.ttf"),
+    Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
+    Path("/usr/share/fonts/truetype/wqy/wqy-microhei.ttc"),
+)
+
+
+def _korean_fixture_font() -> str:
+    for path in _FONT_CANDIDATES:
+        if path.is_file():
+            return str(path)
+    raise AssertionError("Korean fixture font missing: install fonts-nanum or fonts-noto-cjk")
 
 _PROJECTS = [
     (
@@ -436,15 +449,16 @@ def test_non_career_or_non_docx_paths_untouched() -> None:
 
 def _build_career_pdf() -> bytes:
     """Synthetic ruled table; cell text via insert_text to avoid mid-glyph wrap."""
+    font_path = _korean_fixture_font()
     doc = pymupdf.open()
     p1 = doc.new_page(width=595, height=842)
-    p1.insert_font(fontname="ko", fontfile=_FONT)
+    p1.insert_font(fontname="ko", fontfile=font_path)
     p1.insert_text((40, 60), "근무경력", fontsize=12, fontname="ko")
     p1.insert_text((40, 90), "회사명 테스트소프트", fontsize=10, fontname="ko")
     p1.insert_text((40, 110), "담당업무 앱 개발", fontsize=10, fontname="ko")
 
     p2 = doc.new_page(width=595, height=842)
-    p2.insert_font(fontname="ko", fontfile=_FONT)
+    p2.insert_font(fontname="ko", fontfile=font_path)
     p2.insert_text((40, 40), "경력 기술서", fontsize=12, fontname="ko")
     headers = ["사업명", "기간", "역할", "담당업무 상세", "발주처"]
     # Keep titles single-line in the PDF fixture; multiline merge is covered
