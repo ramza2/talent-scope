@@ -544,7 +544,7 @@ def _is_proven_employment_mirror_on_page_one(
         if months != _month_pair(employment.start_date, employment.end_date):
             continue
         for field in (employment.department, employment.responsibilities):
-            for part in re.split(r"[,/·\\n|;]", field or ""):
+            for part in re.split(r"[,/·\n|;]", field or ""):
                 if title == _title_key(part):
                     return True
     return False
