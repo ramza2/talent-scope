@@ -4,6 +4,7 @@ from fastapi import APIRouter
 
 from app.api.v1 import health
 from app.modules.analysis import router as analyses_router
+from app.modules.analysis.orphan_router import router as orphan_analyses_router
 from app.modules.auth import router as auth_router
 from app.modules.career import (
     certifications_router,
@@ -42,6 +43,7 @@ api_router.include_router(upload_sessions_router)
 api_router.include_router(person_documents_router)
 api_router.include_router(documents_router)
 api_router.include_router(document_groups_router)
+api_router.include_router(orphan_analyses_router)
 api_router.include_router(analyses_router)
 api_router.include_router(evidence_router)
 api_router.include_router(search_router)

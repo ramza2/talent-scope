@@ -18,6 +18,7 @@ celery_app = Celery(
         "app.tasks.document_tasks",
         "app.tasks.analysis_tasks",
         "app.tasks.index_tasks",
+        "app.tasks.orphan_tasks",
     ],
 )
 
@@ -34,6 +35,7 @@ celery_app.conf.update(
         "app.tasks.document_tasks.*": {"queue": "document"},
         "app.tasks.analysis_tasks.*": {"queue": "analysis"},
         "app.tasks.index_tasks.*": {"queue": "index"},
+        "app.tasks.orphan_tasks.*": {"queue": "document"},
     },
     # Dispatcher only publishes PENDING jobs; SearchIndexJob DB remains SoT.
     # Beat interval ~15s keeps Confirm→index lag short without Confirm TX .delay().
@@ -41,6 +43,11 @@ celery_app.conf.update(
     # Stale PROCESSING recovery returns stuck reservations to PENDING (~60s).
     # SearchIndexJob DB remains SoT; Confirm TX never calls .delay().
     beat_schedule={
+        # Read-only logging only; NEVER auto-fail a PROCESSING analysis.
+        "report-stale-analysis-runs": {
+            "task": "app.tasks.orphan_tasks.report_stale_analysis_runs",
+            "schedule": 300.0,
+        },
         "dispatch-pending-search-index-jobs": {
             "task": "app.tasks.index_tasks.dispatch_pending_search_index_jobs",
             "schedule": 15.0,

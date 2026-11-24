@@ -9,6 +9,7 @@ import logging
 from uuid import UUID
 
 from app.db.session import SessionLocal
+from app.modules.analysis.execution_guard import worker_execution_guard
 from app.modules.analysis.service import AnalysisService
 from app.modules.upload_identification.service import IdentificationService
 from app.storage.s3 import get_object_storage
@@ -68,12 +69,15 @@ def run_profile_analysis(
     analysis_run_id: str,
     actor_user_id: str | None = None,
 ) -> dict[str, str]:
-    """Run detailed profile analysis for an AnalysisRun."""
-    db = SessionLocal()
+    """Run detailed profile analysis under a shared execution ownership lock."""
     try:
+        run_id = UUID(analysis_run_id)
         actor = UUID(actor_user_id) if actor_user_id else None
-        service = AnalysisService(db, storage=get_object_storage())
-        status = service.run_analysis(UUID(analysis_run_id), actor_user_id=actor)
+        # Recovery cannot acquire its exclusive transaction lock while a
+        # compliant worker owns this shared lock, even if inspection misses it.
+        with worker_execution_guard(run_id), SessionLocal() as db:
+            service = AnalysisService(db, storage=get_object_storage())
+            status = service.run_analysis(run_id, actor_user_id=actor)
         return {"status": status, "analysis_run_id": analysis_run_id}
     except Exception:
         logger.exception(
@@ -81,8 +85,6 @@ def run_profile_analysis(
             analysis_run_id,
         )
         raise
-    finally:
-        db.close()
 
 
 def enqueue_profile_analysis(
