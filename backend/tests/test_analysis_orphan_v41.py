@@ -167,3 +167,32 @@ def test_recovery_commits_one_run_and_audit(monkeypatch):
     assert kwargs["before"]["status"] == "PROCESSING"
     assert kwargs["after"]["status"] == "FAILED"
     db.commit.assert_called_once()
+
+
+def test_orphan_routes_bootstrap_and_respect_auth_contract():
+    """Catch module-vs-APIRouter import mistakes before deployment."""
+    from fastapi.routing import APIRoute
+
+    from app.main import create_app
+
+    routes = [route for route in create_app().routes if isinstance(route, APIRoute)]
+    expected = {
+        ("GET", "/api/v1/analyses/orphan-candidates"),
+        ("GET", "/api/v1/analyses/{analysis_id}/orphan-check"),
+        ("POST", "/api/v1/analyses/{analysis_id}/recover-orphan"),
+    }
+    found = {(method, route.path) for route in routes for method in route.methods}
+    assert expected <= found
+
+    for method, path in expected:
+        matches = [route for route in routes if route.path == path and method in route.methods]
+        assert len(matches) == 1
+        dependencies = {item.call.__name__ for item in matches[0].dependant.dependencies}
+        assert "require_admin" in dependencies
+        if method == "POST":
+            assert "require_csrf" in dependencies
+
+    paths = [route.path for route in routes]
+    assert paths.index("/api/v1/analyses/orphan-candidates") < paths.index(
+        "/api/v1/analyses/{analysis_id}"
+    )
