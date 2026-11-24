@@ -7,6 +7,7 @@ import {
   type AnalysisOrphanCheck,
 } from '@/api/analysisRecovery'
 import { apiErrorMessage } from '@/api/errors'
+import { currentOrphanDiagnosis, canRequestOrphanRecovery } from '@/api/analysisRecoveryPolicy'
 
 /** Mounted only for PROCESSING, keyed by run ID and the latest DB update. */
 export function AnalysisRecoveryPanel({
@@ -72,13 +73,8 @@ export function AnalysisRecoveryPanel({
     },
   })
 
-  const currentDiagnosis = diagnosis?.analysis_id === analysisId &&
-    diagnosis.status === 'PROCESSING' && diagnosis.updated_at === updatedAt
-    ? diagnosis
-    : null
-  const canRecover = currentDiagnosis?.stale === true &&
-    currentDiagnosis.worker_task_state === 'ABSENT' &&
-    currentDiagnosis.recovery_allowed === true
+  const currentDiagnosis = currentOrphanDiagnosis(diagnosis, analysisId, updatedAt)
+  const canRecover = canRequestOrphanRecovery(currentDiagnosis)
   const pending = checkMutation.isPending || recoverMutation.isPending
   let explanation = '완료될 때까지 자동 갱신합니다. 분석이 오래 지속되면 실행 상태를 확인할 수 있습니다.'
   let kind: 'info' | 'warning' | 'error' = 'info'
