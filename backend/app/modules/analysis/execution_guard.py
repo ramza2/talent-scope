@@ -72,7 +72,7 @@ class AnalysisAttemptSuperseded(Exception):
 
 
 def lock_current_attempt(
-    db: Session, run_id: UUID, expected_started_at: datetime,
+    db: Session, run_id: UUID, expected_started_at: datetime | None,
 ) -> AnalysisRun:
     """Refresh under row lock, never let a cached ORM instance authorize writes."""
     run = db.execute(
