@@ -7,6 +7,7 @@ import logging
 from sqlalchemy import text
 
 from app.db.session import SessionLocal
+from app.modules.analysis.execution_guard import worker_guard_held
 from app.modules.analysis.orphan_recovery import inspect_worker, list_stale_candidates
 from app.tasks.celery_app import celery_app
 
@@ -26,11 +27,16 @@ def report_stale_analysis_runs() -> dict[str, int | str]:
         # Rollback expires ORM objects even with expire_on_commit=False.
         # Keep only immutable IDs before closing the read-only session.
         candidate_ids = [run.id for run in list_stale_candidates(db)]
+        owned = {run_id for run_id in candidate_ids if worker_guard_held(db, run_id)}
         db.rollback()
 
     snapshot = inspect_worker() if candidate_ids else None
-    active = sum(snapshot.target_state(run_id) == "ACTIVE" for run_id in candidate_ids) if snapshot else 0
-    absent = sum(snapshot.target_state(run_id) == "ABSENT" for run_id in candidate_ids) if snapshot else 0
+    states = [
+        "ACTIVE" if run_id in owned else snapshot.target_state(run_id)
+        for run_id in candidate_ids
+    ] if snapshot else []
+    active = states.count("ACTIVE")
+    absent = states.count("ABSENT")
     unknown = len(candidate_ids) - active - absent
     if candidate_ids:
         logger.warning(
