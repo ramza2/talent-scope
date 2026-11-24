@@ -171,11 +171,15 @@ def test_recovery_commits_one_run_and_audit(monkeypatch):
 
 def test_orphan_routes_bootstrap_and_respect_auth_contract():
     """Catch module-vs-APIRouter import mistakes before deployment."""
-    from fastapi.routing import APIRoute
-
     from app.main import create_app
 
-    routes = [route for route in create_app().routes if isinstance(route, APIRoute)]
+    # Test the actual registered app routes, not a specific APIRoute class
+    # identity (the isolated test image may use a different routing wrapper).
+    routes = [
+        route for route in create_app().routes
+        if hasattr(route, "dependant") and hasattr(route, "path")
+        and hasattr(route, "methods")
+    ]
     expected = {
         ("GET", "/api/v1/analyses/orphan-candidates"),
         ("GET", "/api/v1/analyses/{analysis_id}/orphan-check"),
