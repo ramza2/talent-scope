@@ -1,7 +1,8 @@
 """V41: conservative detection and administrator recovery of orphaned analyses.
 
 No background task changes analysis status. Recovery is explicitly requested,
-requires a responsive single-worker Celery snapshot twice, and changes one run.
+requires two single-responder Celery snapshots plus an exclusive PostgreSQL
+execution lock, and changes one run.
 """
 
 from __future__ import annotations
@@ -17,9 +18,10 @@ from sqlalchemy.orm import Session
 from app.core.exceptions import AnalysisStateConflictError, NotFoundError
 from app.db.models.analysis import AnalysisRun
 from app.modules.analysis.repository import AnalysisRepository
+from app.modules.analysis.execution_guard import try_recovery_guard, worker_guard_held
 from app.tasks.celery_app import celery_app
 
-# Conservative threshold: a long but active analysis is NEVER a recovery target.
+# Age is a candidate filter, never proof of execution termination.
 STALE_AFTER = timedelta(minutes=30)
 MAX_CANDIDATES = 50
 RECOVERY_ERROR = (
@@ -130,6 +132,9 @@ def evaluate_analysis(db: Session, analysis_id: UUID) -> dict[str, Any]:
     stale = _is_stale(run, datetime.now(UTC))
     snapshot = inspect_worker() if stale else None
     state = snapshot.target_state(analysis_id) if snapshot is not None else "NOT_CHECKED"
+    reason = snapshot.reason if snapshot is not None else "NOT_STALE_OR_NOT_PROCESSING"
+    if stale and worker_guard_held(db, analysis_id):
+        state, reason = "ACTIVE", "DB_EXECUTION_GUARD_HELD"
     return {
         "analysis_id": analysis_id,
         "status": run.status,
@@ -138,7 +143,7 @@ def evaluate_analysis(db: Session, analysis_id: UUID) -> dict[str, Any]:
         "stale": stale,
         "worker_task_state": state,
         "recovery_allowed": stale and state == "ABSENT",
-        "reason": snapshot.reason if snapshot is not None else "NOT_STALE_OR_NOT_PROCESSING",
+        "reason": reason,
     }
 
 
@@ -151,7 +156,8 @@ def recover_orphan(
 
     All DB changes (failed transition and audit) are in one transaction.
     A stale claim is necessary but not sufficient: two healthy worker snapshots
-    must both report the target task absent, including while the DB row is locked.
+    must both report the target task absent; an exclusive execution guard and
+    the same unchanged DB attempt must also be held/confirmed before mutation.
     """
     # Never acquire a write lock when the precondition is already false.
     peek = db.get(AnalysisRun, analysis_id)
@@ -160,6 +166,7 @@ def recover_orphan(
     if not _is_stale(peek, datetime.now(UTC)):
         raise AnalysisStateConflictError("복구 가능한 오래된 PROCESSING 분석이 아닙니다.")
 
+    expected_attempt = (peek.started_at, peek.updated_at)
     first = inspect_worker()
     if first.target_state(analysis_id) != "ABSENT":
         raise AnalysisStateConflictError("Worker 실행 여부가 불확실하거나 분석 작업이 살아 있어 복구하지 않습니다.")
@@ -168,13 +175,19 @@ def recover_orphan(
         # PostgreSQL transaction-local limits; never modify schema or other rows.
         db.execute(text("SET LOCAL lock_timeout = '2s'"))
         db.execute(text("SET LOCAL statement_timeout = '90s'"))
+        # Same lock order as the worker: ownership first, then the DB row.
+        # A missed/nonresponding compliant worker still blocks recovery.
+        if not try_recovery_guard(db, analysis_id):
+            raise AnalysisStateConflictError("Worker가 분석 실행 잠금을 보유하고 있어 복구하지 않습니다.")
         # Identity-map safety: re-read post-lock state, not the earlier peek.
         db.expire(peek)
         repo = AnalysisRepository(db)
         run = repo.get_run(analysis_id, for_update=True)
         if run is None:
             raise NotFoundError("분석을 찾을 수 없습니다.")
-        if not _is_stale(run, datetime.now(UTC)):
+        if not _is_stale(run, datetime.now(UTC)) or (
+            run.started_at, run.updated_at
+        ) != expected_attempt:
             raise AnalysisStateConflictError("분석 상태가 변경되어 복구를 중단합니다.")
 
         second = inspect_worker()
