@@ -23,20 +23,22 @@ def report_stale_analysis_runs() -> dict[str, int | str]:
     with SessionLocal() as db:
         db.execute(text("SET TRANSACTION READ ONLY"))
         db.execute(text("SET LOCAL statement_timeout = '10s'"))
-        candidates = list_stale_candidates(db)
+        # Rollback expires ORM objects even with expire_on_commit=False.
+        # Keep only immutable IDs before closing the read-only session.
+        candidate_ids = [run.id for run in list_stale_candidates(db)]
         db.rollback()
 
-    snapshot = inspect_worker() if candidates else None
-    active = sum(snapshot.target_state(r.id) == "ACTIVE" for r in candidates) if snapshot else 0
-    absent = sum(snapshot.target_state(r.id) == "ABSENT" for r in candidates) if snapshot else 0
-    unknown = len(candidates) - active - absent
-    if candidates:
+    snapshot = inspect_worker() if candidate_ids else None
+    active = sum(snapshot.target_state(run_id) == "ACTIVE" for run_id in candidate_ids) if snapshot else 0
+    absent = sum(snapshot.target_state(run_id) == "ABSENT" for run_id in candidate_ids) if snapshot else 0
+    unknown = len(candidate_ids) - active - absent
+    if candidate_ids:
         logger.warning(
             "analysis orphan monitor stale=%d active=%d absent=%d unknown=%d",
-            len(candidates), active, absent, unknown,
+            len(candidate_ids), active, absent, unknown,
         )
     return {
-        "stale": len(candidates),
+        "stale": len(candidate_ids),
         "active": active,
         "absent": absent,
         "unknown": unknown,
