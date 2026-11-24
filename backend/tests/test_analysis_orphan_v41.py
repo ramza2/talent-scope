@@ -170,33 +170,38 @@ def test_recovery_commits_one_run_and_audit(monkeypatch):
 
 
 def test_orphan_routes_bootstrap_and_respect_auth_contract():
-    """Catch module-vs-APIRouter import mistakes before deployment."""
+    """Use public OpenAPI paths; FastAPI >=0.137 nests included routers."""
     from app.main import create_app
+    from app.modules.analysis.orphan_router import router as orphan_router
 
-    # Test the actual registered app routes, not a specific APIRoute class
-    # identity (the isolated test image may use a different routing wrapper).
-    routes = [
-        route for route in create_app().routes
-        if hasattr(route, "dependant") and hasattr(route, "path")
-        and hasattr(route, "methods")
-    ]
+    # FastAPI >=0.137 keeps app.routes as a tree of included routers.
+    # OpenAPI is the supported, flattened representation of registered paths.
+    paths = create_app().openapi()["paths"]
     expected = {
         ("GET", "/api/v1/analyses/orphan-candidates"),
         ("GET", "/api/v1/analyses/{analysis_id}/orphan-check"),
         ("POST", "/api/v1/analyses/{analysis_id}/recover-orphan"),
     }
-    found = {(method, route.path) for route in routes for method in route.methods}
-    assert expected <= found
-
     for method, path in expected:
-        matches = [route for route in routes if route.path == path and method in route.methods]
+        assert path in paths
+        assert method.lower() in paths[path]
+
+    # On the leaf router, route dependencies remain directly inspectable.
+    leaf_routes = list(orphan_router.routes)
+    for method, path in expected:
+        leaf_path = path.removeprefix("/api/v1")
+        matches = [
+            route for route in leaf_routes
+            if route.path == leaf_path and method in route.methods
+        ]
         assert len(matches) == 1
         dependencies = {item.call.__name__ for item in matches[0].dependant.dependencies}
         assert "require_admin" in dependencies
         if method == "POST":
             assert "require_csrf" in dependencies
 
-    paths = [route.path for route in routes]
-    assert paths.index("/api/v1/analyses/orphan-candidates") < paths.index(
+    # Static collection path must be defined before the dynamic detail path.
+    registered = list(paths)
+    assert registered.index("/api/v1/analyses/orphan-candidates") < registered.index(
         "/api/v1/analyses/{analysis_id}"
     )
