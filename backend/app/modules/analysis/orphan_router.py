@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
+from app.modules.analysis.execution_guard import worker_guard_held
 from app.modules.analysis.orphan_recovery import (
     evaluate_analysis,
     inspect_worker,
@@ -61,6 +62,9 @@ def get_orphan_candidates(
     items = []
     for run in candidates:
         state = snapshot.target_state(run.id) if snapshot is not None else "NOT_CHECKED"
+        reason = snapshot.reason if snapshot is not None else "NO_CANDIDATES"
+        if worker_guard_held(db, run.id):
+            state, reason = "ACTIVE", "DB_EXECUTION_GUARD_HELD"
         items.append(
             OrphanCheckData(
                 analysis_id=run.id,
@@ -70,7 +74,7 @@ def get_orphan_candidates(
                 stale=True,
                 worker_task_state=state,
                 recovery_allowed=state == "ABSENT",
-                reason=snapshot.reason if snapshot is not None else "NO_CANDIDATES",
+                reason=reason,
             )
         )
     return OrphanCandidatesResponse(data=items)
