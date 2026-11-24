@@ -4,7 +4,7 @@ from fastapi import APIRouter
 
 from app.api.v1 import health
 from app.modules.analysis import router as analyses_router
-from app.modules.analysis import orphan_router as orphan_analyses_router
+from app.modules.analysis.orphan_router import router as orphan_analyses_router
 from app.modules.auth import router as auth_router
 from app.modules.career import (
     certifications_router,
