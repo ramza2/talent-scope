@@ -39,6 +39,7 @@ import {
   projectReviewView,
 } from '@/api/projectReviewDisplay'
 import { DiffEvidenceGroups } from '@/pages/analysisDiffEvidence'
+import { AnalysisRecoveryPanel } from '@/pages/AnalysisRecoveryPanel'
 import { ProjectPptxSourceLocations } from '@/pages/projectPptxSourceLocations'
 import { readAnalysesReturnTo } from '@/pages/analysesListState'
 import {
@@ -795,6 +796,12 @@ export function AnalysisDetailPage() {
           style={{ marginBottom: 16 }}
           message="앞선 AI 분석 완료를 기다리고 있습니다."
           description="대기 중에는 Diff 검토와 확정을 할 수 없습니다. 상태가 바뀌면 자동으로 갱신됩니다."
+        />
+      ) : analysis.status === 'PROCESSING' ? (
+        <AnalysisRecoveryPanel
+          key={`${analysis.analysis_id}:${analysis.updated_at}`}
+          analysisId={analysis.analysis_id}
+          updatedAt={analysis.updated_at}
         />
       ) : isActiveAnalysisStatus(analysis.status) ? (
         <Alert
