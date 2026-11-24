@@ -6,6 +6,7 @@ import logging
 import math
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 from collections.abc import Sequence
 from types import SimpleNamespace
@@ -105,6 +106,7 @@ from app.modules.analysis.diff_evidence import (
 from app.modules.analysis.diff_engine import DiffSpec, build_diffs
 from app.modules.analysis.normalize import normalize_candidate
 from app.modules.analysis.repository import AnalysisRepository
+from app.modules.analysis.execution_guard import AnalysisAttemptSuperseded, lock_current_attempt
 from app.modules.analysis.token_budget import (
     PromptChatBudget,
     compute_prompt_chat_budget,
@@ -323,6 +325,7 @@ class _RunContext:
     documents: tuple[DocumentSnapshot, ...]
     catalog: tuple[tuple[str, str, bool], ...]  # code, type, active
     code_catalog_text: str
+    started_at: datetime | None = None
 
 
 class AnalysisService:
@@ -884,6 +887,7 @@ class AnalysisService:
                 self._persist_vlm_transcriptions(
                     bundle.vlm_transcriptions,
                     analysis_run_id=run_id,
+                    expected_started_at=claimed.started_at,
                 )
             prompt_source = bundle.build_prompt_source(
                 int(self.settings.analysis_max_total_text_chars)
@@ -913,19 +917,18 @@ class AnalysisService:
                     claimed.person_id, claimed.base_profile_version
                 )
                 if snap is None:
-                    run = self.repo.get_run(run_id, for_update=True)
-                    if run is not None:
-                        self.repo.mark_failed(
-                            run,
-                            f"base profile revision {claimed.base_profile_version} not found",
-                        )
-                        self.repo.add_audit(
-                            action_type="ANALYSIS_FAILED",
-                            actor_user_id=actor_user_id,
-                            target_id=run_id,
-                            after={"status": "FAILED", "reason": "missing_revision"},
-                        )
-                        self.db.commit()
+                    run = lock_current_attempt(self.db, run_id, claimed.started_at)
+                    self.repo.mark_failed(
+                        run,
+                        f"base profile revision {claimed.base_profile_version} not found",
+                    )
+                    self.repo.add_audit(
+                        action_type="ANALYSIS_FAILED",
+                        actor_user_id=actor_user_id,
+                        target_id=run_id,
+                        after={"status": "FAILED", "reason": "missing_revision"},
+                    )
+                    self.db.commit()
                 return snap
 
             if claimed.prompt_version in {
@@ -1093,11 +1096,19 @@ class AnalysisService:
                 specs=specs,
                 actor_user_id=actor_user_id,
                 source_first_fallback=source_first_fallback,
+                expected_started_at=claimed.started_at,
             )
+        except AnalysisAttemptSuperseded as exc:
+            self.db.rollback()
+            logger.info("analysis superseded run_id=%s status=%s", run_id, exc.status)
+            return exc.status
         except Exception as exc:
             logger.exception("analysis failed run_id=%s", run_id)
             self.db.rollback()
-            return self._fail_run(run_id, exc, actor_user_id=actor_user_id)
+            return self._fail_run(
+                run_id, exc, actor_user_id=actor_user_id,
+                expected_started_at=claimed.started_at,
+            )
 
     def _extract_single_candidate(
         self,
@@ -3583,6 +3594,7 @@ class AnalysisService:
         transcriptions: list[VLMPageTranscription],
         *,
         analysis_run_id: UUID,
+        expected_started_at: datetime | None,
     ) -> None:
         """Write successful VLM page text and re-ensure DocumentChunk sync jobs.
 
@@ -3593,6 +3605,9 @@ class AnalysisService:
         if not transcriptions:
             return
 
+        # The row lock spans page/chunk persistence and its commit. A delayed
+        # worker must not write any page after recovery or a newer claim.
+        lock_current_attempt(self.db, analysis_run_id, expected_started_at)
         persisted = 0
         skipped = 0
         group_ids: set[UUID] = set()
@@ -3693,6 +3708,7 @@ class AnalysisService:
             documents=tuple(documents),
             catalog=catalog,
             code_catalog_text=catalog_text,
+            started_at=claimed.started_at,
         )
 
     def _format_code_catalog(
@@ -3717,15 +3733,9 @@ class AnalysisService:
         specs: list[DiffSpec],
         actor_user_id: UUID | None,
         source_first_fallback: str | None = None,
+        expected_started_at: datetime | None,
     ) -> str:
-        run = self.repo.get_run(run_id, for_update=True)
-        if run is None:
-            self.db.rollback()
-            return "NOT_FOUND"
-        if run.status != "PROCESSING":
-            status = run.status
-            self.db.rollback()
-            return status
+        run = lock_current_attempt(self.db, run_id, expected_started_at)
 
         prior_prompt_version = run.prompt_version
         if source_first_fallback is not None:
@@ -3773,16 +3783,14 @@ class AnalysisService:
         return "REVIEWING"
 
     def _fail_run(
-        self, run_id: UUID, exc: Exception, *, actor_user_id: UUID | None
+        self, run_id: UUID, exc: Exception, *, actor_user_id: UUID | None,
+        expected_started_at: datetime | None,
     ) -> str:
-        run = self.repo.get_run(run_id, for_update=True)
-        if run is None:
+        try:
+            run = lock_current_attempt(self.db, run_id, expected_started_at)
+        except AnalysisAttemptSuperseded as stale:
             self.db.rollback()
-            return "NOT_FOUND"
-        if run.status in {"CONFIRMED", "CANCELLED", "REVIEWING"}:
-            status = run.status
-            self.db.rollback()
-            return status
+            return stale.status
         if isinstance(exc, InsufficientCandidateError):
             message = InsufficientCandidateError.USER_MESSAGE
         elif isinstance(exc, AIResponseValidationError):
