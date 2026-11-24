@@ -113,6 +113,7 @@ def test_recovery_rechecks_worker_while_run_row_locked(monkeypatch):
     run = fake_run()
     db = MagicMock()
     db.get.return_value = run
+    db.execute.return_value.scalar_one.return_value = True
     repo = MagicMock()
     repo.get_run.return_value = run
     monkeypatch.setattr(v41, "AnalysisRepository", lambda _db: repo)
@@ -132,6 +133,7 @@ def test_recovery_rechecks_db_after_lock(monkeypatch):
     run = fake_run()
     db = MagicMock()
     db.get.return_value = run
+    db.execute.return_value.scalar_one.return_value = True
     repo = MagicMock()
 
     def mutate_and_return(*_a, **_kw):
@@ -152,6 +154,7 @@ def test_recovery_commits_one_run_and_audit(monkeypatch):
     run = fake_run()
     db = MagicMock()
     db.get.return_value = run
+    db.execute.return_value.scalar_one.return_value = True
     repo = MagicMock()
     repo.get_run.return_value = run
     monkeypatch.setattr(v41, "AnalysisRepository", lambda _db: repo)
@@ -205,3 +208,38 @@ def test_orphan_routes_bootstrap_and_respect_auth_contract():
     assert registered.index("/api/v1/analyses/orphan-candidates") < registered.index(
         "/api/v1/analyses/{analysis_id}"
     )
+
+
+def test_worker_execution_lock_blocks_recovery_even_if_celery_reports_absent(monkeypatch):
+    run = fake_run()
+    db = MagicMock()
+    db.get.return_value = run
+    db.execute.return_value.scalar_one.return_value = False
+    repo = MagicMock()
+    monkeypatch.setattr(v41, "AnalysisRepository", lambda _db: repo)
+    monkeypatch.setattr(v41, "inspect_worker", lambda: v41.WorkerSnapshot("celery@worker", (), True, "OK"))
+    with pytest.raises(AnalysisStateConflictError):
+        v41.recover_orphan(db, run.id, uuid4())
+    repo.mark_failed.assert_not_called()
+    db.commit.assert_not_called()
+    db.rollback.assert_called_once()
+
+
+def test_recovery_blocks_changed_attempt_even_if_both_revisions_are_stale(monkeypatch):
+    run = fake_run(age_minutes=80)
+    db = MagicMock()
+    db.get.return_value = run
+    db.execute.return_value.scalar_one.return_value = True
+    repo = MagicMock()
+    def changed(*_a, **_kw):
+        run.started_at += timedelta(minutes=5)
+        run.updated_at += timedelta(minutes=5)
+        return run
+    repo.get_run.side_effect = changed
+    monkeypatch.setattr(v41, "AnalysisRepository", lambda _db: repo)
+    monkeypatch.setattr(v41, "inspect_worker", lambda: v41.WorkerSnapshot("celery@worker", (), True, "OK"))
+    with pytest.raises(AnalysisStateConflictError):
+        v41.recover_orphan(db, run.id, uuid4())
+    repo.mark_failed.assert_not_called()
+    db.commit.assert_not_called()
+    db.rollback.assert_called_once()
