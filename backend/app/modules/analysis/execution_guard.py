@@ -33,9 +33,8 @@ def execution_key(run_id: UUID) -> int:
 def worker_execution_guard(run_id: UUID) -> Iterator[None]:
     # Never return a session holding an advisory lock to the connection pool.
     # AUTOCOMMIT avoids a long-lived idle transaction during GPU calls.
-    with engine.connect() as conn:
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
         conn.detach()
-        conn = conn.execution_options(isolation_level="AUTOCOMMIT")
         conn.execute(
             text("SELECT pg_advisory_lock_shared(:key)"),
             {"key": execution_key(run_id)},
